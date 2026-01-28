@@ -1,76 +1,88 @@
-mod hierachy;
+pub mod hierarchy;
+pub mod window;
 
-use minifb::{Key, KeyRepeat, MouseMode, Window, WindowOptions};
+use std::env;
+use std::fs;
+use std::fs::File;
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::SystemTime;
+use macroquad::color::BLACK;
+use macroquad::window::{clear_background, next_frame};
 
-fn main() {
-    let mut window = Window::new(
-        "minifb pixels (esc to quit)",
-        640,
-        360,
-        WindowOptions {
-            resize: true,
-            ..WindowOptions::default()
-        },
-    )
-        .expect("unable to open window");
+fn resolve_from_cwd(user_path: &str) -> std::io::Result<PathBuf> {
+    let p = PathBuf::from(user_path);
 
-    // 0 = no waiting (max fps, max cpu). default is already high.
-    window.set_target_fps(0);
+    if p.is_absolute() {
+        return Ok(p);
+    }
 
-    let mut buffer: Vec<u32> = Vec::new();
-    let mut frame: u32 = 0;
+    let cwd = env::current_dir()?;
+    Ok(cwd.join(p))
+}
 
-    while window.is_open() && !window.is_key_down(Key::Escape) {
-        // a) get screen size (in pixels)
-        let (w, h) = window.get_size();
-        let w = w.max(1);
-        let h = h.max(1);
-
-        // b) ensure we have a big enough pixel buffer
-        if buffer.len() != w * h {
-            buffer.resize(w * h, 0);
-        }
-
-        // c) read inputs (example: mouse position affects the picture)
-        let (mx, my) = window
-            .get_mouse_pos(MouseMode::Clamp)
-            .unwrap_or((0.0, 0.0));
-        let mx = mx as i32;
-        let my = my as i32;
-
-        // d) write pixels (0x00RRGGBB)
-        // this redraws the whole frame every loop
-        let t = frame;
-        for y in 0..h {
-            let yy = y as i32;
-            for x in 0..w {
-                let xx = x as i32;
-
-                let r = ((x as u32).wrapping_add(t) & 0xff) as u32;
-                let g = ((y as u32).wrapping_add(t.wrapping_mul(2)) & 0xff) as u32;
-                let mut b = ((t.wrapping_mul(3)) & 0xff) as u32;
-
-                // simple "spotlight" around the mouse
-                let dx = (xx - mx).abs() as u32;
-                let dy = (yy - my).abs() as u32;
-                if dx < 40 && dy < 40 {
-                    b = 255;
+#[macroquad::main("NeoLOVE")]
+async fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "new" => {
+                if args.len() != 3 {
+                    println!("expected {} arguments, got {}", 3, args.len());
+                    return;
+                }
+                let project_name = args[2].clone();
+                let project_path = resolve_from_cwd(&project_name).unwrap();
+                if fs::create_dir(&project_path).is_err()
+                {
+                    println!("error when creating project folder. does this folder already exist?");
+                    return;
                 }
 
-                buffer[y * w + x] = (r << 16) | (g << 8) | b;
-            }
-        }
+                {
+                    let f = File::create(&project_path.join("neolove.toml"));
+                    let contents = format!("\
+[package]
+name = \"{}\"
+version = \"0.1.0\"
 
-        // e) present the buffer (also pumps window events)
-        window
-            .update_with_buffer(&buffer, w, h)
-            .expect("update failed");
+[dependencies]
+", project_name);
+                    let mut file = f.expect("error when creating neolove.toml");
+                    file.write_all(contents.as_bytes()).expect("could not write toml");
+                }
 
-        // example: press space to reset animation
-        if window.is_key_pressed(Key::Space, KeyRepeat::No) {
-            frame = 0;
-        } else {
-            frame = frame.wrapping_add(1);
+                {
+                    let f = File::create(&project_path.join("main.luau"));
+                    let contents = format!("print(\"Hello, {}!\")", project_name);
+                    let mut file = f.expect("error when creating main.luau");
+                    file.write_all(contents.as_bytes()).expect("could not write main.luau");
+                }
+
+                {
+                    fs::create_dir(&project_path.join("assets")).expect("could not create assets");
+                }
+
+                println!("Created project \"{project_name}\" at {}.", project_path.to_str().unwrap());
+                println!("To run, execute in the project directory the command `Neolove run`")
+            },
+            "run" => {
+                let mut runtime = window::Runtime::new(env::current_dir().unwrap());
+                runtime.start();
+
+                let mut ct = SystemTime::now() .duration_since(SystemTime::UNIX_EPOCH) .unwrap() .as_secs_f64();
+                loop {
+                    clear_background(BLACK);
+                    let ct2 = SystemTime::now() .duration_since(SystemTime::UNIX_EPOCH) .unwrap() .as_secs_f64();
+                    let dt = ct2 - ct;
+                    ct = ct2;
+                    runtime.update(dt as f32);
+                    next_frame().await;
+                }
+            },
+            _ => println!("unrecognized"),
         }
+    } else {
+        println!("no arguments provided");
     }
 }
