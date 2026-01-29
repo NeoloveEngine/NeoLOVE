@@ -8,6 +8,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use macroquad::color::BLACK;
+use macroquad::prelude::draw_text;
 use macroquad::window::{clear_background, next_frame};
 
 fn resolve_from_cwd(user_path: &str) -> std::io::Result<PathBuf> {
@@ -77,6 +78,7 @@ version = \"0.1.0\"
                     let dt = ct2 - ct;
                     ct = ct2;
                     runtime.update(dt as f32);
+                    draw_text((1f64/dt).round().to_string().as_str(), 10f32, 30f32, 32f32, BLACK);
                     next_frame().await;
                 }
             },

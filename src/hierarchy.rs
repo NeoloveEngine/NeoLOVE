@@ -1,12 +1,16 @@
+use mlua::RegistryKey;
+
 pub type EntityId = usize;
 
 pub struct Entity {
-    components: Vec<Component>,
-    children: Vec<EntityId>,
-    parent: Option<EntityId>
+    pub components: Vec<Component>,
+    pub children: Vec<EntityId>,
+    pub parent: Option<EntityId>,
+    pub id: EntityId,
+    pub luau_key: RegistryKey,
 }
 
 pub struct Component {
-    name: String,
-    this: mlua::Table
+    pub name: String,
+    pub this: mlua::Table
 }

@@ -4,11 +4,11 @@ you to easily make performant games in the language luau
 
 ### Roadmap
 
-- [ ] luau processing
-- [ ] hierachy
-- [ ] entities
+- [X] luau processing
+- [X] hierachy
+- [X] entities
 - [ ] components
-- [ ] systems
+- [X] systems
 - [ ] rendering
 - [ ] reading/writing files
 - [ ] audio manager
