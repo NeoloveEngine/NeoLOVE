@@ -4,17 +4,28 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::SystemTime;
 
 use crate::hierarchy;
-use crate::hierarchy::EntityId;
 
 pub struct Runtime {
-    Entities: Rc<RefCell<HashMap<hierarchy::EntityId, hierarchy::Entity>>>,
-    Systems: Rc<RefCell<Vec<RegistryKey>>>,
-    Environment: PathBuf,
+    entities: Rc<RefCell<HashMap<hierarchy::EntityId, hierarchy::Entity>>>,
+    systems: Rc<RefCell<Vec<RegistryKey>>>,
+    environment: PathBuf,
     lua: Lua,
-    entityMax: usize,
+    entity_max: usize,
+}
+
+fn deep_copy_table(lua: &Lua, table: &Table) -> mlua::Result<Table> {
+    let copy = lua.create_table()?;
+    for pair in table.pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        let copied_value = match value {
+            Value::Table(t) => Value::Table(deep_copy_table(lua, &t)?),
+            other => other,
+        };
+        copy.set(key, copied_value)?;
+    }
+    Ok(copy)
 }
 
 fn create_entity_table(lua: &Lua, name: &str, x: f64, y: f64) -> mlua::Result<Table> {
@@ -24,6 +35,8 @@ fn create_entity_table(lua: &Lua, name: &str, x: f64, y: f64) -> mlua::Result<Ta
     table.set("y", y)?;
     table.set("scale_x", 1.0)?;
     table.set("scale_y", 1.0)?;
+    table.set("size_x", 32.0)?;
+    table.set("size_y", 32.0)?;
     table.set("components", lua.create_table()?)?;
     Ok(table)
 }
@@ -31,21 +44,25 @@ fn create_entity_table(lua: &Lua, name: &str, x: f64, y: f64) -> mlua::Result<Ta
 impl Runtime {
     pub fn new(env: PathBuf) -> Runtime {
         Runtime {
-            Entities: Rc::new(RefCell::new(HashMap::new())),
-            Systems: Rc::new(RefCell::new(Vec::new())),
-            Environment: env,
+            entities: Rc::new(RefCell::new(HashMap::new())),
+            systems: Rc::new(RefCell::new(Vec::new())),
+            environment: env,
             lua: Lua::new(),
-            entityMax: 1,
+            entity_max: 1,
         }
     }
 
-    fn get_entity_by_registry_key(&mut self, key: RegistryKey) -> EntityId {
-        for entity in self.Entities.borrow().iter() {
-            if entity.1.luau_key == key {
-                return entity.0.clone();
-            }
-        }
-        0
+    fn set_mouse_table(&mut self) {
+        let (mouse_x, mouse_y) = mouse_position();
+
+        let mouse_table = self.lua.create_table().unwrap();
+        mouse_table.set("x", mouse_x).unwrap();
+        mouse_table.set("y", mouse_y).unwrap();
+
+        self.lua
+            .globals()
+            .set("mouse", mouse_table)
+            .expect("could not set mouse");
     }
 
     pub fn start(&mut self) {
@@ -58,8 +75,10 @@ impl Runtime {
             .set("require", require)
             .expect("failed to set require global");
 
+        self.set_mouse_table();
+
         let env_root = self
-            .Environment
+            .environment
             .canonicalize()
             .expect("bad environment path");
         let entry_file = env_root.join("main.luau");
@@ -84,7 +103,7 @@ impl Runtime {
 
         // Systems
         {
-            let systems = self.Systems.clone();
+            let systems = self.systems.clone();
             let add_system = self
                 .lua
                 .create_function(move |lua, system: Table| {
@@ -100,8 +119,8 @@ impl Runtime {
 
         // Entities
         {
-            let entities = self.Entities.clone();
-            let entity_max = Rc::new(RefCell::new(self.entityMax));
+            let entities = self.entities.clone();
+            let entity_max = Rc::new(RefCell::new(self.entity_max));
             let entity_max_clone = entity_max.clone();
 
             let new = self
@@ -151,8 +170,27 @@ impl Runtime {
                 id: 0,
                 luau_key: root_key,
             };
-            self.Entities.borrow_mut().insert(0, root_entity);
+            self.entities.borrow_mut().insert(0, root_entity);
             ecs.set("root", root_table).expect("failed to set root");
+        }
+
+        // Components
+        {
+            let add_component = self
+                .lua
+                .create_function(move |lua, (entity, component): (Table, Table)| {
+                    let components: Table =
+                        entity.get("components").expect("could not get components");
+                    let comp = deep_copy_table(lua, &component)?;
+                    let awake: Function = comp.get("awake").expect("could not get awake");
+                    awake.call::<()>((&entity, &comp)).expect("failed to awake");
+                    components.push(&comp).expect("failed to add component");
+                    Ok(comp)
+                })
+                .expect("failed to add component");
+
+            ecs.set("addComponent", add_component)
+                .expect("failed to set addComponent");
         }
 
         self.lua
@@ -172,6 +210,8 @@ impl Runtime {
     }
 
     pub fn update(&mut self, dt: f32) {
+        self.set_mouse_table();
+
         let background: Table = self.lua.globals().get("bg").expect("failed to get bg");
         let r: u8 = background.get("R").expect("failed to get R");
         let g: u8 = background.get("G").expect("failed to get G");
@@ -179,7 +219,7 @@ impl Runtime {
 
         clear_background(Color::from_rgba(r, g, b, 255));
 
-        let keys = self.Systems.borrow();
+        let keys = self.systems.borrow();
         for key in keys.iter() {
             let system: Table = match self.lua.registry_value(key) {
                 Ok(s) => s,
@@ -193,6 +233,40 @@ impl Runtime {
                     eprintln!("\x1b[31mLua Error in system update:\x1b[0m\n{}", e);
                     std::process::exit(1);
                 }
+            }
+        }
+
+        for entity in self.entities.borrow().iter() {
+            let ent: Table = self.lua.registry_value(&entity.1.luau_key).unwrap();
+
+            // for now, we draw a box as a test
+            // later on, we will add "native components" which give more information about drawing & what to draw
+
+            let x: f32 = ent.get("x").expect("failed to get x");
+            let y: f32 = ent.get("y").expect("failed to get y");
+
+            let size_x: f32 = ent.get("size_x").expect("failed to get size_x");
+            let size_y: f32 = ent.get("size_y").expect("failed to get size_y");
+
+            draw_rectangle(
+                x,
+                y,
+                size_x,
+                size_y,
+                Color::from_rgba(255 - r, 255 - g, 255 - b, 255),
+            );
+
+            // run through all the components
+
+            let components: Table = ent.get("components").expect("failed to get components");
+
+            for component in components.pairs::<usize, Table>() {
+                let (_key, component) = component.unwrap();
+
+                let update: Function = component.get("update").expect("failed to get update");
+                update
+                    .call::<()>((&ent, component, dt))
+                    .expect("failed to call update");
             }
         }
     }

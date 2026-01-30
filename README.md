@@ -7,9 +7,10 @@ you to easily make performant games in the language luau
 - [X] luau processing
 - [X] hierachy
 - [X] entities
-- [ ] components
+- [X] components
 - [X] systems
-- [ ] rendering
+- [X] rendering <sub>half assed</sub>
+- [ ] core components
 - [ ] reading/writing files
 - [ ] audio manager
 - [ ] commands
