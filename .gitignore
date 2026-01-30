@@ -1,3 +1,5 @@
 /target
 .idea
-samples
+samples/**
+!samples/**/
+!samples/**/*.*
