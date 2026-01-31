@@ -9,16 +9,17 @@ you to easily make performant games in the language luau
 - [X] entities
 - [X] components
 - [X] systems
-- [X] rendering <sub>half assed</sub>
-- [ ] core components
+- [X] rendering
+- [X] core components
+- [ ] texture loading & rendering
 - [ ] reading/writing files
 - [ ] audio manager
 - [ ] commands
 - [ ] network requests
-- [ ] editable images/sounds
-- [ ] physics
-- [ ] gui
-- [ ] package manager
+- [ ] physics?
+- [ ] gui <!-- plans for a PM were removed because pesde would be sufficient -->
 - [ ] documentation
 - [ ] compiling
 - [ ] release
+
+<sub>anything ending in `?` means that it may not be implemented</sub>

@@ -1,5 +1,6 @@
 pub mod hierarchy;
 pub mod window;
+mod core;
 
 use std::env;
 use std::fs;

@@ -33,14 +33,12 @@ mod.component = {
 
             if entity.size_x <= 0.5 then
                 ecs.deleteEntity(entity)
-                print(`Game over! Score: {math.floor(spawner.t)}`)
                 die()
             end
-        end
-        
-        bg.R = math.lerp(bg.R, 255-component.health, dt*15)
-        if bg.R >= 255 then
-            bg.R = 0
+            entity.hp.color = Color4(0,0,0,0)
+        else
+            local off = (255-component.health)/255*205
+            entity.hp.color = Color4(50+off, 50, 255-off, 255)
         end
     end,
 }

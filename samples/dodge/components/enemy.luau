@@ -7,6 +7,8 @@ return {
         entity.x = math.random(0, window.x)
         entity.y = -30
         component.character = require("./character")
+        local renderer = ecs.addComponent(entity, core.Rect2D)
+        renderer.color = Color4(255, 50, 50)
     end,
     update = function(entity, component, dt)
         entity.y += component.t * dt * 20

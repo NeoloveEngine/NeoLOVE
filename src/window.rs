@@ -39,6 +39,7 @@ fn create_entity_table(
     table.set("name", name)?;
     table.set("x", x)?;
     table.set("y", y)?;
+    table.set("z", 0.0)?;
     table.set("scale_x", 1.0)?;
     table.set("scale_y", 1.0)?;
     table.set("size_x", 32.0)?;
@@ -54,7 +55,7 @@ fn create_entity_table(
     Ok(table)
 }
 
-fn get_global_position(entity: &Table) -> mlua::Result<(f32, f32)> {
+pub fn get_global_position(entity: &Table) -> mlua::Result<(f32, f32)> {
     let mut current_entity = entity.clone();
     let mut total_x = 0.0;
     let mut total_y = 0.0;
@@ -374,6 +375,27 @@ impl Runtime {
             ecs.set("duplicateEntity", duplicate)
                 .expect("failed to set duplicateEntity");
 
+            let find_first_child = self
+                .lua
+                .create_function(move |_lua, (parent, name): (Table, String)| {
+                    if let Ok(children) = parent.get::<Table>("children") {
+                        for pair in children.pairs::<Value, Table>() {
+                            if let Ok((_, child)) = pair {
+                                if let Ok(child_name) = child.get::<String>("name") {
+                                    if child_name == name {
+                                        return Ok(Some(child));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(None)
+                })
+                .expect("failed to create findFirstChild function");
+
+            ecs.set("findFirstChild", find_first_child)
+                .expect("failed to set findFirstChild");
+
             // create root entity
             let root_table = create_entity_table(&self.lua, "root", 0.0, 0.0, None).unwrap();
             root_table.set("id", 0).unwrap();
@@ -392,6 +414,8 @@ impl Runtime {
 
         // Components
         {
+            crate::core::add_core_components(&mut self.lua); // a lot of heavy lifting
+
             let add_component = self
                 .lua
                 .create_function(move |lua, (entity, component): (Table, Table)| {
@@ -459,43 +483,36 @@ impl Runtime {
             }
         }
 
-        // Collect keys first to avoid holding the borrow during iteration
-        let entity_ids: Vec<usize> = self.entities.borrow().keys().cloned().collect();
+        let mut entity_data: Vec<(usize, f64)> = Vec::new();
 
-        for id in entity_ids {
-            // Retrieve the entity table within a short-lived borrow scope
-            // This ensures we don't hold the entities borrow while executing Lua code
+        {
+            let entities = self.entities.borrow();
+            for (id, entity) in entities.iter() {
+                if let Ok(table) = self.lua.registry_value::<Table>(&entity.luau_key) {
+                    let z = table.get::<f64>("z").unwrap_or(0.0);
+                    entity_data.push((*id, z));
+                }
+            }
+        }
+
+        entity_data.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut rendering_components: Vec<(Table, Table, Function)> = Vec::new();
+
+        for (id, _) in entity_data {
             let ent: Option<Table> = {
                 let entities = self.entities.borrow();
                 if let Some(entity) = entities.get(&id) {
-                    // We assume getting the value from registry doesn't trigger callbacks that modify entities
                     self.lua.registry_value(&entity.luau_key).ok()
                 } else {
                     None
                 }
             };
 
-            // If entity was deleted or failed to retrieve, skip
             let ent = match ent {
                 Some(e) => e,
                 None => continue,
             };
-
-            // for now, we draw a box as a test
-            // later on, we will add "native components" which give more information about drawing & what to draw
-
-            let (x, y) = get_global_position(&ent).expect("failed to get global position");
-
-            let size_x: f32 = ent.get("size_x").expect("failed to get size_x");
-            let size_y: f32 = ent.get("size_y").expect("failed to get size_y");
-
-            draw_rectangle(
-                x,
-                y,
-                size_x,
-                size_y,
-                Color::from_rgba(255 - r, 255 - g, 255 - b, 255),
-            );
 
             // run through all the components
 
@@ -503,17 +520,20 @@ impl Runtime {
 
             for component in components.pairs::<usize, Table>() {
                 let (_key, component) = component.unwrap();
-
                 let update: Function = component.get("update").expect("failed to get update");
-                if let Err(e) = update.call::<()>((&ent, component, dt)) {
-                    eprintln!("\x1b[31mLua Error in component update:\x1b[0m\n{}", e);
-                    // We don't exit here to allow other components/entities to update,
-                    // but depending on severity we might want to.
-                    // The previous code panicked on unwrap or similar, so let's stick to safe error printing.
-                    // Actually original code did not have try-catch around update, it just unwrapped.
-                    // Let's keep it safe.
+
+                if !component.contains_key("NEOLOVE_RENDERING").unwrap() {
+                    if let Err(e) = update.call::<()>((&ent, component, dt)) {
+                        eprintln!("\x1b[31mLua Error in component update:\x1b[0m\n{}", e);
+                    }
+                } else {
+                    rendering_components.push((ent.clone(), component, update));
                 }
             }
+        }
+
+        for trio in rendering_components {
+            trio.2.call::<()>((trio.0, trio.1, dt)).unwrap();
         }
     }
 }
