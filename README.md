@@ -2,6 +2,8 @@
 a game engine written in Rust that allows
 you to easily make performant games in the language luau
 
+<sub>[you can find docs here!](https://github.com/NeoloveEngine/NeoLOVE/wiki)</sub>
+
 ### Roadmap
 
 - [X] luau processing
