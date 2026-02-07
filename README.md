@@ -6,6 +6,8 @@ you to easily make performant games in the language luau
 
 ### Roadmap
 
+<!-- plans for a PM were removed because pesde would be sufficient -->
+
 - [X] luau processing
 - [X] hierachy
 - [X] entities
@@ -19,7 +21,7 @@ you to easily make performant games in the language luau
 - [ ] commands
 - [ ] network requests
 - [ ] physics?
-- [ ] gui <!-- plans for a PM were removed because pesde would be sufficient -->
+- [ ] gui
 - [ ] documentation
 - [ ] compiling
 - [ ] release
