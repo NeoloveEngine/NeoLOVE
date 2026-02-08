@@ -13,6 +13,16 @@ pub struct Runtime {
     environment: PathBuf,
     lua: Lua,
     entity_max: usize,
+    max_fps: Rc<RefCell<Option<f32>>>,
+}
+
+fn color4_table(lua: &Lua, r: u8, g: u8, b: u8, a: u8) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    t.set("r", r)?;
+    t.set("g", g)?;
+    t.set("b", b)?;
+    t.set("a", a)?;
+    Ok(t)
 }
 
 fn deep_copy_table(lua: &Lua, table: &Table) -> mlua::Result<Table> {
@@ -40,16 +50,13 @@ fn create_entity_table(
     table.set("x", x)?;
     table.set("y", y)?;
     table.set("z", 0.0)?;
-    table.set("scale_x", 1.0)?;
-    table.set("scale_y", 1.0)?;
     table.set("size_x", 32.0)?;
     table.set("size_y", 32.0)?;
     table.set("components", lua.create_table()?)?;
-    if parent.is_some() {
-        let par = parent.unwrap();
+    if let Some(par) = parent {
         table.set("parent", &par)?;
         let children: Table = par.get("children")?;
-        children.push(&table).expect("could not push myself");
+        children.push(&table)?;
     }
     table.set("children", lua.create_table()?)?;
     Ok(table)
@@ -84,60 +91,90 @@ impl Runtime {
             environment: env,
             lua: Lua::new(),
             entity_max: 1,
+            // default to 60fps cap; users can raise/lower/disable via app.setMaxFps
+            max_fps: Rc::new(RefCell::new(Some(60.0))),
         }
     }
 
-    fn set_mouse_table(&mut self) {
+    pub fn max_fps(&self) -> Option<f32> {
+        *self.max_fps.borrow()
+    }
+
+    fn set_mouse_table(&mut self) -> mlua::Result<()> {
         let (mouse_x, mouse_y) = mouse_position();
 
-        let mouse_table = self.lua.create_table().unwrap();
-        mouse_table.set("x", mouse_x).unwrap();
-        mouse_table.set("y", mouse_y).unwrap();
-
-        self.lua
-            .globals()
-            .set("mouse", mouse_table)
-            .expect("could not set mouse");
+        let mouse_table = self.lua.create_table()?;
+        mouse_table.set("x", mouse_x)?;
+        mouse_table.set("y", mouse_y)?;
+        self.lua.globals().set("mouse", mouse_table)?;
+        Ok(())
     }
 
-    fn set_window_table(&mut self) {
+    fn set_window_table(&mut self) -> mlua::Result<()> {
         let width = screen_width();
         let height = screen_height();
-        let table = self.lua.create_table().unwrap();
-        table.set("x", width).unwrap();
-        table.set("y", height).unwrap();
-        self.lua.globals().set("window", table).unwrap();
+        let table = self.lua.create_table()?;
+        table.set("x", width)?;
+        table.set("y", height)?;
+        self.lua.globals().set("window", table)?;
+        Ok(())
     }
 
-    pub fn start(&mut self) {
+    pub fn start(&mut self) -> mlua::Result<()> {
         let require = self
             .lua
-            .create_require_function(TextRequirer::new())
-            .expect("failed to create require function");
-        self.lua
-            .globals()
-            .set("require", require)
-            .expect("failed to set require global");
+            .create_require_function(TextRequirer::new())?;
+        self.lua.globals().set("require", require)?;
 
-        self.set_mouse_table();
-        self.set_window_table();
+        self.set_mouse_table()?;
+        self.set_window_table()?;
+
+        // App
+        {
+            let app = self.lua.create_table()?;
+            app.set("bg", color4_table(&self.lua, 255, 255, 255, 255)?)?;
+
+            let max_fps_setter = self.max_fps.clone();
+            let set_max_fps = self
+                .lua
+                .create_function(move |_lua, fps: Option<f32>| {
+                    let mut max_fps = max_fps_setter.borrow_mut();
+                    match fps {
+                        Some(fps) if fps.is_finite() && fps > 0.0 => *max_fps = Some(fps),
+                        _ => *max_fps = None,
+                    }
+                    Ok(())
+                })?;
+            app.set("setMaxFps", set_max_fps)?;
+
+            let max_fps_getter = self.max_fps.clone();
+            let get_max_fps = self
+                .lua
+                .create_function(move |_lua, ()| Ok(*max_fps_getter.borrow()))?;
+            app.set("getMaxFps", get_max_fps)?;
+
+            self.lua.globals().set("app", app)?;
+        }
 
         let env_root = self
             .environment
             .canonicalize()
-            .expect("bad environment path");
+            .map_err(mlua::Error::external)?;
+
+        crate::assets::add_assets_module(&self.lua, env_root.clone())?;
+
         let entry_file = env_root.join("main.luau");
 
-        let entry_module = entry_file
+        let entry_parent = entry_file
             .parent()
-            .expect("main.luau has no parent dir")
-            .join(entry_file.file_stem().expect("main.luau has no file_stem"));
+            .ok_or_else(|| mlua::Error::external("main.luau has no parent dir"))?;
+        let entry_stem = entry_file
+            .file_stem()
+            .ok_or_else(|| mlua::Error::external("main.luau has no file_stem"))?;
+        let entry_module = entry_parent.join(entry_stem);
 
-        let ecs = self.lua.create_table().expect("failed to create ecs table");
-        let transforms = self
-            .lua
-            .create_table()
-            .expect("failed to create transform table");
+        let ecs = self.lua.create_table()?;
+        let transforms = self.lua.create_table()?;
 
         let die = self
             .lua
@@ -145,32 +182,18 @@ impl Runtime {
                 std::process::exit(1);
                 #[allow(unreachable_code)]
                 Ok(())
-            })
-            .unwrap();
+            })?;
 
-        self.lua.globals().set("die", die).unwrap();
-
-        let colours = self.lua.create_table().expect("failed to create bg table");
-
-        colours.set("R", 255).unwrap();
-        colours.set("G", 255).unwrap();
-        colours.set("B", 255).unwrap();
-
-        self.lua
-            .globals()
-            .set("bg", colours)
-            .expect("failed to make bg");
+        self.lua.globals().set("die", die)?;
 
         // Transforms
         {
             let get_world_position = self
                 .lua
                 .create_function(move |_lua, entity: Table| {
-                    let (x, y) =
-                        get_global_position(&entity).expect("could not get global position");
+                    let (x, y) = get_global_position(&entity)?;
                     Ok((x, y))
-                })
-                .expect("could not create function");
+                })?;
 
             let do_they_overlap = self.lua.create_function(move |_lua, entities: Table| {
                 // go through the entities and see if one overlaps with any of them
@@ -200,18 +223,12 @@ impl Runtime {
                 }
 
                 Ok(false)
-            });
+            })?;
 
             transforms
-                .set("getWorldPosition", get_world_position)
-                .expect("could not create global position function");
+                .set("getWorldPosition", get_world_position)?;
 
-            transforms
-                .set(
-                    "doTheyOverlap",
-                    do_they_overlap.expect("failed to create overlap function"),
-                )
-                .expect("failed to set overlap function");
+            transforms.set("doTheyOverlap", do_they_overlap)?;
         }
 
         // Systems
@@ -223,11 +240,9 @@ impl Runtime {
                     let key = lua.create_registry_value(system)?;
                     systems.borrow_mut().push(key);
                     Ok(())
-                })
-                .expect("failed to create addSystem function");
+                })?;
 
-            ecs.set("addSystem", add_system)
-                .expect("failed to set addSystem");
+            ecs.set("addSystem", add_system)?;
         }
 
         // Entities
@@ -277,10 +292,9 @@ impl Runtime {
 
                         Ok(luau)
                     },
-                )
-                .unwrap();
+                )?;
 
-            ecs.set("newEntity", new).expect("failed to set newEntity");
+            ecs.set("newEntity", new)?;
 
             let delete = self
                 .lua
@@ -309,8 +323,7 @@ impl Runtime {
                     }
 
                     if let Ok(Some(parent)) = entity.get::<Option<Table>>("parent") {
-                        let children: Table =
-                            parent.get("children").expect("parent has no children");
+                        let children: Table = parent.get("children")?;
 
                         let table_remove: Function =
                             lua.globals().get::<Table>("table")?.get("remove")?;
@@ -324,11 +337,9 @@ impl Runtime {
                         }
                     }
                     Ok(())
-                })
-                .expect("failed to create delete function");
+                })?;
 
-            ecs.set("deleteEntity", delete)
-                .expect("failed to set deleteEntity");
+            ecs.set("deleteEntity", delete)?;
 
             let duplicate = self
                 .lua
@@ -353,7 +364,7 @@ impl Runtime {
                     let entity_struct = hierarchy::Entity {
                         components: Vec::new(),
                         children: Vec::new(),
-                        parent: Some(parent.get("id").unwrap_or(0)), // Assuming parent has ID
+                        parent: Some(parent.get::<usize>("id").unwrap_or(0)), // best-effort
                         id,
                         luau_key: reg_key,
                     };
@@ -369,11 +380,9 @@ impl Runtime {
                     }
 
                     Ok(new_entity)
-                })
-                .expect("failed to create duplicate function");
+                })?;
 
-            ecs.set("duplicateEntity", duplicate)
-                .expect("failed to set duplicateEntity");
+            ecs.set("duplicateEntity", duplicate)?;
 
             let find_first_child = self
                 .lua
@@ -390,17 +399,15 @@ impl Runtime {
                         }
                     }
                     Ok(None)
-                })
-                .expect("failed to create findFirstChild function");
+                })?;
 
-            ecs.set("findFirstChild", find_first_child)
-                .expect("failed to set findFirstChild");
+            ecs.set("findFirstChild", find_first_child)?;
 
             // create root entity
-            let root_table = create_entity_table(&self.lua, "root", 0.0, 0.0, None).unwrap();
-            root_table.set("id", 0).unwrap();
+            let root_table = create_entity_table(&self.lua, "root", 0.0, 0.0, None)?;
+            root_table.set("id", 0)?;
 
-            let root_key = self.lua.create_registry_value(&root_table).unwrap();
+            let root_key = self.lua.create_registry_value(&root_table)?;
             let root_entity = hierarchy::Entity {
                 components: Vec::new(),
                 children: Vec::new(),
@@ -409,62 +416,61 @@ impl Runtime {
                 luau_key: root_key,
             };
             self.entities.borrow_mut().insert(0, root_entity);
-            ecs.set("root", root_table).expect("failed to set root");
+            ecs.set("root", root_table)?;
         }
 
         // Components
         {
-            crate::core::add_core_components(&mut self.lua); // a lot of heavy lifting
+            crate::core::add_core_components(&self.lua)?; // a lot of heavy lifting
 
             let add_component = self
                 .lua
                 .create_function(move |lua, (entity, component): (Table, Table)| {
-                    let components: Table =
-                        entity.get("components").expect("could not get components");
+                    let components: Table = entity.get("components")?;
                     let comp = deep_copy_table(lua, &component)?;
                     comp.set("entity", &entity)?;
-                    let awake: Function = comp.get("awake").expect("could not get awake");
-                    awake.call::<()>((&entity, &comp)).expect("failed to awake");
-                    components.push(&comp).expect("failed to add component");
+                    let awake: Function = comp.get("awake").map_err(|_| {
+                        mlua::Error::external("component has no awake function")
+                    })?;
+                    awake.call::<()>((&entity, &comp))?;
+                    components.push(&comp)?;
                     Ok(comp)
-                })
-                .expect("failed to add component");
+                })?;
 
-            ecs.set("addComponent", add_component)
-                .expect("failed to set addComponent");
+            ecs.set("addComponent", add_component)?;
         }
 
-        self.lua
-            .globals()
-            .set("ecs", ecs)
-            .expect("failed to set ECS global");
+        self.lua.globals().set("ecs", ecs)?;
+        self.lua.globals().set("transform", transforms)?;
 
         self.lua
-            .globals()
-            .set("transform", transforms)
-            .expect("failed to set transform");
-
-        if let Err(e) = self
-            .lua
             .load(entry_file.as_path())
             .set_name(format!("@{}", entry_module.display()))
-            .exec()
-        {
-            eprintln!("\x1b[31mLua Error:\x1b[0m {}", e);
-            std::process::exit(1);
-        }
+            .exec()?;
+
+        Ok(())
     }
 
     pub fn update(&mut self, dt: f32) {
-        self.set_mouse_table();
-        self.set_window_table();
+        if let Err(e) = self.set_mouse_table() {
+            eprintln!("\x1b[31mLua Error:\x1b[0m Failed to set mouse: {}", e);
+        }
+        if let Err(e) = self.set_window_table() {
+            eprintln!("\x1b[31mLua Error:\x1b[0m Failed to set window: {}", e);
+        }
 
-        let background: Table = self.lua.globals().get("bg").expect("failed to get bg");
-        let r: u8 = background.get("R").expect("failed to get R");
-        let g: u8 = background.get("G").expect("failed to get G");
-        let b: u8 = background.get("B").expect("failed to get B");
+        let clear = (|| -> mlua::Result<Color> {
+            let app: Table = self.lua.globals().get("app")?;
+            let bg: Table = app.get("bg")?;
+            let r: u8 = bg.get("r")?;
+            let g: u8 = bg.get("g")?;
+            let b: u8 = bg.get("b")?;
+            let a: u8 = bg.get("a")?;
+            Ok(Color::from_rgba(r, g, b, a))
+        })()
+        .unwrap_or(Color::from_rgba(255, 255, 255, 255));
 
-        clear_background(Color::from_rgba(r, g, b, 255));
+        clear_background(clear);
 
         let keys = self.systems.borrow();
         for key in keys.iter() {
@@ -478,7 +484,6 @@ impl Runtime {
             if let Ok(Value::Function(update)) = system.get::<Value>("update") {
                 if let Err(e) = update.call::<()>((system.clone(), dt)) {
                     eprintln!("\x1b[31mLua Error in system update:\x1b[0m\n{}", e);
-                    std::process::exit(1);
                 }
             }
         }
@@ -516,13 +521,43 @@ impl Runtime {
 
             // run through all the components
 
-            let components: Table = ent.get("components").expect("failed to get components");
+            let components: Table = match ent.get("components") {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "\x1b[31mLua Error:\x1b[0m Entity missing components table: {}",
+                        e
+                    );
+                    continue;
+                }
+            };
 
             for component in components.pairs::<usize, Table>() {
-                let (_key, component) = component.unwrap();
-                let update: Function = component.get("update").expect("failed to get update");
+                let (_key, component) = match component {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!(
+                            "\x1b[31mLua Error:\x1b[0m Failed to iterate components: {}",
+                            e
+                        );
+                        continue;
+                    }
+                };
+                let update: Function = match component.get("update") {
+                    Ok(u) => u,
+                    Err(e) => {
+                        eprintln!(
+                            "\x1b[31mLua Error:\x1b[0m Component missing update: {}",
+                            e
+                        );
+                        continue;
+                    }
+                };
 
-                if !component.contains_key("NEOLOVE_RENDERING").unwrap() {
+                let is_rendering = component
+                    .contains_key("NEOLOVE_RENDERING")
+                    .unwrap_or(false);
+                if !is_rendering {
                     if let Err(e) = update.call::<()>((&ent, component, dt)) {
                         eprintln!("\x1b[31mLua Error in component update:\x1b[0m\n{}", e);
                     }
@@ -533,7 +568,12 @@ impl Runtime {
         }
 
         for trio in rendering_components {
-            trio.2.call::<()>((trio.0, trio.1, dt)).unwrap();
+            if let Err(e) = trio.2.call::<()>((trio.0, trio.1, dt)) {
+                eprintln!(
+                    "\x1b[31mLua Error in rendering component update:\x1b[0m\n{}",
+                    e
+                );
+            }
         }
     }
 }
