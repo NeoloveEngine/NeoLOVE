@@ -15,14 +15,14 @@ you to easily make performant games in the language luau
 - [X] systems
 - [X] rendering
 - [X] core components
-- [ ] texture loading & rendering
+- [X] texture loading & rendering
 - [ ] reading/writing files
-- [ ] audio manager
+- [X] audio manager
 - [ ] commands
 - [ ] network requests
 - [ ] physics?
 - [ ] gui
-- [ ] documentation
+- [X] documentation
 - [ ] compiling
 - [ ] release
 
