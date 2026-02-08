@@ -49,6 +49,8 @@ fn create_entity_table(
     table.set("name", name)?;
     table.set("x", x)?;
     table.set("y", y)?;
+    table.set("rotation", 0.0)?;
+    table.set("rotation_pivot", "topleft")?;
     table.set("z", 0.0)?;
     table.set("size_x", 32.0)?;
     table.set("size_y", 32.0)?;
@@ -62,16 +64,41 @@ fn create_entity_table(
     Ok(table)
 }
 
-pub fn get_global_position(entity: &Table) -> mlua::Result<(f32, f32)> {
+fn rotate_point(x: f32, y: f32, rotation: f32) -> (f32, f32) {
+    let cos_r = rotation.cos();
+    let sin_r = rotation.sin();
+    (x * cos_r - y * sin_r, x * sin_r + y * cos_r)
+}
+
+fn uses_middle_rotation_pivot(entity: &Table) -> bool {
+    if let Ok(pivot) = entity.get::<String>("rotation_pivot") {
+        let pivot = pivot.to_ascii_lowercase();
+        return pivot == "middle" || pivot == "center";
+    }
+
+    if let Ok(pivot) = entity.get::<String>("rotationPivot") {
+        let pivot = pivot.to_ascii_lowercase();
+        return pivot == "middle" || pivot == "center";
+    }
+
+    entity.get::<bool>("rotation_pivot_middle").unwrap_or(false)
+}
+
+fn get_local_rotation_pivot(entity: &Table) -> mlua::Result<(f32, f32)> {
+    if uses_middle_rotation_pivot(entity) {
+        let w: f32 = entity.get("size_x")?;
+        let h: f32 = entity.get("size_y")?;
+        return Ok((w * 0.5, h * 0.5));
+    }
+    Ok((0.0, 0.0))
+}
+
+pub fn get_global_transform(entity: &Table) -> mlua::Result<(f32, f32, f32)> {
+    let mut chain = Vec::<Table>::new();
     let mut current_entity = entity.clone();
-    let mut total_x = 0.0;
-    let mut total_y = 0.0;
 
     loop {
-        let x: f32 = current_entity.get("x")?;
-        let y: f32 = current_entity.get("y")?;
-        total_x += x;
-        total_y += y;
+        chain.push(current_entity.clone());
 
         if let Ok(Some(parent)) = current_entity.get::<Option<Table>>("parent") {
             current_entity = parent;
@@ -80,7 +107,47 @@ pub fn get_global_position(entity: &Table) -> mlua::Result<(f32, f32)> {
         }
     }
 
-    Ok((total_x, total_y))
+    let mut world_x = 0.0f32;
+    let mut world_y = 0.0f32;
+    let mut world_rotation = 0.0f32;
+
+    for current in chain.into_iter().rev() {
+        let local_x: f32 = current.get("x")?;
+        let local_y: f32 = current.get("y")?;
+        let local_rotation: f32 = current.get("rotation").unwrap_or(0.0);
+        let (pivot_x, pivot_y) = get_local_rotation_pivot(&current)?;
+        let (rp_x, rp_y) = rotate_point(pivot_x, pivot_y, local_rotation);
+        let origin_shift_x = local_x + pivot_x - rp_x;
+        let origin_shift_y = local_y + pivot_y - rp_y;
+
+        let (rx, ry) = rotate_point(origin_shift_x, origin_shift_y, world_rotation);
+        world_x += rx;
+        world_y += ry;
+        world_rotation += local_rotation;
+    }
+
+    Ok((world_x, world_y, world_rotation))
+}
+
+pub fn get_global_position(entity: &Table) -> mlua::Result<(f32, f32)> {
+    let (x, y, _) = get_global_transform(entity)?;
+    Ok((x, y))
+}
+
+pub fn get_global_rotation(entity: &Table) -> mlua::Result<f32> {
+    let (_, _, r) = get_global_transform(entity)?;
+    Ok(r)
+}
+
+pub fn uses_middle_pivot(entity: &Table) -> bool {
+    uses_middle_rotation_pivot(entity)
+}
+
+pub fn get_global_rotation_pivot(entity: &Table) -> mlua::Result<(f32, f32)> {
+    let (x, y, r) = get_global_transform(entity)?;
+    let (px, py) = get_local_rotation_pivot(entity)?;
+    let (rx, ry) = rotate_point(px, py, r);
+    Ok((x + rx, y + ry))
 }
 
 impl Runtime {
@@ -161,6 +228,7 @@ impl Runtime {
             .canonicalize()
             .map_err(mlua::Error::external)?;
 
+        crate::user_input::add_user_input_module(&self.lua)?;
         crate::audio_system::add_audio_module(&self.lua)?;
         crate::assets::add_assets_module(&self.lua, env_root.clone())?;
 
@@ -195,6 +263,12 @@ impl Runtime {
                     let (x, y) = get_global_position(&entity)?;
                     Ok((x, y))
                 })?;
+            let get_world_rotation = self
+                .lua
+                .create_function(move |_lua, entity: Table| {
+                    let rotation = get_global_rotation(&entity)?;
+                    Ok(rotation)
+                })?;
 
             let do_they_overlap = self.lua.create_function(move |_lua, entities: Table| {
                 // go through the entities and see if one overlaps with any of them
@@ -228,6 +302,8 @@ impl Runtime {
 
             transforms
                 .set("getWorldPosition", get_world_position)?;
+            transforms
+                .set("getWorldRotation", get_world_rotation)?;
 
             transforms.set("doTheyOverlap", do_they_overlap)?;
         }

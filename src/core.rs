@@ -1,7 +1,7 @@
 use macroquad::color::Color;
 use macroquad::prelude::vec2;
-use macroquad::shapes::draw_rectangle;
-use macroquad::text::draw_text;
+use macroquad::shapes::{draw_rectangle_ex, DrawRectangleParams};
+use macroquad::text::{draw_text_ex, TextParams};
 use macroquad::texture::{draw_texture_ex, DrawTextureParams};
 use mlua::{AnyUserData, Lua, Table};
 
@@ -71,11 +71,29 @@ pub fn add_core_components(lua: &Lua) -> mlua::Result<()> {
         rect2d.set(
             "update",
             lua.create_function(move |_ctx, (entity, component, _dt): (Table, Table, f32)| {
-                let (x, y) = crate::window::get_global_position(&entity)?;
+                let (x, y, rotation) = crate::window::get_global_transform(&entity)?;
                 let w: f32 = entity.get("size_x")?;
                 let h: f32 = entity.get("size_y")?;
                 let color = color4_to_color(component.get("color")?)?;
-                draw_rectangle(x, y, w, h, color);
+                let use_middle_pivot = crate::window::uses_middle_pivot(&entity);
+                let (draw_x, draw_y, offset) = if use_middle_pivot {
+                    let (px, py) = crate::window::get_global_rotation_pivot(&entity)?;
+                    (px, py, vec2(0.5, 0.5))
+                } else {
+                    (x, y, vec2(0.0, 0.0))
+                };
+                draw_rectangle_ex(
+                    draw_x,
+                    draw_y,
+                    w,
+                    h,
+                    DrawRectangleParams {
+                        rotation,
+                        offset,
+                        color,
+                        ..Default::default()
+                    },
+                );
                 Ok(())
             })?,
         )?;
@@ -97,12 +115,23 @@ pub fn add_core_components(lua: &Lua) -> mlua::Result<()> {
         textlabel.set(
             "update",
             lua.create_function(move |_ctx, (entity, component, _dt): (Table, Table, f32)| {
-                let (x, y) = crate::window::get_global_position(&entity)?;
+                let (x, y, rotation) = crate::window::get_global_transform(&entity)?;
                 let text: String = component.get("text")?;
                 let scale: f32 = component.get("scale")?;
                 let color: Color = color4_to_color(component.get("color")?)?;
+                let font_size = scale.max(1.0).round() as u16;
 
-                let dimensions = draw_text(text.as_str(), x, y, scale, color);
+                let dimensions = draw_text_ex(
+                    text.as_str(),
+                    x,
+                    y,
+                    TextParams {
+                        font_size,
+                        rotation,
+                        color,
+                        ..Default::default()
+                    },
+                );
                 component.set("dx", dimensions.width)?;
                 component.set("dy", dimensions.height)?;
 
@@ -123,9 +152,10 @@ pub fn add_core_components(lua: &Lua) -> mlua::Result<()> {
                 "update",
                 lua.create_function(
                     move |_ctx, (entity, component, _dt): (Table, Table, f32)| {
-                        let (x, y) = crate::window::get_global_position(&entity)?;
+                        let (x, y, rotation) = crate::window::get_global_transform(&entity)?;
                         let w: f32 = entity.get("size_x")?;
                         let h: f32 = entity.get("size_y")?;
+                        let use_middle_pivot = crate::window::uses_middle_pivot(&entity);
 
                         let tint: Color = color4_to_color(component.get("color")?)?;
                         let image: Option<AnyUserData> = component.get("image")?;
@@ -136,14 +166,23 @@ pub fn add_core_components(lua: &Lua) -> mlua::Result<()> {
                         let image = image.borrow::<crate::assets::ImageHandle>()?;
                         image.ensure_uploaded()?;
                         let texture = image.texture();
+                        let (draw_x, draw_y, pivot) = if use_middle_pivot {
+                            let (px, py) = crate::window::get_global_rotation_pivot(&entity)?;
+                            // draw_texture_ex expects the unrotated rectangle origin when pivot is provided.
+                            (px - w * 0.5, py - h * 0.5, vec2(px, py))
+                        } else {
+                            (x, y, vec2(x, y))
+                        };
 
                         draw_texture_ex(
                             &texture,
-                            x,
-                            y,
+                            draw_x,
+                            draw_y,
                             tint,
                             DrawTextureParams {
                                 dest_size: Some(vec2(w, h)),
+                                rotation,
+                                pivot: Some(pivot),
                                 ..Default::default()
                             },
                         );
