@@ -2,6 +2,7 @@ pub mod hierarchy;
 pub mod window;
 mod core;
 mod assets;
+mod audio_system;
 
 use std::env;
 use std::fs;

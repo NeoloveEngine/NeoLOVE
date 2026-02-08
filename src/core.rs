@@ -134,7 +134,7 @@ pub fn add_core_components(lua: &Lua) -> mlua::Result<()> {
                         };
 
                         let image = image.borrow::<crate::assets::ImageHandle>()?;
-                        image.ensure_uploaded();
+                        image.ensure_uploaded()?;
                         let texture = image.texture();
 
                         draw_texture_ex(

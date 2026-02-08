@@ -161,6 +161,7 @@ impl Runtime {
             .canonicalize()
             .map_err(mlua::Error::external)?;
 
+        crate::audio_system::add_audio_module(&self.lua)?;
         crate::assets::add_assets_module(&self.lua, env_root.clone())?;
 
         let entry_file = env_root.join("main.luau");
