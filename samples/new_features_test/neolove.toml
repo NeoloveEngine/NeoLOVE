@@ -1,0 +1,9 @@
+[package]
+name = "new_features_test"
+version = "0.1.0"
+
+[window]
+title = "NeoLOVE New Features Test"
+icon = "assets/icons/app_icon.png"
+
+[dependencies]

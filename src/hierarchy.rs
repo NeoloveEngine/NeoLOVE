@@ -12,5 +12,5 @@ pub struct Entity {
 
 pub struct Component {
     pub name: String,
-    pub this: mlua::Table
+    pub this: mlua::Table,
 }

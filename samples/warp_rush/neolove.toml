@@ -1,0 +1,5 @@
+[package]
+name = "warp_rush"
+version = "0.1.0"
+
+[dependencies]

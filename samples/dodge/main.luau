@@ -23,7 +23,7 @@ renderer.color = Color4(50, 50, 255)
 healthbox.z = 2
 
 local l = ecs.newEntity("label", ecs.root, 50, 50)
-local textRenderer = ecs.addComponent(l, core.RudimentaryTextLabel)
+local textRenderer = ecs.addComponent(l, core.TextBox)
 textRenderer.color = Color4(0,0,0)
 l.textRenderer = textRenderer
 l.z = 1

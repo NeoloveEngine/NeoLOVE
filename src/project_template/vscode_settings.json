@@ -1,0 +1,6 @@
+{
+  "luau-lsp.platform.type": "standard",
+  "luau-lsp.types.definitionFiles": {
+    "neolove": "./types/neolove_engine_api.d.luau"
+  }
+}
