@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>blackjack</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0e1116;
+      color: #e8ecf1;
+      font: 14px/1.4 "Trebuchet MS", "Segoe UI", sans-serif;
+    }
+    body {
+      display: grid;
+      place-items: stretch;
+    }
+    .shell {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      background:
+        radial-gradient(circle at top, rgba(102, 164, 255, 0.16), transparent 40%),
+        linear-gradient(180deg, #111926 0%, #090c11 100%);
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      cursor: crosshair;
+    }
+    #status {
+      position: absolute;
+      left: 16px;
+      bottom: 16px;
+      margin: 0;
+      max-width: min(720px, calc(100% - 32px));
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(6, 9, 14, 0.68);
+      backdrop-filter: blur(10px);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+      white-space: pre-wrap;
+    }
+    #status[data-state="ready"] {
+      display: none;
+    }
+    #status[data-state="error"] {
+      color: #ffb3b3;
+      border: 1px solid rgba(255, 99, 99, 0.35);
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <canvas id="canvas"></canvas>
+    <p id="status" data-state="loading">Loading...</p>
+  </div>
+  <script>
+    window.Module = {
+      locateFile(path) {
+        return path;
+      },
+      print(text) {
+        console.log(text);
+      },
+      printErr(text) {
+        console.error(text);
+        const status = document.getElementById("status");
+        if (status && !status.textContent) {
+          status.textContent = String(text);
+          status.dataset.state = "info";
+        }
+      }
+    };
+  </script>
+  <script src="neolove.js"></script>
+</body>
+</html>

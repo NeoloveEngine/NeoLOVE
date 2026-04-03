@@ -3,7 +3,7 @@ use image::{Rgba, RgbaImage};
 use mlua::{Lua, Table, UserData, UserDataMethods, Value, Variadic};
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Debug)]
@@ -11,6 +11,7 @@ struct ImageAsset {
     image: RgbaImage,
     unloaded: bool,
     revision: u64,
+    export_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -23,6 +24,7 @@ struct SoundAsset {
     samples: Vec<f32>,
     bytes: Vec<u8>,
     unloaded: bool,
+    export_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -131,15 +133,78 @@ fn encode_wav_bytes(sample_rate: u32, channels: u16, samples: &[f32]) -> mlua::R
     Ok(bytes)
 }
 
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn resolve_export_path(root: &Path, input: &str, extension: &str) -> mlua::Result<PathBuf> {
+    let path = PathBuf::from(input);
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    let mut resolved = normalize_path(&candidate);
+    match resolved.extension().and_then(|value| value.to_str()) {
+        Some(current) if current.eq_ignore_ascii_case(extension) => {}
+        Some(_) => {
+            return Err(mlua::Error::external(format!(
+                "export path must use .{extension}: {input}"
+            )));
+        }
+        None => {
+            resolved.set_extension(extension);
+        }
+    }
+    if !resolved.starts_with(root) {
+        return Err(mlua::Error::external(format!(
+            "export path escapes project root: {input}"
+        )));
+    }
+    Ok(resolved)
+}
+
+fn ensure_parent_dir(path: &Path) -> mlua::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(mlua::Error::external)?;
+    }
+    Ok(())
+}
+
+fn asset_io_error(action: &str, path: &Path, error: impl std::fmt::Display) -> mlua::Error {
+    mlua::Error::external(format!("failed to {action} '{}': {error}", path.display()))
+}
+
+fn asset_decode_error(kind: &str, path: &Path, error: impl std::fmt::Display) -> mlua::Error {
+    mlua::Error::external(format!(
+        "failed to decode {kind} '{}': {error}",
+        path.display()
+    ))
+}
+
 impl ImageHandle {
+    #[allow(dead_code)]
     pub(crate) fn from_rgba_image(image: RgbaImage) -> Self {
         Self(Arc::new(Mutex::new(ImageAsset {
             image,
             unloaded: false,
             revision: 0,
+            export_root: None,
         })))
     }
 
+    #[cfg(not(target_os = "emscripten"))]
     pub(crate) fn id(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
     }
@@ -193,6 +258,7 @@ impl ImageHandle {
         self.with_image(|_| ())
     }
 
+    #[cfg(not(target_os = "emscripten"))]
     pub(crate) fn revision(&self) -> mlua::Result<u64> {
         let image = self
             .0
@@ -204,8 +270,30 @@ impl ImageHandle {
         Ok(image.revision)
     }
 
+    #[cfg(not(target_os = "emscripten"))]
     pub(crate) fn clone_rgba_image(&self) -> mlua::Result<RgbaImage> {
         self.with_image(Clone::clone)
+    }
+
+    pub(crate) fn export_png(&self, user_path: &str) -> mlua::Result<()> {
+        let (image, export_root) = {
+            let image = self
+                .0
+                .lock()
+                .map_err(|_| mlua::Error::external("image lock poisoned"))?;
+            if image.unloaded {
+                return Err(mlua::Error::external("image is unloaded"));
+            }
+            (image.image.clone(), image.export_root.clone())
+        };
+        let export_root = export_root
+            .ok_or_else(|| mlua::Error::external("image export is unavailable for this handle"))?;
+        let path = resolve_export_path(&export_root, user_path, "png")?;
+        ensure_parent_dir(&path)
+            .map_err(|error| asset_io_error("create export directory for image", &path, error))?;
+        image::DynamicImage::ImageRgba8(image)
+            .save_with_format(&path, image::ImageFormat::Png)
+            .map_err(|error| asset_io_error("write png image", &path, error))
     }
 }
 
@@ -236,6 +324,7 @@ impl SoundHandle {
         Ok(sound.channels)
     }
 
+    #[cfg(not(target_os = "emscripten"))]
     pub(crate) fn bytes(&self) -> mlua::Result<Vec<u8>> {
         let sound = self
             .0
@@ -245,6 +334,21 @@ impl SoundHandle {
             return Err(mlua::Error::external("sound is unloaded"));
         }
         Ok(sound.bytes.clone())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_samples<R>(
+        &self,
+        f: impl FnOnce(u32, u16, &[f32]) -> mlua::Result<R>,
+    ) -> mlua::Result<R> {
+        let sound = self
+            .0
+            .lock()
+            .map_err(|_| mlua::Error::external("sound lock poisoned"))?;
+        if sound.unloaded {
+            return Err(mlua::Error::external("sound is unloaded"));
+        }
+        f(sound.sample_rate, sound.channels, &sound.samples)
     }
 
     pub(crate) fn unload(&self) {
@@ -264,6 +368,25 @@ impl SoundHandle {
             return Err(mlua::Error::external("sound is unloaded"));
         }
         Ok(())
+    }
+
+    pub(crate) fn export_wav(&self, user_path: &str) -> mlua::Result<()> {
+        let (bytes, export_root) = {
+            let sound = self
+                .0
+                .lock()
+                .map_err(|_| mlua::Error::external("sound lock poisoned"))?;
+            if sound.unloaded {
+                return Err(mlua::Error::external("sound is unloaded"));
+            }
+            (sound.bytes.clone(), sound.export_root.clone())
+        };
+        let export_root = export_root
+            .ok_or_else(|| mlua::Error::external("sound export is unavailable for this handle"))?;
+        let path = resolve_export_path(&export_root, user_path, "wav")?;
+        ensure_parent_dir(&path)
+            .map_err(|error| asset_io_error("create export directory for sound", &path, error))?;
+        std::fs::write(&path, bytes).map_err(|error| asset_io_error("write wav file", &path, error))
     }
 }
 
@@ -318,6 +441,8 @@ impl UserData for ImageHandle {
             Ok(())
         });
         methods.add_method("upload", |_lua, this, ()| this.ensure_uploaded());
+        methods.add_method("export", |_lua, this, path: String| this.export_png(&path));
+        methods.add_method("save", |_lua, this, path: String| this.export_png(&path));
         methods.add_method("unload", |_lua, this, ()| {
             this.unload();
             Ok(())
@@ -383,6 +508,8 @@ impl UserData for SoundHandle {
             Ok(())
         });
         methods.add_method("upload", |_lua, this, ()| this.ensure_uploaded());
+        methods.add_method("export", |_lua, this, path: String| this.export_wav(&path));
+        methods.add_method("save", |_lua, this, path: String| this.export_wav(&path));
         methods.add_method("unload", |_lua, this, ()| {
             this.unload();
             Ok(())
@@ -438,14 +565,16 @@ impl AssetManager {
             }
         }
 
-        let bytes = std::fs::read(&resolved).map_err(mlua::Error::external)?;
+        let bytes = std::fs::read(&resolved)
+            .map_err(|error| asset_io_error("read image", &resolved, error))?;
         let image = image::load_from_memory(&bytes)
-            .map_err(mlua::Error::external)?
+            .map_err(|error| asset_decode_error("image", &resolved, error))?
             .to_rgba8();
         let handle = Arc::new(Mutex::new(ImageAsset {
             image,
             unloaded: false,
             revision: 0,
+            export_root: Some(self.env_root.clone()),
         }));
         self.images.insert(cache_key, Arc::downgrade(&handle));
         Ok(ImageHandle(handle))
@@ -458,6 +587,7 @@ impl AssetManager {
             image,
             unloaded: false,
             revision: 0,
+            export_root: Some(self.env_root.clone()),
         })))
     }
 
@@ -474,15 +604,20 @@ impl AssetManager {
             }
         }
 
-        let file_bytes = std::fs::read(&resolved).map_err(mlua::Error::external)?;
+        let file_bytes = std::fs::read(&resolved)
+            .map_err(|error| asset_io_error("read sound", &resolved, error))?;
         let mut reader = hound::WavReader::new(Cursor::new(file_bytes.as_slice()))
-            .map_err(mlua::Error::external)?;
+            .map_err(|error| asset_decode_error("wav file", &resolved, error))?;
         let spec = reader.spec();
         let mut samples = Vec::new();
         match spec.sample_format {
             hound::SampleFormat::Float => {
                 for sample in reader.samples::<f32>() {
-                    samples.push(sample.map_err(mlua::Error::external)?.clamp(-1.0, 1.0));
+                    samples.push(
+                        sample
+                            .map_err(|error| asset_decode_error("wav sample", &resolved, error))?
+                            .clamp(-1.0, 1.0),
+                    );
                 }
             }
             hound::SampleFormat::Int => {
@@ -490,13 +625,21 @@ impl AssetManager {
                 if spec.bits_per_sample <= 16 {
                     for sample in reader.samples::<i16>() {
                         samples.push(
-                            (sample.map_err(mlua::Error::external)? as f32 / max).clamp(-1.0, 1.0),
+                            (sample.map_err(|error| {
+                                asset_decode_error("wav sample", &resolved, error)
+                            })? as f32
+                                / max)
+                                .clamp(-1.0, 1.0),
                         );
                     }
                 } else {
                     for sample in reader.samples::<i32>() {
                         samples.push(
-                            (sample.map_err(mlua::Error::external)? as f32 / max).clamp(-1.0, 1.0),
+                            (sample.map_err(|error| {
+                                asset_decode_error("wav sample", &resolved, error)
+                            })? as f32
+                                / max)
+                                .clamp(-1.0, 1.0),
                         );
                     }
                 }
@@ -508,6 +651,7 @@ impl AssetManager {
             samples,
             bytes: file_bytes,
             unloaded: false,
+            export_root: Some(self.env_root.clone()),
         }));
         self.sounds.insert(cache_key, Arc::downgrade(&handle));
         Ok(SoundHandle(handle))
@@ -526,6 +670,7 @@ impl AssetManager {
             samples,
             bytes,
             unloaded: false,
+            export_root: Some(self.env_root.clone()),
         }))))
     }
 
@@ -709,4 +854,125 @@ pub(crate) fn add_assets_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()
 
     lua.globals().set("assets", assets)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("neolove_{name}_{unique}"))
+    }
+
+    #[test]
+    fn image_export_writes_png_and_appends_extension() -> mlua::Result<()> {
+        let root = temp_root("asset_image_export");
+        fs::create_dir_all(&root).map_err(mlua::Error::external)?;
+
+        let mut manager = AssetManager::new(root.clone());
+        let handle = manager.new_image(2, 1, Color::rgba(0, 0, 0, 0));
+        handle.with_image_mut(|image| {
+            image.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+            image.put_pixel(1, 0, Rgba([0, 255, 0, 255]));
+        })?;
+
+        handle.export_png("exports/test_image")?;
+
+        let exported = root.join("exports/test_image.png");
+        assert!(exported.exists());
+        let decoded = image::open(&exported)
+            .map_err(mlua::Error::external)?
+            .to_rgba8();
+        assert_eq!(decoded.dimensions(), (2, 1));
+        assert_eq!(decoded.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(decoded.get_pixel(1, 0).0, [0, 255, 0, 255]);
+
+        fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sound_export_writes_wav_and_appends_extension() -> mlua::Result<()> {
+        let root = temp_root("asset_sound_export");
+        fs::create_dir_all(&root).map_err(mlua::Error::external)?;
+
+        let mut manager = AssetManager::new(root.clone());
+        let handle = manager.new_sound(22_050, 1, vec![0.0, 0.5, -0.5, 0.25])?;
+        handle.export_wav("exports/test_sound")?;
+
+        let exported = root.join("exports/test_sound.wav");
+        assert!(exported.exists());
+        let mut reader = hound::WavReader::open(&exported).map_err(mlua::Error::external)?;
+        let spec = reader.spec();
+        assert_eq!(spec.sample_rate, 22_050);
+        assert_eq!(spec.channels, 1);
+        let samples: Vec<i16> = reader
+            .samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(mlua::Error::external)?;
+        assert_eq!(samples.len(), 4);
+
+        fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn export_rejects_paths_outside_project_root() -> mlua::Result<()> {
+        let root = temp_root("asset_export_escape");
+        fs::create_dir_all(&root).map_err(mlua::Error::external)?;
+
+        let mut manager = AssetManager::new(root.clone());
+        let image = manager.new_image(1, 1, Color::WHITE);
+        let sound = manager.new_sound(8_000, 1, vec![0.0])?;
+
+        assert!(image.export_png("../escape").is_err());
+        assert!(sound.export_wav("../escape").is_err());
+
+        fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn load_image_error_mentions_resolved_path() -> mlua::Result<()> {
+        let root = temp_root("asset_missing_image");
+        fs::create_dir_all(root.join("assets")).map_err(mlua::Error::external)?;
+
+        let mut manager = AssetManager::new(root.clone());
+        let missing_path = root.join("assets").join("missing.png");
+        let error = manager.load_image("missing.png").unwrap_err().to_string();
+
+        assert!(error.contains("failed to read image"));
+        assert!(error.contains(missing_path.to_string_lossy().as_ref()));
+
+        fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn load_sound_error_mentions_resolved_path() -> mlua::Result<()> {
+        let root = temp_root("asset_invalid_sound");
+        let assets_dir = root.join("assets");
+        fs::create_dir_all(&assets_dir).map_err(mlua::Error::external)?;
+
+        let invalid_path = assets_dir.join("broken.wav");
+        fs::write(&invalid_path, b"not a wav").map_err(mlua::Error::external)?;
+
+        let mut manager = AssetManager::new(root.clone());
+        let error = manager
+            .load_sound_wav("broken.wav")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("failed to decode wav file"));
+        assert!(error.contains(invalid_path.to_string_lossy().as_ref()));
+
+        fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
 }

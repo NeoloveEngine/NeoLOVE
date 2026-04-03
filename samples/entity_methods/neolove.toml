@@ -1,0 +1,8 @@
+[package]
+name = "entity_methods"
+version = "0.1.0"
+
+[window]
+title = "NeoLOVE Entity Methods + Listen Sample"
+
+[dependencies]

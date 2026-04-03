@@ -95,7 +95,9 @@ fn path_to_project_string(root: &Path, path: &Path) -> String {
 fn create_walk_entry(lua: &Lua, root: &Path, path: &Path) -> mlua::Result<Table> {
     let metadata = fs::metadata(path).map_err(|error| io_error("stat", path, &error))?;
     let entry = lua.create_table()?;
-    let kind = if metadata.is_dir() {
+    let is_file = metadata.is_file();
+    let is_dir = metadata.is_dir();
+    let kind = if is_dir {
         "directory"
     } else {
         "file"
@@ -108,8 +110,10 @@ fn create_walk_entry(lua: &Lua, root: &Path, path: &Path) -> mlua::Result<Table>
             .unwrap_or_else(|| ".".to_string()),
     )?;
     entry.set("kind", kind)?;
-    entry.set("is_file", metadata.is_file())?;
-    entry.set("is_dir", metadata.is_dir())?;
+    entry.set("isFile", is_file)?;
+    entry.set("isDir", is_dir)?;
+    entry.set("is_file", is_file)?;
+    entry.set("is_dir", is_dir)?;
     Ok(entry)
 }
 

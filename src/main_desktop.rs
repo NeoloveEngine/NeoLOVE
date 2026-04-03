@@ -8,7 +8,9 @@ pub mod hierarchy;
 mod http;
 mod lua_error;
 mod platform;
+mod prefabs;
 mod renderer;
+mod servers;
 mod shader;
 mod user_input;
 pub mod window;
@@ -19,6 +21,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use image::imageops::FilterType;
@@ -33,6 +36,8 @@ use winit::event::{
 };
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{CursorGrabMode, Icon, WindowBuilder};
+use zip::CompressionMethod;
+use zip::write::SimpleFileOptions;
 
 use crate::gpu_renderer::VulkanPresenter;
 use crate::platform::SharedPlatformState;
@@ -43,6 +48,8 @@ const TEMPLATE_LUAURC: &str = include_str!("project_template/.luaurc");
 const TEMPLATE_VSCODE_SETTINGS: &str = include_str!("project_template/vscode_settings.json");
 const TEMPLATE_NEOLOVE_ENGINE_API: &str =
     include_str!("project_template/neolove_engine_api.d.luau");
+const DEFAULT_WINDOW_WIDTH: f32 = 1280.0;
+const DEFAULT_WINDOW_HEIGHT: f32 = 720.0;
 
 #[derive(Default, Clone)]
 struct ProjectSettings {
@@ -591,7 +598,7 @@ fn sanitize_executable_name(value: &str) -> String {
     }
 }
 
-fn build_executable(project_root: &Path) -> Result<PathBuf, String> {
+fn project_output_stem(project_root: &Path) -> String {
     let settings = parse_project_settings(project_root);
     let name_seed = settings
         .package_name
@@ -602,17 +609,22 @@ fn build_executable(project_root: &Path) -> Result<PathBuf, String> {
                 .map(|s| s.to_string_lossy().to_string())
         })
         .unwrap_or_else(|| "game".to_string());
+    sanitize_executable_name(&name_seed)
+}
+
+fn build_executable(project_root: &Path) -> Result<PathBuf, String> {
+    let output_stem = project_output_stem(project_root);
 
     #[cfg(windows)]
     let output_name = {
-        let mut output_name = sanitize_executable_name(&name_seed);
+        let mut output_name = output_stem;
         if !output_name.to_ascii_lowercase().ends_with(".exe") {
             output_name.push_str(".exe");
         }
         output_name
     };
     #[cfg(not(windows))]
-    let output_name = sanitize_executable_name(&name_seed);
+    let output_name = output_stem;
 
     let payload = build_payload(project_root)?;
 
@@ -675,6 +687,460 @@ fn build_executable(project_root: &Path) -> Result<PathBuf, String> {
     progress_bar(3, total_steps, "Build complete");
 
     Ok(output_path)
+}
+
+fn engine_source_root() -> Result<PathBuf, String> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if root.join("Cargo.toml").is_file() {
+        Ok(root)
+    } else {
+        Err(format!(
+            "webasm build requires engine source files; expected Cargo.toml at {}",
+            root.display()
+        ))
+    }
+}
+
+fn run_checked_command(
+    command: &mut std::process::Command,
+    description: &str,
+) -> Result<(), String> {
+    let rendered = format!("{command:?}");
+    let status = command
+        .status()
+        .map_err(|e| format!("failed while {description}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{description} failed with status {status}: {rendered}"
+        ))
+    }
+}
+
+fn emsdk_root() -> Result<PathBuf, String> {
+    let home = user_home_dir().ok_or_else(|| "could not resolve home directory".to_string())?;
+    Ok(home.join(".neolove").join("toolchains").join("emsdk"))
+}
+
+fn emsdk_command_path(root: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        root.join("emsdk.bat")
+    }
+    #[cfg(not(windows))]
+    {
+        root.join("emsdk")
+    }
+}
+
+fn emcc_path(root: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        root.join("upstream").join("emscripten").join("emcc.bat")
+    }
+    #[cfg(not(windows))]
+    {
+        root.join("upstream").join("emscripten").join("emcc")
+    }
+}
+
+fn find_emsdk_node(root: &Path) -> Result<PathBuf, String> {
+    let node_root = root.join("node");
+    let entries = fs::read_dir(&node_root)
+        .map_err(|e| format!("failed to read emsdk node directory {}: {e}", node_root.display()))?;
+
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("failed to read emsdk node entry: {e}"))?;
+        let path = entry.path();
+        #[cfg(windows)]
+        let candidate = path.join("bin").join("node.exe");
+        #[cfg(not(windows))]
+        let candidate = path.join("bin").join("node");
+        if candidate.is_file() {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates.sort();
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| "emsdk node runtime was not found after installation".to_string())
+}
+
+fn apply_emsdk_env(command: &mut std::process::Command, root: &Path) -> Result<(), String> {
+    let emcc_dir = root.join("upstream").join("emscripten");
+    let node_path = find_emsdk_node(root)?;
+
+    let mut paths = vec![root.to_path_buf(), emcc_dir];
+    if let Some(existing) = env::var_os("PATH") {
+        paths.extend(env::split_paths(&existing));
+    }
+    let joined = env::join_paths(paths)
+        .map_err(|e| format!("failed to construct PATH for emsdk: {e}"))?;
+
+    command.env("EMSDK", root);
+    command.env("EMSDK_NODE", node_path);
+    command.env("PATH", joined);
+    Ok(())
+}
+
+fn ensure_emsdk() -> Result<PathBuf, String> {
+    let root = emsdk_root()?;
+    let emcc = emcc_path(&root);
+    if emcc.is_file() {
+        return Ok(root);
+    }
+
+    if let Some(parent) = root.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "failed to create emsdk parent directory {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+
+    if root.exists() {
+        fs::remove_dir_all(&root)
+            .map_err(|e| format!("failed to clean incomplete emsdk install {}: {e}", root.display()))?;
+    }
+
+    let mut git = std::process::Command::new("git");
+    git.arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .arg("https://github.com/emscripten-core/emsdk.git")
+        .arg(&root);
+    run_checked_command(&mut git, "cloning emsdk")?;
+
+    let emsdk = emsdk_command_path(&root);
+    let mut install = std::process::Command::new(&emsdk);
+    install.arg("install").arg("latest");
+    run_checked_command(&mut install, "installing emsdk")?;
+
+    let mut activate = std::process::Command::new(&emsdk);
+    activate.arg("activate").arg("latest");
+    run_checked_command(&mut activate, "activating emsdk")?;
+
+    if !emcc.is_file() {
+        return Err(format!(
+            "emsdk installation completed, but emcc was not found at {}",
+            emcc.display()
+        ));
+    }
+
+    Ok(root)
+}
+
+fn recreate_dir(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        fs::remove_dir_all(path)
+            .map_err(|e| format!("failed to clear directory {}: {e}", path.display()))?;
+    }
+    fs::create_dir_all(path)
+        .map_err(|e| format!("failed to create directory {}: {e}", path.display()))
+}
+
+fn stage_web_project(project_root: &Path, stage_dir: &Path) -> Result<(), String> {
+    recreate_dir(stage_dir)?;
+
+    let mut files = Vec::new();
+    collect_project_files(project_root, project_root, &mut files)?;
+    files.sort();
+
+    for source in files {
+        let relative = source
+            .strip_prefix(project_root)
+            .map_err(|e| format!("failed to strip staged project prefix: {e}"))?;
+        let destination = stage_dir.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create staged directory {}: {e}", parent.display()))?;
+        }
+        fs::copy(&source, &destination).map_err(|e| {
+            format!(
+                "failed to stage webasm project file {} -> {}: {e}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn collect_bundle_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(root)
+        .map_err(|e| format!("failed to read bundle directory {}: {e}", root.display()))?;
+    let mut children = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("failed to read bundle directory entry: {e}"))?;
+        children.push(entry.path());
+    }
+    children.sort();
+
+    for child in children {
+        let file_type = fs::metadata(&child)
+            .map_err(|e| format!("failed to stat {}: {e}", child.display()))?;
+        if file_type.is_dir() {
+            collect_bundle_files(&child, out)?;
+        } else if file_type.is_file() {
+            out.push(child);
+        }
+    }
+    Ok(())
+}
+
+fn create_webasm_zip(bundle_dir: &Path, zip_path: &Path) -> Result<(), String> {
+    let file = File::create(zip_path)
+        .map_err(|e| format!("failed to create webasm package {}: {e}", zip_path.display()))?;
+    let mut archive = zip::ZipWriter::new(file);
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+
+    let mut files = Vec::new();
+    collect_bundle_files(bundle_dir, &mut files)?;
+
+    for path in files {
+        let relative = path
+            .strip_prefix(bundle_dir)
+            .map_err(|e| format!("failed to strip bundle prefix: {e}"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        archive
+            .start_file(&relative, options)
+            .map_err(|e| format!("failed to add {} to webasm package: {e}", relative))?;
+
+        let mut source = File::open(&path)
+            .map_err(|e| format!("failed to open bundle file {}: {e}", path.display()))?;
+        std::io::copy(&mut source, &mut archive).map_err(|e| {
+            format!(
+                "failed to write bundle file {} into {}: {e}",
+                path.display(),
+                zip_path.display()
+            )
+        })?;
+    }
+
+    archive
+        .finish()
+        .map_err(|e| format!("failed to finalize webasm package {}: {e}", zip_path.display()))?;
+
+    Ok(())
+}
+
+fn webasm_index_html(project_root: &Path) -> String {
+    let settings = parse_project_settings(project_root);
+    let title = settings
+        .window_title
+        .or(settings.package_name)
+        .unwrap_or_else(|| project_output_stem(project_root));
+
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    html, body {{
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0e1116;
+      color: #e8ecf1;
+      font: 14px/1.4 "Trebuchet MS", "Segoe UI", sans-serif;
+    }}
+    body {{
+      display: grid;
+      place-items: stretch;
+    }}
+    .shell {{
+      position: relative;
+      width: 100%;
+      height: 100%;
+      background:
+        radial-gradient(circle at top, rgba(102, 164, 255, 0.16), transparent 40%),
+        linear-gradient(180deg, #111926 0%, #090c11 100%);
+    }}
+    canvas {{
+      display: block;
+      width: 100%;
+      height: 100%;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      cursor: crosshair;
+    }}
+    #status {{
+      position: absolute;
+      left: 16px;
+      bottom: 16px;
+      margin: 0;
+      max-width: min(720px, calc(100% - 32px));
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(6, 9, 14, 0.68);
+      backdrop-filter: blur(10px);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+      white-space: pre-wrap;
+    }}
+    #status[data-state="ready"] {{
+      display: none;
+    }}
+    #status[data-state="error"] {{
+      color: #ffb3b3;
+      border: 1px solid rgba(255, 99, 99, 0.35);
+    }}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <canvas id="canvas"></canvas>
+    <p id="status" data-state="loading">Loading...</p>
+  </div>
+  <script>
+    window.Module = {{
+      locateFile(path) {{
+        return path;
+      }},
+      print(text) {{
+        console.log(text);
+      }},
+      printErr(text) {{
+        console.error(text);
+        const status = document.getElementById("status");
+        if (status && !status.textContent) {{
+          status.textContent = String(text);
+          status.dataset.state = "info";
+        }}
+      }}
+    }};
+  </script>
+  <script src="neolove.js"></script>
+</body>
+</html>
+"#
+    )
+}
+
+fn build_webasm(project_root: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let output_stem = project_output_stem(project_root);
+    let output_dir = project_root.join("dist");
+    fs::create_dir_all(&output_dir).map_err(|e| {
+        format!(
+            "failed to create dist directory {}: {e}",
+            output_dir.display()
+        )
+    })?;
+
+    let bundle_dir = output_dir.join("webasm");
+    recreate_dir(&bundle_dir)?;
+
+    let stage_dir = output_dir.join(".webasm-stage");
+    stage_web_project(project_root, &stage_dir)?;
+    let staged_project = fs::canonicalize(&stage_dir)
+        .map_err(|e| format!("failed to resolve staged webasm project {}: {e}", stage_dir.display()))?;
+
+    println!("Ensuring emsdk is installed...");
+    let emsdk = ensure_emsdk()?;
+
+    println!("Ensuring wasm32-unknown-emscripten target is installed...");
+    let mut rustup = std::process::Command::new("rustup");
+    rustup.args(["target", "add", "wasm32-unknown-emscripten"]);
+    run_checked_command(&mut rustup, "installing wasm32-unknown-emscripten target")?;
+
+    let engine_root = engine_source_root()?;
+    let cargo_target_dir = engine_root.join("target").join("webasm-emscripten-legacy-eh");
+    println!("Building NeoLOVE webasm runtime...");
+    let mut cargo = std::process::Command::new("cargo");
+    apply_emsdk_env(&mut cargo, &emsdk)?;
+    cargo.env("CXXFLAGS", "-fwasm-exceptions");
+    cargo.env("CARGO_TARGET_DIR", &cargo_target_dir);
+    cargo
+        .arg("rustc")
+        .arg("--release")
+        .arg("--target")
+        .arg("wasm32-unknown-emscripten")
+        .arg("--bin")
+        .arg(env!("CARGO_PKG_NAME"))
+        .arg("--")
+        .arg("-C")
+        .arg("link-arg=--preload-file")
+        .arg("-C")
+        .arg(format!(
+            "link-arg={}@/project",
+            staged_project.to_string_lossy()
+        ))
+        .arg("-C")
+        .arg("link-arg=-sFORCE_FILESYSTEM=1")
+        .arg("-C")
+        .arg("link-arg=-sALLOW_MEMORY_GROWTH=1")
+        .current_dir(&engine_root);
+    run_checked_command(&mut cargo, "building webasm runtime")?;
+
+    let target_dir = cargo_target_dir
+        .join("wasm32-unknown-emscripten")
+        .join("release");
+    let built_js = target_dir.join(format!("{}.js", env!("CARGO_PKG_NAME")));
+    let built_wasm = target_dir.join(format!("{}.wasm", env!("CARGO_PKG_NAME")));
+    let mut artifacts = vec![built_js, built_wasm];
+    let built_data_candidates = [
+        target_dir.join(format!("{}.data", env!("CARGO_PKG_NAME"))),
+        target_dir
+            .join("deps")
+            .join(format!("{}.data", env!("CARGO_PKG_NAME"))),
+    ];
+
+    for artifact in &artifacts {
+        if !artifact.is_file() {
+            return Err(format!(
+                "webasm build succeeded but expected output was not found: {}",
+                artifact.display()
+            ));
+        }
+    }
+
+    if let Some(data_file) = built_data_candidates.iter().find(|path| path.is_file()) {
+        artifacts.push(data_file.clone());
+    }
+
+    for artifact in &artifacts {
+        let file_name = artifact
+            .file_name()
+            .ok_or_else(|| format!("failed to resolve artifact file name for {}", artifact.display()))?;
+        let destination = bundle_dir.join(file_name);
+        fs::copy(artifact, &destination).map_err(|e| {
+            format!(
+                "failed to copy webasm artifact {} -> {}: {e}",
+                artifact.display(),
+                destination.display()
+            )
+        })?;
+    }
+
+    fs::write(bundle_dir.join("index.html"), webasm_index_html(project_root)).map_err(|e| {
+        format!(
+            "failed to write webasm loader {}: {e}",
+            bundle_dir.join("index.html").display()
+        )
+    })?;
+
+    if stage_dir.exists() {
+        fs::remove_dir_all(&stage_dir)
+            .map_err(|e| format!("failed to clean staged webasm files {}: {e}", stage_dir.display()))?;
+    }
+
+    let zip_output = output_dir.join(format!("{output_stem}-webasm.zip"));
+    create_webasm_zip(&bundle_dir, &zip_output)?;
+
+    Ok((bundle_dir, zip_output))
 }
 
 fn virtual_key_name(key: VirtualKeyCode) -> Option<&'static str> {
@@ -773,231 +1239,307 @@ fn with_platform_state<R>(
     platform_state: &SharedPlatformState,
     context: &str,
     f: impl FnOnce(&mut crate::platform::PlatformState) -> R,
-) -> Option<R> {
-    match platform_state.lock() {
-        Ok(mut platform) => Some(f(&mut platform)),
-        Err(_) => {
-            eprintln!("platform state lock poisoned while {context}");
-            None
-        }
-    }
+) -> Result<R, String> {
+    platform_state
+        .lock()
+        .map(|mut platform| f(&mut platform))
+        .map_err(|_| format!("platform state lock poisoned while {context}"))
 }
 
-fn run_project_window(project_root: PathBuf) {
-    let _ = env::set_current_dir(&project_root);
-    let (title, icon) = window_options_for_project(&project_root);
-    let event_loop = EventLoop::new();
-    let mut builder = WindowBuilder::new()
-        .with_title(title)
-        .with_inner_size(LogicalSize::new(1280.0, 720.0));
-    if let Some(icon) = icon {
-        builder = builder.with_window_icon(Some(icon));
-    }
-    let window = match builder.build(&event_loop) {
-        Ok(window) => std::sync::Arc::new(window),
-        Err(error) => {
-            eprintln!("failed to create window: {}", error);
-            return;
-        }
-    };
+fn report_runtime_failure(title: &str, message: &str) {
+    eprintln!("\x1b[31m{title}\x1b[0m\n{message}");
+}
 
+fn exit_runtime_failure(control_flow: &mut ControlFlow, title: &str, message: &str) {
+    report_runtime_failure(title, message);
+    *control_flow = ControlFlow::Exit;
+}
+
+fn desktop_panic_hint(message: &str) -> Option<&'static str> {
+    if message.contains("Failed to initialize any backend!")
+        || message.contains("NoCompositorListening")
+        || message.contains("XOpenDisplayFailed")
+    {
+        return Some(
+            "NeoLOVE could not connect to a graphical desktop session. Start it from an X11 or Wayland session, and if you are inside a sandbox make sure DISPLAY or WAYLAND_DISPLAY and the matching socket are exposed.",
+        );
+    }
+
+    None
+}
+
+fn describe_desktop_panic(context: &str, payload: &(dyn std::any::Any + Send)) -> String {
+    let panic_message = lua_error::describe_panic(payload);
+    let mut rendered = format!("{context}\nPanic: {panic_message}");
+    if let Some(hint) = desktop_panic_hint(&panic_message) {
+        rendered.push_str("\nHint: ");
+        rendered.push_str(hint);
+    }
+    rendered
+}
+
+fn catch_desktop_panic<T>(context: &str, f: impl FnOnce() -> T) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .map_err(|payload| describe_desktop_panic(context, payload.as_ref()))
+}
+
+fn run_project_window(project_root: PathBuf) -> Result<(), String> {
+    env::set_current_dir(&project_root).map_err(|error| {
+        format!(
+            "failed to set current directory to {}: {error}",
+            project_root.display()
+        )
+    })?;
+    let (title, icon) = window_options_for_project(&project_root);
     let mut runtime = window::Runtime::new(project_root);
-    let size = window.inner_size();
-    runtime.set_platform_window_state(size.width as f32, size.height as f32);
+    runtime.set_platform_window_state(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.start())) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            eprintln!(
-                "\x1b[31mLua Error:\x1b[0m Failed to start runtime\n{}",
+            return Err(format!(
+                "failed to start runtime:\n{}",
                 lua_error::describe_lua_error(&error)
-            );
-            return;
+            ));
         }
         Err(payload) => {
-            eprintln!(
-                "\x1b[31mRust Panic:\x1b[0m Runtime panicked during startup\nPanic: {}",
+            return Err(format!(
+                "runtime panicked during startup\nPanic: {}",
                 lua_error::describe_panic(payload.as_ref())
-            );
-            return;
+            ));
         }
     }
 
+    let event_loop =
+        catch_desktop_panic("failed to initialize the window event loop", EventLoop::new)?;
+    let mut builder = WindowBuilder::new()
+        .with_title(title)
+        .with_inner_size(LogicalSize::new(
+            DEFAULT_WINDOW_WIDTH as f64,
+            DEFAULT_WINDOW_HEIGHT as f64,
+        ));
+    if let Some(icon) = icon {
+        builder = builder.with_window_icon(Some(icon));
+    }
+    let window = builder
+        .build(&event_loop)
+        .map(std::sync::Arc::new)
+        .map_err(|error| format!("failed to create window: {error}"))?;
+    let size = window.inner_size();
+    runtime.set_platform_window_state(size.width as f32, size.height as f32);
+
     let platform_state = runtime.platform_state();
     let render_state = runtime.render_state();
-    let (mut presenter, _surface) = match VulkanPresenter::new(&event_loop, window.clone()) {
-        Ok(presenter) => presenter,
-        Err(error) => {
-            eprintln!("failed to initialize Vulkan: {}", error);
-            return;
-        }
-    };
+    let (mut presenter, _surface) = catch_desktop_panic(
+        "failed while initializing the Vulkan presenter",
+        || VulkanPresenter::new(&event_loop, window.clone()),
+    )?
+    .map_err(|error| format!("failed to initialize Vulkan: {error}"))?;
 
     let mut last_update = Instant::now();
+    let mut cursor_grab_warning_logged = false;
     event_loop.run(move |event, _target, control_flow| {
-        *control_flow = ControlFlow::Poll;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            *control_flow = ControlFlow::Poll;
 
-        match event {
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-                WindowEvent::Resized(size) => {
-                    runtime.set_platform_window_state(size.width as f32, size.height as f32);
-                    presenter.request_swapchain_recreate();
-                }
-                WindowEvent::CursorMoved { position, .. } => {
-                    runtime.set_platform_mouse_state(position.x as f32, position.y as f32);
-                }
-                WindowEvent::MouseInput { state, button, .. } => {
-                    let _ = with_platform_state(
-                        &platform_state,
-                        "updating mouse button state",
-                        |platform| {
-                        let name = mouse_button_name(button).to_string();
-                        match state {
-                            ElementState::Pressed => {
-                                if platform.input_mut().mouse_down.insert(name.clone()) {
-                                    platform.input_mut().mouse_pressed.insert(name);
+            match event {
+                Event::WindowEvent { event, .. } => match event {
+                    WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                    WindowEvent::Resized(size) => {
+                        runtime.set_platform_window_state(size.width as f32, size.height as f32);
+                        presenter.request_swapchain_recreate();
+                    }
+                    WindowEvent::CursorMoved { position, .. } => {
+                        runtime.set_platform_mouse_state(position.x as f32, position.y as f32);
+                    }
+                    WindowEvent::MouseInput { state, button, .. } => {
+                        if let Err(error) = with_platform_state(
+                            &platform_state,
+                            "updating mouse button state",
+                            |platform| {
+                                let name = mouse_button_name(button).to_string();
+                                match state {
+                                    ElementState::Pressed => {
+                                        if platform.input_mut().mouse_down.insert(name.clone()) {
+                                            platform.input_mut().mouse_pressed.insert(name);
+                                        }
+                                    }
+                                    ElementState::Released => {
+                                        platform.input_mut().mouse_down.remove(name.as_str());
+                                        platform.input_mut().mouse_released.insert(name);
+                                    }
                                 }
-                            }
-                            ElementState::Released => {
-                                platform.input_mut().mouse_down.remove(name.as_str());
-                                platform.input_mut().mouse_released.insert(name);
+                            },
+                        ) {
+                            exit_runtime_failure(control_flow, "Fatal Runtime Error:", &error);
+                        }
+                    }
+                    WindowEvent::MouseWheel { delta, .. } => {
+                        if let Err(error) = with_platform_state(
+                            &platform_state,
+                            "updating mouse wheel state",
+                            |platform| {
+                                let (x, y) = normalize_mouse_wheel_delta(delta);
+                                platform.input_mut().wheel_x += x;
+                                platform.input_mut().wheel_y += y;
+                            },
+                        ) {
+                            exit_runtime_failure(control_flow, "Fatal Runtime Error:", &error);
+                        }
+                    }
+                    WindowEvent::ReceivedCharacter(ch) => {
+                        if !ch.is_control() {
+                            if let Err(error) = with_platform_state(
+                                &platform_state,
+                                "recording text input",
+                                |platform| {
+                                    platform.input_mut().char_pressed = Some(ch.to_string());
+                                },
+                            ) {
+                                exit_runtime_failure(control_flow, "Fatal Runtime Error:", &error);
                             }
                         }
-                        },
-                    );
-                }
-                WindowEvent::MouseWheel { delta, .. } => {
-                    let _ = with_platform_state(
-                        &platform_state,
-                        "updating mouse wheel state",
-                        |platform| {
-                        let (x, y) = normalize_mouse_wheel_delta(delta);
-                        platform.input_mut().wheel_x += x;
-                        platform.input_mut().wheel_y += y;
-                        },
-                    );
-                }
-                WindowEvent::ReceivedCharacter(ch) => {
-                    if !ch.is_control() {
-                        let _ =
-                            with_platform_state(&platform_state, "recording text input", |platform| {
-                                platform.input_mut().char_pressed = Some(ch.to_string());
-                            });
                     }
-                }
-                WindowEvent::KeyboardInput {
-                    input:
-                        KeyboardInput {
-                            virtual_keycode: Some(key),
-                            state,
-                            ..
-                        },
-                    ..
-                } => {
-                    if let Some(name) = virtual_key_name(key) {
-                        let _ = with_platform_state(
-                            &platform_state,
-                            "updating keyboard state",
-                            |platform| {
-                            let name = name.to_string();
-                            match state {
-                                ElementState::Pressed => {
-                                    if platform.input_mut().keys_down.insert(name.clone()) {
-                                        platform.input_mut().keys_pressed.insert(name.clone());
-                                    }
-                                    platform.input_mut().last_key_pressed = Some(name);
-                                }
-                                ElementState::Released => {
-                                    platform.input_mut().keys_down.remove(name.as_str());
-                                    platform.input_mut().keys_released.insert(name);
-                                }
-                            }
+                    WindowEvent::KeyboardInput {
+                        input:
+                            KeyboardInput {
+                                virtual_keycode: Some(key),
+                                state,
+                                ..
                             },
+                        ..
+                    } => {
+                        if let Some(name) = virtual_key_name(key) {
+                            if let Err(error) = with_platform_state(
+                                &platform_state,
+                                "updating keyboard state",
+                                |platform| {
+                                    let name = name.to_string();
+                                    match state {
+                                        ElementState::Pressed => {
+                                            if platform.input_mut().keys_down.insert(name.clone()) {
+                                                platform.input_mut().keys_pressed.insert(name.clone());
+                                            }
+                                            platform.input_mut().last_key_pressed = Some(name);
+                                        }
+                                        ElementState::Released => {
+                                            platform.input_mut().keys_down.remove(name.as_str());
+                                            platform.input_mut().keys_released.insert(name);
+                                        }
+                                    }
+                                },
+                            ) {
+                                exit_runtime_failure(control_flow, "Fatal Runtime Error:", &error);
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Event::MainEventsCleared => {
+                    let update_start = Instant::now();
+                    let dt = update_start.duration_since(last_update).as_secs_f32();
+                    last_update = update_start;
+
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.update(dt)))
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            exit_runtime_failure(control_flow, "Fatal Runtime Error:", &error);
+                            return;
+                        }
+                        Err(payload) => {
+                            exit_runtime_failure(
+                                control_flow,
+                                "Rust Panic:",
+                                &format!(
+                                    "Runtime panicked during frame update\nPanic: {}",
+                                    lua_error::describe_panic(payload.as_ref())
+                                ),
+                            );
+                            return;
+                        }
+                    }
+
+                    if runtime.exit_requested() {
+                        *control_flow = ControlFlow::Exit;
+                        return;
+                    }
+
+                    if let Err(error) = with_platform_state(
+                        &platform_state,
+                        "finalizing frame input state",
+                        |platform| {
+                            let mouse_locked = platform.input().mouse_locked;
+                            let grab_mode = if mouse_locked {
+                                CursorGrabMode::Locked
+                            } else {
+                                CursorGrabMode::None
+                            };
+                            if let Err(error) = window.set_cursor_grab(grab_mode) {
+                                if !cursor_grab_warning_logged {
+                                    let action = if mouse_locked { "lock" } else { "release" };
+                                    eprintln!("cursor grab warning: failed to {action} cursor: {error}");
+                                    cursor_grab_warning_logged = true;
+                                }
+                            } else {
+                                cursor_grab_warning_logged = false;
+                            }
+                            window.set_cursor_visible(!mouse_locked);
+                            platform.begin_frame();
+                        },
+                    ) {
+                        exit_runtime_failure(control_flow, "Fatal Runtime Error:", &error);
+                        return;
+                    }
+
+                    if let Some(max_fps) = runtime.max_fps() {
+                        let target = Duration::from_secs_f32(1.0 / max_fps.max(1.0));
+                        let elapsed = update_start.elapsed();
+                        if elapsed < target {
+                            std::thread::sleep(target - elapsed);
+                        }
+                    }
+
+                    window.request_redraw();
+                }
+                Event::RedrawRequested(_) => {
+                    let size = window.inner_size();
+                    if let Err(error) =
+                        presenter.render(&platform_state, &render_state, size.width, size.height)
+                    {
+                        exit_runtime_failure(
+                            control_flow,
+                            "Fatal Render Error:",
+                            &format!("Vulkan presenter failed: {error}"),
                         );
                     }
                 }
                 _ => {}
-            },
-            Event::MainEventsCleared => {
-                let update_start = Instant::now();
-                let dt = update_start.duration_since(last_update).as_secs_f32();
-                last_update = update_start;
-
-                if let Err(payload) =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.update(dt)))
-                {
-                    eprintln!(
-                        "\x1b[31mRust Panic:\x1b[0m Runtime panicked during frame update\nPanic: {}",
-                        lua_error::describe_panic(payload.as_ref())
-                    );
-                    *control_flow = ControlFlow::Exit;
-                    return;
-                }
-
-                let _ = with_platform_state(
-                    &platform_state,
-                    "finalizing frame input state",
-                    |platform| {
-                        let mouse_locked = platform.input().mouse_locked;
-                        let _ = window.set_cursor_grab(if mouse_locked {
-                            CursorGrabMode::Locked
-                        } else {
-                            CursorGrabMode::None
-                        });
-                        window.set_cursor_visible(!mouse_locked);
-                        platform.begin_frame();
-                    },
-                );
-
-                if let Some(max_fps) = runtime.max_fps() {
-                    let target = Duration::from_secs_f32(1.0 / max_fps.max(1.0));
-                    let elapsed = update_start.elapsed();
-                    if elapsed < target {
-                        std::thread::sleep(target - elapsed);
-                    }
-                }
-
-                window.request_redraw();
             }
-            Event::RedrawRequested(_) => {
-                let size = window.inner_size();
-                if let Err(error) =
-                    presenter.render(&platform_state, &render_state, size.width, size.height)
-                {
-                    eprintln!("vulkan present error: {}", error);
-                }
-            }
-            _ => {}
+        }));
+
+        if let Err(payload) = result {
+            exit_runtime_failure(
+                control_flow,
+                "Rust Panic:",
+                &describe_desktop_panic("runtime panicked while processing window events", payload.as_ref()),
+            );
         }
     });
 }
 
-fn handle_new_command(project_name: &str) {
-    let project_path = match resolve_from_cwd(project_name) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("failed to resolve project path: {}", e);
-            return;
-        }
-    };
-    if let Err(e) = fs::create_dir(&project_path) {
-        eprintln!(
-            "error when creating project folder (does it already exist?): {}",
-            e
-        );
-        return;
-    }
+fn handle_new_command(project_name: &str) -> Result<PathBuf, String> {
+    let project_path = resolve_from_cwd(project_name)
+        .map_err(|error| format!("failed to resolve project path '{project_name}': {error}"))?;
+    fs::create_dir(&project_path).map_err(|error| {
+        format!(
+            "failed to create project directory {}: {error}",
+            project_path.display()
+        )
+    })?;
 
-    {
-        let f = match File::create(project_path.join("neolove.toml")) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("error when creating neolove.toml: {}", e);
-                return;
-            }
-        };
-        let contents = format!(
-            "\
+    let toml_path = project_path.join("neolove.toml");
+    let contents = format!(
+        "\
 [package]
 name = \"{}\"
 version = \"0.1.0\"
@@ -1008,126 +1550,64 @@ icon = \"assets/icon.png\"
 
 [dependencies]
 ",
-            project_name, project_name
-        );
-        let mut file = f;
-        if let Err(e) = file.write_all(contents.as_bytes()) {
-            eprintln!("could not write neolove.toml: {}", e);
-            return;
-        }
-    }
-
-    {
-        let f = match File::create(project_path.join("main.luau")) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("error when creating main.luau: {}", e);
-                return;
-            }
-        };
-        let contents = format!("print(\"Hello, {}!\")", project_name);
-        let mut file = f;
-        if let Err(e) = file.write_all(contents.as_bytes()) {
-            eprintln!("could not write main.luau: {}", e);
-            return;
-        }
-    }
-
-    if let Err(e) = fs::create_dir(project_path.join("assets")) {
-        eprintln!("could not create assets folder: {}", e);
-        return;
-    }
-
-    if let Err(e) = fs::write(project_path.join(".luaurc"), TEMPLATE_LUAURC) {
-        eprintln!("could not write .luaurc: {}", e);
-        return;
-    }
-
-    if let Err(e) = fs::create_dir_all(project_path.join(".vscode")) {
-        eprintln!("could not create .vscode folder: {}", e);
-        return;
-    }
-    if let Err(e) = fs::write(
-        project_path.join(".vscode").join("settings.json"),
-        TEMPLATE_VSCODE_SETTINGS,
-    ) {
-        eprintln!("could not write .vscode/settings.json: {}", e);
-        return;
-    }
-
-    if let Err(e) = fs::create_dir_all(project_path.join("types")) {
-        eprintln!("could not create types folder: {}", e);
-        return;
-    }
-    if let Err(e) = fs::write(
-        project_path.join("types").join("neolove_engine_api.d.luau"),
-        TEMPLATE_NEOLOVE_ENGINE_API,
-    ) {
-        eprintln!("could not write types/neolove_engine_api.d.luau: {}", e);
-        return;
-    }
-
-    println!(
-        "Created project \"{project_name}\" at {}.",
-        project_path.display()
+        project_name, project_name
     );
-    println!("Set [window].title and [window].icon in neolove.toml to customize the game window.");
-    println!("To run, execute in the project directory the command `neolove run`");
-    println!("To build a standalone executable, run `neolove build`");
+    fs::write(&toml_path, contents)
+        .map_err(|error| format!("failed to write {}: {error}", toml_path.display()))?;
+
+    let entry_path = project_path.join("main.luau");
+    fs::write(&entry_path, format!("print(\"Hello, {}!\")", project_name))
+        .map_err(|error| format!("failed to write {}: {error}", entry_path.display()))?;
+
+    let assets_path = project_path.join("assets");
+    fs::create_dir(&assets_path)
+        .map_err(|error| format!("failed to create {}: {error}", assets_path.display()))?;
+
+    let luaurc_path = project_path.join(".luaurc");
+    fs::write(&luaurc_path, TEMPLATE_LUAURC)
+        .map_err(|error| format!("failed to write {}: {error}", luaurc_path.display()))?;
+
+    let vscode_dir = project_path.join(".vscode");
+    fs::create_dir_all(&vscode_dir)
+        .map_err(|error| format!("failed to create {}: {error}", vscode_dir.display()))?;
+    let vscode_settings = vscode_dir.join("settings.json");
+    fs::write(&vscode_settings, TEMPLATE_VSCODE_SETTINGS)
+        .map_err(|error| format!("failed to write {}: {error}", vscode_settings.display()))?;
+
+    let types_dir = project_path.join("types");
+    fs::create_dir_all(&types_dir)
+        .map_err(|error| format!("failed to create {}: {error}", types_dir.display()))?;
+    let api_path = types_dir.join("neolove_engine_api.d.luau");
+    fs::write(&api_path, TEMPLATE_NEOLOVE_ENGINE_API)
+        .map_err(|error| format!("failed to write {}: {error}", api_path.display()))?;
+
+    Ok(project_path)
 }
 
-fn handle_api_command(project_dir: Option<&str>) {
-    let project_root = if let Some(dir) = project_dir {
-        match resolve_from_cwd(dir) {
-            Ok(path) => path,
-            Err(e) => {
-                eprintln!("failed to resolve project path: {e}");
-                return;
-            }
-        }
-    } else {
-        match env::current_dir() {
-            Ok(cwd) => cwd,
-            Err(e) => {
-                eprintln!("failed to get current directory: {}", e);
-                return;
-            }
-        }
-    };
-
+fn handle_api_command(project_dir: Option<&str>) -> Result<Vec<PathBuf>, String> {
+    let project_root = resolve_target_project_root(project_dir)?;
     if !project_root.exists() || !project_root.is_dir() {
-        eprintln!(
+        return Err(format!(
             "project path is not a valid directory: {}",
             project_root.display()
-        );
-        return;
+        ));
     }
 
     let types_dir = project_root.join("types");
-    if let Err(e) = fs::create_dir_all(&types_dir) {
-        eprintln!("could not create types folder: {}", e);
-        return;
-    }
+    fs::create_dir_all(&types_dir)
+        .map_err(|error| format!("failed to create {}: {error}", types_dir.display()))?;
 
     let api_path = types_dir.join("neolove_engine_api.d.luau");
-    if let Err(e) = fs::write(&api_path, TEMPLATE_NEOLOVE_ENGINE_API) {
-        eprintln!("could not write {}: {}", api_path.display(), e);
-        return;
-    }
+    fs::write(&api_path, TEMPLATE_NEOLOVE_ENGINE_API)
+        .map_err(|error| format!("failed to write {}: {error}", api_path.display()))?;
 
     let root_api_path = project_root.join("neolove_engine_api.d.luau");
     if root_api_path.exists() {
-        if let Err(e) = fs::write(&root_api_path, TEMPLATE_NEOLOVE_ENGINE_API) {
-            eprintln!("could not write {}: {}", root_api_path.display(), e);
-            return;
-        }
-        println!(
-            "Updated API definitions at {} and {}.",
-            api_path.display(),
-            root_api_path.display()
-        );
+        fs::write(&root_api_path, TEMPLATE_NEOLOVE_ENGINE_API)
+            .map_err(|error| format!("failed to write {}: {error}", root_api_path.display()))?;
+        Ok(vec![api_path, root_api_path])
     } else {
-        println!("Updated API definitions at {}.", api_path.display());
+        Ok(vec![api_path])
     }
 }
 
@@ -1136,7 +1616,7 @@ fn print_usage() {
     println!("Usage:");
     println!("  neolove new <project-name>");
     println!("  neolove run [project-dir]");
-    println!("  neolove build [project-dir]");
+    println!("  neolove build [project-dir] [--webasm]");
     println!("  neolove api [project-dir]");
     println!("  neolove setup-path");
     println!("  neolove --help");
@@ -1173,32 +1653,28 @@ fn validate_project_root(project_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn main() {
+fn resolve_target_project_root(project_dir: Option<&str>) -> Result<PathBuf, String> {
+    match project_dir {
+        Some(dir) => resolve_from_cwd(dir)
+            .map_err(|error| format!("failed to resolve project path '{dir}': {error}")),
+        None => env::current_dir().map_err(|error| format!("failed to get current directory: {error}")),
+    }
+}
+
+fn run_cli() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
 
-    let current_exe = match env::current_exe() {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("failed to resolve executable path: {e}");
-            return;
-        }
-    };
+    let current_exe =
+        env::current_exe().map_err(|error| format!("failed to resolve executable path: {error}"))?;
 
-    let embedded_payload = match read_embedded_payload(&current_exe) {
-        Ok(payload) => payload,
-        Err(e) => {
-            eprintln!("failed to read embedded payload: {e}");
-            None
-        }
-    };
+    let embedded_payload = read_embedded_payload(&current_exe)
+        .map_err(|error| format!("failed to read embedded payload: {error}"))?;
 
     if let Some(payload) = embedded_payload {
         if args.len() == 1 {
-            match extract_embedded_project(&payload) {
-                Ok(project_root) => run_project_window(project_root),
-                Err(e) => eprintln!("failed to extract embedded project: {e}"),
-            }
-            return;
+            let project_root = extract_embedded_project(&payload)
+                .map_err(|error| format!("failed to extract embedded project: {error}"))?;
+            return run_project_window(project_root);
         }
     }
 
@@ -1214,7 +1690,7 @@ fn main() {
 
     if args.len() <= 1 {
         print_usage();
-        return;
+        return Ok(());
     }
 
     match args[1].as_str() {
@@ -1227,89 +1703,101 @@ fn main() {
         "setup-path" => match setup_path_for_neolove() {
             Ok(true) => println!("PATH updated. Restart your terminal."),
             Ok(false) => println!("PATH already contains Neolove."),
-            Err(e) => eprintln!("failed to set PATH: {}", e),
+            Err(error) => return Err(format!("failed to set PATH: {error}")),
         },
         "new" => {
             if args.len() != 3 {
-                println!("expected {} arguments, got {}", 3, args.len());
-                return;
+                return Err(format!(
+                    "new failed: expected 1 project name argument, got {}",
+                    args.len().saturating_sub(2)
+                ));
             }
-            handle_new_command(&args[2]);
+            let project_path = handle_new_command(&args[2])?;
+            println!(
+                "Created project \"{}\" at {}.",
+                args[2],
+                project_path.display()
+            );
+            println!("Set [window].title and [window].icon in neolove.toml to customize the game window.");
+            println!("To run, execute in the project directory the command `neolove run`");
+            println!("To build a standalone executable, run `neolove build`");
+            println!("To build the webasm package, run `neolove build --webasm`");
         }
         "run" => {
-            let project_root = if args.len() >= 3 {
-                match resolve_from_cwd(&args[2]) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        eprintln!("failed to resolve project path: {e}");
-                        return;
-                    }
-                }
-            } else {
-                match env::current_dir() {
-                    Ok(cwd) => cwd,
-                    Err(e) => {
-                        eprintln!("failed to get current directory: {}", e);
-                        return;
-                    }
-                }
-            };
-
-            if let Err(e) = validate_project_root(&project_root) {
-                eprintln!("run failed: {e}");
-                return;
-            }
-
-            run_project_window(project_root);
+            let project_root = resolve_target_project_root(args.get(2).map(String::as_str))?;
+            validate_project_root(&project_root).map_err(|error| format!("run failed: {error}"))?;
+            run_project_window(project_root).map_err(|error| format!("run failed: {error}"))?;
         }
         "build" => {
-            let project_root = if args.len() >= 3 {
-                match resolve_from_cwd(&args[2]) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        eprintln!("failed to resolve project path: {e}");
-                        return;
-                    }
+            let mut project_arg: Option<&str> = None;
+            let mut webasm = false;
+            for arg in &args[2..] {
+                if arg == "--webasm" {
+                    webasm = true;
+                } else if arg.starts_with('-') {
+                    return Err(format!("build failed: unrecognized option: {arg}"));
+                } else if project_arg.is_none() {
+                    project_arg = Some(arg);
+                } else {
+                    return Err("build failed: expected at most one project directory".to_string());
                 }
-            } else {
-                match env::current_dir() {
-                    Ok(cwd) => cwd,
-                    Err(e) => {
-                        eprintln!("failed to get current directory: {}", e);
-                        return;
-                    }
-                }
-            };
-
-            if let Err(e) = validate_project_root(&project_root) {
-                eprintln!("build failed: {e}");
-                return;
             }
 
-            match build_executable(&project_root) {
-                Ok(output) => {
-                    println!("Built executable: {}", output.display());
-                }
-                Err(e) => {
-                    eprintln!("build failed: {e}");
-                }
+            let project_root = resolve_target_project_root(project_arg)?;
+            validate_project_root(&project_root)
+                .map_err(|error| format!("build failed: {error}"))?;
+
+            if webasm {
+                let (bundle_output, zip_output) =
+                    build_webasm(&project_root).map_err(|error| format!("build failed: {error}"))?;
+                println!("Built webasm bundle: {}", bundle_output.display());
+                println!("Built itch.io package: {}", zip_output.display());
+            } else {
+                let output = build_executable(&project_root)
+                    .map_err(|error| format!("build failed: {error}"))?;
+                println!("Built executable: {}", output.display());
             }
         }
         "api" => {
             if args.len() > 3 {
-                println!("expected at most {} arguments, got {}", 3, args.len());
-                return;
+                return Err(format!(
+                    "api failed: expected at most one project directory, got {}",
+                    args.len().saturating_sub(2)
+                ));
             }
-            let project_dir = if args.len() == 3 {
-                Some(args[2].as_str())
-            } else {
-                None
-            };
-            handle_api_command(project_dir);
+            let paths = handle_api_command(args.get(2).map(String::as_str))?;
+            if paths.len() == 2 {
+                println!(
+                    "Updated API definitions at {} and {}.",
+                    paths[0].display(),
+                    paths[1].display()
+                );
+            } else if let Some(path) = paths.first() {
+                println!("Updated API definitions at {}.", path.display());
+            }
         }
         _ => {
-            eprintln!("unrecognized command: {}", args[1]);
             print_usage();
+            return Err(format!("unrecognized command: {}", args[1]));
+        }
+    }
+
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_cli)) {
+        Ok(Ok(())) => ExitCode::SUCCESS,
+        Ok(Err(error)) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+        Err(payload) => {
+            eprintln!(
+                "{}",
+                describe_desktop_panic("neolove encountered an internal panic", payload.as_ref())
+            );
+            ExitCode::FAILURE
         }
     }
 }

@@ -74,7 +74,7 @@ Parsed keys currently used by engine:
 
 1. Initialize Luau compiler settings for runtime.
 2. Install `require` and `softrequire`.
-3. Install globals/modules (`app`, `input`, `assets`, `audio`, `fs`, `http`, `commands`, `shaders`, `ecs`, `transform`/`transforms`, `core`, etc.).
+3. Install globals/modules (`app`, `input`, `assets`, `audio`, `fs`, `http`, `commands`, `shaders`, `ecs`, `prefabs`/`prefab`, `transform`/`transforms`, `core`, etc.).
 4. Load and execute project entry: `main.luau`.
 
 ## Per-frame update order
@@ -106,13 +106,14 @@ Globals exposed to Luau include:
 - `commands` and alias `command`
 - `shaders`
 - `ecs`
+- `prefabs` and alias `prefab`
 - `transform` and alias `transforms`
 - `core`
 - `mouse` (table: `x`, `y`)
 - `window` (table: `x`, `y`)
 - `Color4(r,g,b,a?)`
 - `die()`
-- `softrequire(modulePath, allowed?)`
+- `softrequire(modulePathOrSource, allowed?)`
 
 ## 6. Module Semantics and Details
 
@@ -161,13 +162,15 @@ Image and sound handles are userdata objects with explicit upload/unload control
 
 - `assets.loadImage(path)`
 - `assets.newImage(width, height, color?)`
-- Handle methods: `width`, `height`, `size`, `getPixel`, `setPixel`, `fill`, `upload`, `unload`, `isUnloaded`
+- Handle methods: `width`, `height`, `size`, `getPixel`, `setPixel`, `fill`, `upload`, `export`, `save`, `unload`, `isUnloaded`
+- `export(path)` / `save(path)` writes the current image as `.png` under project root. Missing `.png` is appended automatically.
 
 ### Sound support
 
 - WAV loading via `assets.loadSound(path)`.
 - Generated sound buffers via `assets.newSound(sampleRate, channels, len, fill?)`.
-- Handle methods: `sampleRate`, `channels`, `len`, `getSample`, `setSample`, `upload`, `unload`, `isUnloaded`.
+- Handle methods: `sampleRate`, `channels`, `len`, `getSample`, `setSample`, `upload`, `export`, `save`, `unload`, `isUnloaded`.
+- `export(path)` / `save(path)` writes the current sound as `.wav` under project root. Missing `.wav` is appended automatically.
 
 ### Unload helpers
 
@@ -221,7 +224,8 @@ Important constraints:
 
 Process execution module (cwd sandboxed to project root):
 
-- `run(command, args?, cwd?)` -> `{ ok, status_code, stdout, stderr, error? }`
+- `run(command, args?, cwd?)` -> `{ ok, statusCode, stdout, stderr, error? }`
+- Compatibility alias: `status_code`
 - `runDetached(command, args?, cwd?)` -> `{ ok, pid, error? }`
 
 `cwd` that escapes project root is rejected.
@@ -244,13 +248,34 @@ Shader handle methods:
 
 `options.uniforms` supports string or table descriptors; `options.textures` declares texture samplers.
 
-## 6.9 `softrequire`
+## 6.9 `prefabs` / `prefab`
 
-`softrequire(modulePath, allowed?)` loads a module file in a restricted sandbox and caches by canonical file path.
+Prefab/template module for exact entity-tree cloning:
 
+- `capture(entity)` -> detached template tree
+- `component(source, overrides?)` -> materialized component template
+- `register(name, source)` -> stored template
+- `get(name)` / `remove(name)`
+- `instantiate(sourceOrName, parent?)` -> cloned entity tree
+- `duplicate(sourceOrName, parent?)` -> alias of `instantiate`
+- `ui.label`, `ui.panel`, `ui.dialog`, `ui.statusChip`
+
+Behavior notes:
+
+- Clones preserve nested tables, metatables, userdata handles, and shared table references.
+- Internal entity references inside the captured subtree are remapped to the newly instantiated entities.
+- External entity references stay pointed at the original live entity.
+- `ecs.duplicateEntity(...)` now uses the same recursive exact-clone path.
+
+## 6.10 `softrequire`
+
+`softrequire(modulePathOrSource, allowed?)` loads either a module file or inline Luau source in a restricted sandbox.
+
+- If the string resolves to a project-root module, it is cached by canonical file path.
+- Otherwise the string is treated as Luau source text and cached by source content.
 - Auto extension resolution for `.luau` / `.lua`.
 - Directory path resolves to `init.luau`.
-- Module path is restricted to project root.
+- File-backed module paths are restricted to project root.
 - Sandbox includes selected base functions/libs.
 - `allowed` can expose additional globals/modules.
 
@@ -289,6 +314,33 @@ Layout notes:
 - `ecs.addComponent(entity, componentPrototype)`
 - `ecs.removeComponent(entity, indexOrComponent)`
 - `ecs.root`
+
+Entity instance helpers:
+
+- `entity:listen(event, callback)` / `entity:Listen(event, callback)`
+- Supported events: `leftClick`, `rightClick`, `middleClick`, `scrollUp`, `scrollDown`
+- Returns a connection object with `connection:Disconnect()`
+- `entity:Delete()`
+- `entity:AddComponent(component)` / `entity:RemoveComponent(target)`
+- `entity:Duplicate(parent?)`
+- `entity:FindFirstChild(name)`
+- `entity:GetWorldPosition()` / `entity:GetWorldRotation()`
+
+Component instance helpers:
+
+- `component:Remove()`
+- `component:GetEntity()`
+
+## Prefab operations
+
+- `prefabs.capture(entity)`
+- `prefabs.component(componentOrPrototype, overrides?)`
+- `prefabs.register(name, source)`
+- `prefabs.get(name)`
+- `prefabs.remove(name)`
+- `prefabs.instantiate(sourceOrName, parent?)`
+- `prefabs.duplicate(sourceOrName, parent?)`
+- Built-in UI templates: `prefabs.ui.label`, `prefabs.ui.panel`, `prefabs.ui.dialog`, `prefabs.ui.statusChip`
 
 ## Systems
 
@@ -448,6 +500,28 @@ export type Vec2 = {
 
 export type PositionPivot = "center" | "top_right"
 
+export type EntityListenEvent = "leftClick" | "rightClick" | "middleClick" | "scrollUp" | "scrollDown"
+
+export type EntityListenInfo = {
+	kind: EntityListenEvent,
+	type: EntityListenEvent,
+	button: "left" | "right" | "middle"?,
+	x: number,
+	y: number,
+	mouseX: number,
+	mouseY: number,
+	wheelX: number,
+	wheelY: number,
+	amount: number,
+}
+
+export type Connection = {
+	Disconnect: (self: Connection) -> boolean,
+	disconnect: (self: Connection) -> boolean,
+	IsConnected: (self: Connection) -> boolean,
+	isConnected: (self: Connection) -> boolean,
+}
+
 export type Entity = {
 	id: number,
 	name: string,
@@ -470,6 +544,22 @@ export type Entity = {
 	parent: Entity?,
 	children: { Entity },
 	components: { ComponentInstance },
+	listen: (self: Entity, event: EntityListenEvent | string, callback: (entity: Entity, event: EntityListenInfo) -> ()) -> Connection,
+	Listen: (self: Entity, event: EntityListenEvent | string, callback: (entity: Entity, event: EntityListenInfo) -> ()) -> Connection,
+	delete: (self: Entity) -> (),
+	Delete: (self: Entity) -> (),
+	addComponent: <T>(self: Entity, component: T) -> T,
+	AddComponent: <T>(self: Entity, component: T) -> T,
+	removeComponent: (self: Entity, target: number | ComponentInstance) -> boolean,
+	RemoveComponent: (self: Entity, target: number | ComponentInstance) -> boolean,
+	duplicate: (self: Entity, parent: Entity?) -> Entity,
+	Duplicate: (self: Entity, parent: Entity?) -> Entity,
+	findFirstChild: (self: Entity, name: string) -> Entity?,
+	FindFirstChild: (self: Entity, name: string) -> Entity?,
+	getWorldPosition: (self: Entity) -> (number, number),
+	GetWorldPosition: (self: Entity) -> (number, number),
+	getWorldRotation: (self: Entity) -> number,
+	GetWorldRotation: (self: Entity) -> number,
 	[string]: any,
 }
 
@@ -496,6 +586,10 @@ export type ComponentInstance = {
 	destroy: ((entity: Entity, component: ComponentInstance) -> ())?,
 	onDestroy: ((entity: Entity, component: ComponentInstance) -> ())?,
 	NEOLOVE_RENDERING: boolean?,
+	remove: (self: ComponentInstance) -> boolean,
+	Remove: (self: ComponentInstance) -> boolean,
+	getEntity: (self: ComponentInstance) -> Entity?,
+	GetEntity: (self: ComponentInstance) -> Entity?,
 	[string]: any,
 }
 
@@ -516,6 +610,8 @@ export type ImageHandle = {
 	setPixel: (self: ImageHandle, x: number, y: number, color: Color4Value) -> (),
 	fill: (self: ImageHandle, color: Color4Value) -> (),
 	upload: (self: ImageHandle) -> (),
+	export: (self: ImageHandle, path: string) -> (),
+	save: (self: ImageHandle, path: string) -> (),
 	unload: (self: ImageHandle) -> (),
 	isUnloaded: (self: ImageHandle) -> boolean,
 }
@@ -527,6 +623,8 @@ export type SoundHandle = {
 	getSample: (self: SoundHandle, index: number) -> number,
 	setSample: (self: SoundHandle, index: number, value: number) -> (),
 	upload: (self: SoundHandle) -> (),
+	export: (self: SoundHandle, path: string) -> (),
+	save: (self: SoundHandle, path: string) -> (),
 	unload: (self: SoundHandle) -> (),
 	isUnloaded: (self: SoundHandle) -> boolean,
 }
@@ -537,6 +635,8 @@ export type RaycastHit = {
 	distance: number,
 	x: number,
 	y: number,
+	normalX: number,
+	normalY: number,
 	normal_x: number,
 	normal_y: number,
 }
@@ -596,6 +696,8 @@ export type FsWalkEntry = {
 	path: string,
 	name: string,
 	kind: "file" | "directory",
+	isFile: boolean,
+	isDir: boolean,
 	is_file: boolean,
 	is_dir: boolean,
 }
@@ -633,6 +735,7 @@ export type HttpModule = {
 
 export type CommandRunResult = {
 	ok: boolean,
+	statusCode: number,
 	status_code: number,
 	stdout: string,
 	stderr: string,
@@ -689,6 +792,48 @@ export type EcsModule = {
 	root: Entity,
 	addComponent: <T>(entity: Entity, component: T) -> T,
 	removeComponent: (entity: Entity, target: number | ComponentInstance) -> boolean,
+}
+
+export type PrefabTemplate = {
+	name: string?,
+	x: number?,
+	y: number?,
+	anchor_x: number?,
+	anchor_y: number?,
+	pivot_x: number?,
+	pivot_y: number?,
+	rotation: number?,
+	rotation_pivot: string?,
+	rotation_pivot_x: number?,
+	rotation_pivot_y: number?,
+	position_pivot: PositionPivot?,
+	z: number?,
+	size_x: number?,
+	size_y: number?,
+	scale: number?,
+	parent: PrefabTemplate?,
+	children: { PrefabTemplate }?,
+	components: { ComponentInstance }?,
+	[string]: any,
+}
+
+export type PrefabUiModule = {
+	label: PrefabTemplate,
+	panel: PrefabTemplate,
+	dialog: PrefabTemplate,
+	statusChip: PrefabTemplate,
+	status_chip: PrefabTemplate,
+}
+
+export type PrefabsModule = {
+	capture: (entity: Entity) -> PrefabTemplate,
+	component: <T>(source: T, overrides: { [string]: any }?) -> T,
+	register: (name: string, source: string | Entity | PrefabTemplate) -> PrefabTemplate,
+	get: (name: string) -> PrefabTemplate?,
+	remove: (name: string) -> boolean,
+	instantiate: (source: string | Entity | PrefabTemplate, parent: Entity?) -> Entity,
+	duplicate: (source: string | Entity | PrefabTemplate, parent: Entity?) -> Entity,
+	ui: PrefabUiModule,
 }
 
 export type BaseDrawableComponent = ComponentInstance & {
@@ -872,7 +1017,7 @@ export type CoreModule = {
 
 declare function Color4(r: number, g: number, b: number, a: number?): Color4Value
 declare function die(): ()
-declare function softrequire(modulePath: string, allowedModules: { [string]: any } | { string }?): any
+declare function softrequire(modulePathOrSource: string, allowedModules: { [string]: any } | { string }?): any
 
 declare app: AppModule
 declare input: InputModule
@@ -885,6 +1030,8 @@ declare commands: CommandsModule
 declare command: CommandsModule
 declare shaders: ShadersModule
 declare ecs: EcsModule
+declare prefabs: PrefabsModule
+declare prefab: PrefabsModule
 declare transform: TransformModule
 declare transforms: TransformModule
 declare core: CoreModule

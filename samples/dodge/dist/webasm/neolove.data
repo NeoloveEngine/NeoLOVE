@@ -1,0 +1,165 @@
+--!strict
+--!native
+--!optimize 2
+
+local mod = {}
+
+mod.singleton = nil
+local spawner = require("../spawner")
+local shrinkSpeed = 8
+
+mod.component = {
+    awake = function(entity, component)
+        mod.singleton = component
+        component.health = 255
+        component.follow = true
+    end,
+    update = function(entity, component, dt)
+        if component.follow then
+            entity.x = math.lerp(entity.x, mouse.x, dt*15)
+            entity.y = window.y - 100
+        end
+        if component.health <= 0 then
+            ecs.deleteEntity(spawner.enemyHolder)
+            component.follow = false
+            spawner.cancelSpawning = true
+        end
+
+        if not component.follow then
+            entity.size_x -= dt * shrinkSpeed
+            entity.size_y -= dt * shrinkSpeed
+            entity.x += dt * (shrinkSpeed / 2)
+            entity.y += dt * (shrinkSpeed / 2)
+
+            if entity.size_x <= 0.5 then
+                ecs.deleteEntity(entity)
+                die()
+            end
+            entity.hp.color = Color4(0,0,0,0)
+        else
+            local off = (255-component.health)/255*205
+            entity.hp.color = Color4(50+off, 50, 255-off, 255)
+        end
+    end,
+}
+
+
+return mod--!strict
+--!native
+--!optimize 2
+
+return {
+    awake = function(entity, component) 
+        entity.x = math.random(0, window.x)
+        entity.y = -30
+        component.character = require("./character")
+        local renderer = ecs.addComponent(entity, core.Rect2D)
+        renderer.color = Color4(255, 50, 50)
+    end,
+    update = function(entity, component, dt)
+        entity.y += component.t * dt * 20
+
+        if entity.y - 80 > window.y then
+            ecs.deleteEntity(entity)
+        end
+
+        if transform.doTheyOverlap({entity, component.character.singleton.entity}) then
+            component.character.singleton.health -= component.t
+            ecs.deleteEntity(entity)
+        end
+    end,
+}--!strict
+--!native
+--!optimize 2
+
+bg = {R = 255, G = 255, B = 255}
+
+local characterController = require("./components/character")
+local spawner = require("./spawner")
+
+local player = ecs.newEntity("player", ecs.root, 50, 50)
+player.size_x = 30
+player.size_y = 30
+
+local healthbox = ecs.newEntity("healthbox", player, 5, 5)
+healthbox.size_x = 20
+healthbox.size_y = 20
+
+healthbox.renderer = ecs.addComponent(healthbox, core.Rect2D)
+player.hp = healthbox.renderer
+
+local renderer = ecs.addComponent(player, core.Rect2D)
+renderer.color = Color4(50, 50, 255)
+healthbox.z = 2
+
+local l = ecs.newEntity("label", ecs.root, 50, 50)
+local textRenderer = ecs.addComponent(l, core.TextBox)
+textRenderer.color = Color4(0,0,0)
+l.textRenderer = textRenderer
+l.z = 1
+
+ecs.addComponent(player, characterController.component)
+ecs.addSystem(spawner.system)[package]
+name = "blackjack"
+version = "0.1.0"
+
+[dependencies]
+--!strict
+--!native
+--!optimize 2
+
+local mod = {}
+
+mod.t = 0
+mod.phase = 0
+local spawning = false
+
+local enemyComponent = require("./components/enemy")
+
+mod.enemyHolder = ecs.newEntity("enemyHolder", ecs.root, 0, 0)
+mod.enemyHolder.size_x = 0
+mod.enemyHolder.size_y = 0
+mod.cancelSpawning = false
+
+mod.system = {update = function(system, dt)
+    mod.t += dt
+
+    local textRenderer = ecs.findFirstChild(ecs.root, "label").textRenderer
+
+    if mod.t > 40 then
+        local t_diff = mod.t - 40
+        local frequency = 1 + t_diff * 0.1
+        local amplitude = math.min(window.x / 2, t_diff * 10)
+        
+        mod.phase += dt * frequency
+        mod.enemyHolder.x = amplitude * (1 - math.cos(mod.phase))
+    else
+        mod.enemyHolder.x = 0
+    end
+
+    if not spawning and mod.t > 5 then
+        spawning = true
+    elseif not spawning then
+        textRenderer.text = `Incoming in {tostring(math.floor(5 - mod.t))}`
+    end
+
+    if spawning and not mod.cancelSpawning then
+        local success = pcall(function()
+            if math.random(1, 5/dt/mod.t/(window.x/600)) == 1 then
+                local enemy = ecs.newEntity("enemy", mod.enemyHolder, 50, 50)
+                enemy.size_x = 30
+                enemy.size_y = 30
+
+                local c = ecs.addComponent(enemy, enemyComponent)
+                c.t = mod.t
+            end
+        end)
+        if not success then
+            print("failed when spawning!")
+        end
+
+        textRenderer.text = `Score: {math.floor(mod.t - 5)}`
+    end
+end}
+
+return mod

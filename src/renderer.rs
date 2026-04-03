@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::assets::ImageHandle;
 use crate::platform::{Color, SharedPlatformState};
 use fontdue::Font;
@@ -198,9 +200,9 @@ fn load_font(source: &FontHandle) -> Option<Arc<Font>> {
     }
 
     let font = match source {
-        FontHandle::Default => Arc::new(
-            Font::from_bytes(DEFAULT_FONT_BYTES, fontdue::FontSettings::default()).ok()?,
-        ),
+        FontHandle::Default => {
+            Arc::new(Font::from_bytes(DEFAULT_FONT_BYTES, fontdue::FontSettings::default()).ok()?)
+        }
         FontHandle::Path(path) if !path.trim().is_empty() => {
             let bytes = match std::fs::read(path) {
                 Ok(bytes) => bytes,
@@ -231,9 +233,9 @@ fn load_font(source: &FontHandle) -> Option<Arc<Font>> {
                 }
             }
         }
-        FontHandle::Path(_) => Arc::new(
-            Font::from_bytes(DEFAULT_FONT_BYTES, fontdue::FontSettings::default()).ok()?,
-        ),
+        FontHandle::Path(_) => {
+            Arc::new(Font::from_bytes(DEFAULT_FONT_BYTES, fontdue::FontSettings::default()).ok()?)
+        }
     };
     if let Ok(mut cache) = font_cache().lock() {
         cache.insert(cache_key, font.clone());
@@ -627,14 +629,22 @@ pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<Raste
     let (min_x, min_y, max_x, max_y) = layout.pixel_bounds?;
     let font = load_font(&request.font)?;
     let px = layout.metrics.used_scale.max(1.0);
-    let width = (max_x - min_x).ceil().max(1.0) as u32;
-    let height = (max_y - min_y).ceil().max(1.0) as u32;
+    let border = if request.rotation.abs() > 0.0001
+        && request.stretch_width <= 0.0
+        && request.stretch_height <= 0.0
+    {
+        1u32
+    } else {
+        0u32
+    };
+    let width = (max_x - min_x).ceil().max(1.0) as u32 + border * 2;
+    let height = (max_y - min_y).ceil().max(1.0) as u32 + border * 2;
     let mut text_image: RgbaImage = ImageBuffer::from_pixel(width, height, Rgba([0, 0, 0, 0]));
 
     for glyph in layout.glyphs {
         let (metrics, bitmap) = font.rasterize(glyph.ch, px);
-        let base_x = (glyph.x - min_x).round() as i32;
-        let top_y = (glyph.y - min_y).round() as i32;
+        let base_x = (glyph.x - min_x).round() as i32 + border as i32;
+        let top_y = (glyph.y - min_y).round() as i32 + border as i32;
         for gy in 0..metrics.height {
             for gx in 0..metrics.width {
                 let alpha = bitmap[gy * metrics.width + gx];
@@ -657,6 +667,8 @@ pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<Raste
 
     let filter = if request.stretch_width > 0.0 && request.stretch_height > 0.0 {
         TextureFilter::Nearest
+    } else if request.rotation.abs() > 0.0001 && matches!(request.font, FontHandle::Default) {
+        TextureFilter::Nearest
     } else {
         TextureFilter::Linear
     };
@@ -664,8 +676,8 @@ pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<Raste
     Some(RasterizedTextSprite {
         image: text_image,
         dest: Rect {
-            x: min_x.round(),
-            y: min_y.round(),
+            x: min_x.round() - border as f32,
+            y: min_y.round() - border as f32,
             w: if request.stretch_width > 0.0 && request.stretch_height > 0.0 {
                 request.stretch_width.max(1.0)
             } else {
@@ -702,6 +714,136 @@ fn rotate_local(x: f32, y: f32, rotation: f32) -> (f32, f32) {
 
 fn inverse_rotate(x: f32, y: f32, rotation: f32) -> (f32, f32) {
     rotate_local(x, y, -rotation)
+}
+
+fn world_point(x: f32, y: f32, pivot_x: f32, pivot_y: f32, rotation: f32) -> Vec2 {
+    let local_x = x - pivot_x;
+    let local_y = y - pivot_y;
+    let (rx, ry) = rotate_local(local_x, local_y, rotation);
+    Vec2 {
+        x: pivot_x + rx,
+        y: pivot_y + ry,
+    }
+}
+
+fn rotated_rect_corners(bounds: Rect, pivot: Vec2, rotation: f32) -> [Vec2; 4] {
+    [
+        world_point(bounds.x, bounds.y, pivot.x, pivot.y, rotation),
+        world_point(bounds.x + bounds.w, bounds.y, pivot.x, pivot.y, rotation),
+        world_point(
+            bounds.x + bounds.w,
+            bounds.y + bounds.h,
+            pivot.x,
+            pivot.y,
+            rotation,
+        ),
+        world_point(bounds.x, bounds.y + bounds.h, pivot.x, pivot.y, rotation),
+    ]
+}
+
+fn bounds_from_points(points: &[Vec2]) -> Rect {
+    let min_x = points
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::INFINITY, f32::min);
+    let max_x = points
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::INFINITY, f32::min);
+    let max_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    Rect {
+        x: min_x,
+        y: min_y,
+        w: (max_x - min_x).max(0.0),
+        h: (max_y - min_y).max(0.0),
+    }
+}
+
+fn rect_intersects_viewport(bounds: Rect, width: u32, height: u32) -> bool {
+    bounds.x < width as f32
+        && bounds.x + bounds.w > 0.0
+        && bounds.y < height as f32
+        && bounds.y + bounds.h > 0.0
+}
+
+pub(crate) fn command_intersects_viewport(command: &DrawCommand, width: u32, height: u32) -> bool {
+    if width == 0 || height == 0 {
+        return false;
+    }
+
+    let bounds = match command {
+        DrawCommand::Rect {
+            x,
+            y,
+            w,
+            h,
+            rotation,
+            offset,
+            ..
+        } => {
+            if *w <= 0.0 || *h <= 0.0 {
+                return false;
+            }
+            let pivot = Vec2 {
+                x: *x + *w * offset.x,
+                y: *y + *h * offset.y,
+            };
+            bounds_from_points(&rotated_rect_corners(
+                Rect {
+                    x: *x,
+                    y: *y,
+                    w: *w,
+                    h: *h,
+                },
+                pivot,
+                *rotation,
+            ))
+        }
+        DrawCommand::Triangle { a, b, c, .. } => bounds_from_points(&[*a, *b, *c]),
+        DrawCommand::Circle { center, radius, .. } => {
+            if *radius <= 0.0 {
+                return false;
+            }
+            Rect {
+                x: center.x - *radius,
+                y: center.y - *radius,
+                w: radius * 2.0,
+                h: radius * 2.0,
+            }
+        }
+        DrawCommand::Image {
+            dest,
+            rotation,
+            pivot,
+            ..
+        } => {
+            if dest.w <= 0.0 || dest.h <= 0.0 {
+                return false;
+            }
+            bounds_from_points(&rotated_rect_corners(*dest, *pivot, *rotation))
+        }
+        DrawCommand::Text(request) => {
+            if request.bounds.w <= 0.0 || request.bounds.h <= 0.0 {
+                // Content-sized text computes its real sprite bounds during layout/rasterization,
+                // so pre-layout culling cannot safely reject it here.
+                return true;
+            }
+            bounds_from_points(&rotated_rect_corners(
+                request.bounds,
+                request.pivot,
+                request.rotation,
+            ))
+        }
+    };
+
+    rect_intersects_viewport(bounds, width, height)
 }
 
 pub(crate) struct SoftwareRenderer {
@@ -751,6 +893,9 @@ impl SoftwareRenderer {
             .map_err(|_| "render state lock poisoned".to_string())?
             .drain();
         for command in commands {
+            if !command_intersects_viewport(&command, self.width, self.height) {
+                continue;
+            }
             self.draw_command(command)?;
         }
         Ok(())
@@ -997,4 +1142,44 @@ fn modulate(sample: Color, tint: Color) -> Color {
         ((sample.b as u16 * tint.b as u16) / 255) as u8,
         ((sample.a as u16 * tint.a as u16) / 255) as u8,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_sized_text_is_not_culled_before_layout() {
+        let request = TextRenderRequest {
+            text: "Hello".to_string(),
+            bounds: Rect {
+                x: 32.0,
+                y: 48.0,
+                w: 0.0,
+                h: 0.0,
+            },
+            rotation: 0.0,
+            pivot: Vec2::default(),
+            color: Color::WHITE,
+            font: FontHandle::Default,
+            scale: 16.0,
+            min_scale: 16.0,
+            text_scale: TextScaleMode::None,
+            align_x: TextAlignX::Left,
+            align_y: TextAlignY::Top,
+            wrap: TextWrapMode::None,
+            padding_x: 0.0,
+            padding_y: 0.0,
+            line_spacing: 1.0,
+            letter_spacing: 0.0,
+            stretch_width: 0.0,
+            stretch_height: 0.0,
+        };
+
+        assert!(command_intersects_viewport(
+            &DrawCommand::Text(request),
+            800,
+            600
+        ));
+    }
 }

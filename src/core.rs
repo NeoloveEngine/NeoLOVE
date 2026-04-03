@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::assets::ImageHandle;
 use crate::lua_error::protect_lua_call;
 use crate::platform::{Color, InputState, SharedPlatformState, WindowState};

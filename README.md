@@ -9,7 +9,7 @@ you to easily make performant games in the language luau
 ```bash
 neolove new <project-name>
 neolove run [project-dir]
-neolove build [project-dir]
+neolove build [project-dir] [--webasm]
 neolove setup-path
 neolove --help
 neolove --version
@@ -25,8 +25,11 @@ neolove --version
 
 ### WebAssembly
 
-- `cargo build --target wasm32-unknown-unknown` is now supported as a bootstrap build target.
-- The current wasm target is build-only; the desktop runtime still requires native windowing/Vulkan and is not yet runnable in the browser.
+- `neolove build --webasm` now builds an itch.io-ready HTML5 bundle into `dist/webasm/` and also creates a single upload zip in `dist/<project-name>-webasm.zip`.
+- The web bundle includes `index.html`, `neolove.js`, `neolove.wasm`, and `neolove.data` when the project payload is preloaded into the browser filesystem.
+- Web builds now support the existing `audio.play`, `audio.playOnce`, `audio.stop`, and `audio.setVolume` API through the browser Web Audio backend.
+- `cargo build --target wasm32-unknown-unknown` is still supported directly as the lower-level bootstrap build target.
+- The first `--webasm` build may install `wasm32-unknown-emscripten` and bootstrap a local Emscripten toolchain under `~/.neolove/toolchains/emsdk`.
 
 ### Roadmap
 

@@ -41,7 +41,7 @@ use vulkano::swapchain::{
 };
 use vulkano::sync::{self, GpuFuture};
 use vulkano::{Validated, VulkanError};
-use vulkano::{Version, VulkanLibrary, impl_vertex, single_pass_renderpass};
+use vulkano::{Version, VulkanLibrary, single_pass_renderpass};
 use winit::event_loop::EventLoop;
 use winit::window::Window;
 
@@ -85,14 +85,15 @@ mod fs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Zeroable, Pod)]
+#[derive(Clone, Copy, Debug, Default, Zeroable, Pod, Vertex)]
 struct GpuVertex {
+    #[format(R32G32_SFLOAT)]
     position: [f32; 2],
+    #[format(R32G32B32A32_SFLOAT)]
     color: [f32; 4],
+    #[format(R32G32_SFLOAT)]
     uv: [f32; 2],
 }
-
-impl_vertex!(GpuVertex, position, color, uv);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct TextureKey(u64);
@@ -105,7 +106,6 @@ struct TextureBatch {
 
 struct CachedTexture {
     revision: u64,
-    view: Arc<ImageView>,
     descriptor_nearest: Arc<PersistentDescriptorSet>,
     descriptor_linear: Arc<PersistentDescriptorSet>,
 }
@@ -493,13 +493,15 @@ impl VulkanPresenter {
                     topology: PrimitiveTopology::TriangleList,
                     ..Default::default()
                 }),
-                viewport_state: Some(ViewportState::viewport_fixed_scissor_irrelevant([
-                    Viewport {
+                viewport_state: Some({
+                    let mut state = ViewportState::default();
+                    state.viewports[0] = Viewport {
                         offset: [0.0, 0.0],
                         extent: [width.max(1) as f32, height.max(1) as f32],
                         depth_range: 0.0..=1.0,
-                    },
-                ])),
+                    };
+                    state
+                }),
                 rasterization_state: Some(RasterizationState::default()),
                 multisample_state: Some(MultisampleState {
                     rasterization_samples: msaa_samples,
@@ -614,7 +616,10 @@ impl VulkanPresenter {
 
         match future.map_err(Validated::unwrap) {
             Ok(future) => {
-                self.previous_frame_end = Some(future.boxed());
+                // Serialize frame submission until we add per-image future tracking. This keeps
+                // swapchain image/framebuffer usage ordered and avoids Vulkano validation failures.
+                future.wait(None).map_err(|e| e.to_string())?;
+                self.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
             }
             Err(VulkanError::OutOfDate) => {
                 self.recreate_swapchain = true;
@@ -762,6 +767,9 @@ impl VulkanPresenter {
         let mut current: Option<TextureBatch> = None;
 
         for command in commands {
+            if !renderer::command_intersects_viewport(&command, width, height) {
+                continue;
+            }
             match command {
                 DrawCommand::Rect {
                     x,
@@ -1060,7 +1068,6 @@ impl VulkanPresenter {
             key,
             CachedTexture {
                 revision,
-                view,
                 descriptor_nearest,
                 descriptor_linear,
             },
