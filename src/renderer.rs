@@ -254,6 +254,16 @@ pub(crate) fn drain_commands(render_state: &SharedRenderState) -> Result<Vec<Dra
         .map(|mut state| state.drain())
 }
 
+fn command_uses_custom_shader(command: &DrawCommand) -> bool {
+    match command {
+        DrawCommand::Rect { shader, .. }
+        | DrawCommand::Triangle { shader, .. }
+        | DrawCommand::Circle { shader, .. }
+        | DrawCommand::Image { shader, .. } => shader.is_some(),
+        DrawCommand::Text(_) => false,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PreparedTextLine {
     text: String,
@@ -881,6 +891,16 @@ impl SoftwareRenderer {
         platform: &SharedPlatformState,
         render_state: &SharedRenderState,
     ) -> Result<(), String> {
+        let commands = render_state
+            .lock()
+            .map_err(|_| "render state lock poisoned".to_string())?
+            .drain();
+        if commands.iter().any(command_uses_custom_shader) {
+            return Err(
+                "custom shaders require the Vulkan renderer; the software fallback cannot run shader effects. Install the Vulkan runtime/driver so NeoLOVE can use Vulkan.".to_string(),
+            );
+        }
+
         let clear = platform
             .lock()
             .map_err(|_| "platform lock poisoned".to_string())?
@@ -892,10 +912,6 @@ impl SoftwareRenderer {
             pixel[3] = clear.a;
         }
 
-        let commands = render_state
-            .lock()
-            .map_err(|_| "render state lock poisoned".to_string())?
-            .drain();
         for command in commands {
             if !command_intersects_viewport(&command, self.width, self.height) {
                 continue;
