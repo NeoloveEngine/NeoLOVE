@@ -20,6 +20,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -41,6 +42,7 @@ use zip::write::SimpleFileOptions;
 
 use crate::gpu_renderer::VulkanPresenter;
 use crate::platform::SharedPlatformState;
+use crate::renderer::SoftwareRenderer;
 
 const EMBED_TRAILER_MAGIC: &[u8; 16] = b"NEOLOVE_EMBED_V1";
 const PAYLOAD_MAGIC: &[u8; 8] = b"NLPKGv1\0";
@@ -50,6 +52,88 @@ const TEMPLATE_NEOLOVE_ENGINE_API: &str =
     include_str!("project_template/neolove_engine_api.d.luau");
 const DEFAULT_WINDOW_WIDTH: f32 = 1280.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 720.0;
+
+enum DesktopPresenter {
+    Vulkan(VulkanPresenter),
+    Software {
+        _context: softbuffer::Context,
+        surface: softbuffer::Surface,
+        renderer: SoftwareRenderer,
+    },
+}
+
+impl DesktopPresenter {
+    fn new(event_loop: &EventLoop<()>, window: &std::sync::Arc<winit::window::Window>) -> Result<Self, String> {
+        match catch_desktop_panic("failed while initializing the Vulkan presenter", || {
+            VulkanPresenter::new(event_loop, window.clone())
+        })? {
+            Ok((presenter, _surface)) => Ok(Self::Vulkan(presenter)),
+            Err(vulkan_error) => {
+                eprintln!(
+                    "render warning: Vulkan unavailable, falling back to software renderer: {vulkan_error}"
+                );
+                let context = unsafe { softbuffer::Context::new(window.as_ref()) }
+                    .map_err(|error| format!("failed to create software renderer context: {error}"))?;
+                let surface = unsafe { softbuffer::Surface::new(&context, window.as_ref()) }
+                    .map_err(|error| format!("failed to create software renderer surface: {error}"))?;
+                let size = window.inner_size();
+                Ok(Self::Software {
+                    _context: context,
+                    surface,
+                    renderer: SoftwareRenderer::new(size.width, size.height),
+                })
+            }
+        }
+    }
+
+    fn request_resize(&mut self) {
+        if let Self::Vulkan(presenter) = self {
+            presenter.request_swapchain_recreate();
+        }
+    }
+
+    fn render(
+        &mut self,
+        window: &winit::window::Window,
+        platform_state: &SharedPlatformState,
+        render_state: &crate::renderer::SharedRenderState,
+    ) -> Result<(), String> {
+        match self {
+            Self::Vulkan(presenter) => {
+                let size = window.inner_size();
+                presenter.render(platform_state, render_state, size.width, size.height)
+            }
+            Self::Software {
+                surface, renderer, ..
+            } => {
+                let size = window.inner_size();
+                let width = size.width.max(1);
+                let height = size.height.max(1);
+                renderer.resize(width, height);
+                renderer
+                    .render(platform_state, render_state)
+                    .map_err(|error| format!("software renderer failed: {error}"))?;
+                surface
+                    .resize(
+                        NonZeroU32::new(width).expect("window width is clamped to at least 1"),
+                        NonZeroU32::new(height).expect("window height is clamped to at least 1"),
+                    )
+                    .map_err(|error| format!("failed to resize software surface: {error}"))?;
+                let mut buffer = surface
+                    .buffer_mut()
+                    .map_err(|error| format!("failed to acquire software surface buffer: {error}"))?;
+                for (dst, rgba) in buffer.iter_mut().zip(renderer.pixels().chunks_exact(4)) {
+                    *dst =
+                        (rgba[2] as u32) | ((rgba[1] as u32) << 8) | ((rgba[0] as u32) << 16);
+                }
+                buffer
+                    .present()
+                    .map_err(|error| format!("failed to present software surface: {error}"))?;
+                Ok(())
+            }
+        }
+    }
+}
 
 #[derive(Default, Clone)]
 struct ProjectSettings {
@@ -1351,11 +1435,7 @@ fn run_project_window(project_root: PathBuf) -> Result<(), String> {
 
     let platform_state = runtime.platform_state();
     let render_state = runtime.render_state();
-    let (mut presenter, _surface) = catch_desktop_panic(
-        "failed while initializing the Vulkan presenter",
-        || VulkanPresenter::new(&event_loop, window.clone()),
-    )?
-    .map_err(|error| format!("failed to initialize Vulkan: {error}"))?;
+    let mut presenter = DesktopPresenter::new(&event_loop, &window)?;
 
     let mut last_update = Instant::now();
     let mut cursor_grab_warning_logged = false;
@@ -1368,7 +1448,7 @@ fn run_project_window(project_root: PathBuf) -> Result<(), String> {
                     WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
                     WindowEvent::Resized(size) => {
                         runtime.set_platform_window_state(size.width as f32, size.height as f32);
-                        presenter.request_swapchain_recreate();
+                        presenter.request_resize();
                     }
                     WindowEvent::CursorMoved { position, .. } => {
                         runtime.set_platform_mouse_state(position.x as f32, position.y as f32);
@@ -1524,14 +1604,11 @@ fn run_project_window(project_root: PathBuf) -> Result<(), String> {
                     window.request_redraw();
                 }
                 Event::RedrawRequested(_) => {
-                    let size = window.inner_size();
-                    if let Err(error) =
-                        presenter.render(&platform_state, &render_state, size.width, size.height)
-                    {
+                    if let Err(error) = presenter.render(&window, &platform_state, &render_state) {
                         exit_runtime_failure(
                             control_flow,
                             "Fatal Render Error:",
-                            &format!("Vulkan presenter failed: {error}"),
+                            &format!("desktop presenter failed: {error}"),
                         );
                     }
                 }
