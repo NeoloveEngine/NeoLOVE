@@ -156,12 +156,14 @@ fn build_runtime_fragment_source(
 layout(location = 0) in vec4 color;\n\
 layout(location = 1) in vec2 uv;\n\
 layout(location = 0) out vec4 f_color;\n\
-layout(set = 0, binding = 0) uniform sampler2D Texture;\n",
+layout(binding = 0) uniform texture2D __neolove_Texture_image;\n\
+layout(binding = 1) uniform sampler __neolove_Texture_sampler;\n\
+#define Texture sampler2D(__neolove_Texture_image, __neolove_Texture_sampler)\n",
     );
 
     if !float_uniforms.is_empty() {
         out.push_str(&format!(
-            "layout(set = 0, binding = 1) uniform NeoLoveUniforms {{ vec4 __neolove_uniforms[{}]; }};\n",
+            "layout(binding = 2) uniform NeoLoveUniforms {{ vec4 __neolove_uniforms[{}]; }};\n",
             MAX_SHADER_FLOAT_UNIFORMS
         ));
         for (index, (name, arity)) in float_uniforms.iter().enumerate() {
@@ -172,15 +174,18 @@ layout(set = 0, binding = 0) uniform sampler2D Texture;\n",
         }
     }
 
-    let mut next_binding = 2u32;
+    let mut next_binding = 3u32;
     for name in &texture_uniforms {
         if name == "Texture" {
             continue;
         }
         out.push_str(&format!(
-            "layout(set = 0, binding = {next_binding}) uniform sampler2D {name};\n"
+            "layout(binding = {next_binding}) uniform texture2D __neolove_{name}_image;\n\
+layout(binding = {}) uniform sampler __neolove_{name}_sampler;\n\
+#define {name} sampler2D(__neolove_{name}_image, __neolove_{name}_sampler)\n",
+            next_binding + 1
         ));
-        next_binding += 1;
+        next_binding += 2;
     }
 
     out.push('\n');
@@ -211,7 +216,7 @@ impl ShaderHandle {
         }
 
         let mut texture_bindings = Vec::new();
-        let mut next_binding = 2u32;
+        let mut next_binding = 3u32;
         for name in texture_uniforms {
             if name == "Texture" {
                 continue;
@@ -219,7 +224,7 @@ impl ShaderHandle {
             if let Some(image) = uniforms.textures.get(&name) {
                 texture_bindings.push((next_binding, image.clone()));
             }
-            next_binding += 1;
+            next_binding += 2;
         }
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();

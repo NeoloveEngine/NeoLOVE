@@ -31,7 +31,9 @@ use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveT
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::RasterizationState;
 use vulkano::pipeline::graphics::subpass::PipelineSubpassType;
-use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
+use vulkano::pipeline::graphics::vertex_input::{
+    Vertex, VertexInputAttributeDescription, VertexInputBindingDescription, VertexInputState,
+};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
@@ -65,14 +67,15 @@ void main() {
 "#;
 
 const BUILTIN_FRAGMENT_SHADER: &str = r#"#version 450
-layout(set = 0, binding = 0) uniform sampler2D Texture;
+layout(binding = 0) uniform texture2D Texture;
+layout(binding = 1) uniform sampler TextureSampler;
 
 layout(location = 0) in vec4 color;
 layout(location = 1) in vec2 uv;
 layout(location = 0) out vec4 f_color;
 
 void main() {
-    f_color = texture(Texture, uv) * color;
+    f_color = texture(sampler2D(Texture, TextureSampler), uv) * color;
 }
 "#;
 
@@ -559,9 +562,51 @@ impl VulkanPresenter {
                 .map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
-        let vertex_input_state = GpuVertex::per_vertex()
-            .definition(&vs_entry.info().input_interface)
-            .map_err(|e| e.to_string())?;
+        let vertex_description = GpuVertex::per_vertex();
+        let position = vertex_description
+            .members
+            .get("position")
+            .ok_or_else(|| "vertex layout missing position field".to_string())?;
+        let color = vertex_description
+            .members
+            .get("color")
+            .ok_or_else(|| "vertex layout missing color field".to_string())?;
+        let uv = vertex_description
+            .members
+            .get("uv")
+            .ok_or_else(|| "vertex layout missing uv field".to_string())?;
+        let vertex_input_state = VertexInputState::new()
+            .binding(
+                0,
+                VertexInputBindingDescription {
+                    stride: vertex_description.stride,
+                    input_rate: vertex_description.input_rate,
+                },
+            )
+            .attribute(
+                0,
+                VertexInputAttributeDescription {
+                    binding: 0,
+                    format: position.format,
+                    offset: position.offset as u32,
+                },
+            )
+            .attribute(
+                1,
+                VertexInputAttributeDescription {
+                    binding: 0,
+                    format: color.format,
+                    offset: color.offset as u32,
+                },
+            )
+            .attribute(
+                2,
+                VertexInputAttributeDescription {
+                    binding: 0,
+                    format: uv.format,
+                    offset: uv.offset as u32,
+                },
+            );
         let subpass = Subpass::from(render_pass.clone(), 0)
             .ok_or_else(|| "missing render subpass".to_string())?;
 
@@ -902,11 +947,10 @@ impl VulkanPresenter {
             .get(&texture)
             .ok_or_else(|| "missing cached base texture".to_string())?;
 
-        let mut writes = vec![WriteDescriptorSet::image_view_sampler(
-            0,
-            base_texture.view.clone(),
-            sampler.clone(),
-        )];
+        let mut writes = vec![
+            WriteDescriptorSet::image_view(0, base_texture.view.clone()),
+            WriteDescriptorSet::sampler(1, sampler.clone()),
+        ];
 
         if shader.uses_uniform_buffer {
             let uniform_buffer = Buffer::from_data(
@@ -925,7 +969,7 @@ impl VulkanPresenter {
                 },
             )
             .map_err(|e| e.to_string())?;
-            writes.push(WriteDescriptorSet::buffer(1, uniform_buffer));
+            writes.push(WriteDescriptorSet::buffer(2, uniform_buffer));
         }
 
         for (binding, texture_key) in &shader.extra_textures {
@@ -933,11 +977,8 @@ impl VulkanPresenter {
                 .texture_cache
                 .get(texture_key)
                 .ok_or_else(|| format!("missing cached texture for shader binding {binding}"))?;
-            writes.push(WriteDescriptorSet::image_view_sampler(
-                *binding,
-                cached.view.clone(),
-                sampler.clone(),
-            ));
+            writes.push(WriteDescriptorSet::image_view(*binding, cached.view.clone()));
+            writes.push(WriteDescriptorSet::sampler(*binding + 1, sampler.clone()));
         }
 
         PersistentDescriptorSet::new(&self.descriptor_set_allocator, layout, writes, [])
@@ -1290,22 +1331,20 @@ impl VulkanPresenter {
         let descriptor_nearest = PersistentDescriptorSet::new(
             &self.descriptor_set_allocator,
             layout.clone(),
-            [WriteDescriptorSet::image_view_sampler(
-                0,
-                view.clone(),
-                self.nearest_sampler.clone(),
-            )],
+            [
+                WriteDescriptorSet::image_view(0, view.clone()),
+                WriteDescriptorSet::sampler(1, self.nearest_sampler.clone()),
+            ],
             [],
         )
         .map_err(|e| e.to_string())?;
         let descriptor_linear = PersistentDescriptorSet::new(
             &self.descriptor_set_allocator,
             layout,
-            [WriteDescriptorSet::image_view_sampler(
-                0,
-                view.clone(),
-                self.linear_sampler.clone(),
-            )],
+            [
+                WriteDescriptorSet::image_view(0, view.clone()),
+                WriteDescriptorSet::sampler(1, self.linear_sampler.clone()),
+            ],
             [],
         )
         .map_err(|e| e.to_string())?;
@@ -1406,7 +1445,7 @@ fn vertex_from_point(
     let width = width.max(1) as f32;
     let height = height.max(1) as f32;
     GpuVertex {
-        position: [point.x / width * 2.0 - 1.0, point.y / height * 2.0 - 1.0],
+        position: [point.x / width * 2.0 - 1.0, 1.0 - point.y / height * 2.0],
         color: [
             color.r as f32 / 255.0,
             color.g as f32 / 255.0,
