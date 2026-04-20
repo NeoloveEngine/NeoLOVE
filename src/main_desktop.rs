@@ -72,7 +72,16 @@ fn resolve_from_cwd(user_path: &str) -> std::io::Result<PathBuf> {
 fn user_home_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        env::var_os("USERPROFILE").map(PathBuf::from)
+        env::var_os("USERPROFILE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                let drive = env::var_os("HOMEDRIVE")?;
+                let path = env::var_os("HOMEPATH")?;
+                let mut home = PathBuf::from(drive);
+                home.push(path);
+                Some(home)
+            })
     }
     #[cfg(not(windows))]
     {
@@ -734,6 +743,13 @@ fn emsdk_command_path(root: &Path) -> PathBuf {
     }
 }
 
+#[cfg(windows)]
+fn prepare_windows_batch_command(program: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("cmd");
+    command.arg("/C").arg(program);
+    command
+}
+
 fn emcc_path(root: &Path) -> PathBuf {
     #[cfg(windows)]
     {
@@ -817,10 +833,16 @@ fn ensure_emsdk() -> Result<PathBuf, String> {
     run_checked_command(&mut git, "cloning emsdk")?;
 
     let emsdk = emsdk_command_path(&root);
+    #[cfg(windows)]
+    let mut install = prepare_windows_batch_command(&emsdk);
+    #[cfg(not(windows))]
     let mut install = std::process::Command::new(&emsdk);
     install.arg("install").arg("latest");
     run_checked_command(&mut install, "installing emsdk")?;
 
+    #[cfg(windows)]
+    let mut activate = prepare_windows_batch_command(&emsdk);
+    #[cfg(not(windows))]
     let mut activate = std::process::Command::new(&emsdk);
     activate.arg("activate").arg("latest");
     run_checked_command(&mut activate, "activating emsdk")?;

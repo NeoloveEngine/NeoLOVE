@@ -7,7 +7,11 @@ on:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,4 +35,5 @@ jobs:
         run: cargo test --all-targets --all-features
 
       - name: Check WebAssembly Bootstrap Build
+        if: runner.os == 'Linux'
         run: cargo check --target wasm32-unknown-unknown
