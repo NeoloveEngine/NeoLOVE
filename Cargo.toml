@@ -22,7 +22,7 @@ ring = "0.17.14"
 rustls-pemfile = "1.0.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-shaderc = "0.8.3"
+naga = { version = "29.0.1", default-features = false, features = ["glsl-in", "spv-out"] }
 uuid = { version = "1.22.0", features = ["v4", "v7"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "emscripten"))'.dependencies]

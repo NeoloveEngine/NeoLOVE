@@ -3,7 +3,9 @@ use crate::platform::{Color, SharedPlatformState};
 use crate::renderer::{self, DrawCommand, Rect, SharedRenderState, TextureFilter, Vec2};
 use bytemuck::{Pod, Zeroable};
 use image::RgbaImage;
-use shaderc::{CompileOptions, Compiler, EnvVersion, ShaderKind, TargetEnv};
+use naga::back::spv;
+use naga::front::glsl;
+use naga::valid::{Capabilities, ValidationFlags, Validator};
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -37,7 +39,7 @@ use vulkano::pipeline::{
     PipelineShaderStageCreateInfo,
 };
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
-use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo, spirv};
+use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
 use vulkano::swapchain::{
     self, PresentMode, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
 };
@@ -559,19 +561,28 @@ impl VulkanPresenter {
     fn compile_shader_module(
         device: Arc<Device>,
         source: &str,
-        kind: ShaderKind,
+        stage: naga::ShaderStage,
         label: &str,
     ) -> Result<Arc<ShaderModule>, String> {
-        let compiler =
-            Compiler::new().ok_or_else(|| "failed to create shader compiler".to_string())?;
-        let mut options = CompileOptions::new()
-            .ok_or_else(|| "failed to create shader compiler options".to_string())?;
-        options.set_target_env(TargetEnv::Vulkan, EnvVersion::Vulkan1_1 as u32);
-        let artifact = compiler
-            .compile_into_spirv(source, kind, label, "main", Some(&options))
-            .map_err(|e| format!("failed to compile {label}: {e}"))?;
-        let words = spirv::bytes_to_words(artifact.as_binary_u8())
-            .map_err(|e| format!("failed to parse compiled {label} SPIR-V: {e}"))?;
+        let mut frontend = glsl::Frontend::default();
+        let options = glsl::Options::from(stage);
+        let module = frontend
+            .parse(&options, source)
+            .map_err(|e| format!("failed to parse {label}: {e}"))?;
+        let module_info = Validator::new(ValidationFlags::all(), Capabilities::all())
+            .validate(&module)
+            .map_err(|e| format!("failed to validate {label}: {e}"))?;
+        let pipeline_options = spv::PipelineOptions {
+            shader_stage: stage,
+            entry_point: "main".to_string(),
+        };
+        let words = spv::write_vec(
+            &module,
+            &module_info,
+            &spv::Options::default(),
+            Some(&pipeline_options),
+        )
+        .map_err(|e| format!("failed to generate SPIR-V for {label}: {e}"))?;
         unsafe { ShaderModule::new(device, ShaderModuleCreateInfo::new(&words)) }
             .map_err(|e| e.to_string())
     }
@@ -588,7 +599,7 @@ impl VulkanPresenter {
         let fs = Self::compile_shader_module(
             device.clone(),
             fragment_source,
-            ShaderKind::Fragment,
+            naga::ShaderStage::Fragment,
             "neolove_custom_fragment.glsl",
         )?;
         let vs_entry = vs
