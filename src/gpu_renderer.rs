@@ -49,44 +49,32 @@ use vulkano::{Version, VulkanLibrary, single_pass_renderpass};
 use winit::event_loop::EventLoop;
 use winit::window::Window;
 
-mod vs {
-    vulkano_shaders::shader! {
-        ty: "vertex",
-        src: r#"
-            #version 450
-            layout(location = 0) in vec2 position;
-            layout(location = 1) in vec4 color;
-            layout(location = 2) in vec2 uv;
+const BUILTIN_VERTEX_SHADER: &str = r#"#version 450
+layout(location = 0) in vec2 position;
+layout(location = 1) in vec4 color;
+layout(location = 2) in vec2 uv;
 
-            layout(location = 0) out vec4 v_color;
-            layout(location = 1) out vec2 v_uv;
+layout(location = 0) out vec4 v_color;
+layout(location = 1) out vec2 v_uv;
 
-            void main() {
-                gl_Position = vec4(position, 0.0, 1.0);
-                v_color = color;
-                v_uv = uv;
-            }
-        "#,
-    }
+void main() {
+    gl_Position = vec4(position, 0.0, 1.0);
+    v_color = color;
+    v_uv = uv;
 }
+"#;
 
-mod fs {
-    vulkano_shaders::shader! {
-        ty: "fragment",
-        src: r#"
-            #version 450
-            layout(set = 0, binding = 0) uniform sampler2D tex;
+const BUILTIN_FRAGMENT_SHADER: &str = r#"#version 450
+layout(set = 0, binding = 0) uniform sampler2D Texture;
 
-            layout(location = 0) in vec4 v_color;
-            layout(location = 1) in vec2 v_uv;
-            layout(location = 0) out vec4 f_color;
+layout(location = 0) in vec4 color;
+layout(location = 1) in vec2 uv;
+layout(location = 0) out vec4 f_color;
 
-            void main() {
-                f_color = texture(tex, v_uv) * v_color;
-            }
-        "#,
-    }
+void main() {
+    f_color = texture(Texture, uv) * color;
 }
+"#;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Zeroable, Pod, Vertex)]
@@ -493,69 +481,15 @@ impl VulkanPresenter {
         height: u32,
         msaa_samples: SampleCount,
     ) -> Result<Arc<GraphicsPipeline>, String> {
-        let vs = vs::load(device.clone()).map_err(|e| e.to_string())?;
-        let fs = fs::load(device.clone()).map_err(|e| e.to_string())?;
-        let vs_entry = vs
-            .entry_point("main")
-            .ok_or_else(|| "missing vertex shader entry point".to_string())?;
-        let fs_entry = fs
-            .entry_point("main")
-            .ok_or_else(|| "missing fragment shader entry point".to_string())?;
-        let stages = [
-            PipelineShaderStageCreateInfo::new(vs_entry.clone()),
-            PipelineShaderStageCreateInfo::new(fs_entry.clone()),
-        ];
-        let layout = PipelineLayout::new(
-            device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(device.clone())
-                .map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        let vertex_input_state = GpuVertex::per_vertex()
-            .definition(&vs_entry.info().input_interface)
-            .map_err(|e| e.to_string())?;
-        let subpass = Subpass::from(render_pass.clone(), 0)
-            .ok_or_else(|| "missing render subpass".to_string())?;
-
-        GraphicsPipeline::new(
+        Self::create_pipeline_with_sources(
             device,
-            None,
-            vulkano::pipeline::graphics::GraphicsPipelineCreateInfo {
-                stages: stages.into_iter().collect(),
-                vertex_input_state: Some(vertex_input_state),
-                input_assembly_state: Some(InputAssemblyState {
-                    topology: PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                }),
-                viewport_state: Some({
-                    let mut state = ViewportState::default();
-                    state.viewports[0] = Viewport {
-                        offset: [0.0, 0.0],
-                        extent: [width.max(1) as f32, height.max(1) as f32],
-                        depth_range: 0.0..=1.0,
-                    };
-                    state
-                }),
-                rasterization_state: Some(RasterizationState::default()),
-                multisample_state: Some(MultisampleState {
-                    rasterization_samples: msaa_samples,
-                    ..Default::default()
-                }),
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    1,
-                    ColorBlendAttachmentState {
-                        blend: Some(AttachmentBlend::alpha()),
-                        color_write_mask: ColorComponents::all(),
-                        color_write_enable: true,
-                    },
-                )),
-                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-                subpass: Some(PipelineSubpassType::BeginRenderPass(subpass)),
-                ..vulkano::pipeline::graphics::GraphicsPipelineCreateInfo::layout(layout)
-            },
+            render_pass,
+            width,
+            height,
+            msaa_samples,
+            BUILTIN_VERTEX_SHADER,
+            BUILTIN_FRAGMENT_SHADER,
         )
-        .map_err(|e| e.to_string())
     }
 
     fn compile_shader_module(
@@ -587,20 +521,26 @@ impl VulkanPresenter {
             .map_err(|e| e.to_string())
     }
 
-    fn create_pipeline_with_fragment_source(
+    fn create_pipeline_with_sources(
         device: Arc<Device>,
         render_pass: Arc<RenderPass>,
         width: u32,
         height: u32,
         msaa_samples: SampleCount,
+        vertex_source: &str,
         fragment_source: &str,
     ) -> Result<Arc<GraphicsPipeline>, String> {
-        let vs = vs::load(device.clone()).map_err(|e| e.to_string())?;
+        let vs = Self::compile_shader_module(
+            device.clone(),
+            vertex_source,
+            naga::ShaderStage::Vertex,
+            "neolove_builtin_vertex.glsl",
+        )?;
         let fs = Self::compile_shader_module(
             device.clone(),
             fragment_source,
             naga::ShaderStage::Fragment,
-            "neolove_custom_fragment.glsl",
+            "neolove_fragment.glsl",
         )?;
         let vs_entry = vs
             .entry_point("main")
@@ -663,6 +603,25 @@ impl VulkanPresenter {
             },
         )
         .map_err(|e| e.to_string())
+    }
+
+    fn create_pipeline_with_fragment_source(
+        device: Arc<Device>,
+        render_pass: Arc<RenderPass>,
+        width: u32,
+        height: u32,
+        msaa_samples: SampleCount,
+        fragment_source: &str,
+    ) -> Result<Arc<GraphicsPipeline>, String> {
+        Self::create_pipeline_with_sources(
+            device,
+            render_pass,
+            width,
+            height,
+            msaa_samples,
+            BUILTIN_VERTEX_SHADER,
+            fragment_source,
+        )
     }
 
     fn pipeline_for_batch(

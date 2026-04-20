@@ -12,7 +12,6 @@ fontdue = "0.9.3"
 image = "0.24.9"
 rodio = "0.20.1"
 vulkano = "0.34.1"
-vulkano-shaders = "0.34.0"
 winit = "0.28.7"
 rustls = "0.23.18"
 webpki-roots = "0.26.7"
@@ -40,3 +39,6 @@ cc = "1.2.43"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[profile.release.build-override]
+debug = false
