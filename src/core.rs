@@ -33,6 +33,15 @@ fn color4_to_color(color4: Table) -> mlua::Result<Color> {
     ))
 }
 
+fn shader_from_component(component: &Table) -> mlua::Result<Option<crate::shader::ShaderHandle>> {
+    let shader_ud: Option<AnyUserData> = component.get("shader")?;
+    let Some(shader_ud) = shader_ud else {
+        return Ok(None);
+    };
+    let shader = shader_ud.borrow::<crate::shader::ShaderHandle>()?;
+    Ok(Some(shader.clone()))
+}
+
 fn rotate_local(x: f32, y: f32, rotation: f32) -> (f32, f32) {
     let cos_r = rotation.cos();
     let sin_r = rotation.sin();
@@ -403,6 +412,7 @@ fn queue_rect_fill(
         rotation,
         offset: rect_offset(bounds, pivot),
         color,
+        shader: None,
     });
 }
 
@@ -421,6 +431,7 @@ fn queue_local_triangle(
         b: local_point_to_world(bounds, pivot, rotation, b.0, b.1),
         c: local_point_to_world(bounds, pivot, rotation, c.0, c.1),
         color,
+        shader: None,
     });
 }
 
@@ -791,6 +802,7 @@ fn queue_inline_image(
         pivot: draw.pivot,
         tint: image.tint,
         filter,
+        shader: None,
     });
 }
 
@@ -828,6 +840,7 @@ fn queue_nine_slice(
             pivot,
             tint,
             filter,
+            shader: None,
         });
         return Ok(());
     }
@@ -890,6 +903,7 @@ fn queue_nine_slice(
                 pivot,
                 tint,
                 filter,
+                shader: None,
             });
         }
     }
@@ -1247,6 +1261,7 @@ fn create_basic_drawable(lua: &Lua) -> mlua::Result<Table> {
         lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
             component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
             component.set("visible", true)?;
+            component.set("shader", Value::Nil)?;
             Ok(())
         })?,
     )?;
@@ -1294,6 +1309,7 @@ pub fn add_core_components(
                 let (x, y, rotation) = crate::window::get_global_transform(&entity)?;
                 let (w, h) = crate::window::get_global_size(&entity)?;
                 let color = color4_to_color(component.get("color")?)?;
+                let shader = shader_from_component(&component)?;
                 let use_middle_pivot = crate::window::uses_middle_pivot(&entity);
                 let (draw_x, draw_y, offset) = if use_middle_pivot {
                     let (px, py) = crate::window::get_global_rotation_pivot(&entity)?;
@@ -1312,6 +1328,7 @@ pub fn add_core_components(
                     rotation,
                     offset,
                     color,
+                    shader,
                 });
                 Ok(())
             })?,
@@ -1363,6 +1380,7 @@ pub fn add_core_components(
                 }
 
                 let color = color4_to_color(component.get("color")?)?;
+                let shader = shader_from_component(&component)?;
                 let shape = component
                     .get::<String>("shape")
                     .unwrap_or_else(|_| "box".to_string())
@@ -1394,6 +1412,7 @@ pub fn add_core_components(
                             center,
                             radius,
                             color,
+                            shader: shader.clone(),
                         });
                     }
                     "triangle" | "right_triangle" | "righttriangle" | "rightangledtriangle" => {
@@ -1413,7 +1432,13 @@ pub fn add_core_components(
                             }
                             _ => (to_world(x0, y1), to_world(x0, y0), to_world(x1, y1)),
                         };
-                        renderer.queue(DrawCommand::Triangle { a, b, c, color });
+                        renderer.queue(DrawCommand::Triangle {
+                            a,
+                            b,
+                            c,
+                            color,
+                            shader: shader.clone(),
+                        });
                     }
                     _ => {
                         let p0 = to_world(offset_x, offset_y);
@@ -1425,12 +1450,14 @@ pub fn add_core_components(
                             b: p1,
                             c: p2,
                             color,
+                            shader: shader.clone(),
                         });
                         renderer.queue(DrawCommand::Triangle {
                             a: p0,
                             b: p2,
                             c: p3,
                             color,
+                            shader,
                         });
                     }
                 }
@@ -3326,6 +3353,7 @@ pub fn add_core_components(
                 let use_middle_pivot = crate::window::uses_middle_pivot(&entity);
 
                 let tint: Color = color4_to_color(component.get("color")?)?;
+                let shader = shader_from_component(&component)?;
                 let image: Option<AnyUserData> = component.get("image")?;
                 let Some(image) = image else {
                     return Ok(());
@@ -3356,6 +3384,7 @@ pub fn add_core_components(
                     pivot,
                     tint,
                     filter: app_texture_filter(ctx),
+                    shader,
                 });
 
                 Ok(())
@@ -3399,6 +3428,7 @@ pub fn add_core_components(
                 let use_middle_pivot = crate::window::uses_middle_pivot(&entity);
 
                 let tint: Color = color4_to_color(component.get("color")?)?;
+                let shader = shader_from_component(&component)?;
                 let image: Option<AnyUserData> = component.get("image")?;
                 let Some(image) = image else {
                     return Ok(());
@@ -3534,6 +3564,7 @@ pub fn add_core_components(
                             pivot,
                             tint,
                             filter: app_texture_filter(ctx),
+                            shader: shader.clone(),
                         });
                     }
                 }

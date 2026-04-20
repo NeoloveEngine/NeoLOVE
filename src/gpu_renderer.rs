@@ -3,11 +3,12 @@ use crate::platform::{Color, SharedPlatformState};
 use crate::renderer::{self, DrawCommand, Rect, SharedRenderState, TextureFilter, Vec2};
 use bytemuck::{Pod, Zeroable};
 use image::RgbaImage;
+use shaderc::{CompileOptions, Compiler, EnvVersion, ShaderKind, TargetEnv};
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
+use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer, RenderPassBeginInfo,
@@ -36,6 +37,7 @@ use vulkano::pipeline::{
     PipelineShaderStageCreateInfo,
 };
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
+use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo, spirv};
 use vulkano::swapchain::{
     self, PresentMode, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
 };
@@ -102,12 +104,41 @@ struct TextureBatch {
     texture: TextureKey,
     filter: TextureFilter,
     vertices: Vec<GpuVertex>,
+    shader: BatchShaderState,
 }
 
 struct CachedTexture {
     revision: u64,
+    view: Arc<ImageView>,
     descriptor_nearest: Arc<PersistentDescriptorSet>,
     descriptor_linear: Arc<PersistentDescriptorSet>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct BatchShaderState {
+    pipeline_key: u64,
+    fragment_source: Option<String>,
+    uses_uniform_buffer: bool,
+    uniform_slots: [[f32; 4]; crate::shader::MAX_SHADER_FLOAT_UNIFORMS],
+    extra_textures: Vec<(u32, TextureKey)>,
+}
+
+impl BatchShaderState {
+    fn default_pipeline() -> Self {
+        Self {
+            pipeline_key: 0,
+            fragment_source: None,
+            uses_uniform_buffer: false,
+            uniform_slots: [[0.0; 4]; crate::shader::MAX_SHADER_FLOAT_UNIFORMS],
+            extra_textures: Vec::new(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, BufferContents)]
+struct ShaderUniformBuffer {
+    slots: [[f32; 4]; crate::shader::MAX_SHADER_FLOAT_UNIFORMS],
 }
 
 pub(crate) struct VulkanPresenter {
@@ -128,6 +159,7 @@ pub(crate) struct VulkanPresenter {
     msaa_samples: SampleCount,
     white_texture: TextureKey,
     texture_cache: HashMap<TextureKey, CachedTexture>,
+    shader_cache: HashMap<u64, Arc<GraphicsPipeline>>,
     image_cache_keys: HashMap<usize, TextureKey>,
     text_cache: HashMap<u64, TextureKey>,
     next_texture_key: u64,
@@ -344,6 +376,7 @@ impl VulkanPresenter {
             msaa_samples,
             white_texture: TextureKey(0),
             texture_cache: HashMap::new(),
+            shader_cache: HashMap::new(),
             image_cache_keys: HashMap::new(),
             text_cache: HashMap::new(),
             next_texture_key: 1,
@@ -523,6 +556,132 @@ impl VulkanPresenter {
         .map_err(|e| e.to_string())
     }
 
+    fn compile_shader_module(
+        device: Arc<Device>,
+        source: &str,
+        kind: ShaderKind,
+        label: &str,
+    ) -> Result<Arc<ShaderModule>, String> {
+        let compiler =
+            Compiler::new().ok_or_else(|| "failed to create shader compiler".to_string())?;
+        let mut options = CompileOptions::new()
+            .ok_or_else(|| "failed to create shader compiler options".to_string())?;
+        options.set_target_env(TargetEnv::Vulkan, EnvVersion::Vulkan1_1 as u32);
+        let artifact = compiler
+            .compile_into_spirv(source, kind, label, "main", Some(&options))
+            .map_err(|e| format!("failed to compile {label}: {e}"))?;
+        let words = spirv::bytes_to_words(artifact.as_binary_u8())
+            .map_err(|e| format!("failed to parse compiled {label} SPIR-V: {e}"))?;
+        unsafe { ShaderModule::new(device, ShaderModuleCreateInfo::new(&words)) }
+            .map_err(|e| e.to_string())
+    }
+
+    fn create_pipeline_with_fragment_source(
+        device: Arc<Device>,
+        render_pass: Arc<RenderPass>,
+        width: u32,
+        height: u32,
+        msaa_samples: SampleCount,
+        fragment_source: &str,
+    ) -> Result<Arc<GraphicsPipeline>, String> {
+        let vs = vs::load(device.clone()).map_err(|e| e.to_string())?;
+        let fs = Self::compile_shader_module(
+            device.clone(),
+            fragment_source,
+            ShaderKind::Fragment,
+            "neolove_custom_fragment.glsl",
+        )?;
+        let vs_entry = vs
+            .entry_point("main")
+            .ok_or_else(|| "missing vertex shader entry point".to_string())?;
+        let fs_entry = fs
+            .entry_point("main")
+            .ok_or_else(|| "missing fragment shader entry point".to_string())?;
+        let stages = [
+            PipelineShaderStageCreateInfo::new(vs_entry.clone()),
+            PipelineShaderStageCreateInfo::new(fs_entry.clone()),
+        ];
+        let layout = PipelineLayout::new(
+            device.clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+                .into_pipeline_layout_create_info(device.clone())
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let vertex_input_state = GpuVertex::per_vertex()
+            .definition(&vs_entry.info().input_interface)
+            .map_err(|e| e.to_string())?;
+        let subpass = Subpass::from(render_pass.clone(), 0)
+            .ok_or_else(|| "missing render subpass".to_string())?;
+
+        GraphicsPipeline::new(
+            device,
+            None,
+            vulkano::pipeline::graphics::GraphicsPipelineCreateInfo {
+                stages: stages.into_iter().collect(),
+                vertex_input_state: Some(vertex_input_state),
+                input_assembly_state: Some(InputAssemblyState {
+                    topology: PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                }),
+                viewport_state: Some({
+                    let mut state = ViewportState::default();
+                    state.viewports[0] = Viewport {
+                        offset: [0.0, 0.0],
+                        extent: [width.max(1) as f32, height.max(1) as f32],
+                        depth_range: 0.0..=1.0,
+                    };
+                    state
+                }),
+                rasterization_state: Some(RasterizationState::default()),
+                multisample_state: Some(MultisampleState {
+                    rasterization_samples: msaa_samples,
+                    ..Default::default()
+                }),
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    1,
+                    ColorBlendAttachmentState {
+                        blend: Some(AttachmentBlend::alpha()),
+                        color_write_mask: ColorComponents::all(),
+                        color_write_enable: true,
+                    },
+                )),
+                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+                subpass: Some(PipelineSubpassType::BeginRenderPass(subpass)),
+                ..vulkano::pipeline::graphics::GraphicsPipelineCreateInfo::layout(layout)
+            },
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn pipeline_for_batch(
+        &mut self,
+        shader: &BatchShaderState,
+        width: u32,
+        height: u32,
+    ) -> Result<Arc<GraphicsPipeline>, String> {
+        if shader.pipeline_key == 0 {
+            return Ok(self.pipeline.clone());
+        }
+        if let Some(pipeline) = self.shader_cache.get(&shader.pipeline_key) {
+            return Ok(pipeline.clone());
+        }
+
+        let pipeline = Self::create_pipeline_with_fragment_source(
+            self.device.clone(),
+            self.render_pass.clone(),
+            width,
+            height,
+            self.msaa_samples,
+            shader
+                .fragment_source
+                .as_deref()
+                .ok_or_else(|| "missing fragment source for custom shader batch".to_string())?,
+        )?;
+        self.shader_cache.insert(shader.pipeline_key, pipeline.clone());
+        Ok(pipeline)
+    }
+
     fn init_white_texture(&mut self) -> Result<(), String> {
         let white = RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]));
         let key = self.upload_rgba_texture(TextureKey(0), 0, &white)?;
@@ -554,6 +713,7 @@ impl VulkanPresenter {
             height.max(1),
             self.msaa_samples,
         )?;
+        self.shader_cache.clear();
         self.recreate_swapchain = false;
         Ok(())
     }
@@ -640,7 +800,7 @@ impl VulkanPresenter {
     }
 
     fn build_command_buffer(
-        &self,
+        &mut self,
         image_index: usize,
         width: u32,
         height: u32,
@@ -698,17 +858,14 @@ impl VulkanPresenter {
                 .collect(),
             )
             .map_err(|e| e.to_string())?;
-        builder
-            .bind_pipeline_graphics(self.pipeline.clone())
-            .map_err(|e| e.to_string())?;
 
         for batch in batches {
             if batch.vertices.is_empty() {
                 continue;
             }
-            let descriptor = self
-                .descriptor_for(batch.texture, batch.filter)
-                .ok_or_else(|| "missing cached texture descriptor".to_string())?;
+            let pipeline = self.pipeline_for_batch(&batch.shader, width, height)?;
+            let descriptor =
+                self.descriptor_for_batch(pipeline.clone(), batch.texture, batch.filter, &batch.shader)?;
             let vertex_count = batch.vertices.len() as u32;
             let vertex_buffer = Buffer::from_iter(
                 self.memory_allocator.clone(),
@@ -726,9 +883,11 @@ impl VulkanPresenter {
             .map_err(|e| e.to_string())?;
 
             builder
+                .bind_pipeline_graphics(pipeline.clone())
+                .map_err(|e| e.to_string())?
                 .bind_descriptor_sets(
                     PipelineBindPoint::Graphics,
-                    self.pipeline.layout().clone(),
+                    pipeline.layout().clone(),
                     0,
                     descriptor,
                 )
@@ -743,6 +902,76 @@ impl VulkanPresenter {
             .end_render_pass(SubpassEndInfo::default())
             .map_err(|e| e.to_string())?;
         builder.build().map_err(|e| e.to_string())
+    }
+
+    fn descriptor_for_batch(
+        &self,
+        pipeline: Arc<GraphicsPipeline>,
+        texture: TextureKey,
+        filter: TextureFilter,
+        shader: &BatchShaderState,
+    ) -> Result<Arc<PersistentDescriptorSet>, String> {
+        if shader.pipeline_key == 0 {
+            return self
+                .descriptor_for(texture, filter)
+                .ok_or_else(|| "missing cached texture descriptor".to_string());
+        }
+
+        let layout = pipeline
+            .layout()
+            .set_layouts()
+            .first()
+            .cloned()
+            .ok_or_else(|| "pipeline missing descriptor set layout".to_string())?;
+        let sampler = match filter {
+            TextureFilter::Nearest => self.nearest_sampler.clone(),
+            TextureFilter::Linear => self.linear_sampler.clone(),
+        };
+        let base_texture = self
+            .texture_cache
+            .get(&texture)
+            .ok_or_else(|| "missing cached base texture".to_string())?;
+
+        let mut writes = vec![WriteDescriptorSet::image_view_sampler(
+            0,
+            base_texture.view.clone(),
+            sampler.clone(),
+        )];
+
+        if shader.uses_uniform_buffer {
+            let uniform_buffer = Buffer::from_data(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::UNIFORM_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                ShaderUniformBuffer {
+                    slots: shader.uniform_slots,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            writes.push(WriteDescriptorSet::buffer(1, uniform_buffer));
+        }
+
+        for (binding, texture_key) in &shader.extra_textures {
+            let cached = self
+                .texture_cache
+                .get(texture_key)
+                .ok_or_else(|| format!("missing cached texture for shader binding {binding}"))?;
+            writes.push(WriteDescriptorSet::image_view_sampler(
+                *binding,
+                cached.view.clone(),
+                sampler.clone(),
+            ));
+        }
+
+        PersistentDescriptorSet::new(&self.descriptor_set_allocator, layout, writes, [])
+            .map_err(|e| e.to_string())
     }
 
     fn descriptor_for(
@@ -779,6 +1008,7 @@ impl VulkanPresenter {
                     rotation,
                     offset,
                     color,
+                    shader,
                 } => {
                     let pivot_x = x + w * offset.x;
                     let pivot_y = y + h * offset.y;
@@ -794,20 +1024,30 @@ impl VulkanPresenter {
                         [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
                         color,
                     );
+                    let shader = self.batch_shader_for_command(shader)?;
                     push_vertices(
                         &mut current,
                         &mut batches,
                         self.white_texture,
                         TextureFilter::Nearest,
+                        shader,
                         verts,
                     );
                 }
-                DrawCommand::Triangle { a, b, c, color } => {
+                DrawCommand::Triangle {
+                    a,
+                    b,
+                    c,
+                    color,
+                    shader,
+                } => {
+                    let shader = self.batch_shader_for_command(shader)?;
                     push_vertices(
                         &mut current,
                         &mut batches,
                         self.white_texture,
                         TextureFilter::Nearest,
+                        shader,
                         vec![
                             vertex_from_point(width, height, a, color, [0.0, 0.0]),
                             vertex_from_point(width, height, b, color, [1.0, 0.0]),
@@ -819,6 +1059,7 @@ impl VulkanPresenter {
                     center,
                     radius,
                     color,
+                    shader,
                 } => {
                     let segments =
                         ((radius * std::f32::consts::TAU / 4.0).ceil() as usize).clamp(24, 128);
@@ -839,11 +1080,13 @@ impl VulkanPresenter {
                         verts.push(vertex_from_point(width, height, p1, color, [1.0, 0.0]));
                         verts.push(vertex_from_point(width, height, p2, color, [0.0, 1.0]));
                     }
+                    let shader = self.batch_shader_for_command(shader)?;
                     push_vertices(
                         &mut current,
                         &mut batches,
                         self.white_texture,
                         TextureFilter::Nearest,
+                        shader,
                         verts,
                     );
                 }
@@ -855,12 +1098,14 @@ impl VulkanPresenter {
                     pivot,
                     tint,
                     filter,
+                    shader,
                 } => {
                     let texture = self.texture_for_image(&image)?;
                     let uv = image_uvs(&image, source)?;
                     let corners = image_corners(dest, rotation, pivot);
                     let verts = quad_vertices(width, height, corners, uv, tint);
-                    push_vertices(&mut current, &mut batches, texture, filter, verts);
+                    let shader = self.batch_shader_for_command(shader)?;
+                    push_vertices(&mut current, &mut batches, texture, filter, shader, verts);
                 }
                 DrawCommand::Text(request) => {
                     let Some(sprite) = renderer::rasterize_text_sprite(&request) else {
@@ -875,7 +1120,14 @@ impl VulkanPresenter {
                         [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
                         Color::WHITE,
                     );
-                    push_vertices(&mut current, &mut batches, texture, sprite.filter, verts);
+                    push_vertices(
+                        &mut current,
+                        &mut batches,
+                        texture,
+                        sprite.filter,
+                        BatchShaderState::default_pipeline(),
+                        verts,
+                    );
                 }
             }
         }
@@ -884,6 +1136,30 @@ impl VulkanPresenter {
             batches.push(batch);
         }
         Ok(batches)
+    }
+
+    fn batch_shader_for_command(
+        &mut self,
+        shader: Option<crate::shader::ShaderHandle>,
+    ) -> Result<BatchShaderState, String> {
+        let Some(shader) = shader else {
+            return Ok(BatchShaderState::default_pipeline());
+        };
+
+        let snapshot = shader.snapshot_for_runtime()?;
+        let mut extra_textures = Vec::with_capacity(snapshot.texture_bindings.len());
+        for (binding, image) in snapshot.texture_bindings {
+            let texture = self.texture_for_image(&image)?;
+            extra_textures.push((binding, texture));
+        }
+
+        Ok(BatchShaderState {
+            pipeline_key: snapshot.pipeline_key,
+            fragment_source: Some(snapshot.fragment_source),
+            uses_uniform_buffer: snapshot.uses_uniform_buffer,
+            uniform_slots: snapshot.uniform_slots,
+            extra_textures,
+        })
     }
 
     fn texture_for_image(&mut self, image: &ImageHandle) -> Result<TextureKey, String> {
@@ -1068,6 +1344,7 @@ impl VulkanPresenter {
             key,
             CachedTexture {
                 revision,
+                view,
                 descriptor_nearest,
                 descriptor_linear,
             },
@@ -1081,10 +1358,13 @@ fn push_vertices(
     batches: &mut Vec<TextureBatch>,
     texture: TextureKey,
     filter: TextureFilter,
+    shader: BatchShaderState,
     vertices: Vec<GpuVertex>,
 ) {
     match current {
-        Some(batch) if batch.texture == texture && batch.filter == filter => {
+        Some(batch)
+            if batch.texture == texture && batch.filter == filter && batch.shader == shader =>
+        {
             batch.vertices.extend(vertices);
         }
         Some(_) => {
@@ -1093,6 +1373,7 @@ fn push_vertices(
                 texture,
                 filter,
                 vertices,
+                shader,
             });
         }
         None => {
@@ -1100,6 +1381,7 @@ fn push_vertices(
                 texture,
                 filter,
                 vertices,
+                shader,
             });
         }
     }

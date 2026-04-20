@@ -107,17 +107,20 @@ pub(crate) enum DrawCommand {
         rotation: f32,
         offset: Vec2,
         color: Color,
+        shader: Option<crate::shader::ShaderHandle>,
     },
     Triangle {
         a: Vec2,
         b: Vec2,
         c: Vec2,
         color: Color,
+        shader: Option<crate::shader::ShaderHandle>,
     },
     Circle {
         center: Vec2,
         radius: f32,
         color: Color,
+        shader: Option<crate::shader::ShaderHandle>,
     },
     Image {
         image: ImageHandle,
@@ -127,6 +130,7 @@ pub(crate) enum DrawCommand {
         pivot: Vec2,
         tint: Color,
         filter: TextureFilter,
+        shader: Option<crate::shader::ShaderHandle>,
     },
     Text(TextRenderRequest),
 }
@@ -911,6 +915,7 @@ impl SoftwareRenderer {
                 rotation,
                 offset,
                 color,
+                ..
             } => {
                 let pivot_x = x + w * offset.x;
                 let pivot_y = y + h * offset.y;
@@ -921,11 +926,12 @@ impl SoftwareRenderer {
                 self.fill_triangle(p0, p1, p2, color);
                 self.fill_triangle(p0, p2, p3, color);
             }
-            DrawCommand::Triangle { a, b, c, color } => self.fill_triangle(a, b, c, color),
+            DrawCommand::Triangle { a, b, c, color, .. } => self.fill_triangle(a, b, c, color),
             DrawCommand::Circle {
                 center,
                 radius,
                 color,
+                ..
             } => self.fill_circle(center, radius, color),
             DrawCommand::Image {
                 image,
@@ -935,6 +941,7 @@ impl SoftwareRenderer {
                 pivot,
                 tint,
                 filter,
+                ..
             } => self.draw_image(image, dest, source, rotation, pivot, tint, filter)?,
             DrawCommand::Text(request) => self.draw_text(&request)?,
         }

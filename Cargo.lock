@@ -1238,6 +1238,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "shaderc",
  "uuid",
  "vulkano",
  "vulkano-shaders",
