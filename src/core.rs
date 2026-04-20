@@ -95,19 +95,17 @@ fn parse_font_handle(root: &Path, value: Value) -> FontHandle {
                 .get::<String>("path")
                 .or_else(|_| table.get::<String>("file"))
                 .or_else(|_| table.get::<String>("source"))
+                && let Some(path) = resolve_font_path(root, &path)
             {
-                if let Some(path) = resolve_font_path(root, &path) {
-                    return FontHandle::Path(path);
-                }
+                return FontHandle::Path(path);
             }
 
             if let Ok(builtin) = table
                 .get::<String>("builtin")
                 .or_else(|_| table.get::<String>("name"))
+                && builtin.trim().eq_ignore_ascii_case("default")
             {
-                if builtin.trim().eq_ignore_ascii_case("default") {
-                    return FontHandle::Default;
-                }
+                return FontHandle::Default;
             }
 
             FontHandle::Default

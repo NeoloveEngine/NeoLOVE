@@ -392,7 +392,8 @@ mod native {
 
         #[test]
         fn parse_http_url_supports_https_default_port() {
-            let parsed = parse_http_url("https://example.com/path?q=1").unwrap();
+            let parsed = parse_http_url("https://example.com/path?q=1")
+                .expect("https URL with default port should parse");
             assert_eq!(parsed.scheme, HttpScheme::Https);
             assert_eq!(parsed.host, "example.com");
             assert_eq!(parsed.host_header, "example.com");
@@ -402,7 +403,8 @@ mod native {
 
         #[test]
         fn parse_http_url_supports_custom_port_and_ipv6_host_header() {
-            let parsed = parse_http_url("https://[::1]:8443/hello").unwrap();
+            let parsed = parse_http_url("https://[::1]:8443/hello")
+                .expect("https URL with IPv6 host and custom port should parse");
             assert_eq!(parsed.host, "::1");
             assert_eq!(parsed.host_header, "[::1]:8443");
             assert_eq!(parsed.port, 8443);

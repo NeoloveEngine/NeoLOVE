@@ -848,7 +848,7 @@ impl VulkanPresenter {
                         | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                     ..Default::default()
                 },
-                batch.vertices.into_iter(),
+                batch.vertices,
             )
             .map_err(|e| e.to_string())?;
 
@@ -1135,12 +1135,11 @@ impl VulkanPresenter {
     fn texture_for_image(&mut self, image: &ImageHandle) -> Result<TextureKey, String> {
         let id = image.id();
         let revision = image.revision().map_err(|e| e.to_string())?;
-        if let Some(key) = self.image_cache_keys.get(&id).copied() {
-            if let Some(cached) = self.texture_cache.get(&key) {
-                if cached.revision == revision {
-                    return Ok(key);
-                }
-            }
+        if let Some(key) = self.image_cache_keys.get(&id).copied()
+            && let Some(cached) = self.texture_cache.get(&key)
+            && cached.revision == revision
+        {
+            return Ok(key);
         }
 
         let key = self
@@ -1338,7 +1337,10 @@ fn push_vertices(
             batch.vertices.extend(vertices);
         }
         Some(_) => {
-            batches.push(current.take().unwrap());
+            let finished_batch = current
+                .take()
+                .expect("current batch must exist before starting a new one");
+            batches.push(finished_batch);
             *current = Some(TextureBatch {
                 texture,
                 filter,

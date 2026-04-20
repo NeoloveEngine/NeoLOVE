@@ -3167,7 +3167,10 @@ mod tests {
 
         runtime.set_platform_mouse_state(40.0, 50.0);
         {
-            let mut platform = runtime.platform.lock().unwrap();
+            let mut platform = runtime
+                .platform
+                .lock()
+                .expect("platform mutex should not be poisoned during test");
             platform
                 .input_mut()
                 .mouse_pressed
@@ -3183,7 +3186,10 @@ mod tests {
         assert!(disconnected);
 
         {
-            let mut platform = runtime.platform.lock().unwrap();
+            let mut platform = runtime
+                .platform
+                .lock()
+                .expect("platform mutex should not be poisoned during test");
             platform.begin_frame();
             platform
                 .input_mut()

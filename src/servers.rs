@@ -2173,8 +2173,10 @@ mod native {
 
         #[test]
         fn generated_uuids_have_expected_versions() {
-            let v4 = Uuid::parse_str(&Uuid::new_v4().to_string()).unwrap();
-            let v7 = Uuid::parse_str(&Uuid::now_v7().to_string()).unwrap();
+            let v4 = Uuid::parse_str(&Uuid::new_v4().to_string())
+                .expect("generated UUIDv4 string should parse");
+            let v7 = Uuid::parse_str(&Uuid::now_v7().to_string())
+                .expect("generated UUIDv7 string should parse");
             assert_eq!(v4.get_version_num(), 4);
             assert_eq!(v7.get_version_num(), 7);
         }

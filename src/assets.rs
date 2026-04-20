@@ -107,7 +107,7 @@ fn encode_wav_bytes(sample_rate: u32, channels: u16, samples: &[f32]) -> mlua::R
     if channels == 0 {
         return Err(mlua::Error::external("channels must be >= 1"));
     }
-    if samples.len() % channels as usize != 0 {
+    if !samples.len().is_multiple_of(channels as usize) {
         return Err(mlua::Error::external(
             "sample buffer length must be a multiple of channels",
         ));
@@ -774,9 +774,9 @@ pub(crate) fn add_assets_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()
                 move |lua, (sample_rate, channels, len, fill): (u32, u16, u32, Option<f32>)| {
                     let fill = fill.unwrap_or(0.0).clamp(-1.0, 1.0);
                     let mut samples = vec![fill; len as usize];
-                    if channels > 0 && samples.len() % channels as usize != 0 {
+                    if channels > 0 && !samples.len().is_multiple_of(channels as usize) {
                         let remainder = samples.len() % channels as usize;
-                        samples.extend(std::iter::repeat(fill).take(channels as usize - remainder));
+                        samples.extend(std::iter::repeat_n(fill, channels as usize - remainder));
                     }
                     let handle = manager
                         .lock()
@@ -945,7 +945,10 @@ mod tests {
 
         let mut manager = AssetManager::new(root.clone());
         let missing_path = root.join("assets").join("missing.png");
-        let error = manager.load_image("missing.png").unwrap_err().to_string();
+        let error = manager
+            .load_image("missing.png")
+            .expect_err("missing image should return an error")
+            .to_string();
 
         assert!(error.contains("failed to read image"));
         assert!(error.contains(missing_path.to_string_lossy().as_ref()));
@@ -966,7 +969,7 @@ mod tests {
         let mut manager = AssetManager::new(root.clone());
         let error = manager
             .load_sound_wav("broken.wav")
-            .unwrap_err()
+            .expect_err("invalid wav should return an error")
             .to_string();
 
         assert!(error.contains("failed to decode wav file"));
