@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::assets::ImageHandle;
-use crate::platform::{Color, SharedPlatformState};
+use crate::platform::{lock_platform_state, Color, SharedPlatformState};
 use fontdue::Font;
 use image::{ImageBuffer, Rgba, RgbaImage};
 use std::collections::{HashMap, HashSet};
@@ -635,10 +635,34 @@ fn prepare_text_layout(request: &TextRenderRequest) -> Option<PreparedTextLayout
 }
 
 pub(crate) fn measure_text(request: &TextRenderRequest) -> Option<TextMetrics> {
+    #[cfg(target_os = "emscripten")]
+    {
+        let line_count = request.text.lines().count().max(1);
+        let widest_line = request
+            .text
+            .lines()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0) as f32;
+        let used_scale = request.scale.max(1.0);
+        return Some(TextMetrics {
+            width: widest_line * used_scale * 0.6,
+            height: line_count as f32 * used_scale * request.line_spacing.max(0.1),
+            used_scale,
+            line_count,
+        });
+    }
+
     Some(prepare_text_layout(request)?.metrics)
 }
 
 pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<RasterizedTextSprite> {
+    #[cfg(target_os = "emscripten")]
+    {
+        let _ = request;
+        return None;
+    }
+
     let layout = prepare_text_layout(request)?;
     let (min_x, min_y, max_x, max_y) = layout.pixel_bounds?;
     let font = load_font(&request.font)?;
@@ -895,16 +919,27 @@ impl SoftwareRenderer {
             .lock()
             .map_err(|_| "render state lock poisoned".to_string())?
             .drain();
+        self.render_commands(platform, commands)
+    }
+
+    pub(crate) fn render_commands(
+        &mut self,
+        platform: &SharedPlatformState,
+        commands: Vec<DrawCommand>,
+    ) -> Result<(), String> {
         if commands.iter().any(command_uses_custom_shader) {
+            #[cfg(target_os = "emscripten")]
+            let shader_error =
+                "custom shaders are not supported in WebAssembly yet; the web runtime currently uses the software renderer and cannot run shader effects.".to_string();
+            #[cfg(not(target_os = "emscripten"))]
+            let shader_error =
+                "custom shaders require the Vulkan renderer; the software fallback cannot run shader effects. Install the Vulkan runtime/driver so NeoLOVE can use Vulkan.".to_string();
             return Err(
-                "custom shaders require the Vulkan renderer; the software fallback cannot run shader effects. Install the Vulkan runtime/driver so NeoLOVE can use Vulkan.".to_string(),
+                shader_error,
             );
         }
 
-        let clear = platform
-            .lock()
-            .map_err(|_| "platform lock poisoned".to_string())?
-            .clear_color();
+        let clear = lock_platform_state(platform).clear_color();
         for pixel in self.pixels.chunks_exact_mut(4) {
             pixel[0] = clear.r;
             pixel[1] = clear.g;
@@ -1204,5 +1239,40 @@ mod tests {
             800,
             600
         ));
+    }
+
+    #[test]
+    fn rasterizes_text_sprite_for_default_font() {
+        let request = TextRenderRequest {
+            text: "NeoLOVE".to_string(),
+            bounds: Rect {
+                x: 24.0,
+                y: 32.0,
+                w: 0.0,
+                h: 0.0,
+            },
+            rotation: 0.0,
+            pivot: Vec2::default(),
+            color: Color::WHITE,
+            font: FontHandle::Default,
+            scale: 16.0,
+            min_scale: 16.0,
+            text_scale: TextScaleMode::None,
+            align_x: TextAlignX::Left,
+            align_y: TextAlignY::Top,
+            wrap: TextWrapMode::None,
+            padding_x: 0.0,
+            padding_y: 0.0,
+            line_spacing: 1.0,
+            letter_spacing: 0.0,
+            stretch_width: 0.0,
+            stretch_height: 0.0,
+        };
+
+        let sprite = rasterize_text_sprite(&request).expect("expected rasterized text sprite");
+        assert!(sprite.dest.w > 0.0);
+        assert!(sprite.dest.h > 0.0);
+        assert!(sprite.image.width() > 0);
+        assert!(sprite.image.height() > 0);
     }
 }

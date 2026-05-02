@@ -560,3 +560,8 @@ ecs.addSystem({
 		crossYRenderer.color = mouseLocked and Color4(230, 245, 230, 220) or Color4(230, 245, 230, 0)
 	end,
 })
+[package]
+name = "raycasting"
+version = "0.1.0"
+
+[dependencies]

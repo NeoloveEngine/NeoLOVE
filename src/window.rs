@@ -7,15 +7,20 @@ use rapier2d::prelude::{
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+#[cfg(target_os = "emscripten")]
+use std::ffi::{c_char, CString};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
+#[cfg(target_os = "emscripten")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::hierarchy;
 use crate::lua_error::{describe_lua_error, protect_lua_call};
 use crate::platform::{
-    new_shared_platform_state, Color as PlatformColor, SharedPlatformState, WindowState,
+    lock_platform_state, new_shared_platform_state, Color as PlatformColor, SharedPlatformState,
+    WindowState,
 };
 use crate::renderer::{new_shared_render_state, SharedRenderState};
 
@@ -27,13 +32,18 @@ pub struct Runtime {
     environment: PathBuf,
     lua: Lua,
     entity_max: usize,
-    max_fps: Rc<RefCell<Option<f32>>>,
-    show_fps: Rc<RefCell<bool>>,
     exit_requested: Rc<RefCell<bool>>,
+    exit_reason: Rc<RefCell<Option<String>>>,
     physics_world: Option<PhysicsWorld>,
     physics_signature: u64,
     platform: SharedPlatformState,
     render_state: SharedRenderState,
+    root_table: Option<Table>,
+    mouse_table_key: Option<RegistryKey>,
+    window_table_key: Option<RegistryKey>,
+    app_table_key: Option<RegistryKey>,
+    max_fps_state: Rc<RefCell<Option<f32>>>,
+    show_fps_state: Rc<RefCell<Option<bool>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -101,6 +111,26 @@ fn color4_table(lua: &Lua, r: u8, g: u8, b: u8, a: u8) -> mlua::Result<Table> {
     Ok(t)
 }
 
+fn table_color_channel(table: &Table, primary: &str, legacy: &str, default: f32) -> f32 {
+    table
+        .raw_get::<f32>(primary)
+        .or_else(|_| table.raw_get::<f32>(legacy))
+        .unwrap_or(default)
+}
+
+fn table_to_platform_color(table: &Table) -> PlatformColor {
+    let r = table_color_channel(table, "r", "R", 255.0);
+    let g = table_color_channel(table, "g", "G", 255.0);
+    let b = table_color_channel(table, "b", "B", 255.0);
+    let a = table_color_channel(table, "a", "A", 255.0);
+    PlatformColor::rgba(
+        r.clamp(0.0, 255.0) as u8,
+        g.clamp(0.0, 255.0) as u8,
+        b.clamp(0.0, 255.0) as u8,
+        a.clamp(0.0, 255.0) as u8,
+    )
+}
+
 fn deep_copy_table(lua: &Lua, table: &Table) -> mlua::Result<Table> {
     let copy = lua.create_table()?;
     for pair in table.pairs::<Value, Value>() {
@@ -162,13 +192,16 @@ fn create_entity_listener_connection(
     listeners: Rc<RefCell<HashMap<u64, EntityListener>>>,
     listener_id: u64,
     connected: Rc<Cell<bool>>,
+    registry_lua: Lua,
 ) -> mlua::Result<Table> {
     let connection = lua.create_table()?;
 
     let disconnect_listeners = listeners.clone();
     let disconnect_connected = connected.clone();
-    let disconnect = lua.create_function(move |lua, _self: Table| {
-        let removed = disconnect_entity_listener(lua, &disconnect_listeners, listener_id)?;
+    let disconnect_registry_lua = registry_lua;
+    let disconnect = lua.create_function(move |_lua, _self: Table| {
+        let removed =
+            disconnect_entity_listener(&disconnect_registry_lua, &disconnect_listeners, listener_id)?;
         if removed {
             disconnect_connected.set(false);
         }
@@ -245,6 +278,52 @@ fn describe_component_name(component: &Table, entity: Option<&Table>) -> String 
     }
 
     "anonymous component".to_string()
+}
+
+#[cfg(target_os = "emscripten")]
+unsafe extern "C" {
+    fn neolove_web_debug_log(message: *const c_char);
+}
+
+#[cfg(target_os = "emscripten")]
+fn web_debug_log(message: &str) {
+    let Ok(message) = CString::new(message) else {
+        return;
+    };
+
+    unsafe {
+        neolove_web_debug_log(message.as_ptr());
+    }
+}
+
+#[cfg(not(target_os = "emscripten"))]
+fn web_debug_log(_message: &str) {}
+
+#[cfg(target_os = "emscripten")]
+fn next_web_update_index() -> usize {
+    static UPDATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+    UPDATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+#[cfg(not(target_os = "emscripten"))]
+fn next_web_update_index() -> usize {
+    0
+}
+
+#[cfg(target_os = "emscripten")]
+fn web_update_trace(index: usize) -> Option<usize> {
+    // Keep verbose wasm-side runtime tracing to early startup frames only.
+    const WEB_UPDATE_TRACE_LIMIT: usize = 160;
+    if index <= WEB_UPDATE_TRACE_LIMIT {
+        Some(index)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "emscripten"))]
+fn web_update_trace(_index: usize) -> Option<usize> {
+    None
 }
 
 pub(crate) fn attach_entity_methods(lua: &Lua, entity: &Table) -> mlua::Result<()> {
@@ -981,6 +1060,10 @@ fn extract_physics_components(
     Ok((rigidbody, collider, ropes))
 }
 
+fn is_physics_component_name(name: &str) -> bool {
+    matches!(name, "Rigidbody2D" | "Collider2D" | "Rope2D")
+}
+
 fn physics_topology_signature(physics_infos: &[EntityPhysicsInfo]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     physics_infos.len().hash(&mut hasher);
@@ -1123,15 +1206,18 @@ impl Runtime {
             environment: env,
             lua: Lua::new(),
             entity_max: 1,
-            // default to uncapped; users can opt into a cap via app.setMaxFps
-            max_fps: Rc::new(RefCell::new(None)),
-            // default to showing fps counter in debug runs
-            show_fps: Rc::new(RefCell::new(true)),
             exit_requested: Rc::new(RefCell::new(false)),
+            exit_reason: Rc::new(RefCell::new(None)),
             physics_world: None,
             physics_signature: 0,
             platform: new_shared_platform_state(),
             render_state: new_shared_render_state(),
+            root_table: None,
+            mouse_table_key: None,
+            window_table_key: None,
+            app_table_key: None,
+            max_fps_state: Rc::new(RefCell::new(None)),
+            show_fps_state: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -1144,71 +1230,205 @@ impl Runtime {
     }
 
     pub fn set_platform_window_state(&self, width: f32, height: f32) {
-        if let Ok(mut platform) = self.platform.lock() {
-            platform.set_window(WindowState { width, height });
-        }
+        let width = if width.is_finite() { width.max(0.0) } else { 0.0 };
+        let height = if height.is_finite() { height.max(0.0) } else { 0.0 };
+        let mut platform = lock_platform_state(&self.platform);
+        platform.set_window(WindowState { width, height });
     }
 
     pub fn set_platform_mouse_state(&self, x: f32, y: f32) {
-        if let Ok(mut platform) = self.platform.lock() {
-            platform.set_mouse_position(x, y);
-        }
+        let x = if x.is_finite() { x } else { 0.0 };
+        let y = if y.is_finite() { y } else { 0.0 };
+        let mut platform = lock_platform_state(&self.platform);
+        platform.set_mouse_position(x, y);
     }
 
     pub fn max_fps(&self) -> Option<f32> {
-        *self.max_fps.borrow()
+        #[cfg(target_os = "emscripten")]
+        {
+            return *self.max_fps_state.borrow();
+        }
+
+        #[cfg(not(target_os = "emscripten"))]
+        self.resolve_app_max_fps().ok().flatten()
     }
 
     pub fn show_fps(&self) -> bool {
-        *self.show_fps.borrow()
+        #[cfg(target_os = "emscripten")]
+        {
+            return (*self.show_fps_state.borrow()).unwrap_or(true);
+        }
+
+        #[cfg(not(target_os = "emscripten"))]
+        self.resolve_app_show_fps().unwrap_or(true)
     }
 
     pub fn exit_requested(&self) -> bool {
         *self.exit_requested.borrow()
     }
 
-    fn set_mouse_table(&mut self) -> mlua::Result<()> {
-        let mouse = self
-            .platform
-            .lock()
-            .map_err(|_| mlua::Error::external("platform lock poisoned"))?
-            .mouse();
-        let globals = self.lua.globals();
-        if let Ok(mouse_table) = globals.get::<Table>("mouse") {
-            mouse_table.set("x", mouse.x)?;
-            mouse_table.set("y", mouse.y)?;
-        } else {
-            let mouse_table = self.lua.create_table()?;
-            mouse_table.set("x", mouse.x)?;
-            mouse_table.set("y", mouse.y)?;
-            globals.set("mouse", mouse_table)?;
+    pub fn exit_reason(&self) -> Option<String> {
+        self.exit_reason.borrow().clone()
+    }
+
+    fn ensure_runtime_table(
+        lua: &Lua,
+        globals: &Table,
+        key_slot: &mut Option<RegistryKey>,
+        global_name: &str,
+    ) -> mlua::Result<Table> {
+        if let Some(key) = key_slot.as_ref() {
+            return lua.registry_value(key);
         }
+
+        let table = lua.create_table()?;
+        globals.set(global_name, table.clone())?;
+        *key_slot = Some(lua.create_registry_value(table.clone())?);
+        Ok(table)
+    }
+
+    #[cfg(target_os = "emscripten")]
+    fn install_mouse_table_proxy(&mut self) -> mlua::Result<()> {
+        if self.mouse_table_key.is_some() {
+            return Ok(());
+        }
+
+        let table = self.lua.create_table()?;
+        let metatable = self.lua.create_table()?;
+        let platform = self.platform.clone();
+        let index = self
+            .lua
+            .create_function(move |_lua, (_table, key): (Table, String)| {
+                let mouse = lock_platform_state(&platform).mouse();
+                Ok(match key.as_str() {
+                    "x" => Value::Number(mouse.x as f64),
+                    "y" => Value::Number(mouse.y as f64),
+                    "dx" | "delta_x" | "deltaX" => Value::Number(mouse.delta_x as f64),
+                    "dy" | "delta_y" | "deltaY" => Value::Number(mouse.delta_y as f64),
+                    _ => Value::Nil,
+                })
+            })?;
+        metatable.raw_set("__index", index)?;
+        table.set_metatable(Some(metatable))?;
+        table.set_readonly(true);
+        let globals = self.lua.globals();
+        globals.raw_set("mouse", table.clone())?;
+        self.mouse_table_key = Some(self.lua.create_registry_value(table)?);
+        Ok(())
+    }
+
+    #[cfg(target_os = "emscripten")]
+    fn install_window_table_proxy(&mut self) -> mlua::Result<()> {
+        if self.window_table_key.is_some() {
+            return Ok(());
+        }
+
+        let table = self.lua.create_table()?;
+        let metatable = self.lua.create_table()?;
+        let platform = self.platform.clone();
+        let index = self
+            .lua
+            .create_function(move |_lua, (_table, key): (Table, String)| {
+                let window = lock_platform_state(&platform).window();
+                Ok(match key.as_str() {
+                    "x" | "width" => Value::Number(window.width as f64),
+                    "y" | "height" => Value::Number(window.height as f64),
+                    _ => Value::Nil,
+                })
+            })?;
+        metatable.raw_set("__index", index)?;
+        table.set_metatable(Some(metatable))?;
+        table.set_readonly(true);
+        let globals = self.lua.globals();
+        globals.raw_set("window", table.clone())?;
+        self.window_table_key = Some(self.lua.create_registry_value(table)?);
+        Ok(())
+    }
+
+    fn set_mouse_table(&mut self) -> mlua::Result<()> {
+        #[cfg(target_os = "emscripten")]
+        {
+            self.install_mouse_table_proxy()?;
+            return Ok(());
+        }
+
+        let mouse = lock_platform_state(&self.platform).mouse();
+        let globals = self.lua.globals();
+        let mouse_table = Self::ensure_runtime_table(
+            &self.lua,
+            &globals,
+            &mut self.mouse_table_key,
+            "mouse",
+        )?;
+        mouse_table.raw_set("x", mouse.x)?;
+        mouse_table.raw_set("y", mouse.y)?;
         Ok(())
     }
 
     fn set_window_table(&mut self) -> mlua::Result<()> {
-        let window = self
-            .platform
-            .lock()
-            .map_err(|_| mlua::Error::external("platform lock poisoned"))?
-            .window();
-        let globals = self.lua.globals();
-        if let Ok(table) = globals.get::<Table>("window") {
-            table.set("x", window.width)?;
-            table.set("y", window.height)?;
-        } else {
-            let table = self.lua.create_table()?;
-            table.set("x", window.width)?;
-            table.set("y", window.height)?;
-            globals.set("window", table)?;
+        let window = lock_platform_state(&self.platform).window();
+        #[cfg(target_os = "emscripten")]
+        {
+            self.install_window_table_proxy()?;
         }
 
-        if let Some(root_entity) = self.entities.borrow().get(&0) {
-            let root: Table = self.lua.registry_value(&root_entity.luau_key)?;
-            root.set("size_x", window.width)?;
-            root.set("size_y", window.height)?;
+        #[cfg(not(target_os = "emscripten"))]
+        {
+            let globals = self.lua.globals();
+            let table = Self::ensure_runtime_table(
+                &self.lua,
+                &globals,
+                &mut self.window_table_key,
+                "window",
+            )?;
+            table.raw_set("x", window.width)?;
+            table.raw_set("y", window.height)?;
+        }
+
+        #[cfg(not(target_os = "emscripten"))]
+        if let Some(root) = self.root_table.as_ref() {
+            root.raw_set("size_x", window.width)?;
+            root.raw_set("size_y", window.height)?;
         }
         Ok(())
+    }
+
+    fn app_table(&self) -> mlua::Result<Table> {
+        match self.lua.globals().raw_get::<Value>("app")? {
+            Value::Table(app) => Ok(app),
+            _ => {
+                if let Some(key) = &self.app_table_key {
+                    return self.lua.registry_value(key);
+                }
+                Err(mlua::Error::RuntimeError(
+                    "global app table is missing".to_string(),
+                ))
+            }
+        }
+    }
+
+    fn resolve_app_clear_color(&self) -> mlua::Result<PlatformColor> {
+        let app = self.app_table()?;
+        let bg = match app.raw_get::<Value>("bg")? {
+            Value::Table(bg) => Some(bg),
+            _ => self.lua.globals().get::<Table>("bg").ok(),
+        };
+        let Some(bg) = bg else {
+            return Ok(PlatformColor::WHITE);
+        };
+        Ok(table_to_platform_color(&bg))
+    }
+
+    fn resolve_app_max_fps(&self) -> mlua::Result<Option<f32>> {
+        let app = self.app_table()?;
+        Ok(app
+            .raw_get::<Option<f32>>("maxFps")?
+            .filter(|fps| fps.is_finite() && *fps > 0.0))
+    }
+
+    fn resolve_app_show_fps(&self) -> mlua::Result<bool> {
+        let app = self.app_table()?;
+        Ok(app.raw_get::<Option<bool>>("showFps")?.unwrap_or(true))
     }
 
     pub fn start(&mut self) -> mlua::Result<()> {
@@ -1227,43 +1447,69 @@ impl Runtime {
 
         // App
         {
+            *self.max_fps_state.borrow_mut() = None;
+            *self.show_fps_state.borrow_mut() = Some(true);
             let app = self.lua.create_table()?;
             app.set("bg", color4_table(&self.lua, 255, 255, 255, 255)?)?;
+            app.set("maxFps", Value::Nil)?;
+            app.set("showFps", true)?;
             app.set("nearestNeighborScaling", true)?;
-            if let Ok(mut platform) = self.platform.lock() {
+            {
+                let mut platform = lock_platform_state(&self.platform);
                 platform.set_clear_color(PlatformColor::WHITE);
             }
 
-            let max_fps_setter = self.max_fps.clone();
-            let set_max_fps = self.lua.create_function(move |_lua, fps: Option<f32>| {
-                let mut max_fps = max_fps_setter.borrow_mut();
-                match fps {
-                    Some(fps) if fps.is_finite() && fps > 0.0 => *max_fps = Some(fps),
-                    _ => *max_fps = None,
+            let max_fps_state = self.max_fps_state.clone();
+            let set_max_fps = self.lua.create_function(move |lua, fps: Option<f32>| {
+                let normalized = fps.filter(|fps| fps.is_finite() && *fps > 0.0);
+                #[cfg(target_os = "emscripten")]
+                {
+                    *max_fps_state.borrow_mut() = normalized;
+                }
+                let app: Table = lua.globals().get("app")?;
+                match normalized {
+                    Some(fps) => app.raw_set("maxFps", fps)?,
+                    None => app.raw_set("maxFps", Value::Nil)?,
                 }
                 Ok(())
             })?;
             app.set("setMaxFps", set_max_fps)?;
 
-            let max_fps_getter = self.max_fps.clone();
-            let get_max_fps = self
-                .lua
-                .create_function(move |_lua, ()| Ok(*max_fps_getter.borrow()))?;
+            let max_fps_state = self.max_fps_state.clone();
+            let get_max_fps = self.lua.create_function(move |lua, ()| {
+                #[cfg(target_os = "emscripten")]
+                {
+                    return Ok(*max_fps_state.borrow());
+                }
+                let app: Table = lua.globals().get("app")?;
+                Ok(app
+                    .raw_get::<Option<f32>>("maxFps")?
+                    .filter(|fps| fps.is_finite() && *fps > 0.0))
+            })?;
             app.set("getMaxFps", get_max_fps)?;
 
-            let show_fps_setter = self.show_fps.clone();
-            let set_show_fps = self
-                .lua
-                .create_function(move |_lua, enabled: Option<bool>| {
-                    *show_fps_setter.borrow_mut() = enabled.unwrap_or(true);
-                    Ok(())
-                })?;
+            let show_fps_state = self.show_fps_state.clone();
+            let set_show_fps = self.lua.create_function(move |lua, enabled: Option<bool>| {
+                let enabled = enabled.unwrap_or(true);
+                #[cfg(target_os = "emscripten")]
+                {
+                    *show_fps_state.borrow_mut() = Some(enabled);
+                }
+                let app: Table = lua.globals().get("app")?;
+                app.raw_set("showFps", enabled)?;
+                Ok(())
+            })?;
             app.set("setShowFps", set_show_fps)?;
 
-            let show_fps_getter = self.show_fps.clone();
-            let get_show_fps = self
-                .lua
-                .create_function(move |_lua, ()| Ok(*show_fps_getter.borrow()))?;
+            let show_fps_state = self.show_fps_state.clone();
+            let get_show_fps = self.lua.create_function(move |lua, ()| {
+                #[cfg(target_os = "emscripten")]
+                {
+                    return Ok((*show_fps_state.borrow()).unwrap_or(true));
+                }
+                let app: Table = lua.globals().get("app")?;
+                Ok(app.raw_get::<Option<bool>>("showFps")?.unwrap_or(true))
+            })?;
             app.set("getShowFps", get_show_fps)?;
 
             let set_nearest_neighbor_scaling =
@@ -1281,6 +1527,7 @@ impl Runtime {
             })?;
             app.set("getNearestNeighborScaling", get_nearest_neighbor_scaling)?;
 
+            self.app_table_key = Some(self.lua.create_registry_value(app.clone())?);
             self.lua.globals().set("app", app)?;
         }
 
@@ -1292,6 +1539,7 @@ impl Runtime {
         {
             let softrequire_root = env_root.clone();
             let softrequire_cache = Rc::new(RefCell::new(HashMap::<String, RegistryKey>::new()));
+            let softrequire_registry_lua = self.lua.clone();
             let softrequire = self.lua.create_function(
                 move |lua, (module_input, allowed): (String, Option<Table>)| {
                     if let Some(path) = resolve_existing_softrequire_path(
@@ -1305,7 +1553,8 @@ impl Runtime {
                         {
                             let cache = softrequire_cache.borrow();
                             if let Some(registry_key) = cache.get(&path_key) {
-                                let cached: Value = lua.registry_value(registry_key)?;
+                                let cached: Value =
+                                    softrequire_registry_lua.registry_value(registry_key)?;
                                 return Ok(cached);
                             }
                         }
@@ -1319,7 +1568,8 @@ impl Runtime {
                         )?;
                         let result: Value = function.call(())?;
 
-                        let registry_key = lua.create_registry_value(result.clone())?;
+                        let registry_key =
+                            softrequire_registry_lua.create_registry_value(result.clone())?;
                         softrequire_cache
                             .borrow_mut()
                             .insert(path_key, registry_key);
@@ -1330,7 +1580,8 @@ impl Runtime {
                     {
                         let cache = softrequire_cache.borrow();
                         if let Some(registry_key) = cache.get(&source_key) {
-                            let cached: Value = lua.registry_value(registry_key)?;
+                            let cached: Value =
+                                softrequire_registry_lua.registry_value(registry_key)?;
                             return Ok(cached);
                         }
                     }
@@ -1351,7 +1602,8 @@ impl Runtime {
                     };
                     let result: Value = function.call(())?;
 
-                    let registry_key = lua.create_registry_value(result.clone())?;
+                    let registry_key =
+                        softrequire_registry_lua.create_registry_value(result.clone())?;
                     softrequire_cache
                         .borrow_mut()
                         .insert(source_key, registry_key);
@@ -1369,6 +1621,7 @@ impl Runtime {
         crate::servers::add_servers_module(&self.lua, env_root.clone())?;
         crate::commands::add_commands_module(&self.lua, env_root.clone())?;
         crate::shader::add_shader_module(&self.lua, env_root.clone())?;
+        crate::tweening::add_tweening_module(&self.lua)?;
 
         let entry_file = env_root.join("main.luau");
 
@@ -1384,7 +1637,15 @@ impl Runtime {
         let transforms = self.lua.create_table()?;
 
         let exit_requested = self.exit_requested.clone();
-        let die = self.lua.create_function(move |_lua, ()| {
+        let exit_reason = self.exit_reason.clone();
+        let die = self.lua.create_function(move |_lua, reason: Option<String>| {
+            let reason = reason
+                .map(|reason| reason.trim().to_string())
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or_else(|| "die() called".to_string());
+            #[cfg(target_os = "emscripten")]
+            web_debug_log(&format!("die() called: {reason}"));
+            *exit_reason.borrow_mut() = Some(reason);
             *exit_requested.borrow_mut() = true;
             Ok(())
         })?;
@@ -1393,6 +1654,7 @@ impl Runtime {
 
         let listener_state = self.entity_listeners.clone();
         let next_listener_id = self.next_entity_listener_id.clone();
+        let listener_registry_lua = self.lua.clone();
         let listen_impl = self.lua.create_function(
             move |lua, (entity, event_name, callback): (Table, String, Function)| {
                 let event = EntityListenEvent::from_name(&event_name).ok_or_else(|| {
@@ -1410,7 +1672,7 @@ impl Runtime {
                     listener_id
                 };
                 let connected = Rc::new(Cell::new(true));
-                let callback_key = lua.create_registry_value(callback)?;
+                let callback_key = listener_registry_lua.create_registry_value(callback)?;
 
                 listener_state.borrow_mut().insert(
                     listener_id,
@@ -1427,6 +1689,7 @@ impl Runtime {
                     listener_state.clone(),
                     listener_id,
                     connected,
+                    listener_registry_lua.clone(),
                 )
             },
         )?;
@@ -1436,6 +1699,7 @@ impl Runtime {
 
         // Transforms
         {
+            let raycast_registry_lua = self.lua.clone();
             let get_world_position = self.lua.create_function(move |_lua, entity: Table| {
                 let (x, y) = get_global_position(&entity)?;
                 Ok((x, y))
@@ -1446,23 +1710,22 @@ impl Runtime {
             })?;
 
             let do_they_overlap = self.lua.create_function(move |_lua, entities: Table| {
-                // go through the entities and see if one overlaps with any of them
-                // if so, then return true
-                // otherwise, false
+                // Collect the Lua entity tables once before comparing them. Re-entering
+                // `pairs()` on the same table while the outer iterator is still alive has
+                // been fragile in the web runtime once gameplay starts spawning enemies.
+                let mut collected = Vec::new();
+                for pair in entities.pairs::<Value, Table>() {
+                    let (_, entity) = pair?;
+                    collected.push(entity);
+                }
 
-                for pair1 in entities.pairs::<Value, Table>() {
-                    let (_, entity1) = pair1?;
-                    for pair2 in entities.pairs::<Value, Table>() {
-                        let (_, entity2) = pair2?;
-                        if entity1 == entity2 {
-                            continue;
-                        }
+                for (index, entity1) in collected.iter().enumerate() {
+                    let (x1, y1) = get_global_position(entity1)?;
+                    let (w1, h1) = get_global_size(entity1)?;
 
-                        let (x1, y1) = get_global_position(&entity1)?;
-                        let (w1, h1) = get_global_size(&entity1)?;
-
-                        let (x2, y2) = get_global_position(&entity2)?;
-                        let (w2, h2) = get_global_size(&entity2)?;
+                    for entity2 in collected.iter().skip(index + 1) {
+                        let (x2, y2) = get_global_position(entity2)?;
+                        let (w2, h2) = get_global_size(entity2)?;
 
                         if x1 < x2 + w2 && x1 + w1 > x2 && y1 < y2 + h2 && y1 + h1 > y2 {
                             return Ok(true);
@@ -1514,7 +1777,8 @@ impl Runtime {
                             continue;
                         }
 
-                        let entity = match lua.registry_value::<Table>(&entity_data.luau_key) {
+                        let entity =
+                            match raycast_registry_lua.registry_value::<Table>(&entity_data.luau_key) {
                             Ok(entity) => entity,
                             Err(_) => continue,
                         };
@@ -1589,8 +1853,9 @@ impl Runtime {
         // Systems
         {
             let systems = self.systems.clone();
-            let add_system = self.lua.create_function(move |lua, system: Table| {
-                let key = lua.create_registry_value(system)?;
+            let systems_registry_lua = self.lua.clone();
+            let add_system = self.lua.create_function(move |_lua, system: Table| {
+                let key = systems_registry_lua.create_registry_value(system)?;
                 systems.borrow_mut().push(key);
                 Ok(())
             })?;
@@ -1603,8 +1868,10 @@ impl Runtime {
             let entities = self.entities.clone();
             let entities_delete = self.entities.clone();
             let entity_listeners = self.entity_listeners.clone();
+            let listener_cleanup_lua = self.lua.clone();
             let entity_max = Rc::new(RefCell::new(self.entity_max));
             let entity_max_clone = entity_max.clone();
+            let entities_registry_lua = self.lua.clone();
             let table_remove: Function = self.lua.globals().get::<Table>("table")?.get("remove")?;
 
             let new =
@@ -1630,7 +1897,7 @@ impl Runtime {
 
                         luau.set("id", id)?;
 
-                        let reg_key = lua.create_registry_value(&luau)?;
+                        let reg_key = entities_registry_lua.create_registry_value(&luau)?;
 
                         let entity = hierarchy::Entity {
                             components: Vec::new(),
@@ -1674,7 +1941,11 @@ impl Runtime {
                 }
                 drop(entities);
 
-                disconnect_entity_listeners_for_entities(_lua, &entity_listeners, &ids_to_remove)?;
+                disconnect_entity_listeners_for_entities(
+                    &listener_cleanup_lua,
+                    &entity_listeners,
+                    &ids_to_remove,
+                )?;
 
                 if let Ok(Some(parent)) = entity.get::<Option<Table>>("parent") {
                     let children: Table = parent.get("children")?;
@@ -1726,6 +1997,9 @@ impl Runtime {
             // create root entity
             let root_table = create_entity_table(&self.lua, "root", 0.0, 0.0, None)?;
             root_table.set("id", 0)?;
+            let window = lock_platform_state(&self.platform).window();
+            root_table.raw_set("size_x", window.width)?;
+            root_table.raw_set("size_y", window.height)?;
 
             let root_key = self.lua.create_registry_value(&root_table)?;
             let root_entity = hierarchy::Entity {
@@ -1736,6 +2010,7 @@ impl Runtime {
                 luau_key: root_key,
             };
             self.entities.borrow_mut().insert(0, root_entity);
+            self.root_table = Some(root_table.clone());
             ecs.set("root", root_table)?;
         }
 
@@ -1782,6 +2057,17 @@ impl Runtime {
                             &format!("running component awake callback ({component_name})"),
                             || awake.call::<()>((&entity, &comp)),
                         )?;
+                        if let Ok(component_kind) = comp.get::<String>("__neolove_component") {
+                            if is_physics_component_name(&component_kind) {
+                                let current = entity
+                                    .raw_get::<i64>("__neolove_physics_component_count")
+                                    .unwrap_or(0)
+                                    .max(0);
+                                let next = current.saturating_add(1);
+                                entity.raw_set("__neolove_physics_component_count", next)?;
+                                entity.raw_set("__neolove_has_physics_components", next > 0)?;
+                            }
+                        }
                         components.push(&comp)?;
                         Ok(comp)
                     })?;
@@ -1826,6 +2112,10 @@ impl Runtime {
                         }
 
                         let component: Table = components.get(index)?;
+                        let removed_physics_component = component
+                            .get::<String>("__neolove_component")
+                            .map(|name| is_physics_component_name(&name))
+                            .unwrap_or(false);
                         if let Ok(destroy) = component.get::<Function>("destroy") {
                             let component_name = describe_component_name(&component, Some(&entity));
                             protect_lua_call(
@@ -1842,6 +2132,15 @@ impl Runtime {
                         component.set("entity", Value::Nil)?;
 
                         table_remove_component.call::<()>((&components, index))?;
+                        if removed_physics_component {
+                            let current = entity
+                                .raw_get::<i64>("__neolove_physics_component_count")
+                                .unwrap_or(0)
+                                .max(0);
+                            let next = current.saturating_sub(1);
+                            entity.raw_set("__neolove_physics_component_count", next)?;
+                            entity.raw_set("__neolove_has_physics_components", next > 0)?;
+                        }
                         Ok(true)
                     })?;
 
@@ -1858,10 +2157,26 @@ impl Runtime {
             .set_name(format!("@{}", entry_module.display()))
             .exec()?;
 
+        if let Ok(clear) = self.resolve_app_clear_color() {
+            let mut platform = lock_platform_state(&self.platform);
+            platform.set_clear_color(clear);
+        }
+
+        #[cfg(target_os = "emscripten")]
+        {
+            self.lua.gc_stop();
+            web_debug_log("web runtime: automatic Luau GC stopped");
+        }
+
         Ok(())
     }
 
     fn poll_http_callbacks(&self) {
+        #[cfg(target_os = "emscripten")]
+        {
+            return;
+        }
+
         let globals = self.lua.globals();
         let http = match globals.get::<Table>("http") {
             Ok(table) => table,
@@ -1880,6 +2195,11 @@ impl Runtime {
     }
 
     fn poll_server_callbacks(&self) {
+        #[cfg(target_os = "emscripten")]
+        {
+            return;
+        }
+
         let globals = self.lua.globals();
         let servers = match globals.get::<Table>("servers") {
             Ok(table) => table,
@@ -1898,14 +2218,9 @@ impl Runtime {
     }
 
     fn dispatch_entity_listeners(&self) {
-        let (mouse, input) = match self.platform.lock() {
-            Ok(platform) => (platform.mouse(), platform.input().clone()),
-            Err(_) => {
-                eprintln!(
-                    "\x1b[31mLua Error:\x1b[0m Failed to read input state for entity listeners"
-                );
-                return;
-            }
+        let (mouse, input) = {
+            let platform = lock_platform_state(&self.platform);
+            (platform.mouse(), platform.input().clone())
         };
 
         let mut triggered_events = HashSet::<EntityListenEvent>::new();
@@ -2249,19 +2564,79 @@ impl Runtime {
         Ok(())
     }
 
-    fn simulate_rapier_physics(&mut self, dt: f32) -> mlua::Result<()> {
+    fn simulate_rapier_physics(&mut self, dt: f32, web_trace: Option<usize>) -> mlua::Result<()> {
         let step_dt = dt.clamp(0.0, 0.25);
         if step_dt <= f32::EPSILON {
+            if let Some(trace) = web_trace {
+                web_debug_log(&format!(
+                    "runtime.update {trace}: skipping rapier step because dt={step_dt:.6}"
+                ));
+            }
+            return Ok(());
+        }
+
+        let mut physics_entity_count = 0usize;
+        let scanned_entity_count = {
+            let entities = self.entities.borrow();
+            for entity_data in entities.values() {
+                let Ok(entity) = self.lua.registry_value::<Table>(&entity_data.luau_key) else {
+                    continue;
+                };
+                if entity
+                    .raw_get::<bool>("__neolove_has_physics_components")
+                    .unwrap_or(false)
+                {
+                    physics_entity_count += 1;
+                }
+            }
+            entities.len()
+        };
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!(
+                "runtime.update {trace}: rapier marker scan entities={scanned_entity_count} physics_entities={physics_entity_count}"
+            ));
+        }
+        if physics_entity_count == 0 {
+            if let Some(trace) = web_trace {
+                web_debug_log(&format!(
+                    "runtime.update {trace}: rapier no-physics branch world_present={} signature={}",
+                    self.physics_world.is_some(),
+                    self.physics_signature,
+                ));
+            }
+            self.physics_world = None;
+            self.physics_signature = 0;
+            if let Some(trace) = web_trace {
+                web_debug_log(&format!(
+                    "runtime.update {trace}: cleared rapier world because no physics components are registered"
+                ));
+            }
             return Ok(());
         }
 
         let mut physics_infos: Vec<EntityPhysicsInfo> = Vec::new();
         let mut has_physics_work = false;
+        let mut rigidbody_count = 0usize;
+        let mut collider_count = 0usize;
+        let mut rope_count = 0usize;
         {
             let entities = self.entities.borrow();
-            physics_infos.reserve(entities.len());
+            physics_infos
+                .try_reserve(entities.len())
+                .map_err(|error| {
+                    mlua::Error::external(format!(
+                        "failed to reserve physics info vector for {} entities: {error}",
+                        entities.len()
+                    ))
+                })?;
             for entity_data in entities.values() {
                 if let Ok(entity) = self.lua.registry_value::<Table>(&entity_data.luau_key) {
+                    if !entity
+                        .raw_get::<bool>("__neolove_has_physics_components")
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
                     let entity_id = entity.get::<usize>("id").unwrap_or(0);
                     let (rigidbody, collider, ropes) =
                         if let Ok(components) = entity.get::<Table>("components") {
@@ -2269,6 +2644,13 @@ impl Runtime {
                         } else {
                             (None, None, Vec::new())
                         };
+                    if rigidbody.is_some() {
+                        rigidbody_count += 1;
+                    }
+                    if collider.is_some() {
+                        collider_count += 1;
+                    }
+                    rope_count += ropes.len();
                     if rigidbody.is_some() || collider.is_some() || !ropes.is_empty() {
                         has_physics_work = true;
                     }
@@ -2284,15 +2666,35 @@ impl Runtime {
         }
 
         physics_infos.sort_by_key(|info| info.entity_id);
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!(
+                "runtime.update {trace}: rapier scan results infos={} rigidbodies={} colliders={} ropes={} has_work={has_physics_work}",
+                physics_infos.len(),
+                rigidbody_count,
+                collider_count,
+                rope_count,
+            ));
+        }
 
         if !has_physics_work {
             self.physics_world = None;
             self.physics_signature = 0;
+            if let Some(trace) = web_trace {
+                web_debug_log(&format!(
+                    "runtime.update {trace}: skipping rapier because scanned physics work is empty"
+                ));
+            }
             return Ok(());
         }
 
         let signature = physics_topology_signature(&physics_infos);
         if self.physics_world.is_none() || signature != self.physics_signature {
+            if let Some(trace) = web_trace {
+                web_debug_log(&format!(
+                    "runtime.update {trace}: rebuilding rapier world signature={} previous_signature={}",
+                    signature, self.physics_signature
+                ));
+            }
             self.rebuild_physics_world(&physics_infos)?;
             self.physics_signature = signature;
         }
@@ -2301,6 +2703,15 @@ impl Runtime {
             Some(world) => world,
             None => return Ok(()),
         };
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!(
+                "runtime.update {trace}: rapier world ready bodies={} colliders={} body_sync={} collider_sync={}",
+                world.bodies.len(),
+                world.colliders.len(),
+                world.body_sync.len(),
+                world.collider_sync.len(),
+            ));
+        }
 
         let mut rope_sync: Vec<RapierRopeSync> = Vec::new();
         let mut current_collision_ids: HashMap<usize, HashSet<usize>> = HashMap::new();
@@ -2453,6 +2864,14 @@ impl Runtime {
         let mut pipeline = PhysicsPipeline::new();
         let mut integration_parameters = IntegrationParameters::default();
         integration_parameters.dt = step_dt;
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!(
+                "runtime.update {trace}: before rapier pipeline step dt={step_dt:.6} bodies={} colliders={} rope_joints={}",
+                world.bodies.len(),
+                world.colliders.len(),
+                world.impulse_joints.len(),
+            ));
+        }
 
         pipeline.step(
             &vector![0.0, 0.0],
@@ -2469,6 +2888,13 @@ impl Runtime {
             &(),
             &(),
         );
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!(
+                "runtime.update {trace}: after rapier pipeline step contacts={} intersections={}",
+                world.narrow_phase.contact_pairs().count(),
+                world.narrow_phase.intersection_pairs().count(),
+            ));
+        }
 
         let mut grounded_entities = HashSet::<usize>::new();
         for pair in world.narrow_phase.contact_pairs() {
@@ -2810,39 +3236,154 @@ impl Runtime {
         Ok(())
     }
     pub fn update(&mut self, dt: f32) -> Result<(), String> {
-        crate::core::begin_ui_frame();
+        let update_index = next_web_update_index();
+        let web_trace = web_update_trace(update_index);
+        let panic_stage = Cell::new("initializing runtime.update");
 
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.update_inner(dt, web_trace, &panic_stage)
+        }))
+        .map_err(|payload| {
+            format!(
+                "runtime.update {update_index} panicked during {}: {}",
+                panic_stage.get(),
+                crate::lua_error::describe_panic(payload.as_ref())
+            )
+        })?
+    }
+
+    fn update_inner(
+        &mut self,
+        dt: f32,
+        web_trace: Option<usize>,
+        panic_stage: &Cell<&'static str>,
+    ) -> Result<(), String> {
+        panic_stage.set("runtime.update startup");
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!("runtime.update {trace}: begin dt={dt:.6}"));
+            web_debug_log(&format!(
+                "runtime.update {trace}: exit_requested at begin = {}",
+                *self.exit_requested.borrow()
+            ));
+        }
+
+        panic_stage.set("begin_ui_frame");
+        crate::core::begin_ui_frame();
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!("runtime.update {trace}: after begin_ui_frame"));
+        }
+
+        panic_stage.set("set_mouse_table");
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!("runtime.update {trace}: before set_mouse_table"));
+        }
         self.set_mouse_table()
             .map_err(|error| format!("failed to sync mouse state into Lua: {error}"))?;
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!("runtime.update {trace}: after set_mouse_table"));
+        }
+
+        panic_stage.set("set_window_table");
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!("runtime.update {trace}: before set_window_table"));
+        }
         self.set_window_table()
             .map_err(|error| format!("failed to sync window state into Lua: {error}"))?;
-        self.poll_http_callbacks();
-        self.poll_server_callbacks();
-        self.dispatch_entity_listeners();
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!("runtime.update {trace}: after set_window_table"));
+        }
 
-        let clear = (|| -> mlua::Result<PlatformColor> {
-            let app: Table = self.lua.globals().get("app")?;
-            let bg: Table = app.get("bg")?;
-            let r: u8 = bg.get("r")?;
-            let g: u8 = bg.get("g")?;
-            let b: u8 = bg.get("b")?;
-            let a: u8 = bg.get("a")?;
-            Ok(PlatformColor::rgba(r, g, b, a))
-        })()
+        panic_stage.set("poll_http_callbacks");
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!("runtime.update {trace}: before poll_http_callbacks"));
+        }
+        self.poll_http_callbacks();
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!("runtime.update {trace}: after poll_http_callbacks"));
+        }
+
+        panic_stage.set("poll_server_callbacks");
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!(
+                "runtime.update {trace}: before poll_server_callbacks"
+            ));
+        }
+        self.poll_server_callbacks();
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!(
+                "runtime.update {trace}: after poll_server_callbacks"
+            ));
+        }
+
+        panic_stage.set("update_tweening");
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!("runtime.update {trace}: before update_tweening"));
+        }
+        if let Ok(tweening) = self.lua.globals().get::<Table>("tweening")
+            && let Ok(update) = tweening.get::<Function>("_update")
+        {
+            update.call::<()>(dt as f64).map_err(|error| {
+                format!(
+                    "failed to update tweening:\n{}",
+                    describe_lua_error(&error)
+                )
+            })?;
+        }
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!("runtime.update {trace}: after update_tweening"));
+        }
+
+        panic_stage.set("dispatch_entity_listeners");
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!(
+                "runtime.update {trace}: before dispatch_entity_listeners"
+            ));
+        }
+        self.dispatch_entity_listeners();
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!(
+                "runtime.update {trace}: after dispatch_entity_listeners"
+            ));
+        }
+
+        panic_stage.set("resolve_app_clear_color");
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!(
+                "runtime.update {trace}: before resolve clear color"
+            ));
+        }
+        let clear = self
+            .resolve_app_clear_color()
         .map_err(|error| {
             format!(
                 "failed to resolve app background color:\n{}",
                 describe_lua_error(&error)
             )
         })?;
-        self.platform
-            .lock()
-            .map_err(|_| "platform lock poisoned while updating clear color".to_string())?
-            .set_clear_color(clear);
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!(
+                "runtime.update {trace}: resolved clear color rgba({}, {}, {}, {})",
+                clear.r, clear.g, clear.b, clear.a
+            ));
+        }
+        {
+            let mut platform = lock_platform_state(&self.platform);
+            platform.set_clear_color(clear);
+        }
+        panic_stage.set("systems loop");
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!("runtime.update {trace}: after set_clear_color"));
+        }
 
         {
             let keys = self.systems.borrow();
-            for key in keys.iter() {
+            if let Some(trace) = web_trace {
+                web_debug_log(&format!(
+                    "runtime.update {trace}: before systems loop count={}",
+                    keys.len()
+                ));
+            }
+            for (system_index, key) in keys.iter().enumerate() {
                 let system: Table = match self.lua.registry_value(key) {
                     Ok(s) => s,
                     Err(e) => {
@@ -2850,7 +3391,20 @@ impl Runtime {
                         continue;
                     }
                 };
+                if let Some(trace) = web_trace {
+                    web_debug_log(&format!(
+                        "runtime.update {trace}: system {} loaded",
+                        system_index + 1
+                    ));
+                }
                 if let Ok(Value::Function(update)) = system.get::<Value>("update") {
+                    panic_stage.set("system update callback");
+                    if let Some(trace) = web_trace {
+                        web_debug_log(&format!(
+                            "runtime.update {trace}: before system {} update",
+                            system_index + 1
+                        ));
+                    }
                     if let Err(e) = protect_lua_call("running system update callback", || {
                         update.call::<()>((system.clone(), dt))
                     }) {
@@ -2859,32 +3413,96 @@ impl Runtime {
                             describe_lua_error(&e)
                         );
                     }
+                    if let Some(trace) = web_trace {
+                        web_debug_log(&format!(
+                            "runtime.update {trace}: after system {} update",
+                            system_index + 1
+                        ));
+                    }
+                } else if let Some(trace) = web_trace {
+                    web_debug_log(&format!(
+                        "runtime.update {trace}: system {} has no update function",
+                        system_index + 1
+                    ));
                 }
             }
         }
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!("runtime.update {trace}: after systems loop"));
+            web_debug_log(&format!(
+                "runtime.update {trace}: exit_requested after systems = {}",
+                *self.exit_requested.borrow()
+            ));
+        }
 
-        let mut ordered_entities: Vec<(Table, f64, usize)> = Vec::new();
+        let mut ordered_entities: Vec<(usize, f64, usize)> = Vec::new();
 
         {
+            panic_stage.set("ordered entity collection");
             let entities = self.entities.borrow();
-            ordered_entities.reserve(entities.len());
+            if let Some(trace) = web_trace {
+                web_debug_log(&format!(
+                    "runtime.update {trace}: collecting ordered entities count={}",
+                    entities.len()
+                ));
+            }
+            ordered_entities
+                .try_reserve(entities.len())
+                .map_err(|error| {
+                    format!(
+                        "failed to reserve ordered entity vector for {} entities: {error}",
+                        entities.len()
+                    )
+                })?;
             for entity in entities.values() {
                 if let Ok(table) = self.lua.registry_value::<Table>(&entity.luau_key) {
                     let z = table.get::<f64>("z").unwrap_or(0.0);
-                    let id = table.get::<usize>("id").unwrap_or(0);
-                    ordered_entities.push((table, z, id));
+                    ordered_entities.push((entity.id, z, entity.id));
                 }
             }
         }
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!(
+                "runtime.update {trace}: collected ordered entities count={}",
+                ordered_entities.len()
+            ));
+        }
 
+        panic_stage.set("ordered entity sort");
         ordered_entities.sort_by(|a, b| compare_entity_order(a.1, a.2, b.1, b.2));
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!("runtime.update {trace}: after entity sort"));
+        }
 
-        let mut rendering_components: Vec<(Table, Table, Function)> = Vec::new();
-        rendering_components.reserve(ordered_entities.len());
-
-        for (ent, _, _) in ordered_entities {
-            // run through all the components
-
+        let mut rendering_component_count = 0usize;
+        let mut rendering_components: Vec<(usize, usize, Table, Table, Function)> = Vec::new();
+        panic_stage.set("rendering component reservation");
+        rendering_components
+            .try_reserve(ordered_entities.len())
+            .map_err(|error| {
+                format!(
+                    "failed to reserve rendering component vector for {} ordered entities: {error}",
+                    ordered_entities.len()
+                )
+            })?;
+        panic_stage.set("component scan");
+        for (entity_id, _, _) in ordered_entities.iter() {
+            let ent = {
+                let entities = self.entities.borrow();
+                let Some(entity_data) = entities.get(entity_id) else {
+                    continue;
+                };
+                match self.lua.registry_value::<Table>(&entity_data.luau_key) {
+                    Ok(table) => table,
+                    Err(e) => {
+                        eprintln!(
+                            "\x1b[31mLua Error:\x1b[0m Failed to get entity table: {}",
+                            e
+                        );
+                        continue;
+                    }
+                }
+            };
             let components: Table = match ent.get("components") {
                 Ok(c) => c,
                 Err(e) => {
@@ -2896,8 +3514,10 @@ impl Runtime {
                 }
             };
 
+            let mut component_index = 0usize;
             for component in components.sequence_values::<Table>() {
-                let component = match component {
+                component_index += 1;
+                let component: Table = match component {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!(
@@ -2907,6 +3527,7 @@ impl Runtime {
                         continue;
                     }
                 };
+                let component_name = describe_component_name(&component, Some(&ent));
                 let update: Function = match component.get("update") {
                     Ok(u) => u,
                     Err(e) => {
@@ -2917,10 +3538,10 @@ impl Runtime {
 
                 let is_rendering = component.get::<bool>("NEOLOVE_RENDERING").unwrap_or(false);
                 if !is_rendering {
-                    let component_name = describe_component_name(&component, Some(&ent));
+                    panic_stage.set("component update callback");
                     if let Err(e) = protect_lua_call(
                         &format!("running component update callback ({component_name})"),
-                        || update.call::<()>((&ent, component, dt)),
+                        || update.call::<()>((ent.clone(), component, dt)),
                     ) {
                         eprintln!(
                             "\x1b[31mLua Error in component update:\x1b[0m\n{}",
@@ -2928,29 +3549,74 @@ impl Runtime {
                         );
                     }
                 } else {
-                    rendering_components.push((ent.clone(), component, update));
+                    rendering_component_count += 1;
+                    rendering_components.push((*entity_id, component_index, ent.clone(), component, update));
                 }
             }
         }
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!(
+                "runtime.update {trace}: after component scan rendering_count={rendering_component_count}"
+            ));
+        }
 
-        if let Err(e) = self.simulate_rapier_physics(dt) {
+        panic_stage.set("simulate_rapier_physics");
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!(
+                "runtime.update {trace}: before simulate_rapier_physics"
+            ));
+        }
+        if let Err(e) = self.simulate_rapier_physics(dt, web_trace) {
             eprintln!(
                 "\x1b[31mLua Error in Rapier2D physics:\x1b[0m\n{}",
                 describe_lua_error(&e)
             );
         }
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!(
+                "runtime.update {trace}: after simulate_rapier_physics"
+            ));
+        }
 
-        for trio in rendering_components {
-            let component_name = describe_component_name(&trio.1, Some(&trio.0));
+        panic_stage.set("rendering pass");
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!("runtime.update {trace}: before rendering pass"));
+        }
+        for (entity_id, component_index, ent, component, update) in rendering_components {
+            let component_name = describe_component_name(&component, Some(&ent));
+
+            panic_stage.set("rendering component update callback");
+            if let Some(trace) = web_trace {
+                web_debug_log(&format!(
+                    "runtime.update {trace}: before rendering component entity={} index={} name={component_name}",
+                    entity_id, component_index
+                ));
+            }
             if let Err(e) = protect_lua_call(
                 &format!("running rendering component update callback ({component_name})"),
-                || trio.2.call::<()>((trio.0, trio.1, dt)),
+                || update.call::<()>((ent.clone(), component, dt)),
             ) {
                 eprintln!(
                     "\x1b[31mLua Error in rendering component update:\x1b[0m\n{}",
                     describe_lua_error(&e)
                 );
             }
+            if let Some(trace) = web_trace {
+                web_debug_log(&format!(
+                    "runtime.update {trace}: after rendering component entity={} index={} name={component_name}",
+                    entity_id, component_index
+                ));
+            }
+        }
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!("runtime.update {trace}: after rendering pass"));
+        }
+        panic_stage.set("runtime.update completed");
+        if let Some(trace) = web_trace {
+            web_debug_log(&format!(
+                "runtime.update {trace}: end exit_requested={}",
+                *self.exit_requested.borrow()
+            ));
         }
 
         Ok(())
@@ -2960,6 +3626,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn assert_close(actual: f32, expected: f32) {
@@ -2986,6 +3653,32 @@ mod tests {
 
         let mut runtime = Runtime::new(root.clone());
         runtime.set_platform_window_state(640.0, 480.0);
+        runtime.start()?;
+        Ok((runtime, root))
+    }
+
+    fn copy_project_fixture(source: &Path, destination: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_project_fixture(&source_path, &destination_path)?;
+            } else {
+                std::fs::copy(&source_path, &destination_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn start_sample_runtime(name: &str, sample_relative_path: &str) -> mlua::Result<(Runtime, PathBuf)> {
+        let root = temp_project_root(name);
+        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(sample_relative_path);
+        copy_project_fixture(&fixture_root, &root).map_err(mlua::Error::external)?;
+
+        let mut runtime = Runtime::new(root.clone());
+        runtime.set_platform_window_state(1280.0, 720.0);
         runtime.start()?;
         Ok((runtime, root))
     }
@@ -3133,6 +3826,248 @@ mod tests {
         assert_eq!(order.len(), 2);
         assert_eq!(order[0], "first");
         assert_eq!(order[1], "second");
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn raycasting_sample_queues_draw_commands() -> mlua::Result<()> {
+        let (mut runtime, root) = start_sample_runtime("raycasting_sample", "samples/raycasting")?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        let commands =
+            crate::renderer::drain_commands(&runtime.render_state()).map_err(mlua::Error::external)?;
+
+        assert!(
+            !commands.is_empty(),
+            "expected the raycasting sample to queue draw commands"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, crate::renderer::DrawCommand::Rect { .. })),
+            "expected the raycasting sample to queue rectangle draw commands"
+        );
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn raycasting_sample_renders_visible_pixels() -> mlua::Result<()> {
+        let (mut runtime, root) = start_sample_runtime("raycasting_pixels", "samples/raycasting")?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+
+        let platform = runtime.platform_state();
+        let render_state = runtime.render_state();
+        let mut renderer = crate::renderer::SoftwareRenderer::new(1280, 720);
+        renderer
+            .render(&platform, &render_state)
+            .map_err(mlua::Error::external)?;
+
+        let clear = platform
+            .lock()
+            .map_err(|_| mlua::Error::external("platform lock poisoned"))?
+            .clear_color();
+
+        let pixels = renderer.pixels();
+        let non_clear_pixels = pixels
+            .chunks_exact(4)
+            .filter(|rgba| {
+                rgba[0] != clear.r || rgba[1] != clear.g || rgba[2] != clear.b || rgba[3] != clear.a
+            })
+            .count();
+
+        assert!(
+            non_clear_pixels > 0,
+            "expected the raycasting sample to render pixels different from the clear color"
+        );
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn missing_app_background_defaults_to_white() -> mlua::Result<()> {
+        let (runtime, root) = start_test_runtime("missing_app_background")?;
+
+        let app: Table = runtime.lua.globals().get("app")?;
+        app.raw_set("bg", Value::Nil)?;
+
+        assert_eq!(runtime.resolve_app_clear_color()?, PlatformColor::WHITE);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_global_bg_table_is_used_when_app_bg_is_missing() -> mlua::Result<()> {
+        let (runtime, root) = start_test_runtime("legacy_global_bg")?;
+
+        let app: Table = runtime.lua.globals().get("app")?;
+        app.raw_set("bg", Value::Nil)?;
+
+        let legacy_bg = runtime.lua.create_table()?;
+        legacy_bg.set("R", 12)?;
+        legacy_bg.set("G", 34)?;
+        legacy_bg.set("B", 56)?;
+        runtime.lua.globals().set("bg", legacy_bg)?;
+
+        assert_eq!(
+            runtime.resolve_app_clear_color()?,
+            PlatformColor::rgba(12, 34, 56, 255)
+        );
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_app_clear_color_uses_current_global_app_table() -> mlua::Result<()> {
+        let (runtime, root) = start_test_runtime("replace_global_app")?;
+
+        let replacement_app = runtime.lua.create_table()?;
+        replacement_app.set("nearestNeighborScaling", true)?;
+        replacement_app.set("bg", color4_table(&runtime.lua, 12, 34, 56, 78)?)?;
+        runtime.lua.globals().set("app", replacement_app)?;
+
+        assert_eq!(
+            runtime.resolve_app_clear_color()?,
+            PlatformColor::rgba(12, 34, 56, 78)
+        );
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn app_runtime_settings_use_current_global_app_table() -> mlua::Result<()> {
+        let (runtime, root) = start_test_runtime("replace_global_app_runtime_settings")?;
+
+        let replacement_app = runtime.lua.create_table()?;
+        replacement_app.set("nearestNeighborScaling", true)?;
+        replacement_app.set("bg", color4_table(&runtime.lua, 255, 255, 255, 255)?)?;
+        replacement_app.set("maxFps", 72.0)?;
+        replacement_app.set("showFps", false)?;
+        runtime.lua.globals().set("app", replacement_app)?;
+
+        assert_eq!(runtime.max_fps(), Some(72.0));
+        assert!(!runtime.show_fps());
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rendering_component_update_can_mutate_component_fields() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("rendering_component_mutation")?;
+
+        let ecs: Table = runtime.lua.globals().get("ecs")?;
+        let new_entity: Function = ecs.get("newEntity")?;
+        let add_component: Function = ecs.get("addComponent")?;
+        let entity: Table =
+            new_entity.call(("renderable".to_string(), None::<Table>, Some(0.0), Some(0.0)))?;
+        entity.set("size_x", 10.0)?;
+        entity.set("size_y", 10.0)?;
+
+        let component = runtime.lua.create_table()?;
+        component.set("__neolove_component", "MutableRender")?;
+        component.set("NEOLOVE_RENDERING", true)?;
+        component.set("counter", 0)?;
+        component.set(
+            "awake",
+            runtime
+                .lua
+                .create_function(|_lua, (_entity, _component): (Table, Table)| Ok(()))?,
+        )?;
+        component.set(
+            "update",
+            runtime.lua.create_function(
+                |_lua, (_entity, component, _dt): (Table, Table, f32)| {
+                    let next = component.get::<i64>("counter").unwrap_or(0) + 1;
+                    component.set("counter", next)?;
+                    component.set("label", format!("step-{next}"))?;
+                    Ok(())
+                },
+            )?,
+        )?;
+
+        let instance: Table = add_component.call((entity, Value::Table(component)))?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        assert_eq!(instance.get::<i64>("counter")?, 1);
+        assert_eq!(instance.get::<String>("label")?, "step-1");
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        assert_eq!(instance.get::<i64>("counter")?, 2);
+        assert_eq!(instance.get::<String>("label")?, "step-2");
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn overlap_check_compares_entities_without_reiterating_lua_table() -> mlua::Result<()> {
+        let (runtime, root) = start_test_runtime("overlap_check")?;
+
+        let ecs: Table = runtime.lua.globals().get("ecs")?;
+        let transform: Table = runtime.lua.globals().get("transform")?;
+        let new_entity: Function = ecs.get("newEntity")?;
+        let do_they_overlap: Function = transform.get("doTheyOverlap")?;
+
+        let first: Table =
+            new_entity.call(("first".to_string(), None::<Table>, Some(10.0), Some(20.0)))?;
+        first.set("size_x", 40.0)?;
+        first.set("size_y", 40.0)?;
+
+        let second: Table =
+            new_entity.call(("second".to_string(), None::<Table>, Some(30.0), Some(35.0)))?;
+        second.set("size_x", 40.0)?;
+        second.set("size_y", 40.0)?;
+
+        let overlap_list = runtime.lua.create_table()?;
+        overlap_list.set(1, first.clone())?;
+        overlap_list.set(2, second.clone())?;
+        let overlaps: bool = do_they_overlap.call(overlap_list)?;
+        assert!(overlaps);
+
+        second.set("x", 200.0)?;
+        second.set("y", 200.0)?;
+        let separated_list = runtime.lua.create_table()?;
+        separated_list.set(1, first)?;
+        separated_list.set(2, second)?;
+        let overlaps: bool = do_they_overlap.call(separated_list)?;
+        assert!(!overlaps);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn set_window_table_uses_cached_root_table_when_entity_root_key_is_invalid() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("window_root_registry_recovery")?;
+
+        let foreign_lua = Lua::new();
+        let foreign_table = foreign_lua.create_table()?;
+        let foreign_key = foreign_lua.create_registry_value(foreign_table)?;
+        runtime
+            .entities
+            .borrow_mut()
+            .get_mut(&0)
+            .expect("root entity should exist")
+            .luau_key = foreign_key;
+
+        runtime.set_platform_window_state(320.0, 240.0);
+        runtime.set_window_table()?;
+        runtime.set_platform_window_state(640.0, 360.0);
+        runtime.set_window_table()?;
+
+        let ecs: Table = runtime.lua.globals().get("ecs")?;
+        let root_table: Table = ecs.get("root")?;
+        assert_eq!(root_table.get::<f32>("size_x")?, 640.0);
+        assert_eq!(root_table.get::<f32>("size_y")?, 360.0);
 
         std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())

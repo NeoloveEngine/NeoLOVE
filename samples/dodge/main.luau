@@ -2,7 +2,7 @@
 --!native
 --!optimize 2
 
-bg = {R = 255, G = 255, B = 255}
+app.bg = Color4(255, 255, 255, 255)
 
 local characterController = require("./components/character")
 local spawner = require("./spawner")

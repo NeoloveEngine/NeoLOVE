@@ -1,5 +1,6 @@
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Color {
@@ -33,12 +34,14 @@ pub(crate) struct WindowState {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct InputState {
-    pub keys_down: HashSet<String>,
-    pub keys_pressed: HashSet<String>,
-    pub keys_released: HashSet<String>,
-    pub mouse_down: HashSet<String>,
-    pub mouse_pressed: HashSet<String>,
-    pub mouse_released: HashSet<String>,
+    // These sets stay tiny, and an ordered tree avoids the hash-table clear/drop path
+    // that has been trapping in the web build's end-of-frame input reset.
+    pub keys_down: BTreeSet<String>,
+    pub keys_pressed: BTreeSet<String>,
+    pub keys_released: BTreeSet<String>,
+    pub mouse_down: BTreeSet<String>,
+    pub mouse_pressed: BTreeSet<String>,
+    pub mouse_released: BTreeSet<String>,
     pub wheel_x: f32,
     pub wheel_y: f32,
     pub last_key_pressed: Option<String>,
@@ -125,4 +128,41 @@ pub(crate) type SharedPlatformState = Arc<Mutex<PlatformState>>;
 
 pub(crate) fn new_shared_platform_state() -> SharedPlatformState {
     Arc::new(Mutex::new(PlatformState::default()))
+}
+
+fn report_poisoned_platform_lock() {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if !REPORTED.swap(true, Ordering::Relaxed) {
+        eprintln!("warning: platform state mutex was poisoned; recovering and continuing");
+    }
+}
+
+pub(crate) fn lock_platform_state(platform: &SharedPlatformState) -> MutexGuard<'_, PlatformState> {
+    match platform.lock() {
+        Ok(platform) => platform,
+        Err(poisoned) => {
+            report_poisoned_platform_lock();
+            poisoned.into_inner()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_platform_lock_is_recovered() {
+        let platform = new_shared_platform_state();
+        let poisoned = platform.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison platform state");
+        });
+
+        let mut guard = lock_platform_state(&platform);
+        guard.set_clear_color(Color::rgba(12, 34, 56, 78));
+
+        assert_eq!(guard.clear_color(), Color::rgba(12, 34, 56, 78));
+    }
 }

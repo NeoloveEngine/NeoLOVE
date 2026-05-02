@@ -33,7 +33,7 @@ mod.component = {
 
             if entity.size_x <= 0.5 then
                 ecs.deleteEntity(entity)
-                die()
+                die("player died after health depletion")
             end
             entity.hp.color = Color4(0,0,0,0)
         else

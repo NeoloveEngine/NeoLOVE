@@ -148,10 +148,8 @@ mod native {
     unsafe extern "C" {
         fn neolove_web_audio_play(
             sound_id: i32,
-            samples: *const f32,
-            samples_len: i32,
-            sample_rate: i32,
-            channels: i32,
+            bytes: *const u8,
+            bytes_len: i32,
             looped: i32,
             volume: f32,
         ) -> i32;
@@ -183,41 +181,25 @@ mod native {
     fn play_sound(sound: &SoundHandle, looped: bool, volume: f32) -> mlua::Result<()> {
         let sound_id = sound.id() as i32;
         let volume = volume.clamp(0.0, 1.0);
-        let result = sound.with_samples(|sample_rate, channels, samples| {
-            if channels == 0 {
-                return Err(mlua::Error::external("sound must have at least one channel"));
-            }
-            if samples.is_empty() {
-                return Err(mlua::Error::external("sound has no samples"));
-            }
-            if samples.len() % channels as usize != 0 {
-                return Err(mlua::Error::external(
-                    "sound sample buffer length must be a multiple of channels",
-                ));
-            }
-            if samples.len() > i32::MAX as usize {
-                return Err(mlua::Error::external(
-                    "sound sample buffer is too large for the web audio bridge",
-                ));
-            }
-            if sample_rate > i32::MAX as u32 {
-                return Err(mlua::Error::external(
-                    "sound sample rate is too large for the web audio bridge",
-                ));
-            }
+        let bytes = sound.bytes()?;
+        if bytes.is_empty() {
+            return Err(mlua::Error::external("sound has no encoded audio bytes"));
+        }
+        if bytes.len() > i32::MAX as usize {
+            return Err(mlua::Error::external(
+                "encoded sound is too large for the web audio bridge",
+            ));
+        }
 
-            Ok(unsafe {
-                neolove_web_audio_play(
-                    sound_id,
-                    samples.as_ptr(),
-                    samples.len() as i32,
-                    sample_rate as i32,
-                    channels as i32,
-                    if looped { 1 } else { 0 },
-                    volume,
-                )
-            })
-        })?;
+        let result = unsafe {
+            neolove_web_audio_play(
+                sound_id,
+                bytes.as_ptr(),
+                bytes.len() as i32,
+                if looped { 1 } else { 0 },
+                volume,
+            )
+        };
         check_bridge_result(result, "failed to play audio")
     }
 

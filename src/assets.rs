@@ -324,7 +324,6 @@ impl SoundHandle {
         Ok(sound.channels)
     }
 
-    #[cfg(not(target_os = "emscripten"))]
     pub(crate) fn bytes(&self) -> mlua::Result<Vec<u8>> {
         let sound = self
             .0

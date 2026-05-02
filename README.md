@@ -27,6 +27,7 @@ neolove --version
 
 - `neolove build --webasm` now builds an itch.io-ready HTML5 bundle into `dist/webasm/` and also creates a single upload zip in `dist/<project-name>-webasm.zip`.
 - The web bundle includes `index.html`, `neolove.js`, `neolove.wasm`, and `neolove.data` when the project payload is preloaded into the browser filesystem.
+- Open the web bundle through `http://` or `https://`, not `file://`. For local testing: `cd dist/webasm && python3 -m http.server 8000`, then visit `http://localhost:8000`.
 - Web builds now support the existing `audio.play`, `audio.playOnce`, `audio.stop`, and `audio.setVolume` API through the browser Web Audio backend.
 - `cargo build --target wasm32-unknown-unknown` is still supported directly as the lower-level bootstrap build target.
 - The first `--webasm` build may install `wasm32-unknown-emscripten` and bootstrap a local Emscripten toolchain under `~/.neolove/toolchains/emsdk`.

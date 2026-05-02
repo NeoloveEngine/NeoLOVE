@@ -1,5 +1,5 @@
 use crate::assets::ImageHandle;
-use crate::platform::{Color, SharedPlatformState};
+use crate::platform::{lock_platform_state, Color, SharedPlatformState};
 use crate::renderer::{self, DrawCommand, Rect, SharedRenderState, TextureFilter, Vec2};
 use bytemuck::{Pod, Zeroable};
 use image::RgbaImage;
@@ -749,10 +749,7 @@ impl VulkanPresenter {
         }
 
         let commands = renderer::drain_commands(render_state)?;
-        let clear_color = platform
-            .lock()
-            .map_err(|_| "platform lock poisoned".to_string())?
-            .clear_color();
+        let clear_color = lock_platform_state(platform).clear_color();
         let batches = self.build_batches(commands, width.max(1), height.max(1))?;
 
         let (image_index, suboptimal, acquire_future) =

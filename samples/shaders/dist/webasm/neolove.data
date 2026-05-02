@@ -1,0 +1,691 @@
+app.bg = Color4(255, 255, 255, 255)
+app.setMaxFps(120)
+
+local shaderFiles = {
+	"shader0_pulse.glsl",
+	"shader1_fluid.glsl",
+	"shader2_plasma.glsl",
+	"shader3_voronoi.glsl",
+	"shader4_tunnel.glsl",
+	"shader5_ocean.glsl",
+	"shader6_fire.glsl",
+	"shader7_lava.glsl",
+	"shader8_kaleido.glsl",
+	"shader9_glitch.glsl",
+	"shader10_aurora.glsl",
+	"shader11_marble.glsl",
+	"shader12_starfield.glsl",
+	"shader13_hexwave.glsl",
+	"shader14_moire.glsl",
+}
+
+local shaderNames = {
+	"Pulse Grid",
+	"Fluid Flow",
+	"Neon Plasma",
+	"Voronoi Cells",
+	"Warp Tunnel",
+	"Ocean Bands",
+	"Fire Column",
+	"Lava Veins",
+	"Kaleidoscope",
+	"Glitch Scan",
+	"Aurora Veil",
+	"Marble Flow",
+	"Starfield Warp",
+	"Hex Wave",
+	"Moire Rings",
+}
+
+local shaderOptions = {
+	uniforms = {
+		{ name = "u_time", type = "float1" },
+		{ name = "u_resolution", type = "float2" },
+	}
+}
+
+local shadersLoaded = {}
+for _, path in ipairs(shaderFiles) do
+	shadersLoaded[#shadersLoaded + 1] = shaders.loadFragment(path, shaderOptions)
+end
+
+local box = ecs.newEntity("shader_box", ecs.root, 0, 0)
+local baseW = 360
+local baseH = 240
+local scale = 1.0
+local scaleSpeed = 0.9
+
+local renderer = ecs.addComponent(box, core.Rect2D)
+renderer.color = Color4(255, 255, 255, 255)
+
+local title = ecs.newEntity("title", ecs.root, 20, 32)
+local titleLabel = ecs.addComponent(title, core.TextBox)
+titleLabel.scale = 28
+titleLabel.color = Color4(20, 30, 45, 255)
+
+local hint = ecs.newEntity("hint", ecs.root, 20, 62)
+local hintLabel = ecs.addComponent(hint, core.TextBox)
+hintLabel.scale = 20
+hintLabel.color = Color4(60, 75, 100, 255)
+hintLabel.text = "0-9 core shaders, Left/Right all shaders, Up increase scale, Down decrease scale"
+
+local perf = ecs.newEntity("perf", ecs.root, 20, 88)
+local perfLabel = ecs.addComponent(perf, core.TextBox)
+perfLabel.scale = 18
+perfLabel.color = Color4(70, 86, 110, 255)
+perfLabel.text = "Scale controls: Up increase, Down decrease"
+
+local currentShaderIndex = 1
+renderer.shader = shadersLoaded[currentShaderIndex]
+
+local function setShaderIndex(index)
+	if index < 1 then
+		index = #shadersLoaded
+	end
+	if index > #shadersLoaded then
+		index = 1
+	end
+
+	currentShaderIndex = index
+	renderer.shader = shadersLoaded[currentShaderIndex]
+	titleLabel.text = "Shader " .. tostring(currentShaderIndex - 1) .. ": " .. shaderNames[currentShaderIndex]
+end
+
+setShaderIndex(1)
+
+local t = 0
+ecs.addSystem({
+	update = function(_self, dt)
+		t += dt
+
+		for digit = 0, 9 do
+			if input.isKeyPressed(tostring(digit)) then
+				setShaderIndex(digit + 1)
+			end
+		end
+
+		if input.isKeyPressed("right") then
+			setShaderIndex(currentShaderIndex + 1)
+		end
+		if input.isKeyPressed("left") then
+			setShaderIndex(currentShaderIndex - 1)
+		end
+
+		if input.isKeyDown("up") then
+			scale += dt * scaleSpeed
+		end
+		if input.isKeyDown("down") then
+			scale -= dt * scaleSpeed
+		end
+		scale = math.clamp(scale, 0.25, 3.8)
+
+		local w = baseW * scale
+		local h = baseH * scale
+		box.size_x = w
+		box.size_y = h
+		box.x = (window.x - w) * 0.5
+		box.y = (window.y - h) * 0.56
+
+		local activeShader = shadersLoaded[currentShaderIndex]
+		activeShader:setUniform1f("u_time", t)
+		activeShader:setUniform2f("u_resolution", w, h)
+
+		local pixels = math.floor(w * h)
+		perfLabel.text = "Scale: " .. string.format("%.2f", scale) .. "  Surface: " .. tostring(pixels) .. " px"
+	end
+})
+[package]
+name = "shaders"
+version = "0.1.0"
+
+[dependencies]
+#version 100
+precision lowp float;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform sampler2D Texture;
+uniform float u_time;
+
+void main() {
+    vec4 base = texture2D(Texture, uv) * color;
+    float pulse = 0.55 + 0.45 * sin(u_time * 2.4 + uv.x * 14.0 + uv.y * 8.0);
+    gl_FragColor = vec4(base.rgb * pulse, base.a);
+}
+#version 100
+precision mediump float;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform sampler2D Texture;
+uniform float u_time;
+uniform vec2 u_resolution;
+
+void main() {
+    vec2 p = (uv - 0.5) * 2.0;
+    p.x *= u_resolution.x / max(u_resolution.y, 1.0);
+
+    float rings = sin(length(p) * 16.0 - u_time * 4.0);
+    float grid = sin((uv.x + uv.y + u_time * 0.15) * 20.0);
+    float v = 0.5 + 0.5 * (rings * 0.75 + grid * 0.25);
+
+    vec3 cA = vec3(0.03, 0.10, 0.24);
+    vec3 cB = vec3(0.15, 0.75, 1.00);
+    vec3 cC = vec3(1.00, 0.90, 0.55);
+
+    vec3 outColor = mix(cA, cB, smoothstep(0.1, 0.8, v));
+    outColor = mix(outColor, cC, smoothstep(0.78, 1.0, v));
+
+    vec4 tex = texture2D(Texture, uv);
+    gl_FragColor = vec4(outColor * color.rgb, tex.a * color.a);
+}
+#version 100
+precision mediump float;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform sampler2D Texture;
+uniform float u_time;
+uniform vec2 u_resolution;
+
+void main() {
+    vec2 p = (uv - 0.5) * 2.0;
+    p.x *= u_resolution.x / max(u_resolution.y, 1.0);
+
+    float t = u_time * 0.45;
+    float drift = sin(p.x * 2.0 + t) * 0.25 + sin(p.x * 4.6 - t * 1.6) * 0.12;
+    float bandA = smoothstep(0.24, 0.0, abs(p.y + 0.25 + drift));
+    float bandB = smoothstep(0.22, 0.0, abs(p.y - 0.02 + drift * 0.7));
+    float bandC = smoothstep(0.2, 0.0, abs(p.y - 0.3 + drift * 0.45));
+
+    vec3 base = vec3(0.03, 0.05, 0.12);
+    vec3 c1 = vec3(0.10, 0.95, 0.62) * bandA;
+    vec3 c2 = vec3(0.22, 0.55, 1.00) * bandB;
+    vec3 c3 = vec3(0.70, 0.35, 1.00) * bandC;
+
+    vec3 outColor = base + c1 + c2 + c3;
+    outColor *= 0.95 + 0.05 * sin((p.x + p.y) * 40.0 + u_time * 2.5);
+
+    vec4 tex = texture2D(Texture, uv);
+    gl_FragColor = vec4(outColor * color.rgb, tex.a * color.a);
+}
+#version 100
+precision mediump float;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform sampler2D Texture;
+uniform float u_time;
+uniform vec2 u_resolution;
+
+void main() {
+    vec2 p = (uv - 0.5) * 4.0;
+    p.x *= u_resolution.x / max(u_resolution.y, 1.0);
+
+    float t = u_time * 0.7;
+    float v = sin(p.x + sin(p.y * 1.8 + t) * 1.8 + sin(p.x * 1.4 - t * 1.2));
+    v += 0.45 * sin((p.x + p.y) * 1.7 - t * 1.5);
+    v = 0.5 + 0.5 * (v / 1.45);
+
+    vec3 dark = vec3(0.12, 0.09, 0.08);
+    vec3 mid = vec3(0.68, 0.63, 0.56);
+    vec3 light = vec3(0.96, 0.93, 0.88);
+
+    vec3 outColor = mix(dark, mid, smoothstep(0.18, 0.72, v));
+    outColor = mix(outColor, light, smoothstep(0.68, 1.0, v));
+
+    vec4 tex = texture2D(Texture, uv);
+    gl_FragColor = vec4(outColor * color.rgb, tex.a * color.a);
+}
+#version 100
+precision mediump float;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform sampler2D Texture;
+uniform float u_time;
+uniform vec2 u_resolution;
+
+float star(vec2 p, float flare) {
+    float d = length(p);
+    float m = 0.04 / max(d, 0.0008);
+    float rays = max(0.0, 1.0 - abs(p.x * p.y * 900.0));
+    m += rays * flare;
+    m *= smoothstep(1.0, 0.2, d);
+    return m;
+}
+
+float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+}
+
+void main() {
+    vec2 p = uv - 0.5;
+    p.x *= u_resolution.x / max(u_resolution.y, 1.0);
+
+    vec3 outColor = vec3(0.01, 0.02, 0.07);
+
+    for (int i = 0; i < 3; i++) {
+        float fi = float(i);
+        vec2 lp = p * (2.0 + fi * 1.3);
+        lp.y += u_time * (0.18 + fi * 0.12);
+        vec2 cell = floor(lp);
+        vec2 fracp = fract(lp) - 0.5;
+
+        vec2 r = vec2(hash(cell), hash(cell + 13.7)) - 0.5;
+        vec2 sp = fracp - r * 0.45;
+        float s = star(sp, 0.02 + 0.02 * fi);
+
+        vec3 c = vec3(0.4 + 0.3 * hash(cell + 1.0), 0.5 + 0.4 * hash(cell + 2.0), 1.0);
+        outColor += s * c;
+    }
+
+    outColor = clamp(outColor, 0.0, 1.0);
+
+    vec4 tex = texture2D(Texture, uv);
+    gl_FragColor = vec4(outColor * color.rgb, tex.a * color.a);
+}
+#version 100
+precision mediump float;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform sampler2D Texture;
+uniform float u_time;
+uniform vec2 u_resolution;
+
+vec2 hexCoords(vec2 p) {
+    const vec2 k = vec2(1.7320508, 1.0);
+    p.x /= k.x;
+    p *= 2.0;
+
+    vec2 a = mod(p, k) - 0.5 * k;
+    vec2 b = mod(p - 0.5 * k, k) - 0.5 * k;
+    vec2 g = dot(a, a) < dot(b, b) ? a : b;
+    return g;
+}
+
+void main() {
+    vec2 p = (uv - 0.5) * 3.2;
+    p.x *= u_resolution.x / max(u_resolution.y, 1.0);
+
+    vec2 g = hexCoords(p);
+    float d = length(g);
+
+    float edge = 1.0 - smoothstep(0.18, 0.21, d);
+    float wave = 0.5 + 0.5 * sin((p.x + p.y) * 4.0 - u_time * 2.4 + d * 20.0);
+
+    vec3 bg = vec3(0.03, 0.05, 0.10);
+    vec3 a = vec3(0.08, 0.65, 1.0);
+    vec3 b = vec3(0.82, 0.32, 1.0);
+
+    vec3 outColor = mix(bg, mix(a, b, wave), edge);
+
+    vec4 tex = texture2D(Texture, uv);
+    gl_FragColor = vec4(outColor * color.rgb, tex.a * color.a);
+}
+#version 100
+precision mediump float;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform sampler2D Texture;
+uniform float u_time;
+uniform vec2 u_resolution;
+
+void main() {
+    vec2 p = (uv - 0.5) * 2.4;
+    p.x *= u_resolution.x / max(u_resolution.y, 1.0);
+
+    float r = length(p);
+    float a = atan(p.y, p.x);
+
+    float rings = sin(r * 80.0 - u_time * 8.0);
+    float spokes = sin(a * 42.0 + u_time * 3.0);
+    float moire = rings * 0.65 + spokes * 0.35;
+    float v = 0.5 + 0.5 * moire;
+
+    vec3 c1 = vec3(0.04, 0.08, 0.16);
+    vec3 c2 = vec3(0.10, 0.95, 0.90);
+    vec3 c3 = vec3(0.95, 0.30, 0.95);
+
+    vec3 outColor = mix(c1, c2, smoothstep(0.2, 0.75, v));
+    outColor = mix(outColor, c3, smoothstep(0.72, 1.0, v));
+
+    vec4 tex = texture2D(Texture, uv);
+    gl_FragColor = vec4(outColor * color.rgb, tex.a * color.a);
+}
+#version 100
+precision mediump float;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform sampler2D Texture;
+uniform float u_time;
+uniform vec2 u_resolution;
+
+void main() {
+    vec2 p = (uv - 0.5) * 2.0;
+    p.x *= u_resolution.x / max(u_resolution.y, 1.0);
+
+    float t = u_time * 0.8;
+
+    vec2 q = p;
+    q += 0.28 * vec2(sin(1.7 * q.y + t), cos(1.3 * q.x - t));
+    q += 0.18 * vec2(cos(2.4 * q.y - 1.3 * t), sin(2.0 * q.x + 1.1 * t));
+    q += 0.12 * vec2(sin(3.1 * q.y + 0.6 * t), cos(2.7 * q.x - 0.8 * t));
+
+    float f = 0.0;
+    f += sin(3.2 * q.x + 2.1 * q.y + t * 1.2);
+    f += sin(4.0 * q.y - 2.6 * q.x - t * 0.9);
+    f += sin(2.5 * length(q) - t * 1.5);
+
+    float v = 0.5 + 0.5 * (f / 3.0);
+
+    vec3 deep = vec3(0.01, 0.08, 0.18);
+    vec3 mid = vec3(0.03, 0.55, 0.82);
+    vec3 light = vec3(0.83, 0.97, 1.0);
+
+    vec3 outColor = mix(deep, mid, smoothstep(0.15, 0.75, v));
+    outColor = mix(outColor, light, smoothstep(0.68, 1.0, v));
+
+    vec4 tex = texture2D(Texture, uv);
+    gl_FragColor = vec4(outColor * color.rgb, tex.a * color.a);
+}
+#version 100
+precision mediump float;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform sampler2D Texture;
+uniform float u_time;
+uniform vec2 u_resolution;
+
+void main() {
+    vec2 p = uv;
+    float v = 0.0;
+
+    v += sin((p.x + u_time * 0.12) * 13.0);
+    v += sin((p.y - u_time * 0.15) * 12.0);
+    v += sin((p.x + p.y + u_time * 0.09) * 16.0);
+    v += sin((length((p - 0.5) * 2.0) - u_time * 0.3) * 18.0);
+    v = (v / 4.0) * 0.5 + 0.5;
+
+    vec3 outColor = 0.5 + 0.5 * cos(vec3(0.0, 2.1, 4.2) + v * 6.28318 + u_time * vec3(0.25, 0.18, 0.14));
+
+    vec4 tex = texture2D(Texture, uv);
+    gl_FragColor = vec4(outColor * color.rgb, tex.a * color.a);
+}
+#version 100
+precision mediump float;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform sampler2D Texture;
+uniform float u_time;
+uniform vec2 u_resolution;
+
+vec2 rand2(vec2 p) {
+    return 0.5 + 0.5 * sin(vec2(
+        dot(p, vec2(2.1, 1.7)),
+        dot(p, vec2(1.3, 2.9))
+    ));
+}
+
+void main() {
+    vec2 p = uv * 7.5;
+    vec2 cell = floor(p);
+    vec2 f = fract(p);
+
+    float minDist = 10.0;
+    float secondDist = 10.0;
+
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            vec2 o = vec2(float(x), float(y));
+            vec2 id = cell + o;
+            vec2 r = rand2(id);
+            vec2 site = 0.5 + 0.38 * sin(u_time * 0.85 + 6.28318 * r);
+
+            vec2 d = o + site - f;
+            float dist2 = dot(d, d);
+
+            if (dist2 < minDist) {
+                secondDist = minDist;
+                minDist = dist2;
+            } else if (dist2 < secondDist) {
+                secondDist = dist2;
+            }
+        }
+    }
+
+    float edge = sqrt(secondDist) - sqrt(minDist);
+    float border = 1.0 - smoothstep(0.03, 0.08, edge);
+    float fill = smoothstep(0.02, 0.22, sqrt(minDist));
+
+    vec3 bg = vec3(0.02, 0.04, 0.10);
+    vec3 cellColor = vec3(0.14, 0.74, 0.98);
+    vec3 borderColor = vec3(0.85, 0.98, 1.0);
+
+    vec3 outColor = mix(bg, cellColor, fill);
+    outColor = mix(outColor, borderColor, border * 0.9);
+
+    vec4 tex = texture2D(Texture, uv);
+    gl_FragColor = vec4(outColor * color.rgb, tex.a * color.a);
+}
+#version 100
+precision mediump float;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform sampler2D Texture;
+uniform float u_time;
+uniform vec2 u_resolution;
+
+void main() {
+    vec2 p = uv - 0.5;
+    p.x *= u_resolution.x / max(u_resolution.y, 1.0);
+
+    float r = length(p);
+    float a = atan(p.y, p.x);
+
+    float rings = sin(24.0 * r - u_time * 7.0);
+    float spokes = sin(a * 10.0 + u_time * 1.8);
+    float v = 0.5 + 0.5 * (rings * 0.75 + spokes * 0.25);
+
+    vec3 nearColor = vec3(0.92, 0.35, 1.0);
+    vec3 farColor = vec3(0.02, 0.04, 0.12);
+    vec3 outColor = mix(farColor, nearColor, v);
+
+    float fade = 1.0 - smoothstep(0.2, 1.15, r);
+    outColor *= fade + 0.15;
+
+    vec4 tex = texture2D(Texture, uv);
+    gl_FragColor = vec4(outColor * color.rgb, tex.a * color.a);
+}
+#version 100
+precision mediump float;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform sampler2D Texture;
+uniform float u_time;
+uniform vec2 u_resolution;
+
+void main() {
+    vec2 p = (uv - 0.5) * 2.0;
+    p.x *= u_resolution.x / max(u_resolution.y, 1.0);
+
+    float waveA = sin((p.x * 2.8 + u_time * 0.9) * 2.2 + sin(p.y * 2.3 + u_time * 0.4));
+    float waveB = sin((p.x * 5.1 - u_time * 1.4) + cos(p.y * 3.7 - u_time * 0.25));
+    float h = 0.5 + 0.5 * (waveA * 0.6 + waveB * 0.4);
+
+    vec3 deep = vec3(0.02, 0.09, 0.20);
+    vec3 mid = vec3(0.04, 0.38, 0.68);
+    vec3 foam = vec3(0.78, 0.92, 1.0);
+
+    vec3 outColor = mix(deep, mid, h);
+    float crest = smoothstep(0.72, 0.95, h);
+    outColor = mix(outColor, foam, crest * 0.75);
+
+    vec4 tex = texture2D(Texture, uv);
+    gl_FragColor = vec4(outColor * color.rgb, tex.a * color.a);
+}
+#version 100
+precision mediump float;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform sampler2D Texture;
+uniform float u_time;
+uniform vec2 u_resolution;
+
+float flameField(vec2 p, float t) {
+    float v = 0.0;
+    float a = 0.5;
+
+    for (int i = 0; i < 4; i++) {
+        v += a * (0.5 + 0.5 * sin(p.x) * cos(p.y));
+        p = mat2(1.6, -1.2, 1.2, 1.6) * p + vec2(0.3, 1.1 + 0.2 * t);
+        a *= 0.55;
+    }
+
+    return v;
+}
+
+void main() {
+    float t = u_time * 1.25;
+    vec2 p = vec2((uv.x - 0.5) * 3.2, uv.y * 3.8 - t * 1.8);
+
+    float f = flameField(p, t);
+    float body = smoothstep(1.05, 0.12, abs(uv.x - 0.5) * (1.25 - uv.y));
+    float flame = smoothstep(0.18, 1.12, f + (1.0 - uv.y) * 0.95) * body;
+
+    vec3 dark = vec3(0.06, 0.01, 0.00);
+    vec3 hot = vec3(1.00, 0.30, 0.03);
+    vec3 core = vec3(1.00, 0.92, 0.46);
+
+    vec3 outColor = mix(dark, hot, flame);
+    outColor = mix(outColor, core, smoothstep(0.62, 1.0, flame));
+
+    vec4 tex = texture2D(Texture, uv);
+    gl_FragColor = vec4(outColor * color.rgb, tex.a * color.a);
+}
+#version 100
+precision mediump float;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform sampler2D Texture;
+uniform float u_time;
+uniform vec2 u_resolution;
+
+void main() {
+    vec2 p = (uv - 0.5) * 3.2;
+    p.x *= u_resolution.x / max(u_resolution.y, 1.0);
+
+    float t = u_time * 0.9;
+
+    vec2 q = p;
+    q += 0.30 * vec2(sin(1.8 * q.y + t), cos(1.4 * q.x - 1.2 * t));
+    q += 0.15 * vec2(cos(2.5 * q.y - 0.7 * t), sin(2.1 * q.x + 0.9 * t));
+
+    float veins = abs(sin(3.6 * q.x + 4.2 * q.y + sin(2.0 * q.x - 1.8 * q.y + t)));
+    float crack = pow(1.0 - veins, 4.0);
+
+    float rockNoise = 0.5 + 0.5 * sin(2.4 * p.x - 1.7 * p.y + t * 0.3);
+    vec3 rock = mix(vec3(0.05, 0.02, 0.02), vec3(0.18, 0.08, 0.05), rockNoise);
+
+    vec3 lavaA = vec3(1.00, 0.26, 0.02);
+    vec3 lavaB = vec3(1.00, 0.74, 0.20);
+    vec3 lava = mix(lavaA, lavaB, 0.5 + 0.5 * sin(t * 2.0 + q.x * 4.0));
+
+    vec3 outColor = mix(rock, lava, crack);
+    outColor += crack * 0.18;
+
+    vec4 tex = texture2D(Texture, uv);
+    gl_FragColor = vec4(outColor * color.rgb, tex.a * color.a);
+}
+#version 100
+precision mediump float;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform sampler2D Texture;
+uniform float u_time;
+uniform vec2 u_resolution;
+
+void main() {
+    vec2 p = uv - 0.5;
+    p.x *= u_resolution.x / max(u_resolution.y, 1.0);
+
+    float a = atan(p.y, p.x);
+    float r = length(p);
+
+    float segments = 8.0;
+    float segmentAngle = 6.28318 / segments;
+    a = mod(a, segmentAngle);
+    a = abs(a - 0.5 * segmentAngle);
+
+    vec2 q = vec2(cos(a), sin(a)) * r;
+    float w = sin(15.0 * q.x + u_time * 2.2) * cos(13.0 * q.y - u_time * 1.4);
+    float v = 0.5 + 0.5 * w;
+
+    vec3 outColor = 0.5 + 0.5 * cos(vec3(0.0, 2.2, 4.0) + v * 6.28318 + u_time * 0.35);
+    outColor *= 1.0 - smoothstep(0.75, 1.2, r);
+
+    vec4 tex = texture2D(Texture, uv);
+    gl_FragColor = vec4(outColor * color.rgb, tex.a * color.a);
+}
+#version 100
+precision mediump float;
+
+varying lowp vec2 uv;
+varying lowp vec4 color;
+
+uniform sampler2D Texture;
+uniform float u_time;
+uniform vec2 u_resolution;
+
+vec3 basePattern(vec2 p, float t) {
+    float wave = sin((p.x * 8.0 + p.y * 12.0) - t * 2.2);
+    float ring = sin(length((p - 0.5) * vec2(1.5, 1.0)) * 22.0 - t * 3.0);
+    float v = 0.5 + 0.5 * (0.6 * wave + 0.4 * ring);
+    return 0.5 + 0.5 * cos(vec3(0.0, 2.0, 4.0) + v * 6.28318 + t * 0.2);
+}
+
+void main() {
+    float t = u_time;
+
+    float row = floor(uv.y * 48.0);
+    float pulse = 0.5 + 0.5 * sin(row * 2.7 + floor(t * 12.0));
+    float block = step(0.78, pulse);
+
+    float shift = sin(uv.y * 280.0 + t * 11.0) * 0.005;
+    shift += block * 0.035 * sin(t * 4.0 + row * 0.6);
+
+    vec3 r = basePattern(uv + vec2(shift, 0.0), t);
+    vec3 g = basePattern(uv, t);
+    vec3 b = basePattern(uv - vec2(shift, 0.0), t);
+
+    float scan = 0.92 + 0.08 * sin((uv.y + t * 0.4) * 420.0);
+    vec3 outColor = vec3(r.r, g.g, b.b) * scan;
+
+    vec4 tex = texture2D(Texture, uv);
+    gl_FragColor = vec4(outColor * color.rgb, tex.a * color.a);
+}

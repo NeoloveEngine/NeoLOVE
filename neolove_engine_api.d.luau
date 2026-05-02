@@ -62,8 +62,8 @@ export type Entity = {
 	Listen: (self: Entity, event: EntityListenEvent | string, callback: (entity: Entity, event: EntityListenInfo) -> ()) -> Connection,
 	delete: (self: Entity) -> (),
 	Delete: (self: Entity) -> (),
-	addComponent: <T>(self: Entity, component: T) -> T,
-	AddComponent: <T>(self: Entity, component: T) -> T,
+	addComponent: (self: Entity, component: Component) -> ComponentInstance,
+	AddComponent: (self: Entity, component: Component) -> ComponentInstance,
 	removeComponent: (self: Entity, target: number | ComponentInstance) -> boolean,
 	RemoveComponent: (self: Entity, target: number | ComponentInstance) -> boolean,
 	duplicate: (self: Entity, parent: Entity?) -> Entity,
@@ -93,13 +93,19 @@ export type CollisionCallback = (
 	otherId: number
 ) -> ()
 
-export type ComponentInstance = {
-	entity: Entity?,
+export type Component = {
+	name: string?,
+	__neolove_component: string?,
 	awake: ((entity: Entity, component: ComponentInstance) -> ())?,
 	update: ((entity: Entity, component: ComponentInstance, dt: number) -> ())?,
 	destroy: ((entity: Entity, component: ComponentInstance) -> ())?,
 	onDestroy: ((entity: Entity, component: ComponentInstance) -> ())?,
 	NEOLOVE_RENDERING: boolean?,
+	[string]: any,
+}
+
+export type ComponentInstance = Component & {
+	entity: Entity?,
 	remove: (self: ComponentInstance) -> boolean,
 	Remove: (self: ComponentInstance) -> boolean,
 	getEntity: (self: ComponentInstance) -> Entity?,
@@ -350,7 +356,7 @@ export type EcsModule = {
 	duplicateEntity: (targetEntity: Entity, parent: Entity) -> Entity,
 	findFirstChild: (parent: Entity, name: string) -> Entity?,
 	root: Entity,
-	addComponent: <T>(entity: Entity, component: T) -> T,
+	addComponent: (entity: Entity, component: Component) -> ComponentInstance,
 	removeComponent: (entity: Entity, target: number | ComponentInstance) -> boolean,
 }
 
@@ -373,7 +379,7 @@ export type PrefabTemplate = {
 	scale: number?,
 	parent: PrefabTemplate?,
 	children: { PrefabTemplate }?,
-	components: { ComponentInstance }?,
+	components: { Component }?,
 	[string]: any,
 }
 
@@ -387,13 +393,70 @@ export type PrefabUiModule = {
 
 export type PrefabsModule = {
 	capture: (entity: Entity) -> PrefabTemplate,
-	component: <T>(source: T, overrides: { [string]: any }?) -> T,
+	component: <T>(source: T & Component, overrides: { [string]: any }?) -> T & Component,
 	register: (name: string, source: string | Entity | PrefabTemplate) -> PrefabTemplate,
 	get: (name: string) -> PrefabTemplate?,
 	remove: (name: string) -> boolean,
 	instantiate: (source: string | Entity | PrefabTemplate, parent: Entity?) -> Entity,
 	duplicate: (source: string | Entity | PrefabTemplate, parent: Entity?) -> Entity,
 	ui: PrefabUiModule,
+}
+
+export type EasingStyle =
+	"linear"
+	| "sine"
+	| "quad"
+	| "cubic"
+	| "quart"
+	| "quint"
+	| "expo"
+	| "circ"
+	| "back"
+	| "bounce"
+
+export type EasingDirection = "in" | "out" | "inOut" | "in_out"
+
+export type TweenHandle = {
+	id: number,
+	cancel: (self: TweenHandle) -> boolean,
+	Cancel: (self: TweenHandle) -> boolean,
+	isDone: (self: TweenHandle) -> boolean,
+	IsDone: (self: TweenHandle) -> boolean,
+}
+
+export type TweeningModule = {
+	to: (
+		target: { [any]: any },
+		key: any,
+		value: number,
+		duration: number,
+		style: EasingStyle?,
+		direction: EasingDirection?,
+		onComplete: (() -> ())?
+	) -> TweenHandle,
+	new: (
+		target: { [any]: any },
+		key: any,
+		value: number,
+		duration: number,
+		style: EasingStyle?,
+		direction: EasingDirection?,
+		onComplete: (() -> ())?
+	) -> TweenHandle,
+	create: (
+		target: { [any]: any },
+		key: any,
+		value: number,
+		duration: number,
+		style: EasingStyle?,
+		direction: EasingDirection?,
+		onComplete: (() -> ())?
+	) -> TweenHandle,
+	cancelAll: () -> number,
+	cancel_all: () -> number,
+	count: () -> number,
+	ease: (t: number, style: EasingStyle?, direction: EasingDirection?) -> number,
+	update: (dt: number) -> (),
 }
 
 export type BaseDrawableComponent = ComponentInstance & {
@@ -593,6 +656,8 @@ declare shaders: ShadersModule
 declare ecs: EcsModule
 declare prefabs: PrefabsModule
 declare prefab: PrefabsModule
+declare tweening: TweeningModule
+declare tween: TweeningModule
 declare transform: TransformModule
 declare transforms: TransformModule
 declare core: CoreModule

@@ -25,6 +25,8 @@ EM_JS(void, neolove_js_bootstrap, (), {
     charPressed: "",
     ctx: null,
     imageData: null,
+    overlayEl: null,
+    detailEl: null,
     statusEl: null,
     audio: {
       context: null,
@@ -40,7 +42,9 @@ EM_JS(void, neolove_js_bootstrap, (), {
   }
 
   module.canvas = canvas;
-  state.statusEl = document.getElementById("status");
+  state.overlayEl = document.getElementById("overlay");
+  state.detailEl = document.getElementById("detail");
+  state.statusEl = state.detailEl || document.getElementById("status");
   canvas.tabIndex = 0;
   canvas.style.outline = "none";
   canvas.style.touchAction = "none";
@@ -74,16 +78,22 @@ EM_JS(void, neolove_js_bootstrap, (), {
     existing.stopped = true;
     state.audio.active.delete(soundId);
     try {
-      existing.source.onended = null;
-      existing.source.stop();
+      if (existing.source) {
+        existing.source.onended = null;
+        existing.source.stop();
+      }
     } catch (_error) {
     }
     try {
-      existing.source.disconnect();
+      if (existing.source) {
+        existing.source.disconnect();
+      }
     } catch (_error) {
     }
     try {
-      existing.gain.disconnect();
+      if (existing.gain) {
+        existing.gain.disconnect();
+      }
     } catch (_error) {
     }
   };
@@ -155,17 +165,58 @@ EM_JS(void, neolove_js_bootstrap, (), {
     }
   };
 
+  const shouldAllowBrowserShortcut = (event) => {
+    const key = typeof event.key === "string" ? event.key.toLowerCase() : "";
+    if (key === "f12") {
+      return true;
+    }
+    const primaryModifier = event.ctrlKey || event.metaKey;
+    const secondaryModifier = event.shiftKey || event.altKey;
+    if (!primaryModifier || !secondaryModifier) {
+      return false;
+    }
+    return key === "i" || key === "j" || key === "c";
+  };
+
+  const shouldOpenBrowserContextMenu = (event) => {
+    return event.button === 2 && event.shiftKey;
+  };
+
   const syncCanvasSize = () => {
     const rect = canvas.getBoundingClientRect();
+    let logicalWidth = Math.max(rect.width, canvas.clientWidth, 1);
+    let logicalHeight = Math.max(rect.height, canvas.clientHeight, 1);
+    if (logicalWidth <= 1 && window.innerWidth > 1) {
+      logicalWidth = window.innerWidth;
+    }
+    if (logicalHeight <= 1 && window.innerHeight > 1) {
+      logicalHeight = window.innerHeight;
+    }
     const dpr = window.devicePixelRatio || 1;
-    const width = Math.max(1, Math.round(Math.max(rect.width, 1) * dpr));
-    const height = Math.max(1, Math.round(Math.max(rect.height, 1) * dpr));
+    const width = Math.max(1, Math.round(logicalWidth * dpr));
+    const height = Math.max(1, Math.round(logicalHeight * dpr));
     if (canvas.width !== width || canvas.height !== height) {
       canvas.width = width;
       canvas.height = height;
+      state.imageData = null;
+      if (state.ctx) {
+        state.ctx.imageSmoothingEnabled = false;
+      }
     }
     state.canvasWidth = canvas.width || width;
     state.canvasHeight = canvas.height || height;
+  };
+  module.neoloveSyncCanvasSize = syncCanvasSize;
+
+  const queueCanvasSizeRefresh = () => {
+    if (state.resizeRafQueued) {
+      return;
+    }
+    state.resizeRafQueued = true;
+    requestAnimationFrame(() => {
+      state.resizeRafQueued = false;
+      syncCanvasSize();
+    });
   };
 
   const updateMouse = (event) => {
@@ -178,10 +229,16 @@ EM_JS(void, neolove_js_bootstrap, (), {
 
   if (!state.initialized) {
     canvas.addEventListener("contextmenu", (event) => {
+      if (shouldOpenBrowserContextMenu(event)) {
+        return;
+      }
       event.preventDefault();
     });
 
     canvas.addEventListener("mousedown", (event) => {
+      if (shouldOpenBrowserContextMenu(event)) {
+        return;
+      }
       canvas.focus();
       updateMouse(event);
       const index = buttonIndex(event.button);
@@ -212,6 +269,9 @@ EM_JS(void, neolove_js_bootstrap, (), {
     }, { passive: false });
 
     window.addEventListener("keydown", (event) => {
+      if (shouldAllowBrowserShortcut(event)) {
+        return;
+      }
       const key = normalizeKey(event);
       if (!key) {
         return;
@@ -233,6 +293,9 @@ EM_JS(void, neolove_js_bootstrap, (), {
     });
 
     window.addEventListener("keyup", (event) => {
+      if (shouldAllowBrowserShortcut(event)) {
+        return;
+      }
       const key = normalizeKey(event);
       if (!key) {
         return;
@@ -245,10 +308,20 @@ EM_JS(void, neolove_js_bootstrap, (), {
     });
 
     window.addEventListener("resize", syncCanvasSize);
+    if (!state.resizeObserver && typeof ResizeObserver === "function") {
+      state.resizeObserver = new ResizeObserver(() => {
+        queueCanvasSizeRefresh();
+      });
+      state.resizeObserver.observe(canvas);
+      if (canvas.parentElement) {
+        state.resizeObserver.observe(canvas.parentElement);
+      }
+    }
     state.initialized = true;
   }
 
   syncCanvasSize();
+  queueCanvasSizeRefresh();
 
   if (state.statusEl) {
     state.statusEl.textContent = "Loading...";
@@ -257,10 +330,16 @@ EM_JS(void, neolove_js_bootstrap, (), {
 });
 
 EM_JS(int, neolove_js_canvas_width, (), {
+  if (Module.neoloveSyncCanvasSize) {
+    Module.neoloveSyncCanvasSize();
+  }
   return Module.neoloveState ? Module.neoloveState.canvasWidth : 1;
 });
 
 EM_JS(int, neolove_js_canvas_height, (), {
+  if (Module.neoloveSyncCanvasSize) {
+    Module.neoloveSyncCanvasSize();
+  }
   return Module.neoloveState ? Module.neoloveState.canvasHeight : 1;
 });
 
@@ -368,33 +447,309 @@ EM_JS(void, neolove_js_present_rgba, (const uint8_t* pixels, int width, int heig
   if (!state) {
     return;
   }
+  if (Module.neoloveSyncCanvasSize) {
+    Module.neoloveSyncCanvasSize();
+  }
   const canvas = Module.canvas;
   if (!canvas) {
     return;
   }
   if (!state.ctx) {
-    state.ctx = canvas.getContext("2d", { alpha: true, desynchronized: true });
+    state.ctx = canvas.getContext("2d", { alpha: false }) || canvas.getContext("2d");
     if (state.ctx) {
       state.ctx.imageSmoothingEnabled = false;
     }
   }
   if (!state.ctx) {
+    if (!state.debugMissingContextLogged) {
+      state.debugMissingContextLogged = true;
+      console.warn("[NeoLOVE debug] failed to acquire a 2D canvas context");
+    }
     return;
   }
   if (!state.imageData || state.imageData.width !== width || state.imageData.height !== height) {
     state.imageData = state.ctx.createImageData(width, height);
   }
-  const view = HEAPU8.subarray(pixels, pixels + width * height * 4);
-  state.imageData.data.set(view);
-  state.ctx.putImageData(state.imageData, 0, 0);
+  const expectedBytes = width * height * 4;
+  const view = HEAPU8.subarray(pixels, pixels + expectedBytes);
+  state.presentCount = (state.presentCount || 0) + 1;
+  if (state.presentCount <= 5) {
+    const centerPixel = Math.max(
+      0,
+      ((Math.floor(height / 2) * width + Math.floor(width / 2)) * 4)
+    );
+    console.warn("[NeoLOVE debug] present frame", {
+      frame: state.presentCount,
+      renderWidth: width,
+      renderHeight: height,
+      canvasWidth: canvas.width,
+      canvasHeight: canvas.height,
+      clientWidth: canvas.clientWidth,
+      clientHeight: canvas.clientHeight,
+      bytesExpected: expectedBytes,
+      bytesReceived: view.length,
+      firstPixel: Array.from(view.subarray(0, Math.min(4, view.length))),
+      centerPixel: Array.from(view.subarray(centerPixel, Math.min(centerPixel + 4, view.length)))
+    });
+  }
+  try {
+    state.imageData.data.set(view);
+    state.ctx.putImageData(state.imageData, 0, 0);
+  } catch (error) {
+    console.warn("[NeoLOVE debug] putImageData failed", error);
+  }
+});
+
+EM_JS(void, neolove_js_draw_text, (
+  const char* message,
+  float x,
+  float y,
+  float w,
+  float h,
+  float rotation,
+  float pivot_x,
+  float pivot_y,
+  int r,
+  int g,
+  int b,
+  int a,
+  float scale,
+  float min_scale,
+  int align_x,
+  int align_y,
+  int text_scale,
+  int wrap,
+  float padding_x,
+  float padding_y,
+  float line_spacing,
+  float letter_spacing,
+  int font_kind
+), {
+  const state = Module.neoloveState;
+  if (!state || !Module.canvas) {
+    return;
+  }
+  if (!state.ctx) {
+    state.ctx = Module.canvas.getContext("2d", { alpha: false }) || Module.canvas.getContext("2d");
+    if (state.ctx) {
+      state.ctx.imageSmoothingEnabled = false;
+    }
+  }
+  const ctx = state.ctx;
+  if (!ctx) {
+    return;
+  }
+
+  const text = UTF8ToString(message);
+  if (!text || !text.length || a <= 0) {
+    return;
+  }
+
+  const paddingX = Math.max(0, padding_x);
+  const paddingY = Math.max(0, padding_y);
+  const preferredScale = Math.max(1, scale);
+  const minimumScale = Math.max(1, Math.min(min_scale, preferredScale));
+  const effectiveLineSpacing = Math.max(0.1, line_spacing);
+  const widthLimit = w > 0 ? Math.max(0, w - paddingX * 2) : null;
+  const heightLimit = h > 0 ? Math.max(0, h - paddingY * 2) : null;
+  const activeWrap = widthLimit !== null && wrap !== 0 ? wrap : 0;
+  const family = font_kind === 0 ? "monospace" : "sans-serif";
+  const safeLetterSpacing = Number.isFinite(letter_spacing) ? letter_spacing : 0;
+
+  const setFont = (px) => {
+    ctx.font = `${Math.max(1, px)}px ${family}`;
+  };
+
+  const measureLine = (line) => {
+    const textValue = String(line || "");
+    if (!textValue.length) {
+      return 0;
+    }
+    const glyphs = Array.from(textValue);
+    let width = 0;
+    for (let i = 0; i < glyphs.length; i += 1) {
+      if (i > 0) {
+        width += safeLetterSpacing;
+      }
+      width += ctx.measureText(glyphs[i]).width;
+    }
+    return width;
+  };
+
+  const wrapParagraphChar = (paragraph, limit) => {
+    if (!(limit > 0)) {
+      return [paragraph];
+    }
+    const chars = Array.from(paragraph);
+    const lines = [];
+    let current = "";
+    for (const ch of chars) {
+      const candidate = current + ch;
+      if (current && measureLine(candidate) > limit + 0.5) {
+        lines.push(current);
+        current = ch;
+      } else {
+        current = candidate;
+      }
+    }
+    if (current.length || lines.length === 0) {
+      lines.push(current);
+    }
+    return lines;
+  };
+
+  const wrapParagraphWord = (paragraph, limit) => {
+    if (!(limit > 0)) {
+      return [paragraph];
+    }
+    const trimmed = paragraph.trim();
+    if (!trimmed.length) {
+      return [""];
+    }
+    const words = trimmed.split(" ").filter((part) => part.length > 0);
+    const lines = [];
+    let current = "";
+    for (const word of words) {
+      const candidate = current ? `${current} ${word}` : word;
+      if (!current || measureLine(candidate) <= limit + 0.5) {
+        current = candidate;
+        continue;
+      }
+      if (measureLine(word) > limit + 0.5) {
+        if (current) {
+          lines.push(current);
+          current = "";
+        }
+        const fragments = wrapParagraphChar(word, limit);
+        for (let index = 0; index < fragments.length - 1; index += 1) {
+          lines.push(fragments[index]);
+        }
+        current = fragments[fragments.length - 1] || "";
+      } else {
+        lines.push(current);
+        current = word;
+      }
+    }
+    if (current.length || lines.length === 0) {
+      lines.push(current);
+    }
+    return lines;
+  };
+
+  const layoutForScale = (px) => {
+    setFont(px);
+    const paragraphs = String(text).split("\n");
+    const lines = [];
+    for (const paragraph of paragraphs) {
+      let wrapped;
+      if (activeWrap === 1) {
+        wrapped = wrapParagraphWord(paragraph, widthLimit);
+      } else if (activeWrap === 2) {
+        wrapped = wrapParagraphChar(paragraph, widthLimit);
+      } else {
+        wrapped = [paragraph];
+      }
+      for (const line of wrapped) {
+        lines.push({ text: line, width: measureLine(line) });
+      }
+    }
+    const lineHeight = Math.max(1, px * effectiveLineSpacing);
+    const blockWidth = lines.reduce((maxWidth, line) => Math.max(maxWidth, line.width), 0);
+    const blockHeight = lines.length > 0 ? px + lineHeight * (lines.length - 1) : 0;
+    return { lines, lineHeight, blockWidth, blockHeight, px };
+  };
+
+  const fits = (layout) => {
+    switch (text_scale | 0) {
+      case 1:
+        return (widthLimit === null || layout.blockWidth <= widthLimit + 0.5) &&
+               (heightLimit === null || layout.blockHeight <= heightLimit + 0.5);
+      case 2:
+        return widthLimit === null || layout.blockWidth <= widthLimit + 0.5;
+      case 3:
+        return heightLimit === null || layout.blockHeight <= heightLimit + 0.5;
+      default:
+        return true;
+    }
+  };
+
+  let layout = layoutForScale(preferredScale);
+  let usedScale = preferredScale;
+  if ((text_scale | 0) !== 0 && (widthLimit !== null || heightLimit !== null) && !fits(layout)) {
+    let low = minimumScale;
+    let high = preferredScale;
+    let bestScale = minimumScale;
+    let bestLayout = layoutForScale(minimumScale);
+    if (fits(bestLayout)) {
+      for (let i = 0; i < 10; i += 1) {
+        const mid = (low + high) * 0.5;
+        const candidate = layoutForScale(mid);
+        if (fits(candidate)) {
+          bestScale = mid;
+          bestLayout = candidate;
+          low = mid;
+        } else {
+          high = mid;
+        }
+      }
+    }
+    usedScale = bestScale;
+    layout = bestLayout;
+  }
+
+  ctx.save();
+  setFont(usedScale);
+  ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${Math.max(0, Math.min(1, a / 255))})`;
+  ctx.textBaseline = "top";
+  ctx.textAlign = "left";
+  ctx.imageSmoothingEnabled = false;
+
+  if (rotation !== 0) {
+    ctx.translate(pivot_x, pivot_y);
+    ctx.rotate(rotation);
+    ctx.translate(-pivot_x, -pivot_y);
+  }
+
+  if (w > 0 && h > 0) {
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    ctx.clip();
+  }
+
+  const contentWidth = widthLimit !== null ? widthLimit : layout.blockWidth;
+  const contentHeight = heightLimit !== null ? heightLimit : layout.blockHeight;
+  const originX = x + paddingX;
+  const originY = y + paddingY;
+  const startY = originY + Math.max(0, (
+    align_y === 1 ? (contentHeight - layout.blockHeight) * 0.5 :
+    align_y === 2 ? (contentHeight - layout.blockHeight) :
+    0
+  ));
+
+  for (let index = 0; index < layout.lines.length; index += 1) {
+    const line = layout.lines[index];
+    const lineX = originX + Math.max(0, (
+      align_x === 1 ? (contentWidth - line.width) * 0.5 :
+      align_x === 2 ? (contentWidth - line.width) :
+      0
+    ));
+    const lineY = startY + layout.lineHeight * index;
+    ctx.fillText(line.text, lineX, lineY);
+  }
+
+  ctx.restore();
 });
 
 EM_JS(void, neolove_js_report_status, (const char* message, int is_error), {
   const text = UTF8ToString(message);
   const state = Module.neoloveState;
-  if (state && state.statusEl) {
-    state.statusEl.textContent = text;
-    state.statusEl.dataset.state = is_error ? "error" : "info";
+  if (state) {
+    if (state.statusEl) {
+      state.statusEl.textContent = text;
+    }
+    if (state.overlayEl) {
+      state.overlayEl.dataset.state = is_error ? "error" : "info";
+    }
   }
   if (is_error) {
     console.error(text);
@@ -403,20 +758,26 @@ EM_JS(void, neolove_js_report_status, (const char* message, int is_error), {
   }
 });
 
+EM_JS(void, neolove_js_debug_log, (const char* message), {
+  console.warn("[NeoLOVE debug]", UTF8ToString(message));
+});
+
 EM_JS(void, neolove_js_mark_ready, (), {
   const state = Module.neoloveState;
-  if (state && state.statusEl) {
-    state.statusEl.textContent = "";
-    state.statusEl.dataset.state = "ready";
+  if (state) {
+    if (state.statusEl) {
+      state.statusEl.textContent = "";
+    }
+    if (state.overlayEl) {
+      state.overlayEl.dataset.state = "ready";
+    }
   }
 });
 
 EM_JS(int, neolove_js_audio_play, (
   int sound_id,
-  const float* samples,
-  int samples_len,
-  int sample_rate,
-  int channels,
+  const uint8_t* bytes,
+  int bytes_len,
   int looped,
   float volume
 ), {
@@ -429,64 +790,78 @@ EM_JS(int, neolove_js_audio_play, (
     const context = Module.neoloveEnsureAudioContext();
     Module.neoloveStopAudioInstance(sound_id);
 
-    if (channels <= 0) {
-      throw new Error("sound must have at least one channel");
-    }
-    if (samples_len <= 0) {
-      throw new Error("sound has no samples");
-    }
-    if (samples_len % channels !== 0) {
-      throw new Error("sound sample buffer length must be a multiple of channels");
+    if (bytes_len <= 0) {
+      throw new Error("sound has no encoded bytes");
     }
 
-    const frameCount = samples_len / channels;
-    const sourceSamples = HEAPF32.subarray(samples >> 2, (samples >> 2) + samples_len);
-    const audioBuffer = context.createBuffer(channels, frameCount, Math.max(1, sample_rate));
-    for (let channel = 0; channel < channels; channel += 1) {
-      const channelData = audioBuffer.getChannelData(channel);
-      for (let frame = 0, index = channel; frame < frameCount; frame += 1, index += channels) {
-        channelData[frame] = sourceSamples[index];
-      }
-    }
-
-    const gain = context.createGain();
-    gain.gain.value = Math.min(1, Math.max(0, volume));
-    gain.connect(context.destination);
-
-    const source = context.createBufferSource();
-    source.buffer = audioBuffer;
-    source.loop = !!looped;
-    source.connect(gain);
+    const encodedBytes = new Uint8Array(bytes_len);
+    encodedBytes.set(HEAPU8.subarray(bytes, bytes + bytes_len));
 
     const entry = {
-      source,
-      gain,
-      stopped: false
+      source: null,
+      gain: null,
+      stopped: false,
+      started: false
     };
-    source.onended = () => {
+    const cleanupEntry = () => {
       const current = state.audio.active.get(sound_id);
       if (current !== entry) {
         return;
       }
       state.audio.active.delete(sound_id);
       try {
-        source.disconnect();
+        if (entry.source) {
+          entry.source.disconnect();
+        }
       } catch (_error) {
       }
       try {
-        gain.disconnect();
+        if (entry.gain) {
+          entry.gain.disconnect();
+        }
       } catch (_error) {
       }
     };
 
     state.audio.active.set(sound_id, entry);
-    if (context.state === "suspended") {
-      const promise = context.resume();
-      if (promise && typeof promise.catch === "function") {
-        promise.catch(Module.neoloveSetAudioError);
-      }
-    }
-    source.start(0);
+    const resumePromise = context.state === "running"
+      ? Promise.resolve()
+      : context.resume();
+    const decodePromise = context.decodeAudioData(encodedBytes.buffer.slice(0));
+
+    Promise.all([resumePromise, decodePromise])
+      .then((results) => {
+        const audioBuffer = results[1];
+        if (entry.stopped) {
+          cleanupEntry();
+          return;
+        }
+        if (context.state !== "running") {
+          throw new Error(`AudioContext state is '${context.state}' after resume`);
+        }
+
+        const gain = context.createGain();
+        gain.gain.value = Math.min(1, Math.max(0, volume));
+        gain.connect(context.destination);
+
+        const source = context.createBufferSource();
+        source.buffer = audioBuffer;
+        source.loop = !!looped;
+        source.connect(gain);
+        source.onended = () => {
+          cleanupEntry();
+        };
+
+        entry.gain = gain;
+        entry.source = source;
+        source.start(0);
+        entry.started = true;
+      })
+      .catch((error) => {
+        cleanupEntry();
+        Module.neoloveSetAudioError(error);
+      });
+
     return 1;
   } catch (error) {
     Module.neoloveSetAudioError(error);
@@ -598,6 +973,56 @@ void neolove_web_present_rgba(const uint8_t* pixels, int width, int height) {
   neolove_js_present_rgba(pixels, width, height);
 }
 
+void neolove_web_draw_text(
+    const char* message,
+    float x,
+    float y,
+    float w,
+    float h,
+    float rotation,
+    float pivot_x,
+    float pivot_y,
+    int r,
+    int g,
+    int b,
+    int a,
+    float scale,
+    float min_scale,
+    int align_x,
+    int align_y,
+    int text_scale,
+    int wrap,
+    float padding_x,
+    float padding_y,
+    float line_spacing,
+    float letter_spacing,
+    int font_kind) {
+  neolove_js_draw_text(
+      message,
+      x,
+      y,
+      w,
+      h,
+      rotation,
+      pivot_x,
+      pivot_y,
+      r,
+      g,
+      b,
+      a,
+      scale,
+      min_scale,
+      align_x,
+      align_y,
+      text_scale,
+      wrap,
+      padding_x,
+      padding_y,
+      line_spacing,
+      letter_spacing,
+      font_kind);
+}
+
 void neolove_web_report_status(const char* message) {
   neolove_js_report_status(message, 0);
 }
@@ -606,24 +1031,24 @@ void neolove_web_report_error(const char* message) {
   neolove_js_report_status(message, 1);
 }
 
+void neolove_web_debug_log(const char* message) {
+  neolove_js_debug_log(message);
+}
+
 void neolove_web_mark_ready(void) {
   neolove_js_mark_ready();
 }
 
 int neolove_web_audio_play(
     int sound_id,
-    const float* samples,
-    int samples_len,
-    int sample_rate,
-    int channels,
+    const uint8_t* bytes,
+    int bytes_len,
     int looped,
     float volume) {
   return neolove_js_audio_play(
       sound_id,
-      samples,
-      samples_len,
-      sample_rate,
-      channels,
+      bytes,
+      bytes_len,
       looped,
       volume);
 }

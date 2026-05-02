@@ -1,4 +1,4 @@
-use crate::platform::SharedPlatformState;
+use crate::platform::{lock_platform_state, SharedPlatformState};
 use mlua::Lua;
 
 pub(crate) fn normalize_name(name: &str) -> String {
@@ -17,9 +17,7 @@ pub(crate) fn add_user_input_module(lua: &Lua, platform: SharedPlatformState) ->
             "isKeyDown",
             lua.create_function(move |_lua, key: String| {
                 let key = normalize_name(&key);
-                let platform = platform
-                    .lock()
-                    .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+                let platform = lock_platform_state(&platform);
                 Ok(platform.input().keys_down.contains(&key))
             })?,
         )?;
@@ -31,9 +29,7 @@ pub(crate) fn add_user_input_module(lua: &Lua, platform: SharedPlatformState) ->
             "isKeyPressed",
             lua.create_function(move |_lua, key: String| {
                 let key = normalize_name(&key);
-                let platform = platform
-                    .lock()
-                    .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+                let platform = lock_platform_state(&platform);
                 Ok(platform.input().keys_pressed.contains(&key))
             })?,
         )?;
@@ -45,9 +41,7 @@ pub(crate) fn add_user_input_module(lua: &Lua, platform: SharedPlatformState) ->
             "isKeyReleased",
             lua.create_function(move |_lua, key: String| {
                 let key = normalize_name(&key);
-                let platform = platform
-                    .lock()
-                    .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+                let platform = lock_platform_state(&platform);
                 Ok(platform.input().keys_released.contains(&key))
             })?,
         )?;
@@ -59,9 +53,7 @@ pub(crate) fn add_user_input_module(lua: &Lua, platform: SharedPlatformState) ->
             "isMouseDown",
             lua.create_function(move |_lua, button: Option<String>| {
                 let button = normalize_name(button.as_deref().unwrap_or("left"));
-                let platform = platform
-                    .lock()
-                    .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+                let platform = lock_platform_state(&platform);
                 Ok(platform.input().mouse_down.contains(&button))
             })?,
         )?;
@@ -73,9 +65,7 @@ pub(crate) fn add_user_input_module(lua: &Lua, platform: SharedPlatformState) ->
             "isMousePressed",
             lua.create_function(move |_lua, button: Option<String>| {
                 let button = normalize_name(button.as_deref().unwrap_or("left"));
-                let platform = platform
-                    .lock()
-                    .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+                let platform = lock_platform_state(&platform);
                 Ok(platform.input().mouse_pressed.contains(&button))
             })?,
         )?;
@@ -87,9 +77,7 @@ pub(crate) fn add_user_input_module(lua: &Lua, platform: SharedPlatformState) ->
             "isMouseReleased",
             lua.create_function(move |_lua, button: Option<String>| {
                 let button = normalize_name(button.as_deref().unwrap_or("left"));
-                let platform = platform
-                    .lock()
-                    .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+                let platform = lock_platform_state(&platform);
                 Ok(platform.input().mouse_released.contains(&button))
             })?,
         )?;
@@ -100,9 +88,7 @@ pub(crate) fn add_user_input_module(lua: &Lua, platform: SharedPlatformState) ->
         input.set(
             "getMouseWheel",
             lua.create_function(move |_lua, ()| {
-                let platform = platform
-                    .lock()
-                    .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+                let platform = lock_platform_state(&platform);
                 Ok((platform.input().wheel_x, platform.input().wheel_y))
             })?,
         )?;
@@ -113,9 +99,7 @@ pub(crate) fn add_user_input_module(lua: &Lua, platform: SharedPlatformState) ->
         input.set(
             "isScrollingIn",
             lua.create_function(move |_lua, ()| {
-                let platform = platform
-                    .lock()
-                    .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+                let platform = lock_platform_state(&platform);
                 Ok(platform.input().wheel_y > 0.0)
             })?,
         )?;
@@ -126,9 +110,7 @@ pub(crate) fn add_user_input_module(lua: &Lua, platform: SharedPlatformState) ->
         input.set(
             "isScrollingOut",
             lua.create_function(move |_lua, ()| {
-                let platform = platform
-                    .lock()
-                    .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+                let platform = lock_platform_state(&platform);
                 Ok(platform.input().wheel_y < 0.0)
             })?,
         )?;
@@ -139,9 +121,7 @@ pub(crate) fn add_user_input_module(lua: &Lua, platform: SharedPlatformState) ->
         input.set(
             "getScrollInAmount",
             lua.create_function(move |_lua, ()| {
-                let platform = platform
-                    .lock()
-                    .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+                let platform = lock_platform_state(&platform);
                 Ok(platform.input().wheel_y)
             })?,
         )?;
@@ -152,9 +132,7 @@ pub(crate) fn add_user_input_module(lua: &Lua, platform: SharedPlatformState) ->
         input.set(
             "getMouseDelta",
             lua.create_function(move |_lua, ()| {
-                let platform = platform
-                    .lock()
-                    .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+                let platform = lock_platform_state(&platform);
                 let mouse = platform.mouse();
                 Ok((mouse.delta_x, mouse.delta_y))
             })?,
@@ -166,9 +144,7 @@ pub(crate) fn add_user_input_module(lua: &Lua, platform: SharedPlatformState) ->
         input.set(
             "setMouseLocked",
             lua.create_function(move |_lua, locked: bool| {
-                let mut platform = platform
-                    .lock()
-                    .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+                let mut platform = lock_platform_state(&platform);
                 platform.input_mut().mouse_locked = locked;
                 Ok(())
             })?,
@@ -180,9 +156,7 @@ pub(crate) fn add_user_input_module(lua: &Lua, platform: SharedPlatformState) ->
         input.set(
             "isMouseLocked",
             lua.create_function(move |_lua, ()| {
-                let platform = platform
-                    .lock()
-                    .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+                let platform = lock_platform_state(&platform);
                 Ok(platform.input().mouse_locked)
             })?,
         )?;
@@ -193,9 +167,7 @@ pub(crate) fn add_user_input_module(lua: &Lua, platform: SharedPlatformState) ->
         input.set(
             "getLastKeyPressed",
             lua.create_function(move |_lua, ()| {
-                let platform = platform
-                    .lock()
-                    .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+                let platform = lock_platform_state(&platform);
                 Ok(platform.input().last_key_pressed.clone())
             })?,
         )?;
@@ -206,9 +178,7 @@ pub(crate) fn add_user_input_module(lua: &Lua, platform: SharedPlatformState) ->
         input.set(
             "getCharPressed",
             lua.create_function(move |_lua, ()| {
-                let platform = platform
-                    .lock()
-                    .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+                let platform = lock_platform_state(&platform);
                 Ok(platform.input().char_pressed.clone())
             })?,
         )?;

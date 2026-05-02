@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>dodge</title>
+  <title>shaders</title>
   <link rel="icon" href="data:,">
   <style>
     :root {
@@ -25,18 +25,18 @@
       font: 400 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
     }
     body {
-      position: relative;
+      display: grid;
+      place-items: center;
     }
     .shell {
-      position: fixed;
-      inset: 0;
-    }
-    canvas {
-      position: absolute;
-      inset: 0;
+      position: relative;
       width: 100%;
       height: 100%;
+    }
+    canvas {
       display: block;
+      width: 100%;
+      height: 100%;
       image-rendering: pixelated;
       image-rendering: crisp-edges;
       background: transparent;
@@ -300,23 +300,9 @@
         event.stopImmediatePropagation();
       }, { capture: true });
 
-      window.addEventListener("error", (event) => {
-        console.warn("[NeoLOVE debug] window error", event.message || event.error || event);
-      });
-
-      window.addEventListener("unhandledrejection", (event) => {
-        console.warn("[NeoLOVE debug] unhandled rejection", event.reason || event);
-      });
-
       window.Module = {
         locateFile(path) {
           return path;
-        },
-        monitorRunDependencies(count) {
-          console.warn("[NeoLOVE debug] run dependencies", count);
-        },
-        onRuntimeInitialized() {
-          console.warn("[NeoLOVE debug] runtime initialized");
         },
         setStatus(text) {
           updateFromStatus(text);
@@ -337,7 +323,6 @@
       script.src = "neolove.js";
       script.async = true;
       script.onload = () => {
-        console.warn("[NeoLOVE debug] neolove.js loaded");
         if (bindVisibleStatusTarget()) {
           return;
         }

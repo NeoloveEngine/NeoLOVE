@@ -12,6 +12,7 @@ mod prefabs;
 mod renderer;
 mod servers;
 mod shader;
+mod tweening;
 mod user_input;
 pub mod window;
 
@@ -873,6 +874,13 @@ fn find_emsdk_node(root: &Path) -> Result<PathBuf, String> {
 fn apply_emsdk_env(command: &mut std::process::Command, root: &Path) -> Result<(), String> {
     let emcc_dir = root.join("upstream").join("emscripten");
     let node_path = find_emsdk_node(root)?;
+    let em_cache = std::env::temp_dir().join("neolove-emscripten-cache");
+    fs::create_dir_all(&em_cache).map_err(|e| {
+        format!(
+            "failed to create writable emscripten cache directory {}: {e}",
+            em_cache.display()
+        )
+    })?;
 
     let mut paths = vec![root.to_path_buf(), emcc_dir];
     if let Some(existing) = env::var_os("PATH") {
@@ -883,6 +891,7 @@ fn apply_emsdk_env(command: &mut std::process::Command, root: &Path) -> Result<(
 
     command.env("EMSDK", root);
     command.env("EMSDK_NODE", node_path);
+    command.env("EM_CACHE", em_cache);
     command.env("PATH", joined);
     Ok(())
 }
@@ -1054,82 +1063,358 @@ fn webasm_index_html(project_root: &Path) -> String {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{title}</title>
+  <link rel="icon" href="data:,">
   <style>
+    :root {{
+      color-scheme: dark;
+      --bg: #0b0b0b;
+      --track: #242424;
+      --fill: #f2f2f2;
+      --text: #f5f5f5;
+      --muted: #9a9a9a;
+      --danger: #ff8a8a;
+    }}
     html, body {{
       margin: 0;
       width: 100%;
       height: 100%;
       overflow: hidden;
-      background: #0e1116;
-      color: #e8ecf1;
-      font: 14px/1.4 "Trebuchet MS", "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font: 400 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
     }}
     body {{
-      display: grid;
-      place-items: stretch;
+      position: relative;
     }}
     .shell {{
-      position: relative;
-      width: 100%;
-      height: 100%;
-      background:
-        radial-gradient(circle at top, rgba(102, 164, 255, 0.16), transparent 40%),
-        linear-gradient(180deg, #111926 0%, #090c11 100%);
+      position: fixed;
+      inset: 0;
     }}
     canvas {{
-      display: block;
+      position: absolute;
+      inset: 0;
       width: 100%;
       height: 100%;
+      display: block;
       image-rendering: pixelated;
       image-rendering: crisp-edges;
-      cursor: crosshair;
+      background: transparent;
     }}
-    #status {{
+    .overlay {{
       position: absolute;
-      left: 16px;
-      bottom: 16px;
-      margin: 0;
-      max-width: min(720px, calc(100% - 32px));
-      padding: 10px 12px;
-      border-radius: 12px;
-      background: rgba(6, 9, 14, 0.68);
-      backdrop-filter: blur(10px);
-      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
-      white-space: pre-wrap;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      transition:
+        opacity 360ms ease,
+        visibility 360ms ease;
+      pointer-events: none;
     }}
-    #status[data-state="ready"] {{
+    .overlay[data-state="ready"] {{
+      opacity: 0;
+      visibility: hidden;
+    }}
+    .panel {{
+      width: min(320px, calc(100vw - 48px));
+    }}
+    h1 {{
+      margin: 0 0 18px;
+      text-align: center;
+      font-size: clamp(20px, 3vw, 24px);
+      line-height: 1.1;
+      font-weight: 500;
+    }}
+    .meter {{
+      position: relative;
+      height: 4px;
+      margin: 0;
+      border-radius: 999px;
+      overflow: hidden;
+      background: var(--track);
+    }}
+    .meter-fill {{
+      width: calc(var(--progress, 0) * 1%);
+      height: 100%;
+      border-radius: inherit;
+      background: var(--fill);
+      transition: width 220ms ease;
+    }}
+    .status {{
       display: none;
     }}
-    #status[data-state="error"] {{
-      color: #ffb3b3;
-      border: 1px solid rgba(255, 99, 99, 0.35);
+    .detail {{
+      margin: 12px 0 0;
+      min-height: 1.4em;
+      color: var(--muted);
+      text-align: center;
+      font-size: 12px;
+      white-space: pre-wrap;
+    }}
+    .overlay[data-state="error"] .detail,
+    .overlay[data-state="file"] .detail,
+    .overlay[data-state="error"] .hint,
+    .overlay[data-state="file"] .hint {{
+      color: var(--danger);
+    }}
+    .hint {{
+      margin: 12px 0 0;
+      color: var(--muted);
+      text-align: center;
+      font-size: 12px;
+      line-height: 1.5;
+    }}
+    .hint code {{
+      display: inline-block;
+      margin-top: 8px;
+      padding: 0;
+      background: transparent;
+      color: var(--text);
+      font: 400 12px/1.4 ui-monospace, "SFMono-Regular", "Cascadia Code", "Source Code Pro", Consolas, monospace;
     }}
   </style>
 </head>
 <body>
   <div class="shell">
     <canvas id="canvas"></canvas>
-    <p id="status" data-state="loading">Loading...</p>
+    <div class="overlay" id="overlay" data-state="loading" style="--progress: 8">
+      <section class="panel" aria-live="polite">
+        <h1>Loading</h1>
+        <p class="status" id="status">Starting loader...</p>
+        <div class="meter" aria-hidden="true">
+          <div class="meter-fill"></div>
+        </div>
+        <p class="detail" id="detail"></p>
+        <p class="hint" id="hint" hidden></p>
+      </section>
+    </div>
   </div>
   <script>
-    window.Module = {{
-      locateFile(path) {{
-        return path;
-      }},
-      print(text) {{
-        console.log(text);
-      }},
-      printErr(text) {{
-        console.error(text);
-        const status = document.getElementById("status");
-        if (status && !status.textContent) {{
-          status.textContent = String(text);
-          status.dataset.state = "info";
+    (() => {{
+      const overlay = document.getElementById("overlay");
+      const status = document.getElementById("status");
+      const detail = document.getElementById("detail");
+      const hint = document.getElementById("hint");
+
+      function clampProgress(value) {{
+        return Math.max(0, Math.min(100, Math.round(value)));
+      }}
+
+      function setOverlayState(nextState) {{
+        if (overlay) {{
+          overlay.dataset.state = nextState;
         }}
       }}
-    }};
+
+      function setProgress(value) {{
+        if (!overlay) {{
+          return;
+        }}
+        const safe = clampProgress(value);
+        overlay.style.setProperty("--progress", String(safe));
+      }}
+
+      function setMessage(primary, secondary, state) {{
+        if (state) {{
+          setOverlayState(state);
+        }}
+        if (status) {{
+          status.textContent = primary;
+        }}
+        if (detail) {{
+          detail.textContent = secondary || "";
+        }}
+      }}
+
+      function setHint(html) {{
+        if (!hint) {{
+          return;
+        }}
+        if (!html) {{
+          hint.hidden = true;
+          hint.innerHTML = "";
+          return;
+        }}
+        hint.hidden = false;
+        hint.innerHTML = html;
+      }}
+
+      function bindVisibleStatusTarget() {{
+        if (!window.Module || !Module.neoloveState || !detail) {{
+          return false;
+        }}
+        Module.neoloveState.overlayEl = overlay;
+        Module.neoloveState.detailEl = detail;
+        Module.neoloveState.statusEl = detail;
+        return true;
+      }}
+
+      if (detail && overlay) {{
+        const syncVisibleState = () => {{
+          const state = detail.dataset.state;
+          if (!state) {{
+            return;
+          }}
+          overlay.dataset.state = state;
+        }};
+        new MutationObserver(syncVisibleState).observe(detail, {{
+          attributes: true,
+          attributeFilter: ["data-state"]
+        }});
+      }}
+
+      function updateFromStatus(text) {{
+        const message = String(text || "").trim();
+        if (!message) {{
+          setOverlayState("ready");
+          setProgress(100);
+          setHint("");
+          return;
+        }}
+
+        const progressMatch = message.match(/\((\d+)\s*\/\s*(\d+)\)/);
+        if (progressMatch) {{
+          const loaded = Number(progressMatch[1]);
+          const total = Number(progressMatch[2]);
+          if (Number.isFinite(loaded) && Number.isFinite(total) && total > 0) {{
+            const ratio = (loaded / total) * 100;
+            setProgress(Math.max(12, ratio));
+            setMessage("Streaming project data", "", "loading");
+            return;
+          }}
+        }}
+
+        if (message.includes("Running")) {{
+          setProgress(96);
+          setMessage("Launching game", "", "loading");
+          return;
+        }}
+
+        if (message.includes("Loading")) {{
+          setProgress(18);
+          setMessage("Loading runtime", "", "loading");
+          return;
+        }}
+
+        setMessage(message, "", "info");
+      }}
+
+      setMessage("Starting loader...", "", "loading");
+      setProgress(8);
+
+      if (window.location.protocol === "file:") {{
+        setOverlayState("file");
+        setProgress(100);
+        setMessage(
+          "This build cannot run from `file://`.",
+          "Browsers block `neolove.wasm` and `neolove.data` when the page is opened directly from disk."
+        );
+        setHint("Serve this folder over HTTP, for example:<br><code>cd dist/webasm && python3 -m http.server 8000</code><br>Then open <code>http://localhost:8000</code>.");
+        return;
+      }}
+
+      function isDevToolsShortcut(event) {{
+        const key = typeof event.key === "string" ? event.key.toLowerCase() : "";
+        if (key === "f12") {{
+          return true;
+        }}
+        const primaryModifier = event.ctrlKey || event.metaKey;
+        const secondaryModifier = event.shiftKey || event.altKey;
+        if (!primaryModifier || !secondaryModifier) {{
+          return false;
+        }}
+        return key === "i" || key === "j" || key === "c";
+      }}
+
+      window.addEventListener("keydown", (event) => {{
+        if (!isDevToolsShortcut(event)) {{
+          return;
+        }}
+        event.stopImmediatePropagation();
+      }}, {{ capture: true }});
+
+      window.addEventListener("keyup", (event) => {{
+        if (!isDevToolsShortcut(event)) {{
+          return;
+        }}
+        event.stopImmediatePropagation();
+      }}, {{ capture: true }});
+
+      document.addEventListener("mousedown", (event) => {{
+        if (!(event.target instanceof HTMLCanvasElement)) {{
+          return;
+        }}
+        if (event.button !== 2 || !event.shiftKey) {{
+          return;
+        }}
+        event.stopImmediatePropagation();
+      }}, {{ capture: true }});
+
+      document.addEventListener("contextmenu", (event) => {{
+        if (!(event.target instanceof HTMLCanvasElement)) {{
+          return;
+        }}
+        if (!event.shiftKey) {{
+          return;
+        }}
+        event.stopImmediatePropagation();
+      }}, {{ capture: true }});
+
+      window.addEventListener("error", (event) => {{
+        console.warn("[NeoLOVE debug] window error", event.message || event.error || event);
+      }});
+
+      window.addEventListener("unhandledrejection", (event) => {{
+        console.warn("[NeoLOVE debug] unhandled rejection", event.reason || event);
+      }});
+
+      window.Module = {{
+        locateFile(path) {{
+          return path;
+        }},
+        monitorRunDependencies(count) {{
+          console.warn("[NeoLOVE debug] run dependencies", count);
+        }},
+        onRuntimeInitialized() {{
+          console.warn("[NeoLOVE debug] runtime initialized");
+        }},
+        setStatus(text) {{
+          updateFromStatus(text);
+        }},
+        print(text) {{
+          console.log(text);
+        }},
+        printErr(text) {{
+          const message = String(text);
+          console.error(message);
+          setOverlayState("error");
+          setProgress(100);
+          setMessage("Load failed", message, "error");
+        }}
+      }};
+
+      const script = document.createElement("script");
+      script.src = "neolove.js";
+      script.async = true;
+      script.onload = () => {{
+        console.warn("[NeoLOVE debug] neolove.js loaded");
+        if (bindVisibleStatusTarget()) {{
+          return;
+        }}
+        const timer = window.setInterval(() => {{
+          if (!bindVisibleStatusTarget()) {{
+            return;
+          }}
+          window.clearInterval(timer);
+        }}, 50);
+      }};
+      script.onerror = () => {{
+        setOverlayState("error");
+        setProgress(100);
+        setMessage("Failed to load `neolove.js`.", "Check that the bundle files are being served from the same folder.", "error");
+      }};
+      document.body.appendChild(script);
+    }})();
   </script>
-  <script src="neolove.js"></script>
 </body>
 </html>
 "#
@@ -1343,13 +1628,11 @@ fn normalize_mouse_wheel_delta(delta: MouseScrollDelta) -> (f32, f32) {
 
 fn with_platform_state<R>(
     platform_state: &SharedPlatformState,
-    context: &str,
+    _context: &str,
     f: impl FnOnce(&mut crate::platform::PlatformState) -> R,
 ) -> Result<R, String> {
-    platform_state
-        .lock()
-        .map(|mut platform| f(&mut platform))
-        .map_err(|_| format!("platform state lock poisoned while {context}"))
+    let mut platform = crate::platform::lock_platform_state(platform_state);
+    Ok(f(&mut platform))
 }
 
 fn report_runtime_failure(title: &str, message: &str) {

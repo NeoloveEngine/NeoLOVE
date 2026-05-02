@@ -2,7 +2,7 @@
 
 use crate::assets::ImageHandle;
 use crate::lua_error::protect_lua_call;
-use crate::platform::{Color, InputState, SharedPlatformState, WindowState};
+use crate::platform::{lock_platform_state, Color, InputState, SharedPlatformState, WindowState};
 use crate::renderer::{
     DrawCommand, FontHandle, Rect, RenderState, SharedRenderState, TextAlignX, TextAlignY,
     TextRenderRequest, TextScaleMode, TextWrapMode, TextureFilter, Vec2,
@@ -279,9 +279,7 @@ pub(crate) fn begin_ui_frame() {
 }
 
 fn current_input_snapshot(platform: &SharedPlatformState) -> mlua::Result<UiInputSnapshot> {
-    let platform = platform
-        .lock()
-        .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+    let platform = lock_platform_state(platform);
     let mouse = platform.mouse();
     Ok(UiInputSnapshot {
         mouse: Vec2 {
@@ -3474,9 +3472,7 @@ pub fn add_core_components(
                 // Rotated tile layers keep the full-entity iteration to preserve rendering correctness.
                 let (local_left, local_top, local_right, local_bottom) = if rotation.abs() < 0.0001
                 {
-                    let platform = platform
-                        .lock()
-                        .map_err(|_| mlua::Error::external("platform lock poisoned"))?;
+                    let platform = lock_platform_state(&platform);
                     let screen_w = platform.window().width;
                     let screen_h = platform.window().height;
                     let visible_left = base_x.max(0.0);
