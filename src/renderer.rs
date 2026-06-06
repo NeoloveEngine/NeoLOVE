@@ -1049,6 +1049,10 @@ impl SoftwareRenderer {
         &self.pixels
     }
 
+    pub(crate) fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     pub(crate) fn render(
         &mut self,
         platform: &SharedPlatformState,
@@ -1069,7 +1073,7 @@ impl SoftwareRenderer {
         if commands.iter().any(command_uses_custom_shader) {
             #[cfg(target_os = "emscripten")]
             let shader_error =
-                "custom shaders are not supported in WebAssembly yet; the web runtime currently uses the software renderer and cannot run shader effects.".to_string();
+                "custom shaders require the browser WebGL path, but a shader command reached the software fallback unexpectedly.".to_string();
             #[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
             let shader_error =
                 "custom shaders require the Vulkan renderer; NeoLOVE is currently using the software fallback because Vulkan initialization failed earlier. Check the Vulkan warning above for the exact driver or surface error.".to_string();
@@ -1080,13 +1084,30 @@ impl SoftwareRenderer {
         }
 
         let clear = lock_platform_state(platform).clear_color();
+        self.clear_to_color(clear);
+        self.draw_unshaded_commands(commands)
+    }
+
+    pub(crate) fn clear_to_color(&mut self, clear: Color) {
         for pixel in self.pixels.chunks_exact_mut(4) {
             pixel[0] = clear.r;
             pixel[1] = clear.g;
             pixel[2] = clear.b;
             pixel[3] = clear.a;
         }
+    }
 
+    pub(crate) fn clear_transparent(&mut self) {
+        self.clear_to_color(Color::rgba(0, 0, 0, 0));
+    }
+
+    pub(crate) fn draw_unshaded_commands(
+        &mut self,
+        commands: Vec<DrawCommand>,
+    ) -> Result<(), String> {
+        if commands.iter().any(command_uses_custom_shader) {
+            return Err("draw_unshaded_commands received a shader command".to_string());
+        }
         for command in commands {
             if !command_intersects_viewport(&command, self.width, self.height) {
                 continue;

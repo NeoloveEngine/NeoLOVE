@@ -48,7 +48,24 @@ unsafe extern "C" {
     fn neolove_web_take_last_key(buffer: *mut c_char, capacity: i32) -> i32;
     fn neolove_web_take_char(buffer: *mut c_char, capacity: i32) -> i32;
     fn neolove_web_begin_frame();
+    fn neolove_web_clear_canvas(r: i32, g: i32, b: i32, a: i32);
     fn neolove_web_present_rgba(pixels: *const u8, width: i32, height: i32);
+    fn neolove_web_composite_rgba(pixels: *const u8, width: i32, height: i32);
+    fn neolove_web_draw_shader_rect(
+        fragment_source: *const c_char,
+        uniforms_json: *const c_char,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        rotation: f32,
+        pivot_x: f32,
+        pivot_y: f32,
+        r: i32,
+        g: i32,
+        b: i32,
+        a: i32,
+    );
     fn neolove_web_draw_text(
         text: *const c_char,
         x: f32,
@@ -316,9 +333,8 @@ impl WebApp {
                 images
             ));
         }
-        self.renderer
-            .render_commands(&self.platform_state, pixel_commands)
-            .map_err(|error| format!("software renderer failed: {error}"))?;
+        render_web_commands_in_order(&mut self.renderer, &self.platform_state, pixel_commands)
+            .map_err(|error| format!("web renderer failed: {error}"))?;
         if tick_index <= WEB_DEBUG_TICK_LIMIT {
             let clear = lock_platform_state(&self.platform_state).clear_color();
             debug_log(&format!(
@@ -371,13 +387,7 @@ impl WebApp {
                 self.renderer.pixels().len()
             ));
         }
-        unsafe {
-            neolove_web_present_rgba(
-                self.renderer.pixels().as_ptr(),
-                width as i32,
-                height as i32,
-            );
-        }
+        // Frame pixels were already composited by render_web_commands_in_order.
         if tick_index <= WEB_DEBUG_TICK_LIMIT {
             debug_log(&format!("tick stage {tick_index}: after present_rgba"));
             debug_log(&format!(
@@ -491,6 +501,105 @@ impl WebApp {
 
         Ok(())
     }
+}
+
+
+fn render_web_commands_in_order(
+    renderer: &mut SoftwareRenderer,
+    platform: &SharedPlatformState,
+    commands: Vec<DrawCommand>,
+) -> Result<(), String> {
+    let clear = lock_platform_state(platform).clear_color();
+    unsafe {
+        neolove_web_clear_canvas(clear.r as i32, clear.g as i32, clear.b as i32, clear.a as i32);
+    }
+
+    let mut pending = Vec::new();
+    for command in commands {
+        if command_has_shader(&command) {
+            flush_software_chunk(renderer, std::mem::take(&mut pending))?;
+            draw_web_shader_command(command)?;
+        } else {
+            pending.push(command);
+        }
+    }
+    flush_software_chunk(renderer, pending)
+}
+
+fn flush_software_chunk(renderer: &mut SoftwareRenderer, commands: Vec<DrawCommand>) -> Result<(), String> {
+    if commands.is_empty() {
+        return Ok(());
+    }
+    renderer.clear_transparent();
+    renderer.draw_unshaded_commands(commands)?;
+    let (width, height) = renderer.dimensions();
+    unsafe {
+        neolove_web_composite_rgba(
+            renderer.pixels().as_ptr(),
+            width as i32,
+            height as i32,
+        );
+    }
+    Ok(())
+}
+
+fn command_has_shader(command: &DrawCommand) -> bool {
+    match command {
+        DrawCommand::Rect { shader, .. }
+        | DrawCommand::Triangle { shader, .. }
+        | DrawCommand::Circle { shader, .. }
+        | DrawCommand::Image { shader, .. } => shader.is_some(),
+        DrawCommand::Text(_) => false,
+    }
+}
+
+fn draw_web_shader_command(command: DrawCommand) -> Result<(), String> {
+    match command {
+        DrawCommand::Rect {
+            x,
+            y,
+            w,
+            h,
+            rotation,
+            offset,
+            color,
+            shader: Some(shader),
+        } => {
+            let snapshot = shader.snapshot_for_web()?;
+            let fragment_source = CString::new(snapshot.fragment_source.replace('\0', " "))
+                .map_err(|error| format!("invalid shader source for web: {error}"))?;
+            let uniforms_json = CString::new(snapshot.uniforms_json.replace('\0', " "))
+                .map_err(|error| format!("invalid shader uniforms for web: {error}"))?;
+            unsafe {
+                neolove_web_draw_shader_rect(
+                    fragment_source.as_ptr(),
+                    uniforms_json.as_ptr(),
+                    x,
+                    y,
+                    w,
+                    h,
+                    rotation,
+                    x + w * offset.x,
+                    y + h * offset.y,
+                    color.r as i32,
+                    color.g as i32,
+                    color.b as i32,
+                    color.a as i32,
+                );
+            }
+            Ok(())
+        }
+        DrawCommand::Triangle { shader: Some(_), .. }
+        | DrawCommand::Circle { shader: Some(_), .. }
+        | DrawCommand::Image { shader: Some(_), .. } => Err(
+            "web shader support currently handles Rect2D shader commands; triangle, circle, and image shader commands are not yet available on web".to_string(),
+        ),
+        other => flush_unexpected_unshaded(other),
+    }
+}
+
+fn flush_unexpected_unshaded(_command: DrawCommand) -> Result<(), String> {
+    Err("internal web renderer error: expected a shader command".to_string())
 }
 
 fn split_text_commands(commands: Vec<DrawCommand>) -> (Vec<DrawCommand>, Vec<TextRenderRequest>) {

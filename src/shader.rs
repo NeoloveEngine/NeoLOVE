@@ -21,10 +21,15 @@ pub(crate) struct ShaderHandle {
     pub(crate) uniforms: Arc<Mutex<ShaderUniforms>>,
 }
 
-#[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
 pub(crate) const MAX_SHADER_FLOAT_UNIFORMS: usize = 16;
-#[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
 pub(crate) const MAX_SHADER_TEXTURE_UNIFORMS: usize = 4;
+
+#[cfg(target_os = "emscripten")]
+#[derive(Clone, Debug)]
+pub(crate) struct WebShaderSnapshot {
+    pub(crate) fragment_source: String,
+    pub(crate) uniforms_json: String,
+}
 
 #[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
 #[derive(Clone, Debug)]
@@ -250,6 +255,21 @@ pub(crate) fn bind_shader_from_userdata(_shader_ud: &AnyUserData) -> mlua::Resul
 #[allow(dead_code)]
 pub(crate) fn unbind_shader() {}
 
+#[cfg(target_os = "emscripten")]
+impl ShaderHandle {
+    pub(crate) fn snapshot_for_web(&self) -> Result<WebShaderSnapshot, String> {
+        let uniforms = self
+            .uniforms
+            .lock()
+            .map_err(|_| "shader uniform lock poisoned".to_string())?;
+
+        Ok(WebShaderSnapshot {
+            fragment_source: self.fragment_source.clone(),
+            uniforms_json: serde_json::json!({ "floats": &uniforms.floats }).to_string(),
+        })
+    }
+}
+
 impl UserData for ShaderHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("setUniform1f", |_lua, this, (name, x): (String, f32)| {
@@ -332,33 +352,16 @@ pub(crate) fn add_shader_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()
     let shaders = lua.create_table()?;
     shaders.set("DEFAULT_VERTEX_SHADER", DEFAULT_VERTEX_SHADER)?;
 
-    #[cfg(target_os = "emscripten")]
-    let unsupported_loader =
-        |_lua: &Lua, _: &str| -> mlua::Result<mlua::Value> {
-            Err(mlua::Error::external(
-                "custom shaders are not supported in WebAssembly yet; the web runtime currently uses the software renderer and cannot run shader effects.",
-            ))
-        };
-
     let load_root = env_root.clone();
     shaders.set(
         "load",
         lua.create_function(
             move |lua, (vertex_path, fragment_path, _options): (String, String, Option<Table>)| {
-                #[cfg(target_os = "emscripten")]
-                {
-                    let _ = (&vertex_path, &fragment_path, &_options);
-                    return unsupported_loader(lua, "load");
-                }
-
-                #[cfg(not(target_os = "emscripten"))]
-                {
                 let vertex_source = fs::read_to_string(resolve_path(&load_root, &vertex_path))
                     .map_err(mlua::Error::external)?;
                 let fragment_source = fs::read_to_string(resolve_path(&load_root, &fragment_path))
                     .map_err(mlua::Error::external)?;
                 lua.create_userdata(load_shader_from_sources(&vertex_source, &fragment_source))
-                }
             },
         )?,
     )?;
@@ -368,14 +371,6 @@ pub(crate) fn add_shader_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()
         "loadFragment",
         lua.create_function(
             move |lua, (fragment_path, _options): (String, Option<Table>)| {
-                #[cfg(target_os = "emscripten")]
-                {
-                    let _ = (&fragment_path, &_options);
-                    return unsupported_loader(lua, "loadFragment");
-                }
-
-                #[cfg(not(target_os = "emscripten"))]
-                {
                 let fragment_source =
                     fs::read_to_string(resolve_path(&fragment_root, &fragment_path))
                         .map_err(mlua::Error::external)?;
@@ -383,7 +378,6 @@ pub(crate) fn add_shader_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()
                     DEFAULT_VERTEX_SHADER,
                     &fragment_source,
                 ))
-                }
             },
         )?,
     )?;
@@ -392,16 +386,7 @@ pub(crate) fn add_shader_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()
         "fromSource",
         lua.create_function(
             move |lua, (vertex_source, fragment_source, _options): (String, String, Option<Table>)| {
-                #[cfg(target_os = "emscripten")]
-                {
-                    let _ = (&vertex_source, &fragment_source, &_options);
-                    return unsupported_loader(lua, "fromSource");
-                }
-
-                #[cfg(not(target_os = "emscripten"))]
-                {
                 lua.create_userdata(load_shader_from_sources(&vertex_source, &fragment_source))
-                }
             },
         )?,
     )?;
@@ -410,19 +395,10 @@ pub(crate) fn add_shader_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()
         "fromFragmentSource",
         lua.create_function(
             move |lua, (fragment_source, _options): (String, Option<Table>)| {
-                #[cfg(target_os = "emscripten")]
-                {
-                    let _ = (&fragment_source, &_options);
-                    return unsupported_loader(lua, "fromFragmentSource");
-                }
-
-                #[cfg(not(target_os = "emscripten"))]
-                {
                 lua.create_userdata(load_shader_from_sources(
                     DEFAULT_VERTEX_SHADER,
                     &fragment_source,
                 ))
-                }
             },
         )?,
     )?;
