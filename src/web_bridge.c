@@ -758,6 +758,106 @@ EM_JS(void, neolove_js_report_status, (const char* message, int is_error), {
   }
 });
 
+
+EM_JS(int, neolove_js_http_start, (
+  int request_id,
+  const char* url_ptr,
+  const char* method_ptr,
+  const char* headers_json_ptr,
+  const uint8_t* body_ptr,
+  int body_len
+), {
+  const state = Module.neoloveState;
+  if (!state) {
+    return 0;
+  }
+  const http = state.http || (state.http = { queue: [], current: null });
+  try {
+    const url = UTF8ToString(url_ptr);
+    const method = UTF8ToString(method_ptr || 0) || "GET";
+    const headersJson = UTF8ToString(headers_json_ptr || 0) || "{}";
+    const headers = JSON.parse(headersJson);
+    const options = { method, headers };
+    if (body_len > 0 && method !== "GET" && method !== "HEAD") {
+      const body = new Uint8Array(body_len);
+      body.set(HEAPU8.subarray(body_ptr, body_ptr + body_len));
+      options.body = body;
+    }
+    fetch(url, options)
+      .then((response) => response.text().then((body) => {
+        const responseHeaders = {};
+        response.headers.forEach((value, name) => { responseHeaders[name] = value; });
+        http.queue.push({
+          requestId: request_id,
+          url: response.url || url,
+          status: response.status,
+          ok: 1,
+          body,
+          error: "",
+          headers: JSON.stringify(responseHeaders)
+        });
+      }))
+      .catch((error) => {
+        http.queue.push({
+          requestId: request_id,
+          url,
+          status: -1,
+          ok: 0,
+          body: "",
+          error: String((error && error.message) || error || "fetch failed"),
+          headers: "{}"
+        });
+      });
+    return 1;
+  } catch (error) {
+    http.queue.push({
+      requestId: request_id,
+      url: "",
+      status: -1,
+      ok: 0,
+      body: "",
+      error: String((error && error.message) || error || "failed to start fetch"),
+      headers: "{}"
+    });
+    return 1;
+  }
+});
+
+EM_JS(int, neolove_js_http_poll, (int* request_id, int* status, int* ok), {
+  const state = Module.neoloveState;
+  const http = state && state.http;
+  if (!http || !http.queue.length) {
+    return 0;
+  }
+  const event = http.queue.shift();
+  http.current = event;
+  HEAP32[request_id >> 2] = event.requestId | 0;
+  HEAP32[status >> 2] = event.status | 0;
+  HEAP32[ok >> 2] = event.ok ? 1 : 0;
+  return 1;
+});
+
+EM_JS(int, neolove_js_http_copy_field, (int field, char* buffer, int capacity), {
+  const state = Module.neoloveState;
+  const event = state && state.http && state.http.current;
+  let value = "";
+  if (event) {
+    switch (field) {
+      case 0: value = event.url || ""; break;
+      case 1: value = event.body || ""; break;
+      case 2: value = event.error || ""; break;
+      case 3: value = event.headers || "{}"; break;
+      default: value = ""; break;
+    }
+  }
+  const required = lengthBytesUTF8(value) + 1;
+  if (capacity <= 0 || required > capacity) {
+    return -required;
+  }
+  stringToUTF8(value, buffer, capacity);
+  return required - 1;
+});
+
 EM_JS(void, neolove_js_debug_log, (const char* message), {
   console.warn("[NeoLOVE debug]", UTF8ToString(message));
 });
@@ -1063,4 +1163,22 @@ int neolove_web_audio_set_volume(int sound_id, float volume) {
 
 int neolove_web_take_audio_error(char* buffer, int capacity) {
   return neolove_js_take_audio_error(buffer, capacity);
+}
+
+int neolove_web_http_start(
+    int request_id,
+    const char* url,
+    const char* method,
+    const char* headers_json,
+    const uint8_t* body,
+    int body_len) {
+  return neolove_js_http_start(request_id, url, method, headers_json, body, body_len);
+}
+
+int neolove_web_http_poll(int* request_id, int* status, int* ok) {
+  return neolove_js_http_poll(request_id, status, ok);
+}
+
+int neolove_web_http_copy_field(int field, char* buffer, int capacity) {
+  return neolove_js_http_copy_field(field, buffer, capacity);
 }

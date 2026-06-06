@@ -599,7 +599,7 @@ impl AssetManager {
         })))
     }
 
-    pub(crate) fn load_sound_wav(&mut self, user_path: &str) -> mlua::Result<SoundHandle> {
+    pub(crate) fn load_sound(&mut self, user_path: &str) -> mlua::Result<SoundHandle> {
         let resolved = self.resolve_path(user_path);
         let cache_key = Self::canonical_for_cache(&resolved);
         if let Some(existing) = self.sounds.get(&cache_key).and_then(Weak::upgrade) {
@@ -614,6 +614,38 @@ impl AssetManager {
 
         let file_bytes = std::fs::read(&resolved)
             .map_err(|error| asset_io_error("read sound", &resolved, error))?;
+        let extension = resolved
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if extension != "wav" {
+            #[cfg(target_os = "emscripten")]
+            {
+                if matches!(extension.as_str(), "mp3" | "ogg" | "oga" | "flac" | "aac" | "m4a" | "aiff" | "aif") {
+                    let handle = Arc::new(Mutex::new(SoundAsset {
+                        sample_rate: 0,
+                        channels: 0,
+                        samples: Vec::new(),
+                        bytes: file_bytes,
+                        unloaded: false,
+                        export_root: Some(self.env_root.clone()),
+                    }));
+                    self.sounds.insert(cache_key, Arc::downgrade(&handle));
+                    return Ok(SoundHandle(handle));
+                }
+            }
+            #[cfg(not(target_os = "emscripten"))]
+            {
+                return Err(asset_decode_error(
+                    "sound",
+                    &resolved,
+                    format!(
+                        "unsupported audio format '.{extension}' in this build; WAV is supported natively, while browsers may also decode MP3, OGG, FLAC, AAC/M4A, and AIFF"
+                    ),
+                ));
+            }
+        }
         let mut reader = hound::WavReader::new(Cursor::new(file_bytes.as_slice()))
             .map_err(|error| asset_decode_error("wav file", &resolved, error))?;
         let spec = reader.spec();
@@ -768,7 +800,7 @@ pub(crate) fn add_assets_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()
                 let handle = manager
                     .lock()
                     .map_err(|_| mlua::Error::external("asset manager lock poisoned"))?
-                    .load_sound_wav(&path)?;
+                    .load_sound(&path)?;
                 lua.create_userdata(handle)
             })?,
         )?;
@@ -976,7 +1008,7 @@ mod tests {
 
         let mut manager = AssetManager::new(root.clone());
         let error = manager
-            .load_sound_wav("broken.wav")
+            .load_sound("broken.wav")
             .expect_err("invalid wav should return an error")
             .to_string();
 

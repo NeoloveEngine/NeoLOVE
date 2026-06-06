@@ -247,8 +247,15 @@ export type HttpResponse = {
 	headers: HttpHeaders,
 }
 
+export type HttpRequestOptions = {
+	url: string,
+	method: string?,
+	headers: HttpHeaders?,
+	body: string?,
+}
+
 export type HttpModule = {
-	request: (url: string, callback: (response: HttpResponse) -> ()) -> number,
+	request: ((url: string, callback: (response: HttpResponse) -> ()) -> number) & ((options: HttpRequestOptions, callback: (response: HttpResponse) -> ()) -> number),
 	get: (url: string, callback: (response: HttpResponse) -> ()) -> number,
 	_poll: () -> (),
 }
