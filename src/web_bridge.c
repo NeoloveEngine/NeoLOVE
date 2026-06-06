@@ -500,6 +500,268 @@ EM_JS(void, neolove_js_present_rgba, (const uint8_t* pixels, int width, int heig
   }
 });
 
+
+EM_JS(void, neolove_js_clear_canvas, (int r, int g, int b, int a), {
+  const state = Module.neoloveState;
+  const canvas = Module.canvas;
+  if (!state || !canvas) {
+    return;
+  }
+  if (!state.ctx) {
+    state.ctx = canvas.getContext("2d", { alpha: false }) || canvas.getContext("2d");
+    if (state.ctx) {
+      state.ctx.imageSmoothingEnabled = false;
+    }
+  }
+  const ctx = state.ctx;
+  if (!ctx) {
+    return;
+  }
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = "source-over";
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${Math.max(0, Math.min(1, a / 255))})`;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.restore();
+});
+
+EM_JS(void, neolove_js_composite_rgba, (const uint8_t* pixels, int width, int height), {
+  const state = Module.neoloveState;
+  const canvas = Module.canvas;
+  if (!state || !canvas || width <= 0 || height <= 0) {
+    return;
+  }
+  if (!state.ctx) {
+    state.ctx = canvas.getContext("2d", { alpha: false }) || canvas.getContext("2d");
+    if (state.ctx) {
+      state.ctx.imageSmoothingEnabled = false;
+    }
+  }
+  const ctx = state.ctx;
+  if (!ctx) {
+    return;
+  }
+  const blitCanvas = state.blitCanvas || (state.blitCanvas = document.createElement("canvas"));
+  if (blitCanvas.width !== width || blitCanvas.height !== height) {
+    blitCanvas.width = width;
+    blitCanvas.height = height;
+    state.blitImageData = null;
+  }
+  const blitCtx = state.blitCtx || (state.blitCtx = blitCanvas.getContext("2d"));
+  if (!blitCtx) {
+    return;
+  }
+  if (!state.blitImageData || state.blitImageData.width !== width || state.blitImageData.height !== height) {
+    state.blitImageData = blitCtx.createImageData(width, height);
+  }
+  const expectedBytes = width * height * 4;
+  state.blitImageData.data.set(HEAPU8.subarray(pixels, pixels + expectedBytes));
+  blitCtx.putImageData(state.blitImageData, 0, 0);
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = "source-over";
+  ctx.drawImage(blitCanvas, 0, 0);
+  ctx.restore();
+});
+
+EM_JS(void, neolove_js_draw_shader_rect, (
+  const char* fragment_source_ptr,
+  const char* uniforms_json_ptr,
+  float x,
+  float y,
+  float w,
+  float h,
+  float rotation,
+  float pivot_x,
+  float pivot_y,
+  int r,
+  int g,
+  int b,
+  int a
+), {
+  const state = Module.neoloveState;
+  const canvas = Module.canvas;
+  if (!state || !canvas || !(w > 0) || !(h > 0) || a <= 0) {
+    return;
+  }
+  const fragmentSource = UTF8ToString(fragment_source_ptr);
+  let uniforms = {};
+  try {
+    uniforms = JSON.parse(UTF8ToString(uniforms_json_ptr) || "{}");
+  } catch (error) {
+    console.error("NeoLOVE shader uniform JSON error", error);
+  }
+
+  const glCanvas = state.shaderCanvas || (state.shaderCanvas = document.createElement("canvas"));
+  if (glCanvas.width !== canvas.width || glCanvas.height !== canvas.height) {
+    glCanvas.width = canvas.width;
+    glCanvas.height = canvas.height;
+  }
+  const gl = state.shaderGl || (state.shaderGl = glCanvas.getContext("webgl", { alpha: true, premultipliedAlpha: false }) || glCanvas.getContext("experimental-webgl"));
+  if (!gl) {
+    if (!state.shaderMissingWebglLogged) {
+      state.shaderMissingWebglLogged = true;
+      console.error("NeoLOVE web shaders require WebGL support in this browser");
+    }
+    return;
+  }
+  state.shaderPrograms = state.shaderPrograms || new Map();
+
+  const vertexSource = `
+attribute vec2 a_pos;
+attribute vec2 a_uv;
+attribute vec4 a_color;
+varying lowp vec2 uv;
+varying lowp vec4 color;
+void main() {
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+  uv = a_uv;
+  color = a_color;
+}`;
+
+  const compileShader = (type, source) => {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(shader) || "unknown shader compile error";
+      gl.deleteShader(shader);
+      throw new Error(log);
+    }
+    return shader;
+  };
+
+  let programInfo = state.shaderPrograms.get(fragmentSource);
+  if (!programInfo) {
+    try {
+      const vs = compileShader(gl.VERTEX_SHADER, vertexSource);
+      const fs = compileShader(gl.FRAGMENT_SHADER, fragmentSource);
+      const program = gl.createProgram();
+      gl.attachShader(program, vs);
+      gl.attachShader(program, fs);
+      gl.linkProgram(program);
+      gl.deleteShader(vs);
+      gl.deleteShader(fs);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        const log = gl.getProgramInfoLog(program) || "unknown shader link error";
+        gl.deleteProgram(program);
+        throw new Error(log);
+      }
+      programInfo = {
+        program,
+        aPos: gl.getAttribLocation(program, "a_pos"),
+        aUv: gl.getAttribLocation(program, "a_uv"),
+        aColor: gl.getAttribLocation(program, "a_color"),
+        uTexture: gl.getUniformLocation(program, "Texture"),
+        uniformLocations: new Map()
+      };
+      state.shaderPrograms.set(fragmentSource, programInfo);
+    } catch (error) {
+      console.error("NeoLOVE web shader compile failed", error);
+      return;
+    }
+  }
+
+  const toClipX = (px) => (px / Math.max(1, canvas.width)) * 2 - 1;
+  const toClipY = (py) => 1 - (py / Math.max(1, canvas.height)) * 2;
+  const rotate = (px, py) => {
+    if (rotation === 0) {
+      return [px, py];
+    }
+    const dx = px - pivot_x;
+    const dy = py - pivot_y;
+    const c = Math.cos(rotation);
+    const s = Math.sin(rotation);
+    return [pivot_x + dx * c - dy * s, pivot_y + dx * s + dy * c];
+  };
+  const corners = [
+    rotate(x, y),
+    rotate(x + w, y),
+    rotate(x + w, y + h),
+    rotate(x, y + h)
+  ];
+  const color = [r / 255, g / 255, b / 255, a / 255];
+  const packed = new Float32Array([
+    toClipX(corners[0][0]), toClipY(corners[0][1]), 0, 0, color[0], color[1], color[2], color[3],
+    toClipX(corners[1][0]), toClipY(corners[1][1]), 1, 0, color[0], color[1], color[2], color[3],
+    toClipX(corners[2][0]), toClipY(corners[2][1]), 1, 1, color[0], color[1], color[2], color[3],
+    toClipX(corners[0][0]), toClipY(corners[0][1]), 0, 0, color[0], color[1], color[2], color[3],
+    toClipX(corners[2][0]), toClipY(corners[2][1]), 1, 1, color[0], color[1], color[2], color[3],
+    toClipX(corners[3][0]), toClipY(corners[3][1]), 0, 1, color[0], color[1], color[2], color[3]
+  ]);
+
+  const buffer = state.shaderVertexBuffer || (state.shaderVertexBuffer = gl.createBuffer());
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, packed, gl.STREAM_DRAW);
+  gl.viewport(0, 0, glCanvas.width, glCanvas.height);
+  gl.disable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.useProgram(programInfo.program);
+
+  const stride = 8 * 4;
+  if (programInfo.aPos >= 0) {
+    gl.enableVertexAttribArray(programInfo.aPos);
+    gl.vertexAttribPointer(programInfo.aPos, 2, gl.FLOAT, false, stride, 0);
+  }
+  if (programInfo.aUv >= 0) {
+    gl.enableVertexAttribArray(programInfo.aUv);
+    gl.vertexAttribPointer(programInfo.aUv, 2, gl.FLOAT, false, stride, 2 * 4);
+  }
+  if (programInfo.aColor >= 0) {
+    gl.enableVertexAttribArray(programInfo.aColor);
+    gl.vertexAttribPointer(programInfo.aColor, 4, gl.FLOAT, false, stride, 4 * 4);
+  }
+
+  if (!state.shaderWhiteTexture) {
+    state.shaderWhiteTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, state.shaderWhiteTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
+  }
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, state.shaderWhiteTexture);
+  if (programInfo.uTexture !== null) {
+    gl.uniform1i(programInfo.uTexture, 0);
+  }
+
+  const floats = uniforms.floats || {};
+  for (const name of Object.keys(floats)) {
+    let location = programInfo.uniformLocations.get(name);
+    if (location === undefined) {
+      location = gl.getUniformLocation(programInfo.program, name);
+      programInfo.uniformLocations.set(name, location);
+    }
+    if (!location) {
+      continue;
+    }
+    const values = floats[name] || [];
+    if (values.length === 1) gl.uniform1f(location, values[0]);
+    else if (values.length === 2) gl.uniform2f(location, values[0], values[1]);
+    else if (values.length === 3) gl.uniform3f(location, values[0], values[1], values[2]);
+    else if (values.length >= 4) gl.uniform4f(location, values[0], values[1], values[2], values[3]);
+  }
+
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  if (!state.ctx) {
+    state.ctx = canvas.getContext("2d", { alpha: false }) || canvas.getContext("2d");
+  }
+  if (state.ctx) {
+    state.ctx.save();
+    state.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    state.ctx.globalCompositeOperation = "source-over";
+    state.ctx.drawImage(glCanvas, 0, 0);
+    state.ctx.restore();
+  }
+});
+
 EM_JS(void, neolove_js_draw_text, (
   const char* message,
   float x,
@@ -1069,8 +1331,46 @@ void neolove_web_begin_frame(void) {
   neolove_js_begin_frame();
 }
 
+void neolove_web_clear_canvas(int r, int g, int b, int a) {
+  neolove_js_clear_canvas(r, g, b, a);
+}
+
 void neolove_web_present_rgba(const uint8_t* pixels, int width, int height) {
   neolove_js_present_rgba(pixels, width, height);
+}
+
+void neolove_web_composite_rgba(const uint8_t* pixels, int width, int height) {
+  neolove_js_composite_rgba(pixels, width, height);
+}
+
+void neolove_web_draw_shader_rect(
+    const char* fragment_source,
+    const char* uniforms_json,
+    float x,
+    float y,
+    float w,
+    float h,
+    float rotation,
+    float pivot_x,
+    float pivot_y,
+    int r,
+    int g,
+    int b,
+    int a) {
+  neolove_js_draw_shader_rect(
+      fragment_source,
+      uniforms_json,
+      x,
+      y,
+      w,
+      h,
+      rotation,
+      pivot_x,
+      pivot_y,
+      r,
+      g,
+      b,
+      a);
 }
 
 void neolove_web_draw_text(
