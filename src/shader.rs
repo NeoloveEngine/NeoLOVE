@@ -21,7 +21,9 @@ pub(crate) struct ShaderHandle {
     pub(crate) uniforms: Arc<Mutex<ShaderUniforms>>,
 }
 
+#[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
 pub(crate) const MAX_SHADER_FLOAT_UNIFORMS: usize = 16;
+#[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
 pub(crate) const MAX_SHADER_TEXTURE_UNIFORMS: usize = 4;
 
 #[cfg(target_os = "emscripten")]

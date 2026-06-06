@@ -739,8 +739,7 @@ fn prepare_text_layout(request: &TextRenderRequest) -> Option<PreparedTextLayout
 }
 
 pub(crate) fn measure_text(request: &TextRenderRequest) -> Option<TextMetrics> {
-    #[cfg(target_os = "emscripten")]
-    {
+    if cfg!(target_os = "emscripten") {
         let line_count = request.text.lines().count().max(1);
         let widest_line = request
             .text
@@ -749,21 +748,19 @@ pub(crate) fn measure_text(request: &TextRenderRequest) -> Option<TextMetrics> {
             .max()
             .unwrap_or(0) as f32;
         let used_scale = request.scale.max(1.0);
-        return Some(TextMetrics {
+        Some(TextMetrics {
             width: widest_line * used_scale * 0.6,
             height: line_count as f32 * used_scale * request.line_spacing.max(0.1),
             used_scale,
             line_count,
-        });
+        })
+    } else {
+        Some(prepare_text_layout(request)?.metrics)
     }
-
-    Some(prepare_text_layout(request)?.metrics)
 }
 
 pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<RasterizedTextSprite> {
-    #[cfg(target_os = "emscripten")]
-    {
-        let _ = request;
+    if cfg!(target_os = "emscripten") {
         return None;
     }
 
