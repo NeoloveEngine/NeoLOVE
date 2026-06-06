@@ -804,7 +804,6 @@ EM_JS(void, neolove_js_draw_text, (
   const heightLimit = h > 0 ? Math.max(0, h - paddingY * 2) : null;
   const activeWrap = widthLimit !== null && wrap !== 0 ? wrap : 0;
   const fontPath = font_path_ptr ? UTF8ToString(font_path_ptr) : "";
-  const quoteFontFamily = (family) => `"${String(family).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
   const hashString = (value) => {
     let hash = 0;
     for (let i = 0; i < value.length; i += 1) {
@@ -848,7 +847,7 @@ EM_JS(void, neolove_js_draw_text, (
     return entry;
   };
   const customFont = ensureCustomFont(fontPath);
-  const family = customFont && customFont.loaded ? quoteFontFamily(customFont.family) :
+  const family = customFont && customFont.loaded ? customFont.family :
     (font_kind === 0 ? "monospace" : "sans-serif");
   const safeLetterSpacing = Number.isFinite(letter_spacing) ? letter_spacing : 0;
 
