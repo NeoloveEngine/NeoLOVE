@@ -1271,6 +1271,7 @@ impl Runtime {
         self.exit_reason.borrow().clone()
     }
 
+    #[cfg(not(target_os = "emscripten"))]
     fn ensure_runtime_table(
         lua: &Lua,
         globals: &Table,
@@ -1347,33 +1348,31 @@ impl Runtime {
 
     fn set_mouse_table(&mut self) -> mlua::Result<()> {
         #[cfg(target_os = "emscripten")]
-        {
-            self.install_mouse_table_proxy()?;
-            return Ok(());
-        }
+        self.install_mouse_table_proxy()?;
 
-        let mouse = lock_platform_state(&self.platform).mouse();
-        let globals = self.lua.globals();
-        let mouse_table = Self::ensure_runtime_table(
-            &self.lua,
-            &globals,
-            &mut self.mouse_table_key,
-            "mouse",
-        )?;
-        mouse_table.raw_set("x", mouse.x)?;
-        mouse_table.raw_set("y", mouse.y)?;
+        #[cfg(not(target_os = "emscripten"))]
+        {
+            let mouse = lock_platform_state(&self.platform).mouse();
+            let globals = self.lua.globals();
+            let mouse_table = Self::ensure_runtime_table(
+                &self.lua,
+                &globals,
+                &mut self.mouse_table_key,
+                "mouse",
+            )?;
+            mouse_table.raw_set("x", mouse.x)?;
+            mouse_table.raw_set("y", mouse.y)?;
+        }
         Ok(())
     }
 
     fn set_window_table(&mut self) -> mlua::Result<()> {
-        let window = lock_platform_state(&self.platform).window();
         #[cfg(target_os = "emscripten")]
-        {
-            self.install_window_table_proxy()?;
-        }
+        self.install_window_table_proxy()?;
 
         #[cfg(not(target_os = "emscripten"))]
         {
+            let window = lock_platform_state(&self.platform).window();
             let globals = self.lua.globals();
             let table = Self::ensure_runtime_table(
                 &self.lua,
@@ -1383,12 +1382,11 @@ impl Runtime {
             )?;
             table.raw_set("x", window.width)?;
             table.raw_set("y", window.height)?;
-        }
 
-        #[cfg(not(target_os = "emscripten"))]
-        if let Some(root) = self.root_table.as_ref() {
-            root.raw_set("size_x", window.width)?;
-            root.raw_set("size_y", window.height)?;
+            if let Some(root) = self.root_table.as_ref() {
+                root.raw_set("size_x", window.width)?;
+                root.raw_set("size_y", window.height)?;
+            }
         }
         Ok(())
     }
@@ -1419,6 +1417,7 @@ impl Runtime {
         Ok(table_to_platform_color(&bg))
     }
 
+    #[cfg(not(target_os = "emscripten"))]
     fn resolve_app_max_fps(&self) -> mlua::Result<Option<f32>> {
         let app = self.app_table()?;
         Ok(app
@@ -1426,6 +1425,7 @@ impl Runtime {
             .filter(|fps| fps.is_finite() && *fps > 0.0))
     }
 
+    #[cfg(not(target_os = "emscripten"))]
     fn resolve_app_show_fps(&self) -> mlua::Result<bool> {
         let app = self.app_table()?;
         Ok(app.raw_get::<Option<bool>>("showFps")?.unwrap_or(true))
@@ -1476,15 +1476,18 @@ impl Runtime {
             app.set("setMaxFps", set_max_fps)?;
 
             let _max_fps_state = self.max_fps_state.clone();
-            let get_max_fps = self.lua.create_function(move |lua, ()| {
+            let get_max_fps = self.lua.create_function(move |_lua, ()| {
                 #[cfg(target_os = "emscripten")]
                 {
-                    return Ok(*_max_fps_state.borrow());
+                    Ok(*_max_fps_state.borrow())
                 }
-                let app: Table = lua.globals().get("app")?;
-                Ok(app
-                    .raw_get::<Option<f32>>("maxFps")?
-                    .filter(|fps| fps.is_finite() && *fps > 0.0))
+                #[cfg(not(target_os = "emscripten"))]
+                {
+                    let app: Table = _lua.globals().get("app")?;
+                    Ok(app
+                        .raw_get::<Option<f32>>("maxFps")?
+                        .filter(|fps| fps.is_finite() && *fps > 0.0))
+                }
             })?;
             app.set("getMaxFps", get_max_fps)?;
 
@@ -1502,13 +1505,16 @@ impl Runtime {
             app.set("setShowFps", set_show_fps)?;
 
             let _show_fps_state = self.show_fps_state.clone();
-            let get_show_fps = self.lua.create_function(move |lua, ()| {
+            let get_show_fps = self.lua.create_function(move |_lua, ()| {
                 #[cfg(target_os = "emscripten")]
                 {
-                    return Ok((*_show_fps_state.borrow()).unwrap_or(true));
+                    Ok((*_show_fps_state.borrow()).unwrap_or(true))
                 }
-                let app: Table = lua.globals().get("app")?;
-                Ok(app.raw_get::<Option<bool>>("showFps")?.unwrap_or(true))
+                #[cfg(not(target_os = "emscripten"))]
+                {
+                    let app: Table = _lua.globals().get("app")?;
+                    Ok(app.raw_get::<Option<bool>>("showFps")?.unwrap_or(true))
+                }
             })?;
             app.set("getShowFps", get_show_fps)?;
 
@@ -2172,48 +2178,44 @@ impl Runtime {
     }
 
     fn poll_http_callbacks(&self) {
-        #[cfg(target_os = "emscripten")]
+        #[cfg(not(target_os = "emscripten"))]
         {
-            return;
-        }
-
-        let globals = self.lua.globals();
-        let http = match globals.get::<Table>("http") {
-            Ok(table) => table,
-            Err(_) => return,
-        };
-        let poll = match http.get::<Function>("_poll") {
-            Ok(function) => function,
-            Err(_) => return,
-        };
-        if let Err(e) = protect_lua_call("polling HTTP callbacks", || poll.call::<()>(())) {
-            eprintln!(
-                "\x1b[31mLua Error:\x1b[0m Failed to poll HTTP callbacks\n{}",
-                describe_lua_error(&e)
-            );
+            let globals = self.lua.globals();
+            let http = match globals.get::<Table>("http") {
+                Ok(table) => table,
+                Err(_) => return,
+            };
+            let poll = match http.get::<Function>("_poll") {
+                Ok(function) => function,
+                Err(_) => return,
+            };
+            if let Err(e) = protect_lua_call("polling HTTP callbacks", || poll.call::<()>(())) {
+                eprintln!(
+                    "\x1b[31mLua Error:\x1b[0m Failed to poll HTTP callbacks\n{}",
+                    describe_lua_error(&e)
+                );
+            }
         }
     }
 
     fn poll_server_callbacks(&self) {
-        #[cfg(target_os = "emscripten")]
+        #[cfg(not(target_os = "emscripten"))]
         {
-            return;
-        }
-
-        let globals = self.lua.globals();
-        let servers = match globals.get::<Table>("servers") {
-            Ok(table) => table,
-            Err(_) => return,
-        };
-        let poll = match servers.get::<Function>("_poll") {
-            Ok(function) => function,
-            Err(_) => return,
-        };
-        if let Err(e) = protect_lua_call("polling server callbacks", || poll.call::<()>(())) {
-            eprintln!(
-                "\x1b[31mLua Error:\x1b[0m Failed to poll server callbacks\n{}",
-                describe_lua_error(&e)
-            );
+            let globals = self.lua.globals();
+            let servers = match globals.get::<Table>("servers") {
+                Ok(table) => table,
+                Err(_) => return,
+            };
+            let poll = match servers.get::<Function>("_poll") {
+                Ok(function) => function,
+                Err(_) => return,
+            };
+            if let Err(e) = protect_lua_call("polling server callbacks", || poll.call::<()>(())) {
+                eprintln!(
+                    "\x1b[31mLua Error:\x1b[0m Failed to poll server callbacks\n{}",
+                    describe_lua_error(&e)
+                );
+            }
         }
     }
 

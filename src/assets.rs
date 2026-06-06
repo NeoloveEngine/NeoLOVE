@@ -9,6 +9,10 @@ use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Debug)]
 struct ImageAsset {
+    #[cfg_attr(
+        not(any(target_os = "emscripten", feature = "vulkan")),
+        allow(dead_code)
+    )]
     id: usize,
     image: RgbaImage,
     unloaded: bool,

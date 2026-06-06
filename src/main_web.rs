@@ -49,7 +49,6 @@ unsafe extern "C" {
     fn neolove_web_take_char(buffer: *mut c_char, capacity: i32) -> i32;
     fn neolove_web_begin_frame();
     fn neolove_web_clear_canvas(r: i32, g: i32, b: i32, a: i32);
-    fn neolove_web_present_rgba(pixels: *const u8, width: i32, height: i32);
     fn neolove_web_composite_rgba(pixels: *const u8, width: i32, height: i32, x: i32, y: i32);
     fn neolove_web_draw_image(
         image_id: usize,
@@ -825,7 +824,7 @@ fn rotate_web_point(
 fn web_quad_vertices(
     corners: [crate::renderer::Vec2; 4],
     uv: [[f32; 2]; 4],
-    color: crate::renderer::Color,
+    color: crate::platform::Color,
 ) -> Vec<f32> {
     web_vertices(
         &[
@@ -842,7 +841,7 @@ fn web_quad_vertices(
 
 fn web_vertices(
     points: &[(crate::renderer::Vec2, [f32; 2])],
-    color: crate::renderer::Color,
+    color: crate::platform::Color,
 ) -> Vec<f32> {
     let rgba = [
         color.r as f32 / 255.0,
