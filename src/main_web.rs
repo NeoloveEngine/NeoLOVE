@@ -71,20 +71,17 @@ unsafe extern "C" {
         alpha: f32,
         linear_filter: i32,
     );
-    fn neolove_web_draw_shader_rect(
+    fn neolove_web_draw_shader(
         fragment_source: *const c_char,
         uniforms_json: *const c_char,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        rotation: f32,
-        pivot_x: f32,
-        pivot_y: f32,
-        r: i32,
-        g: i32,
-        b: i32,
-        a: i32,
+        vertices: *const f32,
+        vertex_count: i32,
+        texture_id: usize,
+        texture_revision: f64,
+        texture_pixels: *const u8,
+        texture_width: i32,
+        texture_height: i32,
+        linear_filter: i32,
     );
     fn neolove_web_draw_text(
         text: *const c_char,
@@ -659,7 +656,7 @@ fn command_has_shader(command: &DrawCommand) -> bool {
 }
 
 fn draw_web_shader_command(command: DrawCommand) -> Result<(), String> {
-    match command {
+    let (shader, vertices, texture) = match command {
         DrawCommand::Rect {
             x,
             y,
@@ -670,37 +667,196 @@ fn draw_web_shader_command(command: DrawCommand) -> Result<(), String> {
             color,
             shader: Some(shader),
         } => {
-            let snapshot = shader.snapshot_for_web()?;
-            let fragment_source = CString::new(snapshot.fragment_source.replace('\0', " "))
-                .map_err(|error| format!("invalid shader source for web: {error}"))?;
-            let uniforms_json = CString::new(snapshot.uniforms_json.replace('\0', " "))
-                .map_err(|error| format!("invalid shader uniforms for web: {error}"))?;
-            unsafe {
-                neolove_web_draw_shader_rect(
+            let pivot = (x + w * offset.x, y + h * offset.y);
+            let corners = [
+                rotate_web_point(x, y, pivot.0, pivot.1, rotation),
+                rotate_web_point(x + w, y, pivot.0, pivot.1, rotation),
+                rotate_web_point(x + w, y + h, pivot.0, pivot.1, rotation),
+                rotate_web_point(x, y + h, pivot.0, pivot.1, rotation),
+            ];
+            (
+                shader,
+                web_quad_vertices(
+                    corners,
+                    [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                    color,
+                ),
+                None,
+            )
+        }
+        DrawCommand::Triangle {
+            a,
+            b,
+            c,
+            color,
+            shader: Some(shader),
+        } => (
+            shader,
+            web_vertices(&[(a, [0.0, 0.0]), (b, [1.0, 0.0]), (c, [0.5, 1.0])], color),
+            None,
+        ),
+        DrawCommand::Circle {
+            center,
+            radius,
+            color,
+            shader: Some(shader),
+        } => {
+            let segments = ((radius * std::f32::consts::TAU / 4.0).ceil() as usize).clamp(24, 128);
+            let mut points = Vec::with_capacity(segments * 3);
+            for index in 0..segments {
+                let a0 = index as f32 / segments as f32 * std::f32::consts::TAU;
+                let a1 = (index + 1) as f32 / segments as f32 * std::f32::consts::TAU;
+                points.push((center, [0.5, 0.5]));
+                points.push((
+                    crate::renderer::Vec2 {
+                        x: center.x + a0.cos() * radius,
+                        y: center.y + a0.sin() * radius,
+                    },
+                    [1.0, 0.0],
+                ));
+                points.push((
+                    crate::renderer::Vec2 {
+                        x: center.x + a1.cos() * radius,
+                        y: center.y + a1.sin() * radius,
+                    },
+                    [0.0, 1.0],
+                ));
+            }
+            (shader, web_vertices(&points, color), None)
+        }
+        DrawCommand::Image {
+            image,
+            dest,
+            source,
+            rotation,
+            pivot,
+            tint,
+            filter,
+            shader: Some(shader),
+        } => {
+            let (image_width, image_height) =
+                image.dimensions().map_err(|error| error.to_string())?;
+            let source = source.unwrap_or(crate::renderer::Rect {
+                x: 0.0,
+                y: 0.0,
+                w: image_width as f32,
+                h: image_height as f32,
+            });
+            let u0 = source.x / image_width.max(1) as f32;
+            let v0 = source.y / image_height.max(1) as f32;
+            let u1 = (source.x + source.w) / image_width.max(1) as f32;
+            let v1 = (source.y + source.h) / image_height.max(1) as f32;
+            let corners = [
+                rotate_web_point(dest.x, dest.y, pivot.x, pivot.y, rotation),
+                rotate_web_point(dest.x + dest.w, dest.y, pivot.x, pivot.y, rotation),
+                rotate_web_point(dest.x + dest.w, dest.y + dest.h, pivot.x, pivot.y, rotation),
+                rotate_web_point(dest.x, dest.y + dest.h, pivot.x, pivot.y, rotation),
+            ];
+            (
+                shader,
+                web_quad_vertices(corners, [[u0, v0], [u1, v0], [u1, v1], [u0, v1]], tint),
+                Some((image, filter)),
+            )
+        }
+        other => return flush_unexpected_unshaded(other),
+    };
+
+    let snapshot = shader.snapshot_for_web()?;
+    let fragment_source = CString::new(snapshot.fragment_source.replace('\0', " "))
+        .map_err(|error| format!("invalid shader source for web: {error}"))?;
+    let uniforms_json = CString::new(snapshot.uniforms_json.replace('\0', " "))
+        .map_err(|error| format!("invalid shader uniforms for web: {error}"))?;
+
+    if let Some((image, filter)) = texture {
+        let revision = image.revision().map_err(|error| error.to_string())?;
+        let image_id = image.id().map_err(|error| error.to_string())?;
+        image
+            .with_image(|pixels| unsafe {
+                neolove_web_draw_shader(
                     fragment_source.as_ptr(),
                     uniforms_json.as_ptr(),
-                    x,
-                    y,
-                    w,
-                    h,
-                    rotation,
-                    x + w * offset.x,
-                    y + h * offset.y,
-                    color.r as i32,
-                    color.g as i32,
-                    color.b as i32,
-                    color.a as i32,
+                    vertices.as_ptr(),
+                    (vertices.len() / 8) as i32,
+                    image_id,
+                    revision as f64,
+                    pixels.as_raw().as_ptr(),
+                    pixels.width() as i32,
+                    pixels.height() as i32,
+                    i32::from(matches!(filter, crate::renderer::TextureFilter::Linear)),
                 );
-            }
-            Ok(())
+            })
+            .map_err(|error| error.to_string())
+    } else {
+        unsafe {
+            neolove_web_draw_shader(
+                fragment_source.as_ptr(),
+                uniforms_json.as_ptr(),
+                vertices.as_ptr(),
+                (vertices.len() / 8) as i32,
+                0,
+                0.0,
+                std::ptr::null(),
+                0,
+                0,
+                0,
+            );
         }
-        DrawCommand::Triangle { shader: Some(_), .. }
-        | DrawCommand::Circle { shader: Some(_), .. }
-        | DrawCommand::Image { shader: Some(_), .. } => Err(
-            "web shader support currently handles Rect2D shader commands; triangle, circle, and image shader commands are not yet available on web".to_string(),
-        ),
-        other => flush_unexpected_unshaded(other),
+        Ok(())
     }
+}
+
+fn rotate_web_point(
+    x: f32,
+    y: f32,
+    pivot_x: f32,
+    pivot_y: f32,
+    rotation: f32,
+) -> crate::renderer::Vec2 {
+    let dx = x - pivot_x;
+    let dy = y - pivot_y;
+    let cos_r = rotation.cos();
+    let sin_r = rotation.sin();
+    crate::renderer::Vec2 {
+        x: pivot_x + dx * cos_r - dy * sin_r,
+        y: pivot_y + dx * sin_r + dy * cos_r,
+    }
+}
+
+fn web_quad_vertices(
+    corners: [crate::renderer::Vec2; 4],
+    uv: [[f32; 2]; 4],
+    color: crate::renderer::Color,
+) -> Vec<f32> {
+    web_vertices(
+        &[
+            (corners[0], uv[0]),
+            (corners[1], uv[1]),
+            (corners[2], uv[2]),
+            (corners[0], uv[0]),
+            (corners[2], uv[2]),
+            (corners[3], uv[3]),
+        ],
+        color,
+    )
+}
+
+fn web_vertices(
+    points: &[(crate::renderer::Vec2, [f32; 2])],
+    color: crate::renderer::Color,
+) -> Vec<f32> {
+    let rgba = [
+        color.r as f32 / 255.0,
+        color.g as f32 / 255.0,
+        color.b as f32 / 255.0,
+        color.a as f32 / 255.0,
+    ];
+    let mut vertices = Vec::with_capacity(points.len() * 8);
+    for (point, uv) in points {
+        vertices.extend_from_slice(&[
+            point.x, point.y, uv[0], uv[1], rgba[0], rgba[1], rgba[2], rgba[3],
+        ]);
+    }
+    vertices
 }
 
 fn flush_unexpected_unshaded(_command: DrawCommand) -> Result<(), String> {

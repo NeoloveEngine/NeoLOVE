@@ -636,26 +636,22 @@ EM_JS(void, neolove_js_draw_image, (
   ctx.restore();
 });
 
-EM_JS(void, neolove_js_draw_shader_rect, (
+EM_JS(void, neolove_js_draw_shader, (
   const char* fragment_source_ptr,
   const char* uniforms_json_ptr,
-  float x,
-  float y,
-  float w,
-  float h,
-  float rotation,
-  float pivot_x,
-  float pivot_y,
-  int r,
-  int g,
-  int b,
-  int a
+  const float* vertices_ptr,
+  int vertex_count,
+  uintptr_t texture_id,
+  double texture_revision,
+  const uint8_t* texture_pixels,
+  int texture_width,
+  int texture_height,
+  int linear_filter
 ), {
   const state = Module.neoloveState;
   const canvas = Module.canvas;
-  if (!state || !canvas || !(w > 0) || !(h > 0) || a <= 0) {
-    return;
-  }
+  if (!state || !canvas || vertex_count <= 0) return;
+
   const fragmentSource = UTF8ToString(fragment_source_ptr);
   let uniforms = {};
   try {
@@ -690,7 +686,6 @@ void main() {
   uv = a_uv;
   color = a_color;
 }`;
-
   const compileShader = (type, source) => {
     const shader = gl.createShader(type);
     gl.shaderSource(shader, source);
@@ -734,33 +729,17 @@ void main() {
     }
   }
 
-  const toClipX = (px) => (px / Math.max(1, canvas.width)) * 2 - 1;
-  const toClipY = (py) => 1 - (py / Math.max(1, canvas.height)) * 2;
-  const rotate = (px, py) => {
-    if (rotation === 0) {
-      return [px, py];
-    }
-    const dx = px - pivot_x;
-    const dy = py - pivot_y;
-    const c = Math.cos(rotation);
-    const s = Math.sin(rotation);
-    return [pivot_x + dx * c - dy * s, pivot_y + dx * s + dy * c];
-  };
-  const corners = [
-    rotate(x, y),
-    rotate(x + w, y),
-    rotate(x + w, y + h),
-    rotate(x, y + h)
-  ];
-  const color = [r / 255, g / 255, b / 255, a / 255];
-  const packed = new Float32Array([
-    toClipX(corners[0][0]), toClipY(corners[0][1]), 0, 0, color[0], color[1], color[2], color[3],
-    toClipX(corners[1][0]), toClipY(corners[1][1]), 1, 0, color[0], color[1], color[2], color[3],
-    toClipX(corners[2][0]), toClipY(corners[2][1]), 1, 1, color[0], color[1], color[2], color[3],
-    toClipX(corners[0][0]), toClipY(corners[0][1]), 0, 0, color[0], color[1], color[2], color[3],
-    toClipX(corners[2][0]), toClipY(corners[2][1]), 1, 1, color[0], color[1], color[2], color[3],
-    toClipX(corners[3][0]), toClipY(corners[3][1]), 0, 1, color[0], color[1], color[2], color[3]
-  ]);
+  const packed = new Float32Array(HEAPF32.subarray(vertices_ptr >> 2, (vertices_ptr >> 2) + vertex_count * 8));
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let index = 0; index < vertex_count; index += 1) {
+    const offset = index * 8;
+    const x = packed[offset];
+    const y = packed[offset + 1];
+    minX = Math.min(minX, x); minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+    packed[offset] = (x / Math.max(1, canvas.width)) * 2 - 1;
+    packed[offset + 1] = 1 - (y / Math.max(1, canvas.height)) * 2;
+  }
 
   const buffer = state.shaderVertexBuffer || (state.shaderVertexBuffer = gl.createBuffer());
   gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
@@ -787,20 +766,43 @@ void main() {
     gl.vertexAttribPointer(programInfo.aColor, 4, gl.FLOAT, false, stride, 4 * 4);
   }
 
-  if (!state.shaderWhiteTexture) {
-    state.shaderWhiteTexture = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, state.shaderWhiteTexture);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
+  let texture;
+  if (texture_pixels && texture_width > 0 && texture_height > 0) {
+    state.shaderTextures = state.shaderTextures || new Map();
+    let cached = state.shaderTextures.get(texture_id);
+    if (!cached || cached.revision !== texture_revision || cached.width !== texture_width || cached.height !== texture_height) {
+      if (cached) gl.deleteTexture(cached.texture);
+      texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, texture_width, texture_height, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+        HEAPU8.subarray(texture_pixels, texture_pixels + texture_width * texture_height * 4));
+      cached = { texture, revision: texture_revision, width: texture_width, height: texture_height };
+      state.shaderTextures.set(texture_id, cached);
+    } else {
+      texture = cached.texture;
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+    }
+    const filter = linear_filter ? gl.LINEAR : gl.NEAREST;
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  } else {
+    texture = state.shaderWhiteTexture || (state.shaderWhiteTexture = gl.createTexture());
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    if (!state.shaderWhiteTextureInitialized) {
+      state.shaderWhiteTextureInitialized = true;
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
+    }
   }
   gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D, state.shaderWhiteTexture);
-  if (programInfo.uTexture !== null) {
-    gl.uniform1i(programInfo.uTexture, 0);
-  }
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  if (programInfo.uTexture !== null) gl.uniform1i(programInfo.uTexture, 0);
 
   const floats = uniforms.floats || {};
   for (const name of Object.keys(floats)) {
@@ -809,9 +811,7 @@ void main() {
       location = gl.getUniformLocation(programInfo.program, name);
       programInfo.uniformLocations.set(name, location);
     }
-    if (!location) {
-      continue;
-    }
+    if (location === null) continue;
     const values = floats[name] || [];
     if (values.length === 1) gl.uniform1f(location, values[0]);
     else if (values.length === 2) gl.uniform2f(location, values[0], values[1]);
@@ -819,23 +819,20 @@ void main() {
     else if (values.length >= 4) gl.uniform4f(location, values[0], values[1], values[2], values[3]);
   }
 
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
-
-  if (!state.ctx) {
-    state.ctx = canvas.getContext("2d", { alpha: false }) || canvas.getContext("2d");
-  }
+  gl.drawArrays(gl.TRIANGLES, 0, vertex_count);
+  if (!state.ctx) state.ctx = canvas.getContext("2d", { alpha: false }) || canvas.getContext("2d");
   if (state.ctx) {
-    state.ctx.save();
-    state.ctx.setTransform(1, 0, 0, 1, 0, 0);
-    const sx = Math.max(0, Math.floor(Math.min(corners[0][0], corners[1][0], corners[2][0], corners[3][0])));
-    const sy = Math.max(0, Math.floor(Math.min(corners[0][1], corners[1][1], corners[2][1], corners[3][1])));
-    const ex = Math.min(canvas.width, Math.ceil(Math.max(corners[0][0], corners[1][0], corners[2][0], corners[3][0])));
-    const ey = Math.min(canvas.height, Math.ceil(Math.max(corners[0][1], corners[1][1], corners[2][1], corners[3][1])));
-    state.ctx.globalCompositeOperation = "source-over";
+    const sx = Math.max(0, Math.floor(minX));
+    const sy = Math.max(0, Math.floor(minY));
+    const ex = Math.min(canvas.width, Math.ceil(maxX));
+    const ey = Math.min(canvas.height, Math.ceil(maxY));
     if (ex > sx && ey > sy) {
+      state.ctx.save();
+      state.ctx.setTransform(1, 0, 0, 1, 0, 0);
+      state.ctx.globalCompositeOperation = "source-over";
       state.ctx.drawImage(glCanvas, sx, sy, ex - sx, ey - sy, sx, sy, ex - sx, ey - sy);
+      state.ctx.restore();
     }
-    state.ctx.restore();
   }
 });
 
@@ -1506,34 +1503,20 @@ void neolove_web_draw_image(
       linear_filter);
 }
 
-void neolove_web_draw_shader_rect(
+void neolove_web_draw_shader(
     const char* fragment_source,
     const char* uniforms_json,
-    float x,
-    float y,
-    float w,
-    float h,
-    float rotation,
-    float pivot_x,
-    float pivot_y,
-    int r,
-    int g,
-    int b,
-    int a) {
-  neolove_js_draw_shader_rect(
-      fragment_source,
-      uniforms_json,
-      x,
-      y,
-      w,
-      h,
-      rotation,
-      pivot_x,
-      pivot_y,
-      r,
-      g,
-      b,
-      a);
+    const float* vertices,
+    int vertex_count,
+    uintptr_t texture_id,
+    double texture_revision,
+    const uint8_t* texture_pixels,
+    int texture_width,
+    int texture_height,
+    int linear_filter) {
+  neolove_js_draw_shader(
+      fragment_source, uniforms_json, vertices, vertex_count, texture_id, texture_revision,
+      texture_pixels, texture_width, texture_height, linear_filter);
 }
 
 void neolove_web_draw_text(

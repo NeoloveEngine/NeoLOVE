@@ -348,7 +348,7 @@ Uniform setters:
 Edges:
 
 - Custom shaders require the Vulkan renderer on desktop; build the engine with `--features vulkan`.
-- Web builds support `Rect2D` fragment shaders through the browser WebGL path, including float/vector uniforms and the built-in white `Texture` sampler.
+- Web builds support fragment shaders on rectangles, triangles, circles, and images through the browser WebGL path, including float/vector uniforms. Shape commands use the built-in white `Texture` sampler, while image commands bind their source image to `Texture`.
 - `shaders.DEFAULT_VERTEX_SHADER` contains the built-in vertex shader source.
 
 ## Tweening
@@ -900,7 +900,7 @@ Edges:
 
 - First web builds may install `wasm32-unknown-emscripten` and a local Emscripten toolchain under `~/.neolove/toolchains/emsdk`.
 - Web audio requires browser permission or user gesture.
-- Web `Rect2D` shader effects are rendered through WebGL and composited with the software-rendered scene; unshaded software chunks are dirty-rect composited to avoid full-canvas copies around shader draws.
+- Web shader effects are rendered through WebGL and composited with the software-rendered scene; unshaded software chunks are dirty-rect composited to avoid full-canvas copies around shader draws.
 
 ## Performance Guidance
 
