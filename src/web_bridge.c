@@ -33,7 +33,8 @@ EM_JS(void, neolove_js_bootstrap, (), {
       active: new Map(),
       lastError: "",
       resumeHooksInstalled: false
-    }
+    },
+    fonts: new Map()
   });
 
   const canvas = document.getElementById("canvas");
@@ -472,26 +473,6 @@ EM_JS(void, neolove_js_present_rgba, (const uint8_t* pixels, int width, int heig
   }
   const expectedBytes = width * height * 4;
   const view = HEAPU8.subarray(pixels, pixels + expectedBytes);
-  state.presentCount = (state.presentCount || 0) + 1;
-  if (state.presentCount <= 5) {
-    const centerPixel = Math.max(
-      0,
-      ((Math.floor(height / 2) * width + Math.floor(width / 2)) * 4)
-    );
-    console.warn("[NeoLOVE debug] present frame", {
-      frame: state.presentCount,
-      renderWidth: width,
-      renderHeight: height,
-      canvasWidth: canvas.width,
-      canvasHeight: canvas.height,
-      clientWidth: canvas.clientWidth,
-      clientHeight: canvas.clientHeight,
-      bytesExpected: expectedBytes,
-      bytesReceived: view.length,
-      firstPixel: Array.from(view.subarray(0, Math.min(4, view.length))),
-      centerPixel: Array.from(view.subarray(centerPixel, Math.min(centerPixel + 4, view.length)))
-    });
-  }
   try {
     state.imageData.data.set(view);
     state.ctx.putImageData(state.imageData, 0, 0);
@@ -526,7 +507,7 @@ EM_JS(void, neolove_js_clear_canvas, (int r, int g, int b, int a), {
   ctx.restore();
 });
 
-EM_JS(void, neolove_js_composite_rgba, (const uint8_t* pixels, int width, int height), {
+EM_JS(void, neolove_js_composite_rgba, (const uint8_t* pixels, int width, int height, int dst_x, int dst_y), {
   const state = Module.neoloveState;
   const canvas = Module.canvas;
   if (!state || !canvas || width <= 0 || height <= 0) {
@@ -561,7 +542,7 @@ EM_JS(void, neolove_js_composite_rgba, (const uint8_t* pixels, int width, int he
   ctx.save();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.globalCompositeOperation = "source-over";
-  ctx.drawImage(blitCanvas, 0, 0);
+  ctx.drawImage(blitCanvas, dst_x, dst_y);
   ctx.restore();
 });
 
@@ -756,8 +737,14 @@ void main() {
   if (state.ctx) {
     state.ctx.save();
     state.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    const sx = Math.max(0, Math.floor(Math.min(corners[0][0], corners[1][0], corners[2][0], corners[3][0])));
+    const sy = Math.max(0, Math.floor(Math.min(corners[0][1], corners[1][1], corners[2][1], corners[3][1])));
+    const ex = Math.min(canvas.width, Math.ceil(Math.max(corners[0][0], corners[1][0], corners[2][0], corners[3][0])));
+    const ey = Math.min(canvas.height, Math.ceil(Math.max(corners[0][1], corners[1][1], corners[2][1], corners[3][1])));
     state.ctx.globalCompositeOperation = "source-over";
-    state.ctx.drawImage(glCanvas, 0, 0);
+    if (ex > sx && ey > sy) {
+      state.ctx.drawImage(glCanvas, sx, sy, ex - sx, ey - sy, sx, sy, ex - sx, ey - sy);
+    }
     state.ctx.restore();
   }
 });
@@ -785,7 +772,8 @@ EM_JS(void, neolove_js_draw_text, (
   float padding_y,
   float line_spacing,
   float letter_spacing,
-  int font_kind
+  int font_kind,
+  const char* font_path_ptr
 ), {
   const state = Module.neoloveState;
   if (!state || !Module.canvas) {
@@ -815,7 +803,53 @@ EM_JS(void, neolove_js_draw_text, (
   const widthLimit = w > 0 ? Math.max(0, w - paddingX * 2) : null;
   const heightLimit = h > 0 ? Math.max(0, h - paddingY * 2) : null;
   const activeWrap = widthLimit !== null && wrap !== 0 ? wrap : 0;
-  const family = font_kind === 0 ? "monospace" : "sans-serif";
+  const fontPath = font_path_ptr ? UTF8ToString(font_path_ptr) : "";
+  const quoteFontFamily = (family) => `"${String(family).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  const hashString = (value) => {
+    let hash = 0;
+    for (let i = 0; i < value.length; i += 1) {
+      hash = ((hash << 5) - hash + value.charCodeAt(i)) | 0;
+    }
+    return hash;
+  };
+  const ensureCustomFont = (path) => {
+    if (!path || font_kind === 0 || typeof FontFace === "undefined" || typeof FS === "undefined") {
+      return null;
+    }
+    state.fonts = state.fonts || new Map();
+    let entry = state.fonts.get(path);
+    if (entry) {
+      return entry;
+    }
+    const family = `NeoLOVE_${state.fonts.size}_${Math.abs(hashString(path))}`;
+    entry = { family, loaded: false, failed: false };
+    state.fonts.set(path, entry);
+    try {
+      const bytes = FS.readFile(path);
+      const face = new FontFace(family, bytes);
+      entry.face = face;
+      face.load().then((loadedFace) => {
+        document.fonts.add(loadedFace);
+        entry.loaded = true;
+      }).catch((error) => {
+        entry.failed = true;
+        if (!entry.logged) {
+          entry.logged = true;
+          console.warn(`NeoLOVE failed to load web font '${path}'`, error);
+        }
+      });
+    } catch (error) {
+      entry.failed = true;
+      if (!entry.logged) {
+        entry.logged = true;
+        console.warn(`NeoLOVE failed to read web font '${path}'`, error);
+      }
+    }
+    return entry;
+  };
+  const customFont = ensureCustomFont(fontPath);
+  const family = customFont && customFont.loaded ? quoteFontFamily(customFont.family) :
+    (font_kind === 0 ? "monospace" : "sans-serif");
   const safeLetterSpacing = Number.isFinite(letter_spacing) ? letter_spacing : 0;
 
   const setFont = (px) => {
@@ -1339,8 +1373,8 @@ void neolove_web_present_rgba(const uint8_t* pixels, int width, int height) {
   neolove_js_present_rgba(pixels, width, height);
 }
 
-void neolove_web_composite_rgba(const uint8_t* pixels, int width, int height) {
-  neolove_js_composite_rgba(pixels, width, height);
+void neolove_web_composite_rgba(const uint8_t* pixels, int width, int height, int x, int y) {
+  neolove_js_composite_rgba(pixels, width, height, x, y);
 }
 
 void neolove_web_draw_shader_rect(
@@ -1396,7 +1430,8 @@ void neolove_web_draw_text(
     float padding_y,
     float line_spacing,
     float letter_spacing,
-    int font_kind) {
+    int font_kind,
+    const char* font_path) {
   neolove_js_draw_text(
       message,
       x,
@@ -1420,7 +1455,8 @@ void neolove_web_draw_text(
       padding_y,
       line_spacing,
       letter_spacing,
-      font_kind);
+      font_kind,
+      font_path);
 }
 
 void neolove_web_report_status(const char* message) {

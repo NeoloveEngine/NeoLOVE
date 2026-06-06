@@ -622,7 +622,7 @@ Aliases: `core.TextLabel`, `core.RudimentaryTextLabel`.
 
 Edges:
 
-- `font` may be `"default"` or a project-root path.
+- `font` may be `"default"` or a project-root path; web builds load project fonts from the bundled Emscripten filesystem through the browser FontFace API.
 - Text can auto-fit within entity bounds using `text_scale`.
 - Content-sized text is not culled before layout.
 
@@ -900,7 +900,7 @@ Edges:
 
 - First web builds may install `wasm32-unknown-emscripten` and a local Emscripten toolchain under `~/.neolove/toolchains/emsdk`.
 - Web audio requires browser permission or user gesture.
-- Web `Rect2D` shader effects are rendered through WebGL and composited with the software-rendered scene.
+- Web `Rect2D` shader effects are rendered through WebGL and composited with the software-rendered scene; unshaded software chunks are dirty-rect composited to avoid full-canvas copies around shader draws.
 
 ## Performance Guidance
 
@@ -911,6 +911,7 @@ Edges:
 - For collision-heavy gameplay, use Collider2D/Rigidbody2D for broad physical simulation and Spritebox2D for precise final checks.
 - Use `assets.gc()` after unloading large batches of assets.
 - Keep web bundles lean by removing unused assets before building.
+- On web, group shader-heavy entities where possible; the runtime avoids full-frame uploads for software-only frames and dirty-rect composites mixed software/shader chunks, but each WebGL shader switch still has browser overhead.
 
 ## Troubleshooting
 

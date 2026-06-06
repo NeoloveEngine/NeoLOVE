@@ -950,12 +950,17 @@ fn rect_intersects_viewport(bounds: Rect, width: u32, height: u32) -> bool {
         && bounds.y + bounds.h > 0.0
 }
 
-pub(crate) fn command_intersects_viewport(command: &DrawCommand, width: u32, height: u32) -> bool {
-    if width == 0 || height == 0 {
-        return false;
-    }
 
-    let bounds = match command {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DirtyBounds {
+    pub(crate) x: u32,
+    pub(crate) y: u32,
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+}
+
+fn command_bounds(command: &DrawCommand) -> Option<Rect> {
+    match command {
         DrawCommand::Rect {
             x,
             y,
@@ -966,13 +971,13 @@ pub(crate) fn command_intersects_viewport(command: &DrawCommand, width: u32, hei
             ..
         } => {
             if *w <= 0.0 || *h <= 0.0 {
-                return false;
+                return None;
             }
             let pivot = Vec2 {
                 x: *x + *w * offset.x,
                 y: *y + *h * offset.y,
             };
-            bounds_from_points(&rotated_rect_corners(
+            Some(bounds_from_points(&rotated_rect_corners(
                 Rect {
                     x: *x,
                     y: *y,
@@ -981,19 +986,19 @@ pub(crate) fn command_intersects_viewport(command: &DrawCommand, width: u32, hei
                 },
                 pivot,
                 *rotation,
-            ))
+            )))
         }
-        DrawCommand::Triangle { a, b, c, .. } => bounds_from_points(&[*a, *b, *c]),
+        DrawCommand::Triangle { a, b, c, .. } => Some(bounds_from_points(&[*a, *b, *c])),
         DrawCommand::Circle { center, radius, .. } => {
             if *radius <= 0.0 {
-                return false;
+                return None;
             }
-            Rect {
+            Some(Rect {
                 x: center.x - *radius,
                 y: center.y - *radius,
                 w: radius * 2.0,
                 h: radius * 2.0,
-            }
+            })
         }
         DrawCommand::Image {
             dest,
@@ -1002,23 +1007,145 @@ pub(crate) fn command_intersects_viewport(command: &DrawCommand, width: u32, hei
             ..
         } => {
             if dest.w <= 0.0 || dest.h <= 0.0 {
-                return false;
+                return None;
             }
-            bounds_from_points(&rotated_rect_corners(*dest, *pivot, *rotation))
+            Some(bounds_from_points(&rotated_rect_corners(
+                *dest, *pivot, *rotation,
+            )))
         }
         DrawCommand::Text(request) => {
             if request.bounds.w <= 0.0 || request.bounds.h <= 0.0 {
-                // Content-sized text computes its real sprite bounds during layout/rasterization,
-                // so pre-layout culling cannot safely reject it here.
-                return true;
+                return Some(request.bounds);
             }
-            bounds_from_points(&rotated_rect_corners(
+            Some(bounds_from_points(&rotated_rect_corners(
                 request.bounds,
                 request.pivot,
                 request.rotation,
-            ))
+            )))
         }
+    }
+}
+
+pub(crate) fn commands_dirty_bounds(
+    commands: &[DrawCommand],
+    viewport: (u32, u32),
+) -> Option<DirtyBounds> {
+    let (width, height) = viewport;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let mut min_x = width as i32;
+    let mut min_y = height as i32;
+    let mut max_x = 0i32;
+    let mut max_y = 0i32;
+    let mut found = false;
+
+    for command in commands {
+        let Some(bounds) = command_bounds(command) else {
+            continue;
+        };
+        if !rect_intersects_viewport(bounds, width, height) {
+            continue;
+        }
+        let left = bounds.x.floor().max(0.0) as i32;
+        let top = bounds.y.floor().max(0.0) as i32;
+        let right = (bounds.x + bounds.w).ceil().min(width as f32) as i32;
+        let bottom = (bounds.y + bounds.h).ceil().min(height as f32) as i32;
+        if right <= left || bottom <= top {
+            continue;
+        }
+        min_x = min_x.min(left);
+        min_y = min_y.min(top);
+        max_x = max_x.max(right);
+        max_y = max_y.max(bottom);
+        found = true;
+    }
+
+    found.then_some(DirtyBounds {
+        x: min_x as u32,
+        y: min_y as u32,
+        w: (max_x - min_x) as u32,
+        h: (max_y - min_y) as u32,
+    })
+}
+
+pub(crate) fn translate_commands(commands: Vec<DrawCommand>, dx: f32, dy: f32) -> Vec<DrawCommand> {
+    commands
+        .into_iter()
+        .map(|command| translate_command(command, dx, dy))
+        .collect()
+}
+
+fn translate_command(command: DrawCommand, dx: f32, dy: f32) -> DrawCommand {
+    match command {
+        DrawCommand::Rect {
+            x,
+            y,
+            w,
+            h,
+            rotation,
+            offset,
+            color,
+            shader,
+        } => DrawCommand::Rect {
+            x: x + dx,
+            y: y + dy,
+            w,
+            h,
+            rotation,
+            offset,
+            color,
+            shader,
+        },
+        DrawCommand::Triangle { a, b, c, color, shader } => DrawCommand::Triangle {
+            a: Vec2 { x: a.x + dx, y: a.y + dy },
+            b: Vec2 { x: b.x + dx, y: b.y + dy },
+            c: Vec2 { x: c.x + dx, y: c.y + dy },
+            color,
+            shader,
+        },
+        DrawCommand::Circle { center, radius, color, shader } => DrawCommand::Circle {
+            center: Vec2 { x: center.x + dx, y: center.y + dy },
+            radius,
+            color,
+            shader,
+        },
+        DrawCommand::Image { image, dest, source, rotation, pivot, tint, filter, shader } => {
+            DrawCommand::Image {
+                image,
+                dest: Rect { x: dest.x + dx, y: dest.y + dy, ..dest },
+                source,
+                rotation,
+                pivot: Vec2 { x: pivot.x + dx, y: pivot.y + dy },
+                tint,
+                filter,
+                shader,
+            }
+        }
+        DrawCommand::Text(mut request) => {
+            request.bounds.x += dx;
+            request.bounds.y += dy;
+            request.pivot.x += dx;
+            request.pivot.y += dy;
+            DrawCommand::Text(request)
+        }
+    }
+}
+
+pub(crate) fn command_intersects_viewport(command: &DrawCommand, width: u32, height: u32) -> bool {
+    if width == 0 || height == 0 {
+        return false;
+    }
+
+    let Some(bounds) = command_bounds(command) else {
+        return false;
     };
+    if matches!(command, DrawCommand::Text(request) if request.bounds.w <= 0.0 || request.bounds.h <= 0.0) {
+        // Content-sized text computes its real sprite bounds during layout/rasterization,
+        // so pre-layout culling cannot safely reject it here.
+        return true;
+    }
 
     rect_intersects_viewport(bounds, width, height)
 }
