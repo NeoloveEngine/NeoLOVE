@@ -48,7 +48,24 @@ unsafe extern "C" {
     fn neolove_web_take_last_key(buffer: *mut c_char, capacity: i32) -> i32;
     fn neolove_web_take_char(buffer: *mut c_char, capacity: i32) -> i32;
     fn neolove_web_begin_frame();
+    fn neolove_web_clear_canvas(r: i32, g: i32, b: i32, a: i32);
     fn neolove_web_present_rgba(pixels: *const u8, width: i32, height: i32);
+    fn neolove_web_composite_rgba(pixels: *const u8, width: i32, height: i32, x: i32, y: i32);
+    fn neolove_web_draw_shader_rect(
+        fragment_source: *const c_char,
+        uniforms_json: *const c_char,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        rotation: f32,
+        pivot_x: f32,
+        pivot_y: f32,
+        r: i32,
+        g: i32,
+        b: i32,
+        a: i32,
+    );
     fn neolove_web_draw_text(
         text: *const c_char,
         x: f32,
@@ -73,6 +90,7 @@ unsafe extern "C" {
         line_spacing: f32,
         letter_spacing: f32,
         font_kind: i32,
+        font_path: *const c_char,
     );
     fn neolove_web_report_status(message: *const c_char);
     fn neolove_web_report_error(message: *const c_char);
@@ -156,8 +174,8 @@ const WEB_KEYS: &[WebKey] = &[
 const WEB_MOUSE_BUTTONS: &[(&str, i32)] = &[("left", 0), ("middle", 1), ("right", 2), ("other", 3)];
 // Rust-side `format!` logging is useful during early startup, but leaving it on for
 // hundreds of frames in the wasm build is expensive and can destabilize the debug path.
-const WEB_DEBUG_TICK_LIMIT: u32 = 160;
-const WEB_DEBUG_PIXEL_SAMPLE_LIMIT: u32 = 8;
+const WEB_DEBUG_TICK_LIMIT: u32 = 0;
+const WEB_DEBUG_PIXEL_SAMPLE_LIMIT: u32 = 0;
 
 struct WebApp {
     runtime: window::Runtime,
@@ -316,9 +334,8 @@ impl WebApp {
                 images
             ));
         }
-        self.renderer
-            .render_commands(&self.platform_state, pixel_commands)
-            .map_err(|error| format!("software renderer failed: {error}"))?;
+        render_web_commands_in_order(&mut self.renderer, &self.platform_state, pixel_commands)
+            .map_err(|error| format!("web renderer failed: {error}"))?;
         if tick_index <= WEB_DEBUG_TICK_LIMIT {
             let clear = lock_platform_state(&self.platform_state).clear_color();
             debug_log(&format!(
@@ -371,13 +388,7 @@ impl WebApp {
                 self.renderer.pixels().len()
             ));
         }
-        unsafe {
-            neolove_web_present_rgba(
-                self.renderer.pixels().as_ptr(),
-                width as i32,
-                height as i32,
-            );
-        }
+        // Frame pixels were already composited by render_web_commands_in_order.
         if tick_index <= WEB_DEBUG_TICK_LIMIT {
             debug_log(&format!("tick stage {tick_index}: after present_rgba"));
             debug_log(&format!(
@@ -493,6 +504,130 @@ impl WebApp {
     }
 }
 
+
+fn render_web_commands_in_order(
+    renderer: &mut SoftwareRenderer,
+    platform: &SharedPlatformState,
+    commands: Vec<DrawCommand>,
+) -> Result<(), String> {
+    if !commands.iter().any(command_has_shader) {
+        renderer.render_commands(platform, commands)?;
+        let (width, height) = renderer.dimensions();
+        unsafe {
+            neolove_web_present_rgba(renderer.pixels().as_ptr(), width as i32, height as i32);
+        }
+        return Ok(());
+    }
+
+    let clear = lock_platform_state(platform).clear_color();
+    unsafe {
+        neolove_web_clear_canvas(clear.r as i32, clear.g as i32, clear.b as i32, clear.a as i32);
+    }
+
+    let viewport = renderer.dimensions();
+    let mut pending = Vec::new();
+    for command in commands {
+        if command_has_shader(&command) {
+            flush_software_chunk(renderer, viewport, std::mem::take(&mut pending))?;
+            draw_web_shader_command(command)?;
+        } else {
+            pending.push(command);
+        }
+    }
+    let result = flush_software_chunk(renderer, viewport, pending);
+    renderer.resize(viewport.0, viewport.1);
+    result
+}
+
+fn flush_software_chunk(
+    renderer: &mut SoftwareRenderer,
+    viewport: (u32, u32),
+    commands: Vec<DrawCommand>,
+) -> Result<(), String> {
+    if commands.is_empty() {
+        return Ok(());
+    }
+    let Some(bounds) = crate::renderer::commands_dirty_bounds(&commands, viewport) else {
+        return Ok(());
+    };
+    renderer.resize(bounds.w, bounds.h);
+    renderer.clear_transparent();
+    renderer.draw_unshaded_commands(crate::renderer::translate_commands(
+        commands,
+        -(bounds.x as f32),
+        -(bounds.y as f32),
+    ))?;
+    unsafe {
+        neolove_web_composite_rgba(
+            renderer.pixels().as_ptr(),
+            bounds.w as i32,
+            bounds.h as i32,
+            bounds.x as i32,
+            bounds.y as i32,
+        );
+    }
+    Ok(())
+}
+
+fn command_has_shader(command: &DrawCommand) -> bool {
+    match command {
+        DrawCommand::Rect { shader, .. }
+        | DrawCommand::Triangle { shader, .. }
+        | DrawCommand::Circle { shader, .. }
+        | DrawCommand::Image { shader, .. } => shader.is_some(),
+        DrawCommand::Text(_) => false,
+    }
+}
+
+fn draw_web_shader_command(command: DrawCommand) -> Result<(), String> {
+    match command {
+        DrawCommand::Rect {
+            x,
+            y,
+            w,
+            h,
+            rotation,
+            offset,
+            color,
+            shader: Some(shader),
+        } => {
+            let snapshot = shader.snapshot_for_web()?;
+            let fragment_source = CString::new(snapshot.fragment_source.replace('\0', " "))
+                .map_err(|error| format!("invalid shader source for web: {error}"))?;
+            let uniforms_json = CString::new(snapshot.uniforms_json.replace('\0', " "))
+                .map_err(|error| format!("invalid shader uniforms for web: {error}"))?;
+            unsafe {
+                neolove_web_draw_shader_rect(
+                    fragment_source.as_ptr(),
+                    uniforms_json.as_ptr(),
+                    x,
+                    y,
+                    w,
+                    h,
+                    rotation,
+                    x + w * offset.x,
+                    y + h * offset.y,
+                    color.r as i32,
+                    color.g as i32,
+                    color.b as i32,
+                    color.a as i32,
+                );
+            }
+            Ok(())
+        }
+        DrawCommand::Triangle { shader: Some(_), .. }
+        | DrawCommand::Circle { shader: Some(_), .. }
+        | DrawCommand::Image { shader: Some(_), .. } => Err(
+            "web shader support currently handles Rect2D shader commands; triangle, circle, and image shader commands are not yet available on web".to_string(),
+        ),
+        other => flush_unexpected_unshaded(other),
+    }
+}
+
+fn flush_unexpected_unshaded(_command: DrawCommand) -> Result<(), String> {
+    Err("internal web renderer error: expected a shader command".to_string())
+}
+
 fn split_text_commands(commands: Vec<DrawCommand>) -> (Vec<DrawCommand>, Vec<TextRenderRequest>) {
     let mut pixel_commands = Vec::with_capacity(commands.len());
     let mut text_commands = Vec::new();
@@ -562,6 +697,13 @@ fn font_kind_code(value: &FontHandle) -> i32 {
     }
 }
 
+fn font_path_cstring(value: &FontHandle) -> Option<CString> {
+    match value {
+        FontHandle::Default => None,
+        FontHandle::Path(path) => CString::new(path.replace('\0', " ")).ok(),
+    }
+}
+
 fn draw_web_text_commands(commands: &[TextRenderRequest]) {
     for request in commands {
         if request.text.is_empty() || request.color.a == 0 {
@@ -571,6 +713,11 @@ fn draw_web_text_commands(commands: &[TextRenderRequest]) {
         let Ok(text) = CString::new(sanitized) else {
             continue;
         };
+        let font_path = font_path_cstring(&request.font);
+        let font_path_ptr = font_path
+            .as_ref()
+            .map(|value| value.as_ptr())
+            .unwrap_or(std::ptr::null());
         unsafe {
             neolove_web_draw_text(
                 text.as_ptr(),
@@ -596,6 +743,7 @@ fn draw_web_text_commands(commands: &[TextRenderRequest]) {
                 request.line_spacing,
                 request.letter_spacing,
                 font_kind_code(&request.font),
+                font_path_ptr,
             );
         }
     }

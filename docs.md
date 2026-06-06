@@ -348,7 +348,7 @@ Uniform setters:
 Edges:
 
 - Custom shaders require the Vulkan renderer on desktop; build the engine with `--features vulkan`.
-- The current web runtime uses the software renderer and reports an error for custom shader draw commands.
+- Web builds support `Rect2D` fragment shaders through the browser WebGL path, including float/vector uniforms and the built-in white `Texture` sampler.
 - `shaders.DEFAULT_VERTEX_SHADER` contains the built-in vertex shader source.
 
 ## Tweening
@@ -622,7 +622,7 @@ Aliases: `core.TextLabel`, `core.RudimentaryTextLabel`.
 
 Edges:
 
-- `font` may be `"default"` or a project-root path.
+- `font` may be `"default"` or a project-root path; web builds load project fonts from the bundled Emscripten filesystem through the browser FontFace API.
 - Text can auto-fit within entity bounds using `text_scale`.
 - Content-sized text is not culled before layout.
 
@@ -900,7 +900,7 @@ Edges:
 
 - First web builds may install `wasm32-unknown-emscripten` and a local Emscripten toolchain under `~/.neolove/toolchains/emsdk`.
 - Web audio requires browser permission or user gesture.
-- Web shader support is limited by the current software renderer.
+- Web `Rect2D` shader effects are rendered through WebGL and composited with the software-rendered scene; unshaded software chunks are dirty-rect composited to avoid full-canvas copies around shader draws.
 
 ## Performance Guidance
 
@@ -911,6 +911,7 @@ Edges:
 - For collision-heavy gameplay, use Collider2D/Rigidbody2D for broad physical simulation and Spritebox2D for precise final checks.
 - Use `assets.gc()` after unloading large batches of assets.
 - Keep web bundles lean by removing unused assets before building.
+- On web, group shader-heavy entities where possible; the runtime avoids full-frame uploads for software-only frames and dirty-rect composites mixed software/shader chunks, but each WebGL shader switch still has browser overhead.
 
 ## Troubleshooting
 
@@ -920,4 +921,4 @@ Edges:
 - Sprite clicks hit transparent padding: use `core.Spritebox2D` and call `ComputeSpritebox`.
 - Spritebox always returns false: verify the sprite component is attached before the Spritebox computes, the image has alpha greater than `alpha_threshold`, and world coordinates are being passed to `IsInside`.
 - Web build is blank from `file://`: serve through HTTP.
-- Custom shader errors in web builds: the current web renderer does not support custom shader draw commands.
+- Custom shader errors in web builds: verify the browser supports WebGL and that the fragment shader is valid GLSL ES 1.00 (`#version 100`).
