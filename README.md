@@ -2,7 +2,7 @@
 a game engine written in Rust that allows
 you to easily make performant games in the language luau
 
-<sub>[you can find docs here!](https://github.com/NeoloveEngine/NeoLOVE/wiki)</sub>
+<sub>[read the engine docs](docs.md) | [wiki](https://github.com/NeoloveEngine/NeoLOVE/wiki)</sub>
 
 ### CLI
 
@@ -19,7 +19,9 @@ neolove --version
 
 ### Production Defaults
 
-- `cargo build --release` now uses thin LTO, single codegen unit, stripped binaries, and `panic = "abort"`.
+- `cargo build --release` now uses size optimization, fat LTO, one codegen unit, stripped binaries, and `panic = "abort"`.
+- Desktop release builds default to the smaller software renderer. Build with `cargo build --release --features vulkan` when you need Vulkan shader acceleration.
+- PNG image support and WAV audio support are compiled by default to keep the executable smaller.
 - CI is configured in `.github/workflows/ci.yml` to run `fmt`, `clippy`, and `test` on push/PR.
 - Lua-exposed `fs` and command `cwd` paths are restricted to the project root.
 

@@ -1459,12 +1459,12 @@ impl Runtime {
                 platform.set_clear_color(PlatformColor::WHITE);
             }
 
-            let max_fps_state = self.max_fps_state.clone();
+            let _max_fps_state = self.max_fps_state.clone();
             let set_max_fps = self.lua.create_function(move |lua, fps: Option<f32>| {
                 let normalized = fps.filter(|fps| fps.is_finite() && *fps > 0.0);
                 #[cfg(target_os = "emscripten")]
                 {
-                    *max_fps_state.borrow_mut() = normalized;
+                    *_max_fps_state.borrow_mut() = normalized;
                 }
                 let app: Table = lua.globals().get("app")?;
                 match normalized {
@@ -1475,11 +1475,11 @@ impl Runtime {
             })?;
             app.set("setMaxFps", set_max_fps)?;
 
-            let max_fps_state = self.max_fps_state.clone();
+            let _max_fps_state = self.max_fps_state.clone();
             let get_max_fps = self.lua.create_function(move |lua, ()| {
                 #[cfg(target_os = "emscripten")]
                 {
-                    return Ok(*max_fps_state.borrow());
+                    return Ok(*_max_fps_state.borrow());
                 }
                 let app: Table = lua.globals().get("app")?;
                 Ok(app
@@ -1488,12 +1488,12 @@ impl Runtime {
             })?;
             app.set("getMaxFps", get_max_fps)?;
 
-            let show_fps_state = self.show_fps_state.clone();
+            let _show_fps_state = self.show_fps_state.clone();
             let set_show_fps = self.lua.create_function(move |lua, enabled: Option<bool>| {
                 let enabled = enabled.unwrap_or(true);
                 #[cfg(target_os = "emscripten")]
                 {
-                    *show_fps_state.borrow_mut() = Some(enabled);
+                    *_show_fps_state.borrow_mut() = Some(enabled);
                 }
                 let app: Table = lua.globals().get("app")?;
                 app.raw_set("showFps", enabled)?;
@@ -1501,11 +1501,11 @@ impl Runtime {
             })?;
             app.set("setShowFps", set_show_fps)?;
 
-            let show_fps_state = self.show_fps_state.clone();
+            let _show_fps_state = self.show_fps_state.clone();
             let get_show_fps = self.lua.create_function(move |lua, ()| {
                 #[cfg(target_os = "emscripten")]
                 {
-                    return Ok((*show_fps_state.borrow()).unwrap_or(true));
+                    return Ok((*_show_fps_state.borrow()).unwrap_or(true));
                 }
                 let app: Table = lua.globals().get("app")?;
                 Ok(app.raw_get::<Option<bool>>("showFps")?.unwrap_or(true))
@@ -3890,6 +3890,27 @@ mod tests {
     }
 
     #[test]
+    fn spriteboxes_sample_queues_image_commands() -> mlua::Result<()> {
+        let (mut runtime, root) = start_sample_runtime("spriteboxes_sample", "samples/spriteboxes")?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        let commands =
+            crate::renderer::drain_commands(&runtime.render_state()).map_err(mlua::Error::external)?;
+        let image_commands = commands
+            .iter()
+            .filter(|command| matches!(command, crate::renderer::DrawCommand::Image { .. }))
+            .count();
+
+        assert!(
+            image_commands >= 14,
+            "expected spritebox demo to queue nine-slice and sprite image commands"
+        );
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
     fn missing_app_background_defaults_to_white() -> mlua::Result<()> {
         let (runtime, root) = start_test_runtime("missing_app_background")?;
 
@@ -4040,6 +4061,101 @@ mod tests {
         separated_list.set(2, second)?;
         let overlaps: bool = do_they_overlap.call(separated_list)?;
         assert!(!overlaps);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn spritebox_uses_opaque_sprite_pixels_for_hit_testing() -> mlua::Result<()> {
+        let (runtime, root) = start_test_runtime("spritebox_hit_testing")?;
+
+        let mut sprite = image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 0]));
+        for y in 1..=2 {
+            for x in 1..=2 {
+                sprite.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let image = runtime
+            .lua
+            .create_userdata(crate::assets::ImageHandle::from_rgba_image(sprite))?;
+
+        let ecs: Table = runtime.lua.globals().get("ecs")?;
+        let core: Table = runtime.lua.globals().get("core")?;
+        let new_entity: Function = ecs.get("newEntity")?;
+        let add_component: Function = ecs.get("addComponent")?;
+        let sprite_proto: Table = core.get("Sprite2D")?;
+        let spritebox_proto: Table = core.get("Spritebox2D")?;
+
+        let first: Table =
+            new_entity.call(("first".to_string(), None::<Table>, Some(10.0), Some(10.0)))?;
+        first.set("size_x", 40.0)?;
+        first.set("size_y", 40.0)?;
+        let first_sprite: Table = add_component.call((first.clone(), sprite_proto.clone()))?;
+        first_sprite.set("image", image.clone())?;
+        let first_box: Table = add_component.call((first.clone(), spritebox_proto.clone()))?;
+        let compute: Function = first_box.get("ComputeSpritebox")?;
+        assert!(compute.call::<bool>(first_box.clone())?);
+        assert_eq!(first_box.get::<usize>("rect_count")?, 1);
+
+        let is_inside: Function = first_box.get("IsInside")?;
+        assert!(is_inside.call::<bool>((first_box.clone(), 25.0f32, 25.0f32))?);
+        assert!(!is_inside.call::<bool>((first_box.clone(), 12.0f32, 12.0f32))?);
+
+        let second: Table =
+            new_entity.call(("second".to_string(), None::<Table>, Some(25.0), Some(10.0)))?;
+        second.set("size_x", 40.0)?;
+        second.set("size_y", 40.0)?;
+        let second_sprite: Table = add_component.call((second.clone(), sprite_proto))?;
+        second_sprite.set("image", image)?;
+        let second_box: Table = add_component.call((second.clone(), spritebox_proto))?;
+        let compute_second: Function = second_box.get("ComputeSpritebox")?;
+        assert!(compute_second.call::<bool>(second_box.clone())?);
+
+        let intersects: Function = first_box.get("IsIntersecting")?;
+        assert!(intersects.call::<bool>((first_box.clone(), second.clone()))?);
+        assert!(intersects.call::<bool>((first_box.clone(), second_box.clone()))?);
+
+        second.set("x", 60.0)?;
+        assert!(!intersects.call::<bool>((first_box, second))?);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn nine_slice_sprite_queues_slice_images() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("nine_slice_sprite")?;
+
+        let sprite = image::RgbaImage::from_pixel(3, 3, image::Rgba([255, 255, 255, 255]));
+        let image = runtime
+            .lua
+            .create_userdata(crate::assets::ImageHandle::from_rgba_image(sprite))?;
+
+        let ecs: Table = runtime.lua.globals().get("ecs")?;
+        let core: Table = runtime.lua.globals().get("core")?;
+        let new_entity: Function = ecs.get("newEntity")?;
+        let add_component: Function = ecs.get("addComponent")?;
+        let entity: Table =
+            new_entity.call(("panel".to_string(), None::<Table>, Some(0.0), Some(0.0)))?;
+        entity.set("size_x", 30.0)?;
+        entity.set("size_y", 30.0)?;
+        let nine_slice_proto: Table = core.get("NineSliceSprite2D")?;
+        let nine_slice: Table = add_component.call((entity, nine_slice_proto))?;
+        nine_slice.set("image", image)?;
+        nine_slice.set("slice_left", 1.0)?;
+        nine_slice.set("slice_right", 1.0)?;
+        nine_slice.set("slice_top", 1.0)?;
+        nine_slice.set("slice_bottom", 1.0)?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        let commands =
+            crate::renderer::drain_commands(&runtime.render_state()).map_err(mlua::Error::external)?;
+        let image_commands = commands
+            .iter()
+            .filter(|command| matches!(command, crate::renderer::DrawCommand::Image { .. }))
+            .count();
+        assert_eq!(image_commands, 9);
 
         std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())

@@ -3,6 +3,7 @@ mod audio_system;
 mod commands;
 mod core;
 mod fs_module;
+#[cfg(feature = "vulkan")]
 mod gpu_renderer;
 pub mod hierarchy;
 mod http;
@@ -41,6 +42,7 @@ use winit::window::{CursorGrabMode, Icon, WindowBuilder};
 use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
 
+#[cfg(feature = "vulkan")]
 use crate::gpu_renderer::VulkanPresenter;
 use crate::platform::SharedPlatformState;
 use crate::renderer::SoftwareRenderer;
@@ -55,39 +57,62 @@ const DEFAULT_WINDOW_WIDTH: f32 = 1280.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 720.0;
 
 enum DesktopPresenter {
+    #[cfg(feature = "vulkan")]
     Vulkan(VulkanPresenter),
     Software {
         _context: softbuffer::Context,
         surface: softbuffer::Surface,
         renderer: SoftwareRenderer,
+        vulkan_error: Option<String>,
     },
 }
 
 impl DesktopPresenter {
-    fn new(event_loop: &EventLoop<()>, window: &std::sync::Arc<winit::window::Window>) -> Result<Self, String> {
-        match catch_desktop_panic("failed while initializing the Vulkan presenter", || {
-            VulkanPresenter::new(event_loop, window.clone())
-        })? {
-            Ok((presenter, _surface)) => Ok(Self::Vulkan(presenter)),
-            Err(vulkan_error) => {
-                eprintln!(
-                    "render warning: Vulkan unavailable, falling back to software renderer: {vulkan_error}"
-                );
-                let context = unsafe { softbuffer::Context::new(window.as_ref()) }
-                    .map_err(|error| format!("failed to create software renderer context: {error}"))?;
-                let surface = unsafe { softbuffer::Surface::new(&context, window.as_ref()) }
-                    .map_err(|error| format!("failed to create software renderer surface: {error}"))?;
-                let size = window.inner_size();
-                Ok(Self::Software {
-                    _context: context,
-                    surface,
-                    renderer: SoftwareRenderer::new(size.width, size.height),
-                })
+    fn new(
+        event_loop: &EventLoop<()>,
+        window: &std::sync::Arc<winit::window::Window>,
+    ) -> Result<Self, String> {
+        #[cfg(feature = "vulkan")]
+        {
+            match catch_desktop_panic("failed while initializing the Vulkan presenter", || {
+                VulkanPresenter::new(event_loop, window.clone())
+            })? {
+                Ok((presenter, _surface)) => Ok(Self::Vulkan(presenter)),
+                Err(vulkan_error) => {
+                    eprintln!(
+                        "render warning: Vulkan unavailable, falling back to software renderer: {vulkan_error}"
+                    );
+                    Self::new_software(window, Some(vulkan_error))
+                }
             }
+        }
+
+        #[cfg(not(feature = "vulkan"))]
+        {
+            let _ = event_loop;
+            Self::new_software(window, None)
         }
     }
 
+    fn new_software(
+        window: &std::sync::Arc<winit::window::Window>,
+        vulkan_error: Option<String>,
+    ) -> Result<Self, String> {
+        let context = unsafe { softbuffer::Context::new(window.as_ref()) }
+            .map_err(|error| format!("failed to create software renderer context: {error}"))?;
+        let surface = unsafe { softbuffer::Surface::new(&context, window.as_ref()) }
+            .map_err(|error| format!("failed to create software renderer surface: {error}"))?;
+        let size = window.inner_size();
+        Ok(Self::Software {
+            _context: context,
+            surface,
+            renderer: SoftwareRenderer::new(size.width, size.height),
+            vulkan_error,
+        })
+    }
+
     fn request_resize(&mut self) {
+        #[cfg(feature = "vulkan")]
         if let Self::Vulkan(presenter) = self {
             presenter.request_swapchain_recreate();
         }
@@ -100,20 +125,31 @@ impl DesktopPresenter {
         render_state: &crate::renderer::SharedRenderState,
     ) -> Result<(), String> {
         match self {
+            #[cfg(feature = "vulkan")]
             Self::Vulkan(presenter) => {
                 let size = window.inner_size();
                 presenter.render(platform_state, render_state, size.width, size.height)
             }
             Self::Software {
-                surface, renderer, ..
+                surface,
+                renderer,
+                vulkan_error,
+                ..
             } => {
                 let size = window.inner_size();
                 let width = size.width.max(1);
                 let height = size.height.max(1);
                 renderer.resize(width, height);
-                renderer
-                    .render(platform_state, render_state)
-                    .map_err(|error| format!("software renderer failed: {error}"))?;
+                renderer.render(platform_state, render_state).map_err(|error| {
+                    let mut message = format!("software renderer failed: {error}");
+                    if error.contains("custom shaders require the Vulkan renderer")
+                        && let Some(vulkan_error) = vulkan_error.as_deref()
+                    {
+                        message.push_str("\nVulkan initialization error: ");
+                        message.push_str(vulkan_error);
+                    }
+                    message
+                })?;
                 surface
                     .resize(
                         NonZeroU32::new(width).expect("window width is clamped to at least 1"),

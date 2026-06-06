@@ -204,7 +204,7 @@ impl ImageHandle {
         })))
     }
 
-    #[cfg(not(target_os = "emscripten"))]
+    #[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
     pub(crate) fn id(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
     }
@@ -220,6 +220,7 @@ impl ImageHandle {
         Ok(f(&image.image))
     }
 
+    #[cfg(test)]
     fn with_image_mut<R>(&self, f: impl FnOnce(&mut RgbaImage) -> R) -> mlua::Result<R> {
         let mut image = self
             .0
@@ -258,7 +259,7 @@ impl ImageHandle {
         self.with_image(|_| ())
     }
 
-    #[cfg(not(target_os = "emscripten"))]
+    #[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
     pub(crate) fn revision(&self) -> mlua::Result<u64> {
         let image = self
             .0
@@ -270,7 +271,7 @@ impl ImageHandle {
         Ok(image.revision)
     }
 
-    #[cfg(not(target_os = "emscripten"))]
+    #[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
     pub(crate) fn clone_rgba_image(&self) -> mlua::Result<RgbaImage> {
         self.with_image(Clone::clone)
     }
@@ -412,31 +413,39 @@ impl UserData for ImageHandle {
                 return Err(mlua::Error::external("pixel out of bounds"));
             }
             let color = parse_color_args(&args[2..])?;
-            let updated = this.with_image_mut(|image| {
-                let x = x as u32;
-                let y = y as u32;
-                if x >= image.width() || y >= image.height() {
-                    return None;
-                }
-                image.put_pixel(x, y, Rgba([color.r, color.g, color.b, color.a]));
-                Some(())
-            })?;
-            updated.ok_or_else(|| mlua::Error::external("pixel out of bounds"))?;
-            if let Ok(mut image) = this.0.lock() {
-                image.revision = image.revision.wrapping_add(1);
+            let mut image = this
+                .0
+                .lock()
+                .map_err(|_| mlua::Error::external("image lock poisoned"))?;
+            if image.unloaded {
+                return Err(mlua::Error::external("image is unloaded"));
             }
+            let x = x as u32;
+            let y = y as u32;
+            if x >= image.image.width() || y >= image.image.height() {
+                return Err(mlua::Error::external("pixel out of bounds"));
+            }
+            image
+                .image
+                .put_pixel(x, y, Rgba([color.r, color.g, color.b, color.a]));
+            image.revision = image.revision.wrapping_add(1);
             Ok(())
         });
         methods.add_method("fill", |_lua, this, args: Variadic<Value>| {
             let color = parse_color_args(&args)?;
-            this.with_image_mut(|image| {
-                for pixel in image.pixels_mut() {
+            let mut image = this
+                .0
+                .lock()
+                .map_err(|_| mlua::Error::external("image lock poisoned"))?;
+            if image.unloaded {
+                return Err(mlua::Error::external("image is unloaded"));
+            }
+            {
+                for pixel in image.image.pixels_mut() {
                     *pixel = Rgba([color.r, color.g, color.b, color.a]);
                 }
-            })?;
-            if let Ok(mut image) = this.0.lock() {
-                image.revision = image.revision.wrapping_add(1);
             }
+            image.revision = image.revision.wrapping_add(1);
             Ok(())
         });
         methods.add_method("upload", |_lua, this, ()| this.ensure_uploaded());

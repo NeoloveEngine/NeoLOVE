@@ -149,12 +149,45 @@ pub(crate) fn new_shared_render_state() -> SharedRenderState {
 
 #[derive(Clone)]
 pub(crate) struct RasterizedTextSprite {
-    pub image: RgbaImage,
+    pub image: Arc<RgbaImage>,
     pub dest: Rect,
     pub pivot: Vec2,
     pub rotation: f32,
     pub filter: TextureFilter,
 }
+
+#[derive(Clone)]
+struct CachedRasterizedTextSprite {
+    image: Arc<RgbaImage>,
+    dest: Rect,
+    pivot: Vec2,
+    rotation: f32,
+    filter: TextureFilter,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TextSpriteCacheKey {
+    text: String,
+    bounds: [u32; 4],
+    rotation: u32,
+    pivot: [u32; 2],
+    color: [u8; 4],
+    font: FontHandle,
+    scale: u32,
+    min_scale: u32,
+    text_scale: TextScaleMode,
+    align_x: TextAlignX,
+    align_y: TextAlignY,
+    wrap: TextWrapMode,
+    padding_x: u32,
+    padding_y: u32,
+    line_spacing: u32,
+    letter_spacing: u32,
+    stretch_width: u32,
+    stretch_height: u32,
+}
+
+const TEXT_SPRITE_CACHE_LIMIT: usize = 256;
 
 impl RenderState {
     pub(crate) fn queue(&mut self, command: DrawCommand) {
@@ -180,6 +213,59 @@ fn font_cache() -> &'static Mutex<HashMap<String, Arc<Font>>> {
 fn font_warning_cache() -> &'static Mutex<HashSet<String>> {
     static CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn text_sprite_cache() -> &'static Mutex<HashMap<TextSpriteCacheKey, CachedRasterizedTextSprite>> {
+    static CACHE: OnceLock<Mutex<HashMap<TextSpriteCacheKey, CachedRasterizedTextSprite>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn text_layout_cache() -> &'static Mutex<HashMap<TextSpriteCacheKey, PreparedTextLayout>> {
+    static CACHE: OnceLock<Mutex<HashMap<TextSpriteCacheKey, PreparedTextLayout>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn f32_cache_key(value: f32) -> u32 {
+    if value == 0.0 {
+        0
+    } else {
+        value.to_bits()
+    }
+}
+
+fn text_sprite_cache_key(request: &TextRenderRequest) -> TextSpriteCacheKey {
+    TextSpriteCacheKey {
+        text: request.text.clone(),
+        bounds: [
+            f32_cache_key(request.bounds.x),
+            f32_cache_key(request.bounds.y),
+            f32_cache_key(request.bounds.w),
+            f32_cache_key(request.bounds.h),
+        ],
+        rotation: f32_cache_key(request.rotation),
+        pivot: [f32_cache_key(request.pivot.x), f32_cache_key(request.pivot.y)],
+        color: [
+            request.color.r,
+            request.color.g,
+            request.color.b,
+            request.color.a,
+        ],
+        font: request.font.clone(),
+        scale: f32_cache_key(request.scale),
+        min_scale: f32_cache_key(request.min_scale),
+        text_scale: request.text_scale,
+        align_x: request.align_x,
+        align_y: request.align_y,
+        wrap: request.wrap,
+        padding_x: f32_cache_key(request.padding_x),
+        padding_y: f32_cache_key(request.padding_y),
+        line_spacing: f32_cache_key(request.line_spacing),
+        letter_spacing: f32_cache_key(request.letter_spacing),
+        stretch_width: f32_cache_key(request.stretch_width),
+        stretch_height: f32_cache_key(request.stretch_height),
+    }
 }
 
 fn warn_font_once(key: &str, message: impl FnOnce() -> String) {
@@ -448,7 +534,7 @@ fn layout_lines_for(
     lines
 }
 
-fn prepare_text_layout(request: &TextRenderRequest) -> Option<PreparedTextLayout> {
+fn prepare_text_layout_uncached(request: &TextRenderRequest) -> Option<PreparedTextLayout> {
     if request.text.is_empty() {
         return Some(PreparedTextLayout {
             glyphs: Vec::new(),
@@ -634,6 +720,24 @@ fn prepare_text_layout(request: &TextRenderRequest) -> Option<PreparedTextLayout
     })
 }
 
+fn prepare_text_layout(request: &TextRenderRequest) -> Option<PreparedTextLayout> {
+    let cache_key = text_sprite_cache_key(request);
+    if let Ok(cache) = text_layout_cache().lock() {
+        if let Some(layout) = cache.get(&cache_key) {
+            return Some(layout.clone());
+        }
+    }
+
+    let layout = prepare_text_layout_uncached(request)?;
+    if let Ok(mut cache) = text_layout_cache().lock() {
+        if cache.len() >= TEXT_SPRITE_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(cache_key, layout.clone());
+    }
+    Some(layout)
+}
+
 pub(crate) fn measure_text(request: &TextRenderRequest) -> Option<TextMetrics> {
     #[cfg(target_os = "emscripten")]
     {
@@ -663,6 +767,19 @@ pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<Raste
         return None;
     }
 
+    let cache_key = text_sprite_cache_key(request);
+    if let Ok(cache) = text_sprite_cache().lock() {
+        if let Some(sprite) = cache.get(&cache_key) {
+            return Some(RasterizedTextSprite {
+                image: sprite.image.clone(),
+                dest: sprite.dest,
+                pivot: sprite.pivot,
+                rotation: sprite.rotation,
+                filter: sprite.filter,
+            });
+        }
+    }
+
     let layout = prepare_text_layout(request)?;
     let (min_x, min_y, max_x, max_y) = layout.pixel_bounds?;
     let font = load_font(&request.font)?;
@@ -685,7 +802,7 @@ pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<Raste
         let top_y = (glyph.y - min_y).round() as i32 + border as i32;
         for gy in 0..metrics.height {
             for gx in 0..metrics.width {
-                let alpha = bitmap[gy * metrics.width + gx];
+                let alpha = modulate_alpha(bitmap[gy * metrics.width + gx], request.color.a);
                 if alpha == 0 {
                     continue;
                 }
@@ -711,8 +828,8 @@ pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<Raste
         TextureFilter::Linear
     };
 
-    Some(RasterizedTextSprite {
-        image: text_image,
+    let sprite = RasterizedTextSprite {
+        image: Arc::new(text_image),
         dest: Rect {
             x: min_x.round() - border as f32,
             y: min_y.round() - border as f32,
@@ -730,7 +847,25 @@ pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<Raste
         pivot: request.pivot,
         rotation: request.rotation,
         filter,
-    })
+    };
+
+    if let Ok(mut cache) = text_sprite_cache().lock() {
+        if cache.len() >= TEXT_SPRITE_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(
+            cache_key,
+            CachedRasterizedTextSprite {
+                image: sprite.image.clone(),
+                dest: sprite.dest,
+                pivot: sprite.pivot,
+                rotation: sprite.rotation,
+                filter: sprite.filter,
+            },
+        );
+    }
+
+    Some(sprite)
 }
 
 fn blend(dest: &mut [u8], src: Color) {
@@ -742,6 +877,10 @@ fn blend(dest: &mut [u8], src: Color) {
     dest[3] = ((src.a as f32) + dest[3] as f32 * inv)
         .round()
         .clamp(0.0, 255.0) as u8;
+}
+
+fn modulate_alpha(mask: u8, alpha: u8) -> u8 {
+    ((mask as u16 * alpha as u16 + 127) / 255) as u8
 }
 
 fn rotate_local(x: f32, y: f32, rotation: f32) -> (f32, f32) {
@@ -931,12 +1070,13 @@ impl SoftwareRenderer {
             #[cfg(target_os = "emscripten")]
             let shader_error =
                 "custom shaders are not supported in WebAssembly yet; the web runtime currently uses the software renderer and cannot run shader effects.".to_string();
-            #[cfg(not(target_os = "emscripten"))]
+            #[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
             let shader_error =
-                "custom shaders require the Vulkan renderer; the software fallback cannot run shader effects. Install the Vulkan runtime/driver so NeoLOVE can use Vulkan.".to_string();
-            return Err(
-                shader_error,
-            );
+                "custom shaders require the Vulkan renderer; NeoLOVE is currently using the software fallback because Vulkan initialization failed earlier. Check the Vulkan warning above for the exact driver or surface error.".to_string();
+            #[cfg(all(not(target_os = "emscripten"), not(feature = "vulkan")))]
+            let shader_error =
+                "custom shaders require the Vulkan renderer, but this NeoLOVE binary was built without Vulkan support. Rebuild or reinstall with `--features vulkan` so NeoLOVE can use your installed Vulkan driver.".to_string();
+            return Err(shader_error);
         }
 
         let clear = lock_platform_state(platform).clear_color();
@@ -1074,6 +1214,23 @@ impl SoftwareRenderer {
             w: img_w as f32,
             h: img_h as f32,
         });
+        image
+            .with_image(|source_image| {
+                self.draw_image_pixels(source_image, dest, source, rotation, pivot, tint, filter)
+            })
+            .map_err(|e| e.to_string())?
+    }
+
+    fn draw_image_pixels(
+        &mut self,
+        source_image: &RgbaImage,
+        dest: Rect,
+        source: Rect,
+        rotation: f32,
+        pivot: Vec2,
+        tint: Color,
+        filter: TextureFilter,
+    ) -> Result<(), String> {
         let corners = [
             self.to_world(dest.x, dest.y, pivot.x, pivot.y, rotation),
             self.to_world(dest.x + dest.w, dest.y, pivot.x, pivot.y, rotation),
@@ -1105,29 +1262,25 @@ impl SoftwareRenderer {
             .ceil()
             .min(self.height as f32 - 1.0) as i32;
 
-        image
-            .with_image(|source_image| {
-                for py in min_y..=max_y {
-                    for px in min_x..=max_x {
-                        let local_x = px as f32 + 0.5 - pivot.x;
-                        let local_y = py as f32 + 0.5 - pivot.y;
-                        let (rx, ry) = inverse_rotate(local_x, local_y, rotation);
-                        let image_x = rx + pivot.x;
-                        let image_y = ry + pivot.y;
-                        let u = (image_x - dest.x) / dest.w;
-                        let v = (image_y - dest.y) / dest.h;
-                        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
-                            continue;
-                        }
-                        let src_x = source.x + source.w * u;
-                        let src_y = source.y + source.h * v;
-                        let sample = sample_rgba(source_image, src_x, src_y, filter);
-                        let color = modulate(sample, tint);
-                        self.put_pixel(px as u32, py as u32, color);
-                    }
+        for py in min_y..=max_y {
+            for px in min_x..=max_x {
+                let local_x = px as f32 + 0.5 - pivot.x;
+                let local_y = py as f32 + 0.5 - pivot.y;
+                let (rx, ry) = inverse_rotate(local_x, local_y, rotation);
+                let image_x = rx + pivot.x;
+                let image_y = ry + pivot.y;
+                let u = (image_x - dest.x) / dest.w;
+                let v = (image_y - dest.y) / dest.h;
+                if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                    continue;
                 }
-            })
-            .map_err(|e| e.to_string())?;
+                let src_x = source.x + source.w * u;
+                let src_y = source.y + source.h * v;
+                let sample = sample_rgba(source_image, src_x, src_y, filter);
+                let color = modulate(sample, tint);
+                self.put_pixel(px as u32, py as u32, color);
+            }
+        }
         Ok(())
     }
 
@@ -1135,11 +1288,15 @@ impl SoftwareRenderer {
         let Some(sprite) = rasterize_text_sprite(request) else {
             return Ok(());
         };
-        let image = crate::assets::ImageHandle::from_rgba_image(sprite.image);
-        self.draw_image(
-            image,
+        self.draw_image_pixels(
+            sprite.image.as_ref(),
             sprite.dest,
-            None,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                w: sprite.image.width() as f32,
+                h: sprite.image.height() as f32,
+            },
             sprite.rotation,
             sprite.pivot,
             Color::WHITE,
@@ -1274,5 +1431,40 @@ mod tests {
         assert!(sprite.dest.h > 0.0);
         assert!(sprite.image.width() > 0);
         assert!(sprite.image.height() > 0);
+    }
+
+    #[test]
+    fn rasterized_text_sprite_applies_color_alpha_to_glyph_mask() {
+        let request = TextRenderRequest {
+            text: "NeoLOVE".to_string(),
+            bounds: Rect {
+                x: 24.0,
+                y: 32.0,
+                w: 0.0,
+                h: 0.0,
+            },
+            rotation: 0.0,
+            pivot: Vec2::default(),
+            color: Color::rgba(255, 255, 255, 96),
+            font: FontHandle::Default,
+            scale: 16.0,
+            min_scale: 16.0,
+            text_scale: TextScaleMode::None,
+            align_x: TextAlignX::Left,
+            align_y: TextAlignY::Top,
+            wrap: TextWrapMode::None,
+            padding_x: 0.0,
+            padding_y: 0.0,
+            line_spacing: 1.0,
+            letter_spacing: 0.0,
+            stretch_width: 0.0,
+            stretch_height: 0.0,
+        };
+
+        let sprite = rasterize_text_sprite(&request).expect("expected rasterized text sprite");
+        let max_alpha = sprite.image.pixels().map(|pixel| pixel.0[3]).max().unwrap_or(0);
+
+        assert!(max_alpha > 0);
+        assert!(max_alpha <= request.color.a);
     }
 }

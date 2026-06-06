@@ -1,6 +1,7 @@
 use mlua::{AnyUserData, Lua, Table, UserData, UserDataMethods};
 use std::collections::HashMap;
 use std::fs;
+#[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -20,12 +21,12 @@ pub(crate) struct ShaderHandle {
     pub(crate) uniforms: Arc<Mutex<ShaderUniforms>>,
 }
 
-#[cfg(not(target_os = "emscripten"))]
+#[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
 pub(crate) const MAX_SHADER_FLOAT_UNIFORMS: usize = 16;
-#[cfg(not(target_os = "emscripten"))]
+#[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
 pub(crate) const MAX_SHADER_TEXTURE_UNIFORMS: usize = 4;
 
-#[cfg(not(target_os = "emscripten"))]
+#[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
 #[derive(Clone, Debug)]
 pub(crate) struct ShaderRuntimeSnapshot {
     pub(crate) pipeline_key: u64,
@@ -66,7 +67,7 @@ fn load_shader_from_sources(vertex_source: &str, fragment_source: &str) -> Shade
     }
 }
 
-#[cfg(not(target_os = "emscripten"))]
+#[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
 fn parse_declared_uniform(trimmed: &str) -> Option<(&str, &str)> {
     let statement = trimmed.strip_suffix(';')?;
     let mut parts = statement.split_whitespace();
@@ -82,7 +83,7 @@ fn parse_declared_uniform(trimmed: &str) -> Option<(&str, &str)> {
     Some((ty, name))
 }
 
-#[cfg(not(target_os = "emscripten"))]
+#[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
 fn uniform_arity(ty: &str) -> Option<usize> {
     match ty {
         "float" => Some(1),
@@ -93,7 +94,7 @@ fn uniform_arity(ty: &str) -> Option<usize> {
     }
 }
 
-#[cfg(not(target_os = "emscripten"))]
+#[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
 fn uniform_swizzle(arity: usize) -> &'static str {
     match arity {
         1 => ".x",
@@ -103,7 +104,7 @@ fn uniform_swizzle(arity: usize) -> &'static str {
     }
 }
 
-#[cfg(not(target_os = "emscripten"))]
+#[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
 fn build_runtime_fragment_source(
     fragment_source: &str,
 ) -> Result<(String, Vec<(String, usize)>, Vec<String>), String> {
@@ -195,7 +196,7 @@ layout(binding = {}) uniform sampler __neolove_{name}_sampler;\n\
     Ok((out, float_uniforms, texture_uniforms))
 }
 
-#[cfg(not(target_os = "emscripten"))]
+#[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
 impl ShaderHandle {
     pub(crate) fn snapshot_for_runtime(&self) -> Result<ShaderRuntimeSnapshot, String> {
         let (fragment_source, float_uniforms, texture_uniforms) =

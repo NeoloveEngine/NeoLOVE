@@ -525,8 +525,48 @@ export type TextBox = BaseDrawableComponent & UiTextStyle & {
 export type TextLabel = TextBox
 export type RudimentaryTextLabel = TextBox
 
-export type Image2D = BaseDrawableComponent & {
+export type Sprite2D = BaseDrawableComponent & {
+	__neolove_component: "Sprite2D" | "Image2D",
 	image: ImageHandle?,
+	source_x: number?,
+	source_y: number?,
+	source_w: number?,
+	source_h: number?,
+	source_width: number?,
+	source_height: number?,
+	sourceX: number?,
+	sourceY: number?,
+	sourceW: number?,
+	sourceH: number?,
+	sourceWidth: number?,
+	sourceHeight: number?,
+}
+
+export type Image2D = Sprite2D
+
+export type NineSliceSprite2D = BaseDrawableComponent & {
+	__neolove_component: "NineSliceSprite2D",
+	image: ImageHandle?,
+	source_x: number?,
+	source_y: number?,
+	source_w: number?,
+	source_h: number?,
+	source_width: number?,
+	source_height: number?,
+	sourceX: number?,
+	sourceY: number?,
+	sourceW: number?,
+	sourceH: number?,
+	sourceWidth: number?,
+	sourceHeight: number?,
+	slice_left: number,
+	slice_right: number,
+	slice_top: number,
+	slice_bottom: number,
+	sliceLeft: number?,
+	sliceRight: number?,
+	sliceTop: number?,
+	sliceBottom: number?,
 }
 
 export type TileTexture2D = BaseDrawableComponent & {
@@ -535,6 +575,23 @@ export type TileTexture2D = BaseDrawableComponent & {
 	tile_height: number,
 	offset_x: number,
 	offset_y: number,
+}
+
+export type Spritebox2D = ComponentInstance & {
+	__neolove_component: "Spritebox2D",
+	computed: boolean,
+	alpha_threshold: number,
+	rect_count: number,
+	bounds_x: number,
+	bounds_y: number,
+	bounds_w: number,
+	bounds_h: number,
+	ComputeSpritebox: (self: Spritebox2D) -> boolean,
+	computeSpritebox: (self: Spritebox2D) -> boolean,
+	IsInside: (self: Spritebox2D, x: number, y: number) -> boolean,
+	isInside: (self: Spritebox2D, x: number, y: number) -> boolean,
+	IsIntersecting: (self: Spritebox2D, other: Entity | Spritebox2D) -> boolean,
+	isIntersecting: (self: Spritebox2D, other: Entity | Spritebox2D) -> boolean,
 }
 
 export type Collider2D = ComponentInstance & {
@@ -630,8 +687,12 @@ export type CoreModule = {
 	TextBox: TextBox,
 	TextLabel: TextLabel,
 	RudimentaryTextLabel: RudimentaryTextLabel,
+	Sprite2D: Sprite2D,
 	Image2D: Image2D,
+	NineSliceSprite2D: NineSliceSprite2D,
+	["9SliceSprite2D"]: NineSliceSprite2D,
 	TileTexture2D: TileTexture2D,
+	Spritebox2D: Spritebox2D,
 	Collider2D: Collider2D,
 	Rigidbody2D: Rigidbody2D,
 	Rope2D: Rope2D,

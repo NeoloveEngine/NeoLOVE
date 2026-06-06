@@ -7,7 +7,7 @@ use crate::renderer::{
     DrawCommand, FontHandle, Rect, RenderState, SharedRenderState, TextAlignX, TextAlignY,
     TextRenderRequest, TextScaleMode, TextWrapMode, TextureFilter, Vec2,
 };
-use mlua::{AnyUserData, Function, Lua, Table, Value};
+use mlua::{AnyUserData, Function, Lua, Table, UserData, Value};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -638,16 +638,604 @@ fn get_string_key(component: &Table, key: &str) -> Option<String> {
 }
 
 fn get_source_rect(component: &Table, prefix: &str) -> Option<Rect> {
-    let x = get_number_key(component, &format!("{prefix}_x")).unwrap_or(0.0);
-    let y = get_number_key(component, &format!("{prefix}_y")).unwrap_or(0.0);
+    let x = get_number_key(component, &format!("{prefix}_x"))
+        .or_else(|| get_number_key(component, &format!("{prefix}X")))
+        .unwrap_or(0.0);
+    let y = get_number_key(component, &format!("{prefix}_y"))
+        .or_else(|| get_number_key(component, &format!("{prefix}Y")))
+        .unwrap_or(0.0);
     let w = get_number_key(component, &format!("{prefix}_w"))
-        .or_else(|| get_number_key(component, &format!("{prefix}_width")))?;
+        .or_else(|| get_number_key(component, &format!("{prefix}W")))
+        .or_else(|| get_number_key(component, &format!("{prefix}_width")))
+        .or_else(|| get_number_key(component, &format!("{prefix}Width")))?;
     let h = get_number_key(component, &format!("{prefix}_h"))
-        .or_else(|| get_number_key(component, &format!("{prefix}_height")))?;
+        .or_else(|| get_number_key(component, &format!("{prefix}H")))
+        .or_else(|| get_number_key(component, &format!("{prefix}_height")))
+        .or_else(|| get_number_key(component, &format!("{prefix}Height")))?;
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
     Some(Rect { x, y, w, h })
+}
+
+fn clamp_rect_to_bounds(rect: Rect, bounds: Rect) -> Rect {
+    let left = rect.x.max(bounds.x);
+    let top = rect.y.max(bounds.y);
+    let right = (rect.x + rect.w).min(bounds.x + bounds.w);
+    let bottom = (rect.y + rect.h).min(bounds.y + bounds.h);
+    Rect {
+        x: left,
+        y: top,
+        w: (right - left).max(0.0),
+        h: (bottom - top).max(0.0),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveSpriteboxRect {
+    x0: u32,
+    x1: u32,
+    y0: u32,
+    y1: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SpriteboxShape {
+    rects: Vec<Rect>,
+    bounds: Rect,
+}
+
+#[derive(Clone, Debug)]
+struct SpriteboxShapeHandle {
+    shape: SpriteboxShape,
+}
+
+impl UserData for SpriteboxShapeHandle {}
+
+#[derive(Clone, Debug)]
+struct SpriteboxSource {
+    image: ImageHandle,
+    source: Rect,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SpriteboxWorldRect {
+    corners: [Vec2; 4],
+    bounds: Rect,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SpriteboxWorldShape {
+    rects: Vec<SpriteboxWorldRect>,
+    bounds: Rect,
+}
+
+#[derive(Clone, Debug)]
+struct SpriteboxWorldShapeHandle {
+    shape: SpriteboxWorldShape,
+}
+
+impl UserData for SpriteboxWorldShapeHandle {}
+
+fn is_sprite_component_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Sprite2D" | "Image2D" | "NineSliceSprite2D" | "9SliceSprite2D"
+    )
+}
+
+fn is_spritebox_component(component: &Table) -> bool {
+    component
+        .get::<String>("__neolove_component")
+        .map(|name| name == "Spritebox2D")
+        .unwrap_or(false)
+}
+
+fn sprite_source_rect(component: &Table, image: &ImageHandle) -> mlua::Result<Rect> {
+    let (image_w, image_h) = image.dimensions()?;
+    let image_bounds = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: image_w as f32,
+        h: image_h as f32,
+    };
+    Ok(get_source_rect(component, "source")
+        .map(|source| clamp_rect_to_bounds(source, image_bounds))
+        .filter(|source| source.w > 0.0 && source.h > 0.0)
+        .unwrap_or(image_bounds))
+}
+
+fn find_spritebox_source(entity: &Table, spritebox: &Table) -> mlua::Result<Option<SpriteboxSource>> {
+    let components: Table = entity.get("components")?;
+    for component in components.sequence_values::<Table>() {
+        let component = component?;
+        if component.to_pointer() == spritebox.to_pointer() {
+            continue;
+        }
+
+        let Ok(component_name) = component.get::<String>("__neolove_component") else {
+            continue;
+        };
+        if !is_sprite_component_name(&component_name) {
+            continue;
+        }
+
+        let Some(image) = get_image_field(&component, "image")? else {
+            continue;
+        };
+        let source = sprite_source_rect(&component, &image)?;
+        return Ok(Some(SpriteboxSource { image, source }));
+    }
+
+    Ok(None)
+}
+
+fn push_spritebox_pixel_rect(
+    out: &mut Vec<Rect>,
+    rect: ActiveSpriteboxRect,
+    source_x: u32,
+    source_y: u32,
+    source_w: f32,
+    source_h: f32,
+) {
+    if rect.x1 <= rect.x0 || rect.y1 <= rect.y0 || source_w <= 0.0 || source_h <= 0.0 {
+        return;
+    }
+
+    out.push(Rect {
+        x: (rect.x0.saturating_sub(source_x)) as f32 / source_w,
+        y: (rect.y0.saturating_sub(source_y)) as f32 / source_h,
+        w: (rect.x1 - rect.x0) as f32 / source_w,
+        h: (rect.y1 - rect.y0) as f32 / source_h,
+    });
+}
+
+fn spritebox_bounds(rects: &[Rect]) -> Rect {
+    let Some(first) = rects.first().copied() else {
+        return Rect::default();
+    };
+
+    let mut min_x = first.x;
+    let mut min_y = first.y;
+    let mut max_x = first.x + first.w;
+    let mut max_y = first.y + first.h;
+    for rect in rects.iter().skip(1) {
+        min_x = min_x.min(rect.x);
+        min_y = min_y.min(rect.y);
+        max_x = max_x.max(rect.x + rect.w);
+        max_y = max_y.max(rect.y + rect.h);
+    }
+
+    Rect {
+        x: min_x,
+        y: min_y,
+        w: (max_x - min_x).max(0.0),
+        h: (max_y - min_y).max(0.0),
+    }
+}
+
+fn build_spritebox_shape(
+    image: &ImageHandle,
+    source: Rect,
+    alpha_threshold: u8,
+) -> mlua::Result<SpriteboxShape> {
+    image.with_image(|image| {
+        let sx0 = source.x.floor().clamp(0.0, image.width() as f32) as u32;
+        let sy0 = source.y.floor().clamp(0.0, image.height() as f32) as u32;
+        let sx1 = (source.x + source.w)
+            .ceil()
+            .clamp(0.0, image.width() as f32) as u32;
+        let sy1 = (source.y + source.h)
+            .ceil()
+            .clamp(0.0, image.height() as f32) as u32;
+        if sx1 <= sx0 || sy1 <= sy0 {
+            return SpriteboxShape::default();
+        }
+
+        let source_w = (sx1 - sx0) as f32;
+        let source_h = (sy1 - sy0) as f32;
+        let mut rects = Vec::<Rect>::new();
+        let mut active = Vec::<ActiveSpriteboxRect>::new();
+
+        for y in sy0..sy1 {
+            let mut spans = Vec::<(u32, u32)>::new();
+            let mut x = sx0;
+            while x < sx1 {
+                while x < sx1 && image.get_pixel(x, y).0[3] <= alpha_threshold {
+                    x += 1;
+                }
+                if x >= sx1 {
+                    break;
+                }
+                let start = x;
+                while x < sx1 && image.get_pixel(x, y).0[3] > alpha_threshold {
+                    x += 1;
+                }
+                spans.push((start, x));
+            }
+
+            let mut next_active = Vec::with_capacity(spans.len());
+            for (x0, x1) in spans {
+                if let Some(index) = active
+                    .iter()
+                    .position(|rect| rect.x0 == x0 && rect.x1 == x1)
+                {
+                    let mut rect = active.swap_remove(index);
+                    rect.y1 = y + 1;
+                    next_active.push(rect);
+                } else {
+                    next_active.push(ActiveSpriteboxRect {
+                        x0,
+                        x1,
+                        y0: y,
+                        y1: y + 1,
+                    });
+                }
+            }
+
+            for rect in active.drain(..) {
+                push_spritebox_pixel_rect(&mut rects, rect, sx0, sy0, source_w, source_h);
+            }
+            active = next_active;
+        }
+
+        for rect in active {
+            push_spritebox_pixel_rect(&mut rects, rect, sx0, sy0, source_w, source_h);
+        }
+
+        let bounds = spritebox_bounds(&rects);
+        SpriteboxShape { rects, bounds }
+    })
+}
+
+fn write_spritebox_shape(lua: &Lua, component: &Table, shape: &SpriteboxShape) -> mlua::Result<()> {
+    let revision = component
+        .raw_get::<i64>("__spritebox_revision")
+        .unwrap_or(0)
+        .saturating_add(1);
+    component.raw_set("__spritebox_revision", revision)?;
+    component.set(
+        "__spritebox_shape",
+        lua.create_userdata(SpriteboxShapeHandle {
+            shape: shape.clone(),
+        })?,
+    )?;
+    component.set("__spritebox_world_shape", Value::Nil)?;
+    component.set("__spritebox_rects", Value::Nil)?;
+    component.set("computed", true)?;
+    component.set("rect_count", shape.rects.len())?;
+    component.set("bounds_x", shape.bounds.x)?;
+    component.set("bounds_y", shape.bounds.y)?;
+    component.set("bounds_w", shape.bounds.w)?;
+    component.set("bounds_h", shape.bounds.h)?;
+    Ok(())
+}
+
+fn read_spritebox_shape(component: &Table) -> mlua::Result<Option<SpriteboxShape>> {
+    if !component.get::<bool>("computed").unwrap_or(false) {
+        return Ok(None);
+    }
+
+    if let Some(shape) = component
+        .get::<Option<AnyUserData>>("__spritebox_shape")
+        .unwrap_or(None)
+    {
+        let shape = shape.borrow::<SpriteboxShapeHandle>()?;
+        return Ok(Some(shape.shape.clone()));
+    }
+
+    let Some(rect_table) = component.get::<Option<Table>>("__spritebox_rects").unwrap_or(None)
+    else {
+        return Ok(None);
+    };
+
+    let rect_count = component.get::<usize>("rect_count").unwrap_or(0);
+    let mut rects = Vec::with_capacity(rect_count);
+    for index in 0..rect_count {
+        let base = index * 4 + 1;
+        let rect = Rect {
+            x: rect_table.raw_get::<f32>(base).unwrap_or(0.0),
+            y: rect_table.raw_get::<f32>(base + 1).unwrap_or(0.0),
+            w: rect_table.raw_get::<f32>(base + 2).unwrap_or(0.0),
+            h: rect_table.raw_get::<f32>(base + 3).unwrap_or(0.0),
+        };
+        if rect.w > 0.0 && rect.h > 0.0 {
+            rects.push(rect);
+        }
+    }
+
+    let bounds = if rects.is_empty() {
+        Rect::default()
+    } else {
+        Rect {
+            x: component.get::<f32>("bounds_x").unwrap_or(0.0),
+            y: component.get::<f32>("bounds_y").unwrap_or(0.0),
+            w: component.get::<f32>("bounds_w").unwrap_or(0.0),
+            h: component.get::<f32>("bounds_h").unwrap_or(0.0),
+        }
+    };
+    Ok(Some(SpriteboxShape { rects, bounds }))
+}
+
+fn spritebox_entity(component: &Table) -> mlua::Result<Table> {
+    component
+        .get::<Option<Table>>("entity")?
+        .ok_or_else(|| mlua::Error::external("Spritebox2D is not attached to an entity"))
+}
+
+fn resolve_spritebox_component(value: Value) -> mlua::Result<Option<Table>> {
+    let Value::Table(table) = value else {
+        return Ok(None);
+    };
+
+    if is_spritebox_component(&table) {
+        return Ok(Some(table));
+    }
+
+    if let Ok(components) = table.get::<Table>("components") {
+        for component in components.sequence_values::<Table>() {
+            let component = component?;
+            if is_spritebox_component(&component) {
+                return Ok(Some(component));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn transform_local_point(origin: Vec2, rotation: f32, x: f32, y: f32) -> Vec2 {
+    let (rx, ry) = rotate_local(x, y, rotation);
+    Vec2 {
+        x: origin.x + rx,
+        y: origin.y + ry,
+    }
+}
+
+fn bounds_from_points(points: &[Vec2]) -> Rect {
+    let Some(first) = points.first().copied() else {
+        return Rect::default();
+    };
+
+    let mut min_x = first.x;
+    let mut min_y = first.y;
+    let mut max_x = first.x;
+    let mut max_y = first.y;
+    for point in points.iter().skip(1) {
+        min_x = min_x.min(point.x);
+        min_y = min_y.min(point.y);
+        max_x = max_x.max(point.x);
+        max_y = max_y.max(point.y);
+    }
+
+    Rect {
+        x: min_x,
+        y: min_y,
+        w: (max_x - min_x).max(0.0),
+        h: (max_y - min_y).max(0.0),
+    }
+}
+
+fn rect_aabb_intersects(a: Rect, b: Rect) -> bool {
+    a.w >= 0.0
+        && a.h >= 0.0
+        && b.w >= 0.0
+        && b.h >= 0.0
+        && a.x <= b.x + b.w
+        && a.x + a.w >= b.x
+        && a.y <= b.y + b.h
+        && a.y + a.h >= b.y
+}
+
+fn spritebox_world_rect(origin: Vec2, rotation: f32, size: Vec2, rect: Rect) -> SpriteboxWorldRect {
+    let x0 = rect.x * size.x;
+    let y0 = rect.y * size.y;
+    let x1 = (rect.x + rect.w) * size.x;
+    let y1 = (rect.y + rect.h) * size.y;
+    let corners = [
+        transform_local_point(origin, rotation, x0, y0),
+        transform_local_point(origin, rotation, x1, y0),
+        transform_local_point(origin, rotation, x1, y1),
+        transform_local_point(origin, rotation, x0, y1),
+    ];
+    SpriteboxWorldRect {
+        corners,
+        bounds: bounds_from_points(&corners),
+    }
+}
+
+fn spritebox_world_cache_matches(
+    component: &Table,
+    origin_x: f32,
+    origin_y: f32,
+    rotation: f32,
+    width: f32,
+    height: f32,
+    revision: i64,
+) -> bool {
+    component
+        .raw_get::<i64>("__spritebox_world_revision")
+        .unwrap_or(-1)
+        == revision
+        && component
+            .raw_get::<f32>("__spritebox_world_x")
+            .unwrap_or(f32::NAN)
+            == origin_x
+        && component
+            .raw_get::<f32>("__spritebox_world_y")
+            .unwrap_or(f32::NAN)
+            == origin_y
+        && component
+            .raw_get::<f32>("__spritebox_world_rotation")
+            .unwrap_or(f32::NAN)
+            == rotation
+        && component
+            .raw_get::<f32>("__spritebox_world_w")
+            .unwrap_or(f32::NAN)
+            == width
+        && component
+            .raw_get::<f32>("__spritebox_world_h")
+            .unwrap_or(f32::NAN)
+            == height
+}
+
+fn write_spritebox_world_cache(
+    lua: &Lua,
+    component: &Table,
+    shape: &SpriteboxWorldShape,
+    origin_x: f32,
+    origin_y: f32,
+    rotation: f32,
+    width: f32,
+    height: f32,
+    revision: i64,
+) -> mlua::Result<()> {
+    component.raw_set("__spritebox_world_revision", revision)?;
+    component.raw_set("__spritebox_world_x", origin_x)?;
+    component.raw_set("__spritebox_world_y", origin_y)?;
+    component.raw_set("__spritebox_world_rotation", rotation)?;
+    component.raw_set("__spritebox_world_w", width)?;
+    component.raw_set("__spritebox_world_h", height)?;
+    component.set(
+        "__spritebox_world_shape",
+        lua.create_userdata(SpriteboxWorldShapeHandle {
+            shape: shape.clone(),
+        })?,
+    )?;
+    Ok(())
+}
+
+fn build_world_spritebox_shape(
+    lua: &Lua,
+    component: &Table,
+) -> mlua::Result<Option<SpriteboxWorldShape>> {
+    let Some(shape) = read_spritebox_shape(component)? else {
+        return Ok(None);
+    };
+    if shape.rects.is_empty() {
+        return Ok(Some(SpriteboxWorldShape::default()));
+    }
+
+    let entity = spritebox_entity(component)?;
+    let (origin_x, origin_y, rotation) = crate::window::get_global_transform(&entity)?;
+    let (width, height) = crate::window::get_global_size(&entity)?;
+    if width <= 0.0 || height <= 0.0 {
+        return Ok(Some(SpriteboxWorldShape::default()));
+    }
+    let revision = component.raw_get::<i64>("__spritebox_revision").unwrap_or(0);
+
+    if spritebox_world_cache_matches(
+        component, origin_x, origin_y, rotation, width, height, revision,
+    ) {
+        if let Some(cached) = component
+            .get::<Option<AnyUserData>>("__spritebox_world_shape")
+            .unwrap_or(None)
+        {
+            let cached = cached.borrow::<SpriteboxWorldShapeHandle>()?;
+            return Ok(Some(cached.shape.clone()));
+        }
+    }
+
+    let origin = Vec2 {
+        x: origin_x,
+        y: origin_y,
+    };
+    let size = Vec2 {
+        x: width,
+        y: height,
+    };
+    let rects = shape
+        .rects
+        .iter()
+        .map(|rect| spritebox_world_rect(origin, rotation, size, *rect))
+        .collect::<Vec<_>>();
+    let bounds = spritebox_world_rect(origin, rotation, size, shape.bounds).bounds;
+    let world_shape = SpriteboxWorldShape { rects, bounds };
+    write_spritebox_world_cache(
+        lua,
+        component,
+        &world_shape,
+        origin_x,
+        origin_y,
+        rotation,
+        width,
+        height,
+        revision,
+    )?;
+    Ok(Some(world_shape))
+}
+
+fn projection_on_axis(corners: &[Vec2; 4], axis: Vec2) -> (f32, f32) {
+    let mut min = corners[0].x * axis.x + corners[0].y * axis.y;
+    let mut max = min;
+    for corner in corners.iter().skip(1) {
+        let projected = corner.x * axis.x + corner.y * axis.y;
+        min = min.min(projected);
+        max = max.max(projected);
+    }
+    (min, max)
+}
+
+fn has_separating_axis(a: &[Vec2; 4], b: &[Vec2; 4], axis: Vec2) -> bool {
+    let len_sq = axis.x * axis.x + axis.y * axis.y;
+    if len_sq <= f32::EPSILON {
+        return false;
+    }
+
+    let (a_min, a_max) = projection_on_axis(a, axis);
+    let (b_min, b_max) = projection_on_axis(b, axis);
+    a_max < b_min || b_max < a_min
+}
+
+fn spritebox_rects_intersect(a: &SpriteboxWorldRect, b: &SpriteboxWorldRect) -> bool {
+    if !rect_aabb_intersects(a.bounds, b.bounds) {
+        return false;
+    }
+
+    for corners in [&a.corners, &b.corners] {
+        for edge in 0..2 {
+            let next = edge + 1;
+            let dx = corners[next].x - corners[edge].x;
+            let dy = corners[next].y - corners[edge].y;
+            let axis = Vec2 { x: -dy, y: dx };
+            if has_separating_axis(&a.corners, &b.corners, axis) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn point_in_spritebox_shape(component: &Table, point: Vec2) -> mlua::Result<bool> {
+    let Some(shape) = read_spritebox_shape(component)? else {
+        return Ok(false);
+    };
+    if shape.rects.is_empty() {
+        return Ok(false);
+    }
+
+    let entity = spritebox_entity(component)?;
+    let (origin_x, origin_y, rotation) = crate::window::get_global_transform(&entity)?;
+    let (width, height) = crate::window::get_global_size(&entity)?;
+    if width <= 0.0 || height <= 0.0 {
+        return Ok(false);
+    }
+
+    let (local_x, local_y) = rotate_local(point.x - origin_x, point.y - origin_y, -rotation);
+    let nx = local_x / width;
+    let ny = local_y / height;
+    if nx < shape.bounds.x
+        || nx > shape.bounds.x + shape.bounds.w
+        || ny < shape.bounds.y
+        || ny > shape.bounds.y + shape.bounds.h
+    {
+        return Ok(false);
+    }
+
+    Ok(shape.rects.iter().any(|rect| {
+        nx >= rect.x && nx <= rect.x + rect.w && ny >= rect.y && ny <= rect.y + rect.h
+    }))
 }
 
 fn parse_icon_side(raw: &str) -> UiIconSide {
@@ -810,6 +1398,8 @@ fn queue_nine_slice(
     rotation: f32,
     tint: Color,
     filter: TextureFilter,
+    shader: Option<crate::shader::ShaderHandle>,
+    source: Option<Rect>,
     left: f32,
     right: f32,
     top: f32,
@@ -820,8 +1410,18 @@ fn queue_nine_slice(
     }
 
     let (image_w, image_h) = image.dimensions()?;
-    let image_w = image_w as f32;
-    let image_h = image_h as f32;
+    let image_bounds = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: image_w as f32,
+        h: image_h as f32,
+    };
+    let source = source
+        .map(|source| clamp_rect_to_bounds(source, image_bounds))
+        .filter(|source| source.w > 0.0 && source.h > 0.0)
+        .unwrap_or(image_bounds);
+    let image_w = source.w;
+    let image_h = source.h;
     let left = left.max(0.0).min(image_w);
     let right = right.max(0.0).min((image_w - left).max(0.0));
     let top = top.max(0.0).min(image_h);
@@ -831,12 +1431,12 @@ fn queue_nine_slice(
         renderer.queue(DrawCommand::Image {
             image,
             dest: bounds,
-            source: None,
+            source: Some(source),
             rotation,
             pivot,
             tint,
             filter,
-            shader: None,
+            shader,
         });
         return Ok(());
     }
@@ -890,8 +1490,8 @@ fn queue_nine_slice(
                     h: dest_h,
                 },
                 source: Some(Rect {
-                    x: *src_x,
-                    y: *src_y,
+                    x: source.x + *src_x,
+                    y: source.y + *src_y,
                     w: *src_w,
                     h: *src_h,
                 }),
@@ -899,7 +1499,7 @@ fn queue_nine_slice(
                 pivot,
                 tint,
                 filter,
-                shader: None,
+                shader: shader.clone(),
             });
         }
     }
@@ -947,6 +1547,8 @@ fn render_panel(
             rotation,
             style.background_color,
             style.filter,
+            None,
+            None,
             style.slice_left,
             style.slice_right,
             style.slice_top,
@@ -3336,10 +3938,32 @@ pub fn add_core_components(
     // draw an image (texture) tinted by component.color, scaled to entity size
     {
         let image2d = create_basic_drawable(lua)?;
+        image2d.set(
+            "awake",
+            lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "Image2D")?;
+                component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
+                component.set("visible", true)?;
+                component.set("shader", Value::Nil)?;
+                component.set("image", Value::Nil)?;
+                Ok(())
+            })?,
+        )?;
+        let sprite2d = create_basic_drawable(lua)?;
+        sprite2d.set(
+            "awake",
+            lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "Sprite2D")?;
+                component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
+                component.set("visible", true)?;
+                component.set("shader", Value::Nil)?;
+                component.set("image", Value::Nil)?;
+                Ok(())
+            })?,
+        )?;
         let render_state = render_state.clone();
 
-        image2d.set(
-            "update",
+        let image_update =
             lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
                 if !component.get::<bool>("visible").unwrap_or(true) {
                     return Ok(());
@@ -3357,6 +3981,16 @@ pub fn add_core_components(
 
                 let image = image.borrow::<crate::assets::ImageHandle>()?;
                 image.ensure_uploaded()?;
+                let (image_w, image_h) = image.dimensions()?;
+                let image_bounds = Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: image_w as f32,
+                    h: image_h as f32,
+                };
+                let source = get_source_rect(&component, "source")
+                    .map(|source| clamp_rect_to_bounds(source, image_bounds))
+                    .filter(|source| source.w > 0.0 && source.h > 0.0);
                 let (draw_x, draw_y, pivot) = if use_middle_pivot {
                     let (px, py) = crate::window::get_global_rotation_pivot(&entity)?;
                     // draw_texture_ex expects the unrotated rectangle origin when pivot is provided.
@@ -3375,7 +4009,7 @@ pub fn add_core_components(
                         w,
                         h,
                     },
-                    source: None,
+                    source,
                     rotation,
                     pivot,
                     tint,
@@ -3384,10 +4018,181 @@ pub fn add_core_components(
                 });
 
                 Ok(())
+            })?;
+
+        image2d.set("update", image_update.clone())?;
+        sprite2d.set("update", image_update)?;
+
+        core_components.set("Image2D", image2d)?;
+        core_components.set("Sprite2D", sprite2d)?;
+    }
+
+    // NineSliceSprite2D / 9SliceSprite2D
+    // draw a sprite with fixed-size edges and stretched center.
+    {
+        let nine_slice = create_basic_drawable(lua)?;
+        let render_state = render_state.clone();
+
+        nine_slice.set(
+            "awake",
+            lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "NineSliceSprite2D")?;
+                component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
+                component.set("visible", true)?;
+                component.set("shader", Value::Nil)?;
+                component.set("image", Value::Nil)?;
+                component.set("slice_left", 0.0)?;
+                component.set("slice_right", 0.0)?;
+                component.set("slice_top", 0.0)?;
+                component.set("slice_bottom", 0.0)?;
+                Ok(())
             })?,
         )?;
 
-        core_components.set("Image2D", image2d)?;
+        nine_slice.set(
+            "update",
+            lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
+                if !component.get::<bool>("visible").unwrap_or(true) {
+                    return Ok(());
+                }
+                let (x, y, rotation) = crate::window::get_global_transform(&entity)?;
+                let (w, h) = crate::window::get_global_size(&entity)?;
+                if w <= 0.0 || h <= 0.0 {
+                    return Ok(());
+                }
+                let image = get_image_field(&component, "image")?;
+                let Some(image) = image else {
+                    return Ok(());
+                };
+                let tint = color4_to_color(component.get("color")?)?;
+                let shader = shader_from_component(&component)?;
+                let source = get_source_rect(&component, "source");
+                let use_middle_pivot = crate::window::uses_middle_pivot(&entity);
+                let (draw_x, draw_y, pivot) = if use_middle_pivot {
+                    let (px, py) = crate::window::get_global_rotation_pivot(&entity)?;
+                    (px - w * 0.5, py - h * 0.5, Vec2 { x: px, y: py })
+                } else {
+                    (x, y, Vec2 { x, y })
+                };
+
+                let mut renderer = render_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
+                queue_nine_slice(
+                    &mut renderer,
+                    image,
+                    Rect {
+                        x: draw_x,
+                        y: draw_y,
+                        w,
+                        h,
+                    },
+                    pivot,
+                    rotation,
+                    tint,
+                    app_texture_filter(ctx),
+                    shader,
+                    source,
+                    get_number_field(&component, "slice_left", "sliceLeft").unwrap_or(0.0),
+                    get_number_field(&component, "slice_right", "sliceRight").unwrap_or(0.0),
+                    get_number_field(&component, "slice_top", "sliceTop").unwrap_or(0.0),
+                    get_number_field(&component, "slice_bottom", "sliceBottom").unwrap_or(0.0),
+                )?;
+                Ok(())
+            })?,
+        )?;
+
+        core_components.set("NineSliceSprite2D", nine_slice.clone())?;
+        core_components.set("9SliceSprite2D", nine_slice)?;
+    }
+
+    // Spritebox2D
+    // cached geometric hit shape derived from the opaque pixels of Sprite2D/Image2D sprites.
+    {
+        let spritebox2d = lua.create_table()?;
+
+        spritebox2d.set(
+            "awake",
+            lua.create_function(move |_ctx, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "Spritebox2D")?;
+                component.set("computed", false)?;
+                component.set("alpha_threshold", 0.0)?;
+                component.set("rect_count", 0)?;
+                component.set("bounds_x", 0.0)?;
+                component.set("bounds_y", 0.0)?;
+                component.set("bounds_w", 0.0)?;
+                component.set("bounds_h", 0.0)?;
+                component.raw_set("__spritebox_revision", 0)?;
+                Ok(())
+            })?,
+        )?;
+
+        let compute_spritebox = lua.create_function(move |lua, component: Table| {
+            let entity = spritebox_entity(&component)?;
+            let source = find_spritebox_source(&entity, &component)?.ok_or_else(|| {
+                mlua::Error::external(
+                    "Spritebox2D requires a Sprite2D, Image2D, or NineSliceSprite2D on the same entity",
+                )
+            })?;
+            let alpha_threshold = component
+                .get::<f32>("alpha_threshold")
+                .unwrap_or(0.0)
+                .clamp(0.0, 255.0) as u8;
+            let shape = build_spritebox_shape(&source.image, source.source, alpha_threshold)?;
+            write_spritebox_shape(lua, &component, &shape)?;
+            Ok(true)
+        })?;
+        spritebox2d.set("ComputeSpritebox", compute_spritebox.clone())?;
+        spritebox2d.set("computeSpritebox", compute_spritebox)?;
+
+        let is_inside = lua.create_function(move |_ctx, (component, x, y): (Table, f32, f32)| {
+            point_in_spritebox_shape(&component, Vec2 { x, y })
+        })?;
+        spritebox2d.set("IsInside", is_inside.clone())?;
+        spritebox2d.set("isInside", is_inside)?;
+
+        let is_intersecting = lua.create_function(move |lua, (component, other): (Table, Value)| {
+            let Some(other) = resolve_spritebox_component(other)? else {
+                return Ok(false);
+            };
+
+            let Some(a) = build_world_spritebox_shape(lua, &component)? else {
+                return Ok(false);
+            };
+            let Some(b) = build_world_spritebox_shape(lua, &other)? else {
+                return Ok(false);
+            };
+            if a.rects.is_empty()
+                || b.rects.is_empty()
+                || !rect_aabb_intersects(a.bounds, b.bounds)
+            {
+                return Ok(false);
+            }
+
+            for a_rect in &a.rects {
+                if !rect_aabb_intersects(a_rect.bounds, b.bounds) {
+                    continue;
+                }
+                for b_rect in &b.rects {
+                    if spritebox_rects_intersect(a_rect, b_rect) {
+                        return Ok(true);
+                    }
+                }
+            }
+
+            Ok(false)
+        })?;
+        spritebox2d.set("IsIntersecting", is_intersecting.clone())?;
+        spritebox2d.set("isIntersecting", is_intersecting)?;
+
+        spritebox2d.set(
+            "update",
+            lua.create_function(move |_ctx, (_entity, _component, _dt): (Table, Table, f32)| {
+                Ok(())
+            })?,
+        )?;
+
+        core_components.set("Spritebox2D", spritebox2d)?;
     }
 
     // TileTexture2D
@@ -3507,6 +4312,7 @@ pub fn add_core_components(
                     (((world_top - phase_anchor_y) as f64) / (tile_h as f64)).floor() as i32;
                 let iy_max =
                     (((world_bottom - phase_anchor_y) as f64) / (tile_h as f64)).ceil() as i32;
+                let filter = app_texture_filter(ctx);
 
                 let mut renderer = render_state
                     .lock()
@@ -3557,7 +4363,7 @@ pub fn add_core_components(
                             rotation,
                             pivot,
                             tint,
-                            filter: app_texture_filter(ctx),
+                            filter,
                             shader: shader.clone(),
                         });
                     }

@@ -1119,7 +1119,7 @@ impl VulkanPresenter {
                     let Some(sprite) = renderer::rasterize_text_sprite(&request) else {
                         continue;
                     };
-                    let texture = self.texture_for_text(&request, &sprite.image)?;
+                    let texture = self.texture_for_text(&request, sprite.image.as_ref())?;
                     let corners = image_corners(sprite.dest, sprite.rotation, sprite.pivot);
                     let verts = quad_vertices(
                         width,

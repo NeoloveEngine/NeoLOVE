@@ -1,0 +1,8 @@
+[package]
+name = "spriteboxes"
+version = "0.1.0"
+
+[window]
+title = "NeoLOVE Spriteboxes Demo"
+
+[dependencies]
