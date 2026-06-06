@@ -26,7 +26,7 @@ cargo build --release
 cargo build --release --features vulkan
 ```
 
-The default desktop binary uses the software renderer and omits Vulkan to reduce executable size. Use `--features vulkan` for GPU acceleration and custom shader rendering. The default asset codecs are PNG images and WAV audio.
+The default desktop binary uses the software renderer and omits Vulkan to reduce executable size. Use `--features vulkan` for GPU acceleration and custom shader rendering. The default asset codecs include PNG, BMP, TGA, PNM, and WebP images plus WAV audio on native builds; web builds can also play browser-decodable audio formats.
 
 ## Project Model
 
@@ -183,7 +183,7 @@ local imageCount, soundCount = assets.gc()
 
 Edges:
 
-- PNG is the default compiled image format for small release binaries.
+- Images can be loaded from PNG, BMP, TGA, PNM, and WebP files in the default build.
 - `getPixel` and `setPixel` use zero-based coordinates.
 - Unloaded handles reject further reads, writes, uploads, and rendering.
 - `save` and `export` paths stay inside the project root and receive `.png` or `.wav` extensions when omitted.
@@ -202,7 +202,7 @@ audio.stop(sound)
 
 Edges:
 
-- WAV is the default compiled audio format for small release binaries.
+- Native builds load WAV audio. Web builds can also pass browser-decodable MP3, OGG, FLAC, AAC/M4A, and AIFF files to `audio.play`; editable sample data is available for WAV sounds.
 - Volume is clamped to `0..1`.
 - Browser audio may not start until the user interacts with the page.
 - `playOnce` is `play(sound, false, volume)`.
@@ -263,13 +263,23 @@ http.get("https://example.com", function(response)
         print(response.error)
     end
 end)
+
+http.request({
+    url = "https://example.com/api",
+    method = "POST",
+    headers = { ["Content-Type"] = "application/json" },
+    body = "{\"hello\":true}",
+}, function(response)
+    print(response.status, response.body)
+end)
 ```
 
-`http.request(url, callback)` and `http.get(url, callback)` return request ids. Responses include `ok`, `url`, `status`, `body`, `error`, and `headers`.
+`http.request(url, callback)`, `http.request(options, callback)`, and `http.get(url, callback)` return request ids. Options include `url`, `method`, `headers`, and string `body`. Responses include `ok`, `url`, `status`, `body`, `error`, and `headers`.
 
 Edges:
 
 - Requests are asynchronous.
+- Native builds use a compact HTTP/HTTPS client; web builds use browser `fetch` and follow browser CORS rules.
 - `_poll()` is internal and normally called by the engine.
 
 ## Servers

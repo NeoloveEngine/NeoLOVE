@@ -21,7 +21,7 @@ neolove --version
 
 - `cargo build --release` now uses size optimization, fat LTO, one codegen unit, stripped binaries, and `panic = "abort"`.
 - Desktop release builds default to the smaller software renderer. Build with `cargo build --release --features vulkan` when you need Vulkan shader acceleration.
-- PNG image support and WAV audio support are compiled by default to keep the executable smaller.
+- PNG, BMP, TGA, PNM, and WebP image support are compiled by default. Native audio loads WAV files; web builds can also play browser-decodable MP3, OGG, FLAC, AAC/M4A, and AIFF files.
 - CI is configured in `.github/workflows/ci.yml` to run `fmt`, `clippy`, and `test` on push/PR.
 - Lua-exposed `fs` and command `cwd` paths are restricted to the project root.
 
