@@ -34,7 +34,9 @@ EM_JS(void, neolove_js_bootstrap, (), {
       lastError: "",
       resumeHooksInstalled: false
     },
-    fonts: new Map()
+    fonts: new Map(),
+    images: new Map(),
+    imageUseCounter: 0
   });
 
   const canvas = document.getElementById("canvas");
@@ -543,6 +545,94 @@ EM_JS(void, neolove_js_composite_rgba, (const uint8_t* pixels, int width, int he
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.globalCompositeOperation = "source-over";
   ctx.drawImage(blitCanvas, dst_x, dst_y);
+  ctx.restore();
+});
+
+EM_JS(void, neolove_js_draw_image, (
+  uintptr_t image_id,
+  double revision,
+  const uint8_t* pixels,
+  int image_width,
+  int image_height,
+  float source_x,
+  float source_y,
+  float source_w,
+  float source_h,
+  float dest_x,
+  float dest_y,
+  float dest_w,
+  float dest_h,
+  float rotation,
+  float pivot_x,
+  float pivot_y,
+  float alpha,
+  int linear_filter
+), {
+  const state = Module.neoloveState;
+  const canvas = Module.canvas;
+  if (!state || !canvas || image_width <= 0 || image_height <= 0 ||
+      source_w <= 0 || source_h <= 0 || dest_w <= 0 || dest_h <= 0) {
+    return;
+  }
+  if (!state.ctx) {
+    state.ctx = canvas.getContext("2d", { alpha: false }) || canvas.getContext("2d");
+  }
+  const ctx = state.ctx;
+  if (!ctx) {
+    return;
+  }
+
+  state.images ||= new Map();
+  state.imageUseCounter = (state.imageUseCounter || 0) + 1;
+  let cached = state.images.get(image_id);
+  if (!cached || cached.revision !== revision ||
+      cached.canvas.width !== image_width || cached.canvas.height !== image_height) {
+    const imageCanvas = cached ? cached.canvas : document.createElement("canvas");
+    imageCanvas.width = image_width;
+    imageCanvas.height = image_height;
+    const imageCtx = imageCanvas.getContext("2d");
+    if (!imageCtx) {
+      return;
+    }
+    const byteLength = image_width * image_height * 4;
+    const copiedPixels = new Uint8ClampedArray(byteLength);
+    copiedPixels.set(HEAPU8.subarray(pixels, pixels + byteLength));
+    imageCtx.putImageData(new ImageData(copiedPixels, image_width, image_height), 0, 0);
+    cached = { canvas: imageCanvas, revision: revision, lastUsed: state.imageUseCounter };
+    state.images.set(image_id, cached);
+    if (state.images.size > 256) {
+      let oldestId = null;
+      let oldestUse = Number.POSITIVE_INFINITY;
+      for (const [cachedId, entry] of state.images) {
+        if (entry.lastUsed < oldestUse) {
+          oldestId = cachedId;
+          oldestUse = entry.lastUsed;
+        }
+      }
+      if (oldestId !== null && oldestId !== image_id) {
+        state.images.delete(oldestId);
+      }
+    }
+  }
+  cached.lastUsed = state.imageUseCounter;
+
+  ctx.save();
+  ctx.imageSmoothingEnabled = linear_filter !== 0;
+  ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+  ctx.translate(pivot_x, pivot_y);
+  ctx.rotate(rotation);
+  ctx.translate(-pivot_x, -pivot_y);
+  ctx.drawImage(
+    cached.canvas,
+    source_x,
+    source_y,
+    source_w,
+    source_h,
+    dest_x,
+    dest_y,
+    dest_w,
+    dest_h
+  );
   ctx.restore();
 });
 
@@ -1374,6 +1464,46 @@ void neolove_web_present_rgba(const uint8_t* pixels, int width, int height) {
 
 void neolove_web_composite_rgba(const uint8_t* pixels, int width, int height, int x, int y) {
   neolove_js_composite_rgba(pixels, width, height, x, y);
+}
+
+void neolove_web_draw_image(
+    uintptr_t image_id,
+    double revision,
+    const uint8_t* pixels,
+    int image_width,
+    int image_height,
+    float source_x,
+    float source_y,
+    float source_w,
+    float source_h,
+    float dest_x,
+    float dest_y,
+    float dest_w,
+    float dest_h,
+    float rotation,
+    float pivot_x,
+    float pivot_y,
+    float alpha,
+    int linear_filter) {
+  neolove_js_draw_image(
+      image_id,
+      revision,
+      pixels,
+      image_width,
+      image_height,
+      source_x,
+      source_y,
+      source_w,
+      source_h,
+      dest_x,
+      dest_y,
+      dest_w,
+      dest_h,
+      rotation,
+      pivot_x,
+      pivot_y,
+      alpha,
+      linear_filter);
 }
 
 void neolove_web_draw_shader_rect(

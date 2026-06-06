@@ -51,6 +51,26 @@ unsafe extern "C" {
     fn neolove_web_clear_canvas(r: i32, g: i32, b: i32, a: i32);
     fn neolove_web_present_rgba(pixels: *const u8, width: i32, height: i32);
     fn neolove_web_composite_rgba(pixels: *const u8, width: i32, height: i32, x: i32, y: i32);
+    fn neolove_web_draw_image(
+        image_id: usize,
+        revision: f64,
+        pixels: *const u8,
+        image_width: i32,
+        image_height: i32,
+        source_x: f32,
+        source_y: f32,
+        source_w: f32,
+        source_h: f32,
+        dest_x: f32,
+        dest_y: f32,
+        dest_w: f32,
+        dest_h: f32,
+        rotation: f32,
+        pivot_x: f32,
+        pivot_y: f32,
+        alpha: f32,
+        linear_filter: i32,
+    );
     fn neolove_web_draw_shader_rect(
         fragment_source: *const c_char,
         uniforms_json: *const c_char,
@@ -510,15 +530,6 @@ fn render_web_commands_in_order(
     platform: &SharedPlatformState,
     commands: Vec<DrawCommand>,
 ) -> Result<(), String> {
-    if !commands.iter().any(command_has_shader) {
-        renderer.render_commands(platform, commands)?;
-        let (width, height) = renderer.dimensions();
-        unsafe {
-            neolove_web_present_rgba(renderer.pixels().as_ptr(), width as i32, height as i32);
-        }
-        return Ok(());
-    }
-
     let clear = lock_platform_state(platform).clear_color();
     unsafe {
         neolove_web_clear_canvas(clear.r as i32, clear.g as i32, clear.b as i32, clear.a as i32);
@@ -527,7 +538,13 @@ fn render_web_commands_in_order(
     let viewport = renderer.dimensions();
     let mut pending = Vec::new();
     for command in commands {
-        if command_has_shader(&command) {
+        if !crate::renderer::command_intersects_viewport(&command, viewport.0, viewport.1) {
+            continue;
+        }
+        if is_web_native_image(&command) {
+            flush_software_chunk(renderer, viewport, std::mem::take(&mut pending))?;
+            draw_web_image(command)?;
+        } else if command_has_shader(&command) {
             flush_software_chunk(renderer, viewport, std::mem::take(&mut pending))?;
             draw_web_shader_command(command)?;
         } else {
@@ -537,6 +554,68 @@ fn render_web_commands_in_order(
     let result = flush_software_chunk(renderer, viewport, pending);
     renderer.resize(viewport.0, viewport.1);
     result
+}
+
+fn is_web_native_image(command: &DrawCommand) -> bool {
+    matches!(
+        command,
+        DrawCommand::Image {
+            tint,
+            shader: None,
+            ..
+        } if tint.r == 255 && tint.g == 255 && tint.b == 255
+    )
+}
+
+fn draw_web_image(command: DrawCommand) -> Result<(), String> {
+    let DrawCommand::Image {
+        image,
+        dest,
+        source,
+        rotation,
+        pivot,
+        tint,
+        filter,
+        shader: None,
+    } = command
+    else {
+        return Err("internal web renderer error: expected an unshaded image command".to_string());
+    };
+
+    let revision = image.revision().map_err(|error| error.to_string())?;
+    let image_id = image.id().map_err(|error| error.to_string())?;
+    image
+        .with_image(|pixels| {
+            let source = source.unwrap_or(crate::renderer::Rect {
+                x: 0.0,
+                y: 0.0,
+                w: pixels.width() as f32,
+                h: pixels.height() as f32,
+            });
+            unsafe {
+                neolove_web_draw_image(
+                    image_id,
+                    revision as f64,
+                    pixels.as_raw().as_ptr(),
+                    pixels.width() as i32,
+                    pixels.height() as i32,
+                    source.x,
+                    source.y,
+                    source.w,
+                    source.h,
+                    dest.x,
+                    dest.y,
+                    dest.w,
+                    dest.h,
+                    rotation,
+                    pivot.x,
+                    pivot.y,
+                    tint.a as f32 / 255.0,
+                    i32::from(matches!(filter, crate::renderer::TextureFilter::Linear)),
+                );
+            }
+        })
+        .map_err(|error| error.to_string())
 }
 
 fn flush_software_chunk(

@@ -1171,7 +1171,7 @@ impl VulkanPresenter {
     }
 
     fn texture_for_image(&mut self, image: &ImageHandle) -> Result<TextureKey, String> {
-        let id = image.id();
+        let id = image.id().map_err(|e| e.to_string())?;
         let revision = image.revision().map_err(|e| e.to_string())?;
         if let Some(key) = self.image_cache_keys.get(&id).copied()
             && let Some(cached) = self.texture_cache.get(&key)

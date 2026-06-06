@@ -4273,31 +4273,46 @@ pub fn add_core_components(
                 let phase_anchor_y = phase_origin_y + offset_y;
                 let tile_eps = 0.0001f32;
 
-                // For non-rotated tile layers, cull to visible screen-space bounds first.
-                // Rotated tile layers keep the full-entity iteration to preserve rendering correctness.
-                let (local_left, local_top, local_right, local_bottom) = if rotation.abs() < 0.0001
-                {
+                // Transform the viewport into the tile layer's unrotated coordinate space.
+                // This keeps iteration bounded to potentially visible tiles even for rotated layers.
+                let (screen_w, screen_h) = {
                     let platform = lock_platform_state(&platform);
-                    let screen_w = platform.window().width;
-                    let screen_h = platform.window().height;
-                    let visible_left = base_x.max(0.0);
-                    let visible_top = base_y.max(0.0);
-                    let visible_right = (base_x + w).min(screen_w);
-                    let visible_bottom = (base_y + h).min(screen_h);
-
-                    if visible_right <= visible_left || visible_bottom <= visible_top {
-                        return Ok(());
-                    }
-
-                    (
-                        visible_left - base_x,
-                        visible_top - base_y,
-                        visible_right - base_x,
-                        visible_bottom - base_y,
-                    )
-                } else {
-                    (0.0, 0.0, w, h)
+                    let window = platform.window();
+                    (window.width, window.height)
                 };
+                let viewport_corners = [
+                    (0.0, 0.0),
+                    (screen_w, 0.0),
+                    (screen_w, screen_h),
+                    (0.0, screen_h),
+                ];
+                let mut visible_left = f32::INFINITY;
+                let mut visible_top = f32::INFINITY;
+                let mut visible_right = f32::NEG_INFINITY;
+                let mut visible_bottom = f32::NEG_INFINITY;
+                for (screen_x, screen_y) in viewport_corners {
+                    let (local_x, local_y) =
+                        rotate_local(screen_x - pivot.x, screen_y - pivot.y, -rotation);
+                    let unrotated_x = pivot.x + local_x;
+                    let unrotated_y = pivot.y + local_y;
+                    visible_left = visible_left.min(unrotated_x);
+                    visible_top = visible_top.min(unrotated_y);
+                    visible_right = visible_right.max(unrotated_x);
+                    visible_bottom = visible_bottom.max(unrotated_y);
+                }
+                visible_left = visible_left.max(base_x);
+                visible_top = visible_top.max(base_y);
+                visible_right = visible_right.min(base_x + w);
+                visible_bottom = visible_bottom.min(base_y + h);
+                if visible_right <= visible_left || visible_bottom <= visible_top {
+                    return Ok(());
+                }
+                let (local_left, local_top, local_right, local_bottom) = (
+                    visible_left - base_x,
+                    visible_top - base_y,
+                    visible_right - base_x,
+                    visible_bottom - base_y,
+                );
 
                 let world_left = base_x + local_left;
                 let world_top = base_y + local_top;

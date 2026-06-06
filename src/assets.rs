@@ -4,10 +4,12 @@ use mlua::{Lua, Table, UserData, UserDataMethods, Value, Variadic};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Debug)]
 struct ImageAsset {
+    id: usize,
     image: RgbaImage,
     unloaded: bool,
     revision: u64,
@@ -16,6 +18,11 @@ struct ImageAsset {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ImageHandle(Arc<Mutex<ImageAsset>>);
+
+fn next_image_id() -> usize {
+    static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug)]
 struct SoundAsset {
@@ -197,6 +204,7 @@ impl ImageHandle {
     #[allow(dead_code)]
     pub(crate) fn from_rgba_image(image: RgbaImage) -> Self {
         Self(Arc::new(Mutex::new(ImageAsset {
+            id: next_image_id(),
             image,
             unloaded: false,
             revision: 0,
@@ -204,9 +212,13 @@ impl ImageHandle {
         })))
     }
 
-    #[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
-    pub(crate) fn id(&self) -> usize {
-        Arc::as_ptr(&self.0) as usize
+    #[cfg(any(target_os = "emscripten", feature = "vulkan"))]
+    pub(crate) fn id(&self) -> mlua::Result<usize> {
+        let image = self
+            .0
+            .lock()
+            .map_err(|_| mlua::Error::external("image lock poisoned"))?;
+        Ok(image.id)
     }
 
     pub(crate) fn with_image<R>(&self, f: impl FnOnce(&RgbaImage) -> R) -> mlua::Result<R> {
@@ -259,7 +271,7 @@ impl ImageHandle {
         self.with_image(|_| ())
     }
 
-    #[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
+    #[cfg(any(target_os = "emscripten", feature = "vulkan"))]
     pub(crate) fn revision(&self) -> mlua::Result<u64> {
         let image = self
             .0
@@ -579,6 +591,7 @@ impl AssetManager {
             .map_err(|error| asset_decode_error("image", &resolved, error))?
             .to_rgba8();
         let handle = Arc::new(Mutex::new(ImageAsset {
+            id: next_image_id(),
             image,
             unloaded: false,
             revision: 0,
@@ -592,6 +605,7 @@ impl AssetManager {
         let pixel = Rgba([color.r, color.g, color.b, color.a]);
         let image = RgbaImage::from_pixel(width as u32, height as u32, pixel);
         ImageHandle(Arc::new(Mutex::new(ImageAsset {
+            id: next_image_id(),
             image,
             unloaded: false,
             revision: 0,
