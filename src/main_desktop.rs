@@ -848,6 +848,39 @@ fn run_checked_command(
     }
 }
 
+fn run_checked_command_quiet(
+    command: &mut std::process::Command,
+    description: &str,
+) -> Result<(), String> {
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .map_err(|e| format!("failed while {description}: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let diagnostics = [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if diagnostics.is_empty() {
+        Err(format!(
+            "{description} failed with status {}: {rendered}",
+            output.status
+        ))
+    } else {
+        Err(format!(
+            "{description} failed with status {}: {rendered}\n{diagnostics}",
+            output.status
+        ))
+    }
+}
+
 fn emsdk_root() -> Result<PathBuf, String> {
     let home = user_home_dir().ok_or_else(|| "could not resolve home directory".to_string())?;
     Ok(home.join(".neolove").join("toolchains").join("emsdk"))
@@ -1510,7 +1543,7 @@ fn build_webasm(project_root: &Path) -> Result<(PathBuf, PathBuf), String> {
         .arg("-C")
         .arg("link-arg=-sALLOW_MEMORY_GROWTH=1")
         .current_dir(&engine_root);
-    run_checked_command(&mut cargo, "building webasm runtime")?;
+    run_checked_command_quiet(&mut cargo, "building webasm runtime")?;
 
     let target_dir = cargo_target_dir
         .join("wasm32-unknown-emscripten")
