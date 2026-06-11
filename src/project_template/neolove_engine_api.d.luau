@@ -373,6 +373,8 @@ export type ShadersModule = {
 export type TransformModule = {
 	getWorldPosition: (entity: Entity) -> (number, number),
 	getWorldRotation: (entity: Entity) -> number,
+	GetEntitiesInFront: (world_x: number, world_y: number, minimum_z: number?) -> { Entity },
+	getEntitiesInFront: (world_x: number, world_y: number, minimum_z: number?) -> { Entity },
 	doTheyOverlap: (entities: { Entity }) -> boolean,
 	raycast: (
 		origin_x: number,

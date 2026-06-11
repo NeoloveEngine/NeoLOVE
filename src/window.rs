@@ -1946,6 +1946,42 @@ impl Runtime {
                 Ok(false)
             })?;
 
+            let entities_in_front_registry_lua = self.lua.clone();
+            let entities_in_front_state = self.entities.clone();
+            let get_entities_in_front = self.lua.create_function(
+                move |lua, (world_x, world_y, minimum_z): (f32, f32, Option<f64>)| {
+                    let minimum_z = minimum_z.unwrap_or(f64::NEG_INFINITY);
+                    let mut matches = Vec::<(Table, f64, usize)>::new();
+
+                    for (id, entity_data) in entities_in_front_state.borrow().iter() {
+                        if *id == 0 {
+                            continue;
+                        }
+
+                        let entity = match entities_in_front_registry_lua
+                            .registry_value::<Table>(&entity_data.luau_key)
+                        {
+                            Ok(entity) => entity,
+                            Err(_) => continue,
+                        };
+                        let z = entity.get::<f64>("z").unwrap_or(0.0);
+                        if z < minimum_z {
+                            continue;
+                        }
+                        if point_hits_entity(&entity, world_x, world_y).unwrap_or(false) {
+                            matches.push((entity, z, *id));
+                        }
+                    }
+
+                    matches.sort_by(|a, b| compare_entity_order(a.1, a.2, b.1, b.2).reverse());
+                    let result = lua.create_table_with_capacity(matches.len(), 0)?;
+                    for (index, (entity, _, _)) in matches.into_iter().enumerate() {
+                        result.raw_set(index + 1, entity)?;
+                    }
+                    Ok(result)
+                },
+            )?;
+
             let raycast_entities = self.entities.clone();
             let raycast = self.lua.create_function(
                 move |lua,
@@ -2057,6 +2093,8 @@ impl Runtime {
             transforms.set("getWorldRotation", get_world_rotation)?;
 
             transforms.set("doTheyOverlap", do_they_overlap)?;
+            transforms.set("GetEntitiesInFront", get_entities_in_front.clone())?;
+            transforms.set("getEntitiesInFront", get_entities_in_front)?;
             transforms.set("raycast", raycast)?;
         }
 
@@ -4396,6 +4434,54 @@ mod tests {
         separated_list.set(2, second)?;
         let overlaps: bool = do_they_overlap.call(separated_list)?;
         assert!(!overlaps);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn get_entities_in_front_filters_point_and_z_and_sorts_frontmost_first() -> mlua::Result<()> {
+        let (runtime, root) = start_test_runtime("entities_in_front")?;
+
+        let ecs: Table = runtime.lua.globals().get("ecs")?;
+        let transform: Table = runtime.lua.globals().get("transform")?;
+        let new_entity: Function = ecs.get("newEntity")?;
+        let get_entities_in_front: Function = transform.get("GetEntitiesInFront")?;
+
+        let back: Table =
+            new_entity.call(("back".to_string(), None::<Table>, Some(10.0), Some(20.0)))?;
+        back.set("size_x", 50.0)?;
+        back.set("size_y", 40.0)?;
+        back.set("z", 2.0)?;
+
+        let front: Table =
+            new_entity.call(("front".to_string(), None::<Table>, Some(20.0), Some(25.0)))?;
+        front.set("size_x", 30.0)?;
+        front.set("size_y", 30.0)?;
+        front.set("z", 8.0)?;
+
+        let outside: Table =
+            new_entity.call(("outside".to_string(), None::<Table>, Some(200.0), Some(200.0)))?;
+        outside.set("size_x", 40.0)?;
+        outside.set("size_y", 40.0)?;
+        outside.set("z", 20.0)?;
+
+        let matches: Table =
+            get_entities_in_front.call((30.0f32, 30.0f32, None::<f64>))?;
+        assert_eq!(matches.raw_len(), 2);
+        assert_eq!(matches.raw_get::<Table>(1)?.get::<String>("name")?, "front");
+        assert_eq!(matches.raw_get::<Table>(2)?.get::<String>("name")?, "back");
+
+        let filtered: Table = get_entities_in_front.call((30.0f32, 30.0f32, Some(8.0f64)))?;
+        assert_eq!(filtered.raw_len(), 1);
+        assert_eq!(
+            filtered.raw_get::<Table>(1)?.get::<String>("name")?,
+            "front"
+        );
+
+        let empty: Table =
+            get_entities_in_front.call((30.0f32, 30.0f32, Some(9.0f64)))?;
+        assert_eq!(empty.raw_len(), 0);
 
         std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())

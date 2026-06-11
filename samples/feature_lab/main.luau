@@ -564,7 +564,11 @@ probe("ecs + hierarchy", function()
 	assert(worldX ~= nil and worldY ~= nil and worldRotation ~= nil)
 	assert(transform.getWorldPosition(child) ~= nil)
 	assert(transforms.getWorldRotation(child) ~= nil)
-	return "methods, lifecycle, duplicate, find, world transform"
+	local entitiesInFront = transform.GetEntitiesInFront(worldX + 1, worldY + 1, child.z)
+	local aliasMatches = transforms.getEntitiesInFront(worldX + 1, worldY + 1, child.z)
+	assert(entitiesInFront[1] == child)
+	assert(aliasMatches[1] == child)
+	return "methods, lifecycle, duplicate, find, world transform, front query"
 end)
 
 local temporary = ecs.newEntity("temporary", runtimePanel, 0, 0)
