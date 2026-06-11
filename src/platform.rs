@@ -156,7 +156,9 @@ mod tests {
         let platform = new_shared_platform_state();
         let poisoned = platform.clone();
         let _ = std::panic::catch_unwind(move || {
-            let _guard = poisoned.lock().unwrap();
+            let _guard = poisoned
+                .lock()
+                .expect("fresh platform state lock should not be poisoned");
             panic!("poison platform state");
         });
 
