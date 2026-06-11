@@ -22,7 +22,8 @@ optional `neolove.toml` configuration file.
 - Keyboard, mouse, audio, image, file system, HTTP, and server APIs
 - Standalone desktop executables with embedded game assets
 - Itch.io-ready WebAssembly bundles
-- Project-root restrictions for file and command working-directory paths
+- External writable data directories for packaged desktop games
+- Project-root restrictions for command working-directory paths
 
 ## Requirements
 
@@ -168,6 +169,20 @@ and a local toolchain under `~/.neolove/toolchains/emsdk`.
 
 Browser audio may require a user interaction before playback begins.
 
+## Writable Game Data
+
+During development, relative `fs` paths and image/sound exports use the project
+directory. A packaged desktop executable instead creates a writable
+`<game-name>_data` directory beside the executable. Relative writes and exports
+go there, while reads fall back to bundled project resources.
+
+Use `fs.getDataDirectory()` to inspect that location or `fs.dataPath("save.json")`
+to build a path for APIs such as image and sound export. Absolute paths and
+normalized parent-relative paths are also supported by `fs` and asset export.
+They are not restricted to the project, data, or executable directory; normal
+operating-system permissions still apply. See [`docs.md`](docs.md) for path and
+async task examples.
+
 ## Examples
 
 The [`samples`](samples) directory includes projects covering:
@@ -177,6 +192,7 @@ The [`samples`](samples) directory includes projects covering:
   [`raycasting`](samples/raycasting)
 - [`spriteboxes`](samples/spriteboxes) and [`shaders`](samples/shaders)
 - [`tweening`](samples/tweening) and [`webasm_smoke`](samples/webasm_smoke)
+- [`feature_lab`](samples/feature_lab), a comprehensive interactive API smoke test
 
 Run any sample by passing its directory to the CLI:
 

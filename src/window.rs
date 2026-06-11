@@ -1,4 +1,7 @@
-use mlua::{Compiler, Function, Lua, RegistryKey, Table, TextRequirer, Value};
+use mlua::{
+    Compiler, Function, Lua, MultiValue, RegistryKey, Table, TextRequirer, Thread, ThreadStatus,
+    Value,
+};
 use rapier2d::prelude::{
     nalgebra, point, vector, CCDSolver, ColliderBuilder, ColliderHandle, ColliderSet,
     DefaultBroadPhase, ImpulseJointHandle, ImpulseJointSet, IntegrationParameters, IslandManager,
@@ -30,6 +33,7 @@ pub struct Runtime {
     next_entity_listener_id: Rc<RefCell<u64>>,
     systems: Rc<RefCell<Vec<RegistryKey>>>,
     environment: PathBuf,
+    data_root: PathBuf,
     lua: Lua,
     entity_max: usize,
     exit_requested: Rc<RefCell<bool>>,
@@ -44,6 +48,15 @@ pub struct Runtime {
     app_table_key: Option<RegistryKey>,
     max_fps_state: Rc<RefCell<Option<f32>>>,
     show_fps_state: Rc<RefCell<Option<bool>>>,
+    async_tasks: Rc<RefCell<Vec<AsyncTask>>>,
+    async_cancelled: Rc<RefCell<HashSet<u64>>>,
+    next_async_id: Rc<Cell<u64>>,
+}
+
+struct AsyncTask {
+    id: u64,
+    thread: Thread,
+    handle: Table,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1198,12 +1211,17 @@ fn write_id_set_to_table(lua: &Lua, ids: &HashSet<usize>) -> mlua::Result<Table>
 
 impl Runtime {
     pub fn new(env: PathBuf) -> Runtime {
+        Self::with_data_root(env.clone(), env)
+    }
+
+    pub fn with_data_root(env: PathBuf, data_root: PathBuf) -> Runtime {
         Runtime {
             entities: Rc::new(RefCell::new(HashMap::new())),
             entity_listeners: Rc::new(RefCell::new(HashMap::new())),
             next_entity_listener_id: Rc::new(RefCell::new(1)),
             systems: Rc::new(RefCell::new(Vec::new())),
             environment: env,
+            data_root,
             lua: Lua::new(),
             entity_max: 1,
             exit_requested: Rc::new(RefCell::new(false)),
@@ -1218,6 +1236,9 @@ impl Runtime {
             app_table_key: None,
             max_fps_state: Rc::new(RefCell::new(None)),
             show_fps_state: Rc::new(RefCell::new(None)),
+            async_tasks: Rc::new(RefCell::new(Vec::new())),
+            async_cancelled: Rc::new(RefCell::new(HashSet::new())),
+            next_async_id: Rc::new(Cell::new(1)),
         }
     }
 
@@ -1431,6 +1452,175 @@ impl Runtime {
         Ok(app.raw_get::<Option<bool>>("showFps")?.unwrap_or(true))
     }
 
+    fn install_async_module(&self) -> mlua::Result<()> {
+        self.async_tasks.borrow_mut().clear();
+        self.async_cancelled.borrow_mut().clear();
+        self.next_async_id.set(1);
+
+        let module = self.lua.create_table()?;
+        let metatable = self.lua.create_table()?;
+        let tasks = self.async_tasks.clone();
+        let cancelled = self.async_cancelled.clone();
+        let next_id = self.next_async_id.clone();
+        let call = self.lua.create_function(
+            move |lua, (_module, callback): (Table, Function)| {
+                let id = next_id.get();
+                next_id.set(id.saturating_add(1));
+
+                let handle = lua.create_table()?;
+                handle.raw_set("id", id)?;
+                handle.raw_set("done", false)?;
+                handle.raw_set("cancelled", false)?;
+                handle.raw_set("status", "queued")?;
+                handle.raw_set("error", Value::Nil)?;
+                handle.raw_set("result", Value::Nil)?;
+                handle.raw_set("results", lua.create_table()?)?;
+
+                let is_done = lua.create_function(|_lua, handle: Table| {
+                    handle.raw_get::<bool>("done")
+                })?;
+                handle.raw_set("isDone", is_done.clone())?;
+                handle.raw_set("IsDone", is_done)?;
+
+                let task_cancelled = cancelled.clone();
+                let cancel = lua.create_function(move |_lua, handle: Table| {
+                    if handle.raw_get::<bool>("done")? {
+                        return Ok(false);
+                    }
+                    task_cancelled.borrow_mut().insert(id);
+                    handle.raw_set("done", true)?;
+                    handle.raw_set("cancelled", true)?;
+                    handle.raw_set("status", "cancelled")?;
+                    Ok(true)
+                })?;
+                handle.raw_set("cancel", cancel.clone())?;
+                handle.raw_set("Cancel", cancel)?;
+
+                let get_status = lua.create_function(|_lua, handle: Table| {
+                    handle.raw_get::<String>("status")
+                })?;
+                handle.raw_set("getStatus", get_status.clone())?;
+                handle.raw_set("GetStatus", get_status)?;
+
+                let get_error = lua.create_function(|_lua, handle: Table| {
+                    handle.raw_get::<Option<String>>("error")
+                })?;
+                handle.raw_set("getError", get_error.clone())?;
+                handle.raw_set("GetError", get_error)?;
+
+                let get_result = lua.create_function(|_lua, handle: Table| {
+                    let results = handle.raw_get::<Table>("results")?;
+                    let mut values = Vec::with_capacity(results.raw_len());
+                    for index in 1..=results.raw_len() {
+                        values.push(results.raw_get::<Value>(index)?);
+                    }
+                    Ok(MultiValue::from_vec(values))
+                })?;
+                handle.raw_set("getResult", get_result.clone())?;
+                handle.raw_set("GetResult", get_result)?;
+
+                tasks.borrow_mut().push(AsyncTask {
+                    id,
+                    thread: lua.create_thread(callback)?,
+                    handle: handle.clone(),
+                });
+                Ok(handle)
+            },
+        )?;
+        metatable.raw_set("__call", call)?;
+        module.set_metatable(Some(metatable))?;
+
+        let yield_now: Function = self
+            .lua
+            .load("return function(...) return coroutine.yield(...) end")
+            .eval()?;
+        module.raw_set("yield", yield_now)?;
+
+        let tasks = self.async_tasks.clone();
+        module.raw_set(
+            "count",
+            self.lua.create_function(move |_lua, ()| {
+                Ok(tasks
+                    .borrow()
+                    .iter()
+                    .filter(|task| !task.handle.raw_get::<bool>("done").unwrap_or(true))
+                    .count())
+            })?,
+        )?;
+
+        let tasks = self.async_tasks.clone();
+        let cancelled = self.async_cancelled.clone();
+        module.raw_set(
+            "cancelAll",
+            self.lua.create_function(move |_lua, ()| {
+                let mut count = 0;
+                for task in tasks.borrow().iter() {
+                    if !task.handle.raw_get::<bool>("done")? {
+                        cancelled.borrow_mut().insert(task.id);
+                        task.handle.raw_set("done", true)?;
+                        task.handle.raw_set("cancelled", true)?;
+                        task.handle.raw_set("status", "cancelled")?;
+                        count += 1;
+                    }
+                }
+                Ok(count)
+            })?,
+        )?;
+
+        self.lua.globals().raw_set("async", module)
+    }
+
+    fn poll_async_tasks(&self) {
+        let tasks = std::mem::take(&mut *self.async_tasks.borrow_mut());
+        let mut remaining = Vec::with_capacity(tasks.len());
+
+        for task in tasks {
+            if self.async_cancelled.borrow_mut().remove(&task.id) {
+                continue;
+            }
+
+            let _ = task.handle.raw_set("status", "running");
+            match task.thread.resume::<MultiValue>(()) {
+                Ok(_values) if task.thread.status() == ThreadStatus::Resumable => {
+                    let _ = task.handle.raw_set("status", "suspended");
+                    remaining.push(task);
+                }
+                Ok(values) => {
+                    let values = values.into_vec();
+                    let results = match task.handle.raw_get::<Table>("results") {
+                        Ok(results) => results,
+                        Err(error) => {
+                            eprintln!(
+                                "\x1b[31mLua async task error:\x1b[0m Failed to store result: {}",
+                                describe_lua_error(&error)
+                            );
+                            continue;
+                        }
+                    };
+                    for (index, value) in values.iter().cloned().enumerate() {
+                        let _ = results.raw_set(index + 1, value);
+                    }
+                    let _ = task
+                        .handle
+                        .raw_set("result", values.first().cloned().unwrap_or(Value::Nil));
+                    let _ = task.handle.raw_set("status", "completed");
+                    let _ = task.handle.raw_set("done", true);
+                }
+                Err(error) => {
+                    let message = describe_lua_error(&error);
+                    let _ = task.handle.raw_set("error", message.clone());
+                    let _ = task.handle.raw_set("status", "error");
+                    let _ = task.handle.raw_set("done", true);
+                    eprintln!("\x1b[31mLua async task error:\x1b[0m\n{message}");
+                }
+            }
+        }
+
+        let mut newly_queued = self.async_tasks.borrow_mut();
+        remaining.append(&mut newly_queued);
+        *newly_queued = remaining;
+    }
+
     pub fn start(&mut self) -> mlua::Result<()> {
         self.lua.set_compiler(
             Compiler::new()
@@ -1541,6 +1731,11 @@ impl Runtime {
             .environment
             .canonicalize()
             .map_err(mlua::Error::external)?;
+        fs::create_dir_all(&self.data_root).map_err(mlua::Error::external)?;
+        let data_root = self
+            .data_root
+            .canonicalize()
+            .map_err(mlua::Error::external)?;
 
         {
             let softrequire_root = env_root.clone();
@@ -1621,13 +1816,22 @@ impl Runtime {
 
         crate::user_input::add_user_input_module(&self.lua, self.platform.clone())?;
         crate::audio_system::add_audio_module(&self.lua)?;
-        crate::assets::add_assets_module(&self.lua, env_root.clone())?;
-        crate::fs_module::add_fs_module(&self.lua, env_root.clone())?;
+        crate::assets::add_assets_module_with_data_root(
+            &self.lua,
+            env_root.clone(),
+            data_root.clone(),
+        )?;
+        crate::fs_module::add_fs_module_with_data_root(
+            &self.lua,
+            env_root.clone(),
+            data_root,
+        )?;
         crate::http::add_http_module(&self.lua)?;
         crate::servers::add_servers_module(&self.lua, env_root.clone())?;
         crate::commands::add_commands_module(&self.lua, env_root.clone())?;
         crate::shader::add_shader_module(&self.lua, env_root.clone())?;
         crate::tweening::add_tweening_module(&self.lua)?;
+        self.install_async_module()?;
 
         let entry_file = env_root.join("main.luau");
 
@@ -3317,6 +3521,9 @@ impl Runtime {
             ));
         }
 
+        panic_stage.set("poll_async_tasks");
+        self.poll_async_tasks();
+
         panic_stage.set("update_tweening");
         if let Some(trace) = web_trace {
             web_debug_log(&format!("runtime.update {trace}: before update_tweening"));
@@ -3686,6 +3893,89 @@ mod tests {
     }
 
     #[test]
+    fn async_tasks_resume_once_per_update_and_return_results() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("async_resume")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                asyncSteps = 0
+                asyncTask = async(function()
+                    asyncSteps += 1
+                    async.yield()
+                    asyncSteps += 1
+                    return 42, "complete"
+                end)
+                "#,
+            )
+            .exec()?;
+
+        assert_eq!(runtime.lua.globals().get::<i64>("asyncSteps")?, 0);
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        assert_eq!(runtime.lua.globals().get::<i64>("asyncSteps")?, 1);
+        runtime
+            .lua
+            .load("assert(not asyncTask:isDone()); assert(asyncTask:getStatus() == 'suspended')")
+            .exec()?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        runtime
+            .lua
+            .load(
+                r#"
+                assert(asyncSteps == 2)
+                assert(asyncTask:isDone())
+                assert(asyncTask:getStatus() == "completed")
+                local numberResult, textResult = asyncTask:getResult()
+                assert(numberResult == 42)
+                assert(textResult == "complete")
+                "#,
+            )
+            .exec()?;
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn async_tasks_can_be_cancelled_and_report_errors() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("async_cancel_error")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                cancelledTask = async(function()
+                    error("cancelled task should never run")
+                end)
+                assert(cancelledTask:cancel())
+
+                failedTask = async(function()
+                    error("expected async failure")
+                end)
+                "#,
+            )
+            .exec()?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        runtime
+            .lua
+            .load(
+                r#"
+                assert(cancelledTask:isDone())
+                assert(cancelledTask.cancelled)
+                assert(cancelledTask:getStatus() == "cancelled")
+                assert(failedTask:isDone())
+                assert(failedTask:getStatus() == "error")
+                assert(string.find(failedTask:getError(), "expected async failure", 1, true))
+                "#,
+            )
+            .exec()?;
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
     fn child_translation_inherits_parent_scale() -> mlua::Result<()> {
         let lua = Lua::new();
         let parent = create_entity_table(&lua, "parent", 0.0, 0.0, None)?;
@@ -3906,6 +4196,49 @@ mod tests {
         assert!(
             image_commands >= 14,
             "expected spritebox demo to queue nine-slice and sprite image commands"
+        );
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn feature_lab_sample_starts_and_queues_draw_commands() -> mlua::Result<()> {
+        let (mut runtime, root) =
+            start_sample_runtime("feature_lab_sample", "samples/feature_lab")?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        runtime
+            .lua
+            .load(
+                r#"
+                assert(featureLabAsyncTask:isDone())
+                assert(featureLabAsyncTask:getStatus() == "completed")
+                assert(featureLabAsyncTask:getResult() == "async complete")
+                "#,
+            )
+            .exec()?;
+        let commands =
+            crate::renderer::drain_commands(&runtime.render_state()).map_err(mlua::Error::external)?;
+
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, crate::renderer::DrawCommand::Rect { .. })),
+            "expected the feature lab to queue rectangle draw commands"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, crate::renderer::DrawCommand::Image { .. })),
+            "expected the feature lab to queue image draw commands"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, crate::renderer::DrawCommand::Text(_))),
+            "expected the feature lab to queue text draw commands"
         );
 
         std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;

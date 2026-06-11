@@ -223,6 +223,8 @@ export type FsWalkEntry = {
 }
 
 export type FsModule = {
+	getDataDirectory: () -> string,
+	dataPath: (path: string) -> string,
 	readFile: (path: string) -> string,
 	writeFile: (path: string, content: string) -> (),
 	appendFile: (path: string, content: string) -> (),
@@ -235,6 +237,32 @@ export type FsModule = {
 	copy: (from: string, to: string) -> (),
 	removeFile: (path: string) -> boolean,
 }
+
+export type AsyncTask = {
+	id: number,
+	done: boolean,
+	cancelled: boolean,
+	status: "queued" | "running" | "suspended" | "completed" | "cancelled" | "error",
+	error: string?,
+	result: any,
+	results: { any },
+	cancel: (self: AsyncTask) -> boolean,
+	Cancel: (self: AsyncTask) -> boolean,
+	isDone: (self: AsyncTask) -> boolean,
+	IsDone: (self: AsyncTask) -> boolean,
+	getStatus: (self: AsyncTask) -> string,
+	GetStatus: (self: AsyncTask) -> string,
+	getError: (self: AsyncTask) -> string?,
+	GetError: (self: AsyncTask) -> string?,
+	getResult: (self: AsyncTask) -> ...any,
+	GetResult: (self: AsyncTask) -> ...any,
+}
+
+export type AsyncModule = {
+	yield: (...any) -> ...any,
+	count: () -> number,
+	cancelAll: () -> number,
+} & ((callback: () -> ...any) -> AsyncTask)
 
 export type HttpHeaders = { [string]: string }
 
@@ -729,6 +757,7 @@ declare tween: TweeningModule
 declare transform: TransformModule
 declare transforms: TransformModule
 declare core: CoreModule
+declare async: AsyncModule
 
 declare mouse: Vec2
 declare window: Vec2

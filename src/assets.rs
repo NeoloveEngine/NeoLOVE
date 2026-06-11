@@ -43,7 +43,8 @@ pub(crate) struct SoundHandle(Arc<Mutex<SoundAsset>>);
 
 #[derive(Debug)]
 pub(crate) struct AssetManager {
-    env_root: PathBuf,
+    resource_root: PathBuf,
+    data_root: PathBuf,
     images: HashMap<PathBuf, Weak<Mutex<ImageAsset>>>,
     sounds: HashMap<PathBuf, Weak<Mutex<SoundAsset>>>,
 }
@@ -177,11 +178,6 @@ fn resolve_export_path(root: &Path, input: &str, extension: &str) -> mlua::Resul
         None => {
             resolved.set_extension(extension);
         }
-    }
-    if !resolved.starts_with(root) {
-        return Err(mlua::Error::external(format!(
-            "export path escapes project root: {input}"
-        )));
     }
     Ok(resolved)
 }
@@ -549,9 +545,15 @@ impl UserData for SoundHandle {
 }
 
 impl AssetManager {
+    #[cfg(test)]
     pub(crate) fn new(env_root: PathBuf) -> Self {
+        Self::with_data_root(env_root.clone(), env_root)
+    }
+
+    pub(crate) fn with_data_root(resource_root: PathBuf, data_root: PathBuf) -> Self {
         Self {
-            env_root,
+            resource_root,
+            data_root,
             images: HashMap::new(),
             sounds: HashMap::new(),
         }
@@ -560,16 +562,28 @@ impl AssetManager {
     fn resolve_path(&self, user_path: &str) -> PathBuf {
         let path = PathBuf::from(user_path);
         if path.is_absolute() {
-            return path;
+            return normalize_path(&path);
         }
-        if user_path.starts_with("./")
+
+        let project_relative = user_path.starts_with("./")
             || user_path.starts_with("../")
             || user_path.starts_with("assets/")
-            || user_path.starts_with("assets\\")
-        {
-            return self.env_root.join(path);
+            || user_path.starts_with("assets\\");
+        let data_path = if project_relative {
+            self.data_root.join(&path)
+        } else {
+            self.data_root.join("assets").join(&path)
+        };
+        if data_path.exists() {
+            return normalize_path(&data_path);
         }
-        self.env_root.join("assets").join(path)
+
+        let resource_path = if project_relative {
+            self.resource_root.join(path)
+        } else {
+            self.resource_root.join("assets").join(path)
+        };
+        normalize_path(&resource_path)
     }
 
     fn canonical_for_cache(path: &Path) -> PathBuf {
@@ -599,7 +613,7 @@ impl AssetManager {
             image,
             unloaded: false,
             revision: 0,
-            export_root: Some(self.env_root.clone()),
+            export_root: Some(self.data_root.clone()),
         }));
         self.images.insert(cache_key, Arc::downgrade(&handle));
         Ok(ImageHandle(handle))
@@ -613,7 +627,7 @@ impl AssetManager {
             image,
             unloaded: false,
             revision: 0,
-            export_root: Some(self.env_root.clone()),
+            export_root: Some(self.data_root.clone()),
         })))
     }
 
@@ -647,7 +661,7 @@ impl AssetManager {
                         samples: Vec::new(),
                         bytes: file_bytes,
                         unloaded: false,
-                        export_root: Some(self.env_root.clone()),
+                        export_root: Some(self.data_root.clone()),
                     }));
                     self.sounds.insert(cache_key, Arc::downgrade(&handle));
                     return Ok(SoundHandle(handle));
@@ -709,7 +723,7 @@ impl AssetManager {
             samples,
             bytes: file_bytes,
             unloaded: false,
-            export_root: Some(self.env_root.clone()),
+            export_root: Some(self.data_root.clone()),
         }));
         self.sounds.insert(cache_key, Arc::downgrade(&handle));
         Ok(SoundHandle(handle))
@@ -728,7 +742,7 @@ impl AssetManager {
             samples,
             bytes,
             unloaded: false,
-            export_root: Some(self.env_root.clone()),
+            export_root: Some(self.data_root.clone()),
         }))))
     }
 
@@ -770,8 +784,15 @@ impl AssetManager {
     }
 }
 
-pub(crate) fn add_assets_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()> {
-    let manager = Arc::new(Mutex::new(AssetManager::new(env_root)));
+pub(crate) fn add_assets_module_with_data_root(
+    lua: &Lua,
+    resource_root: PathBuf,
+    data_root: PathBuf,
+) -> mlua::Result<()> {
+    let manager = Arc::new(Mutex::new(AssetManager::with_data_root(
+        resource_root,
+        data_root,
+    )));
     let assets = lua.create_table()?;
 
     {
@@ -981,18 +1002,51 @@ mod tests {
     }
 
     #[test]
-    fn export_rejects_paths_outside_project_root() -> mlua::Result<()> {
+    fn separate_data_root_receives_exports_and_supports_reload() -> mlua::Result<()> {
+        let root = temp_root("asset_data_root");
+        let resource_root = root.join("project");
+        let data_root = root.join("game_data");
+        fs::create_dir_all(&resource_root).map_err(mlua::Error::external)?;
+        fs::create_dir_all(&data_root).map_err(mlua::Error::external)?;
+
+        let mut manager = AssetManager::with_data_root(resource_root, data_root.clone());
+        let image = manager.new_image(2, 2, Color::rgba(10, 20, 30, 255));
+        let sound = manager.new_sound(8_000, 1, vec![0.0, 0.25, -0.25])?;
+        image.export_png("runtime/image")?;
+        sound.export_wav("runtime/sound")?;
+
+        assert!(data_root.join("runtime/image.png").is_file());
+        assert!(data_root.join("runtime/sound.wav").is_file());
+        assert_eq!(
+            manager.load_image("./runtime/image.png")?.dimensions()?,
+            (2, 2)
+        );
+        assert_eq!(
+            manager.load_sound("./runtime/sound.wav")?.sample_rate()?,
+            8_000
+        );
+
+        fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn export_allows_paths_outside_project_root() -> mlua::Result<()> {
         let root = temp_root("asset_export_escape");
+        let outside = temp_root("asset_export_outside");
         fs::create_dir_all(&root).map_err(mlua::Error::external)?;
 
         let mut manager = AssetManager::new(root.clone());
         let image = manager.new_image(1, 1, Color::WHITE);
         let sound = manager.new_sound(8_000, 1, vec![0.0])?;
 
-        assert!(image.export_png("../escape").is_err());
-        assert!(sound.export_wav("../escape").is_err());
+        image.export_png(outside.join("escape_image").to_string_lossy().as_ref())?;
+        sound.export_wav(outside.join("escape_sound").to_string_lossy().as_ref())?;
+        assert!(outside.join("escape_image.png").is_file());
+        assert!(outside.join("escape_sound.wav").is_file());
 
         fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        fs::remove_dir_all(outside).map_err(mlua::Error::external)?;
         Ok(())
     }
 

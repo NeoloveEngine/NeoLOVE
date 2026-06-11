@@ -1,0 +1,8 @@
+[package]
+name = "feature_lab"
+version = "0.1.0"
+
+[window]
+title = "NeoLOVE Complete Feature Lab"
+
+[dependencies]

@@ -1741,7 +1741,7 @@ fn catch_desktop_panic<T>(context: &str, f: impl FnOnce() -> T) -> Result<T, Str
         .map_err(|payload| describe_desktop_panic(context, payload.as_ref()))
 }
 
-fn run_project_window(project_root: PathBuf) -> Result<(), String> {
+fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Result<(), String> {
     env::set_current_dir(&project_root).map_err(|error| {
         format!(
             "failed to set current directory to {}: {error}",
@@ -1749,7 +1749,10 @@ fn run_project_window(project_root: PathBuf) -> Result<(), String> {
         )
     })?;
     let (title, icon) = window_options_for_project(&project_root);
-    let mut runtime = window::Runtime::new(project_root);
+    let mut runtime = match data_root {
+        Some(data_root) => window::Runtime::with_data_root(project_root, data_root),
+        None => window::Runtime::new(project_root),
+    };
     runtime.set_platform_window_state(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.start())) {
         Ok(Ok(())) => {}
@@ -2112,6 +2115,18 @@ fn resolve_target_project_root(project_dir: Option<&str>) -> Result<PathBuf, Str
     }
 }
 
+fn embedded_data_root(executable: &Path) -> Result<PathBuf, String> {
+    let parent = executable
+        .parent()
+        .ok_or_else(|| "embedded executable has no parent directory".to_string())?;
+    let stem = executable
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(sanitize_executable_name)
+        .unwrap_or_else(|| "game".to_string());
+    Ok(parent.join(format!("{stem}_data")))
+}
+
 fn run_cli() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
 
@@ -2125,7 +2140,8 @@ fn run_cli() -> Result<(), String> {
         if args.len() == 1 {
             let project_root = extract_embedded_project(&payload)
                 .map_err(|error| format!("failed to extract embedded project: {error}"))?;
-            return run_project_window(project_root);
+            let data_root = embedded_data_root(&current_exe)?;
+            return run_project_window(project_root, Some(data_root));
         }
     }
 
@@ -2177,7 +2193,7 @@ fn run_cli() -> Result<(), String> {
         "run" => {
             let project_root = resolve_target_project_root(args.get(2).map(String::as_str))?;
             validate_project_root(&project_root).map_err(|error| format!("run failed: {error}"))?;
-            run_project_window(project_root).map_err(|error| format!("run failed: {error}"))?;
+            run_project_window(project_root, None).map_err(|error| format!("run failed: {error}"))?;
         }
         "build" => {
             let mut project_arg: Option<&str> = None;

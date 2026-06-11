@@ -27,14 +27,15 @@ fn resolve_path(root: &Path, input: &str) -> mlua::Result<PathBuf> {
     } else {
         root.join(path)
     };
-    let resolved = normalize_path(&candidate);
-    if !resolved.starts_with(root) {
-        return Err(mlua::Error::external(format!(
-            "path escapes project root: {}",
-            input
-        )));
+    Ok(normalize_path(&candidate))
+}
+
+fn resolve_read_path(resource_root: &Path, data_root: &Path, input: &str) -> mlua::Result<PathBuf> {
+    let data_path = resolve_path(data_root, input)?;
+    if data_path.exists() || Path::new(input).is_absolute() || data_root == resource_root {
+        return Ok(data_path);
     }
-    Ok(resolved)
+    resolve_path(resource_root, input)
 }
 
 fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
@@ -185,18 +186,46 @@ fn copy_path(source: &Path, destination: &Path) -> std::io::Result<()> {
 }
 
 pub(crate) fn add_fs_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()> {
+    add_fs_module_with_data_root(lua, env_root.clone(), env_root)
+}
+
+pub(crate) fn add_fs_module_with_data_root(
+    lua: &Lua,
+    resource_root: PathBuf,
+    data_root: PathBuf,
+) -> mlua::Result<()> {
     let module = lua.create_table()?;
 
-    let read_root = env_root.clone();
+    module.set(
+        "getDataDirectory",
+        lua.create_function({
+            let data_root = data_root.clone();
+            move |_lua, ()| Ok(data_root.to_string_lossy().into_owned())
+        })?,
+    )?;
+    module.set(
+        "dataPath",
+        lua.create_function({
+            let data_root = data_root.clone();
+            move |_lua, path: String| {
+                Ok(resolve_path(&data_root, &path)?
+                    .to_string_lossy()
+                    .into_owned())
+            }
+        })?,
+    )?;
+
+    let read_resource_root = resource_root.clone();
+    let read_data_root = data_root.clone();
     module.set(
         "readFile",
         lua.create_function(move |_lua, path: String| {
-            let path = resolve_path(&read_root, &path)?;
+            let path = resolve_read_path(&read_resource_root, &read_data_root, &path)?;
             fs::read_to_string(&path).map_err(|error| io_error("read file", &path, &error))
         })?,
     )?;
 
-    let write_root = env_root.clone();
+    let write_root = data_root.clone();
     module.set(
         "writeFile",
         lua.create_function(move |_lua, (path, content): (String, String)| {
@@ -209,7 +238,7 @@ pub(crate) fn add_fs_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()> {
         })?,
     )?;
 
-    let append_root = env_root.clone();
+    let append_root = data_root.clone();
     module.set(
         "appendFile",
         lua.create_function(move |_lua, (path, content): (String, String)| {
@@ -228,34 +257,38 @@ pub(crate) fn add_fs_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()> {
         })?,
     )?;
 
-    let exists_root = env_root.clone();
+    let exists_resource_root = resource_root.clone();
+    let exists_data_root = data_root.clone();
     module.set(
         "exists",
         lua.create_function(move |_lua, path: String| {
-            let path = resolve_path(&exists_root, &path)?;
+            let path = resolve_read_path(&exists_resource_root, &exists_data_root, &path)?;
             Ok(path.exists())
         })?,
     )?;
 
-    let is_file_root = env_root.clone();
+    let is_file_resource_root = resource_root.clone();
+    let is_file_data_root = data_root.clone();
     module.set(
         "isFile",
         lua.create_function(move |_lua, path: String| {
-            let path = resolve_path(&is_file_root, &path)?;
+            let path =
+                resolve_read_path(&is_file_resource_root, &is_file_data_root, &path)?;
             Ok(path.is_file())
         })?,
     )?;
 
-    let is_dir_root = env_root.clone();
+    let is_dir_resource_root = resource_root.clone();
+    let is_dir_data_root = data_root.clone();
     module.set(
         "isDir",
         lua.create_function(move |_lua, path: String| {
-            let path = resolve_path(&is_dir_root, &path)?;
+            let path = resolve_read_path(&is_dir_resource_root, &is_dir_data_root, &path)?;
             Ok(path.is_dir())
         })?,
     )?;
 
-    let mkdir_root = env_root.clone();
+    let mkdir_root = data_root.clone();
     module.set(
         "createDir",
         lua.create_function(move |_lua, path: String| {
@@ -264,49 +297,60 @@ pub(crate) fn add_fs_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()> {
         })?,
     )?;
 
-    let walk_root = env_root.clone();
+    let walk_resource_root = resource_root.clone();
+    let walk_data_root = data_root.clone();
     module.set(
         "walk",
         lua.create_function(
             move |lua, (path, recursive): (Option<String>, Option<bool>)| {
                 let start = match path {
-                    Some(path) => resolve_path(&walk_root, &path)?,
-                    None => walk_root.clone(),
+                    Some(path) => {
+                        resolve_read_path(&walk_resource_root, &walk_data_root, &path)?
+                    }
+                    None => walk_data_root.clone(),
                 };
                 let mut entries = Vec::new();
                 collect_walk_entries(&start, recursive.unwrap_or(true), &mut entries)
                     .map_err(|error| io_error("walk path", &start, &error))?;
                 let result = lua.create_table()?;
+                let display_root = if start.starts_with(&walk_data_root) {
+                    &walk_data_root
+                } else if start.starts_with(&walk_resource_root) {
+                    &walk_resource_root
+                } else {
+                    &start
+                };
                 for path in entries {
-                    result.push(create_walk_entry(lua, &walk_root, &path)?)?;
+                    result.push(create_walk_entry(lua, display_root, &path)?)?;
                 }
                 Ok(result)
             },
         )?,
     )?;
 
-    let rename_root = env_root.clone();
+    let rename_data_root = data_root.clone();
     module.set(
         "rename",
         lua.create_function(move |_lua, (from, to): (String, String)| {
-            let from = resolve_path(&rename_root, &from)?;
-            let to = resolve_path(&rename_root, &to)?;
+            let from = resolve_path(&rename_data_root, &from)?;
+            let to = resolve_path(&rename_data_root, &to)?;
             ensure_parent_dir(&to).map_err(|error| io_error("create parent directory", &to, &error))?;
             fs::rename(&from, &to).map_err(|error| io_pair_error("rename", &from, &to, &error))
         })?,
     )?;
 
-    let copy_root = env_root.clone();
+    let copy_resource_root = resource_root;
+    let copy_data_root = data_root.clone();
     module.set(
         "copy",
         lua.create_function(move |_lua, (from, to): (String, String)| {
-            let from = resolve_path(&copy_root, &from)?;
-            let to = resolve_path(&copy_root, &to)?;
+            let from = resolve_read_path(&copy_resource_root, &copy_data_root, &from)?;
+            let to = resolve_path(&copy_data_root, &to)?;
             copy_path(&from, &to).map_err(|error| io_pair_error("copy", &from, &to, &error))
         })?,
     )?;
 
-    let rm_root = env_root;
+    let rm_root = data_root;
     module.set(
         "removeFile",
         lua.create_function(move |_lua, path: String| {
@@ -337,10 +381,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_path_rejects_project_escape() {
+    fn resolve_path_allows_paths_outside_project_root() -> mlua::Result<()> {
         let root = PathBuf::from("/tmp/neolove_project");
-        let result = resolve_path(&root, "../escape.txt");
-        assert!(result.is_err());
+        let result = resolve_path(&root, "../escape.txt")?;
+        assert_eq!(result, PathBuf::from("/tmp/escape.txt"));
+        Ok(())
     }
 
     #[test]
@@ -378,6 +423,52 @@ mod tests {
         assert_eq!(rendered, vec!["a.txt", "b", "b/c.txt"]);
 
         fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn separate_data_root_writes_externally_and_reads_packaged_fallbacks() -> mlua::Result<()> {
+        let root = temp_root("fs_roots");
+        let resource_root = root.join("project");
+        let data_root = root.join("game_data");
+        let absolute_file = root.join("absolute.txt");
+        fs::create_dir_all(&resource_root).map_err(mlua::Error::external)?;
+        fs::create_dir_all(&data_root).map_err(mlua::Error::external)?;
+        fs::write(resource_root.join("bundled.txt"), "bundled")
+            .map_err(mlua::Error::external)?;
+
+        let lua = Lua::new();
+        add_fs_module_with_data_root(&lua, resource_root.clone(), data_root.clone())?;
+        lua.globals()
+            .set("absoluteFile", absolute_file.to_string_lossy().into_owned())?;
+        lua.load(
+            r#"
+            assert(fs.getDataDirectory() ~= "")
+            assert(fs.readFile("bundled.txt") == "bundled")
+            fs.writeFile("save/state.txt", "saved")
+            assert(fs.readFile("save/state.txt") == "saved")
+            fs.copy("bundled.txt", "copied.txt")
+            fs.writeFile(absoluteFile, "absolute")
+            assert(fs.dataPath("save/state.txt") ~= "")
+            "#,
+        )
+        .exec()?;
+
+        assert_eq!(
+            fs::read_to_string(data_root.join("save/state.txt"))
+                .map_err(mlua::Error::external)?,
+            "saved"
+        );
+        assert_eq!(
+            fs::read_to_string(data_root.join("copied.txt")).map_err(mlua::Error::external)?,
+            "bundled"
+        );
+        assert_eq!(
+            fs::read_to_string(&absolute_file).map_err(mlua::Error::external)?,
+            "absolute"
+        );
+
+        fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())
     }
 
