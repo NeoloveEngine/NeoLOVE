@@ -557,6 +557,17 @@ export type TextBox = BaseDrawableComponent & UiTextStyle & {
 	dx: number,
 	dy: number,
 	line_count: number,
+	setBold: (self: TextBox, startIndex: number, endIndex: number) -> (),
+	setItalic: (self: TextBox, startIndex: number, endIndex: number) -> (),
+	setUnderline: (self: TextBox, startIndex: number, endIndex: number) -> (),
+	setColor: (self: TextBox, startIndex: number, endIndex: number, color: Color4) -> (),
+	setSize: (self: TextBox, startIndex: number, endIndex: number, scale: number) -> (),
+	setFont: (self: TextBox, startIndex: number, endIndex: number, fontPath: string) -> (),
+	clearFormatting: (self: TextBox, startIndex: number?, endIndex: number?) -> (),
+	clearAllFormatting: (self: TextBox) -> (),
+	getLetterCount: (self: TextBox) -> number,
+	getLetterPosition: (self: TextBox, charIndex: number) -> (number?, number?),
+	getLetterBounds: (self: TextBox, charIndex: number) -> (number?, number?, number?, number?),
 }
 
 export type TextLabel = TextBox
