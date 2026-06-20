@@ -778,6 +778,20 @@ Fields:
 - `font`
 - `scale_x`, `scale_y`, `dx`, `dy`, `line_count`
 
+Rich text methods use zero-based, end-exclusive character ranges. Formatting is stored separately from `text`, so surviving ranges continue to apply after text reassignment when their indices still overlap the new string. Overlapping formatting is supported. `clearFormatting()` with no arguments clears the whole string; `clearAllFormatting()` is an explicit alias.
+
+- `setBold(startIndex, endIndex)`
+- `setItalic(startIndex, endIndex)`
+- `setUnderline(startIndex, endIndex)`
+- `setColor(startIndex, endIndex, Color4)`
+- `setSize(startIndex, endIndex, scale)` relative to the component `scale`
+- `setFont(startIndex, endIndex, fontPath)`
+- `clearFormatting(startIndex?, endIndex?)`
+- `clearAllFormatting()`
+- `getLetterCount()`
+- `getLetterPosition(charIndex)` returns `x, y` or nils when unavailable/out of range
+- `getLetterBounds(charIndex)` returns `x, y, w, h` or nils when unavailable/out of range
+
 Aliases: `core.TextLabel`, `core.RudimentaryTextLabel`.
 
 Edges:

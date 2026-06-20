@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::assets::ImageHandle;
-use crate::platform::{lock_platform_state, Color, SharedPlatformState};
+use crate::platform::{Color, SharedPlatformState, lock_platform_state};
 use fontdue::Font;
 use image::{ImageBuffer, Rgba, RgbaImage};
 use std::collections::{HashMap, HashSet};
@@ -67,6 +67,18 @@ pub(crate) enum TextWrapMode {
     Char,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TextStyleRange {
+    pub start: usize,
+    pub end: usize,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub color: Option<[u8; 4]>,
+    pub size: Option<u32>,
+    pub font: Option<FontHandle>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct TextRenderRequest {
     pub text: String,
@@ -87,14 +99,16 @@ pub(crate) struct TextRenderRequest {
     pub letter_spacing: f32,
     pub stretch_width: f32,
     pub stretch_height: f32,
+    pub rich_text: Vec<TextStyleRange>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct TextMetrics {
     pub width: f32,
     pub height: f32,
     pub used_scale: f32,
     pub line_count: usize,
+    pub letter_bounds: Vec<Rect>,
 }
 
 #[derive(Clone, Debug)]
@@ -185,6 +199,7 @@ struct TextSpriteCacheKey {
     letter_spacing: u32,
     stretch_width: u32,
     stretch_height: u32,
+    rich_text: Vec<TextStyleRange>,
 }
 
 const TEXT_SPRITE_CACHE_LIMIT: usize = 256;
@@ -228,11 +243,7 @@ fn text_layout_cache() -> &'static Mutex<HashMap<TextSpriteCacheKey, PreparedTex
 }
 
 fn f32_cache_key(value: f32) -> u32 {
-    if value == 0.0 {
-        0
-    } else {
-        value.to_bits()
-    }
+    if value == 0.0 { 0 } else { value.to_bits() }
 }
 
 fn text_sprite_cache_key(request: &TextRenderRequest) -> TextSpriteCacheKey {
@@ -245,7 +256,10 @@ fn text_sprite_cache_key(request: &TextRenderRequest) -> TextSpriteCacheKey {
             f32_cache_key(request.bounds.h),
         ],
         rotation: f32_cache_key(request.rotation),
-        pivot: [f32_cache_key(request.pivot.x), f32_cache_key(request.pivot.y)],
+        pivot: [
+            f32_cache_key(request.pivot.x),
+            f32_cache_key(request.pivot.y),
+        ],
         color: [
             request.color.r,
             request.color.g,
@@ -265,6 +279,7 @@ fn text_sprite_cache_key(request: &TextRenderRequest) -> TextSpriteCacheKey {
         letter_spacing: f32_cache_key(request.letter_spacing),
         stretch_width: f32_cache_key(request.stretch_width),
         stretch_height: f32_cache_key(request.stretch_height),
+        rich_text: request.rich_text.clone(),
     }
 }
 
@@ -356,11 +371,23 @@ struct PreparedTextLine {
     width: f32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PreparedGlyph {
     ch: char,
     x: f32,
     y: f32,
+    style: ResolvedTextStyle,
+    bounds: Rect,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedTextStyle {
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    color: Color,
+    scale: f32,
+    font: FontHandle,
 }
 
 #[derive(Clone, Debug)]
@@ -534,6 +561,34 @@ fn layout_lines_for(
     lines
 }
 
+fn style_for_index(request: &TextRenderRequest, index: usize) -> ResolvedTextStyle {
+    let mut style = ResolvedTextStyle {
+        bold: false,
+        italic: false,
+        underline: false,
+        color: request.color,
+        scale: request.scale.max(1.0),
+        font: request.font.clone(),
+    };
+    for range in &request.rich_text {
+        if index >= range.start && index < range.end {
+            style.bold |= range.bold;
+            style.italic |= range.italic;
+            style.underline |= range.underline;
+            if let Some([r, g, b, a]) = range.color {
+                style.color = Color::rgba(r, g, b, a);
+            }
+            if let Some(bits) = range.size {
+                style.scale = (request.scale * f32::from_bits(bits)).max(1.0);
+            }
+            if let Some(font) = &range.font {
+                style.font = font.clone();
+            }
+        }
+    }
+    style
+}
+
 fn prepare_text_layout_uncached(request: &TextRenderRequest) -> Option<PreparedTextLayout> {
     if request.text.is_empty() {
         return Some(PreparedTextLayout {
@@ -654,7 +709,7 @@ fn prepare_text_layout_uncached(request: &TextRenderRequest) -> Option<PreparedT
     let mut max_x = f32::NEG_INFINITY;
     let mut max_y = f32::NEG_INFINITY;
     let spacing = request.letter_spacing;
-    let px = used_scale.max(1.0);
+    let _px = used_scale.max(1.0);
 
     for (line_index, line) in lines.iter().enumerate() {
         let line_start_x = padded_origin_x
@@ -669,23 +724,38 @@ fn prepare_text_layout_uncached(request: &TextRenderRequest) -> Option<PreparedT
         let mut previous = None;
 
         for (char_index, ch) in line.text.chars().enumerate() {
+            let global_index = glyphs.len();
+            let style = style_for_index(request, global_index);
+            let glyph_font = load_font(&style.font).unwrap_or_else(|| font.clone());
+            let glyph_px = style.scale.max(1.0);
             if char_index > 0 {
                 pen_x += spacing;
             }
             if let Some(prev) = previous {
-                pen_x += font.horizontal_kern(prev, ch, px).unwrap_or(0.0);
+                pen_x += glyph_font
+                    .horizontal_kern(prev, ch, glyph_px)
+                    .unwrap_or(0.0);
             }
-            let metrics = font.metrics(ch, px);
+            let metrics = glyph_font.metrics(ch, glyph_px);
+            let italic_slant = if style.italic { glyph_px * 0.18 } else { 0.0 };
             let glyph_x = line_start_x + pen_x + metrics.xmin as f32;
             let glyph_y = baseline_y - metrics.height as f32 - metrics.ymin as f32;
-            min_x = min_x.min(glyph_x.floor());
-            min_y = min_y.min(glyph_y.floor());
-            max_x = max_x.max((glyph_x + metrics.width as f32).ceil());
-            max_y = max_y.max((glyph_y + metrics.height as f32).ceil());
+            let bounds = Rect {
+                x: glyph_x,
+                y: glyph_y,
+                w: metrics.width as f32 + italic_slant + if style.bold { 1.0 } else { 0.0 },
+                h: metrics.height as f32,
+            };
+            min_x = min_x.min(bounds.x.floor());
+            min_y = min_y.min(bounds.y.floor());
+            max_x = max_x.max((bounds.x + bounds.w).ceil());
+            max_y = max_y.max((bounds.y + bounds.h).ceil());
             glyphs.push(PreparedGlyph {
                 ch,
                 x: glyph_x,
                 y: glyph_y,
+                style,
+                bounds,
             });
             pen_x += metrics.advance_width;
             previous = Some(ch);
@@ -707,6 +777,7 @@ fn prepare_text_layout_uncached(request: &TextRenderRequest) -> Option<PreparedT
             .unwrap_or(block_height),
         used_scale,
         line_count: lines.len(),
+        letter_bounds: glyphs.iter().map(|glyph| glyph.bounds).collect(),
     };
     if request.stretch_width > 0.0 && request.stretch_height > 0.0 {
         metrics.width = request.stretch_width;
@@ -753,10 +824,20 @@ pub(crate) fn measure_text(request: &TextRenderRequest) -> Option<TextMetrics> {
             height: line_count as f32 * used_scale * request.line_spacing.max(0.1),
             used_scale,
             line_count,
+            letter_bounds: Vec::new(),
         })
     } else {
         Some(prepare_text_layout(request)?.metrics)
     }
+}
+
+pub(crate) fn text_letter_bounds(request: &TextRenderRequest) -> Vec<Rect> {
+    if cfg!(target_os = "emscripten") {
+        return Vec::new();
+    }
+    prepare_text_layout(request)
+        .map(|layout| layout.metrics.letter_bounds)
+        .unwrap_or_default()
 }
 
 pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<RasterizedTextSprite> {
@@ -780,7 +861,7 @@ pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<Raste
     let layout = prepare_text_layout(request)?;
     let (min_x, min_y, max_x, max_y) = layout.pixel_bounds?;
     let font = load_font(&request.font)?;
-    let px = layout.metrics.used_scale.max(1.0);
+    let _px = layout.metrics.used_scale.max(1.0);
     let border = if request.rotation.abs() > 0.0001
         && request.stretch_width <= 0.0
         && request.stretch_height <= 0.0
@@ -794,24 +875,54 @@ pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<Raste
     let mut text_image: RgbaImage = ImageBuffer::from_pixel(width, height, Rgba([0, 0, 0, 0]));
 
     for glyph in layout.glyphs {
-        let (metrics, bitmap) = font.rasterize(glyph.ch, px);
+        let glyph_font = load_font(&glyph.style.font).unwrap_or_else(|| font.clone());
+        let (metrics, bitmap) = glyph_font.rasterize(glyph.ch, glyph.style.scale.max(1.0));
         let base_x = (glyph.x - min_x).round() as i32 + border as i32;
         let top_y = (glyph.y - min_y).round() as i32 + border as i32;
-        for gy in 0..metrics.height {
-            for gx in 0..metrics.width {
-                let alpha = modulate_alpha(bitmap[gy * metrics.width + gx], request.color.a);
-                if alpha == 0 {
-                    continue;
+        let passes = if glyph.style.bold { 2 } else { 1 };
+        for pass in 0..passes {
+            for gy in 0..metrics.height {
+                for gx in 0..metrics.width {
+                    let alpha =
+                        modulate_alpha(bitmap[gy * metrics.width + gx], glyph.style.color.a);
+                    if alpha == 0 {
+                        continue;
+                    }
+                    let slant = if glyph.style.italic {
+                        ((metrics.height - gy) as f32 * 0.18).round() as i32
+                    } else {
+                        0
+                    };
+                    let tx = base_x + gx as i32 + pass as i32 + slant;
+                    let ty = top_y + gy as i32;
+                    if tx < 0 || ty < 0 || tx >= width as i32 || ty >= height as i32 {
+                        continue;
+                    }
+                    text_image.put_pixel(
+                        tx as u32,
+                        ty as u32,
+                        Rgba([
+                            glyph.style.color.r,
+                            glyph.style.color.g,
+                            glyph.style.color.b,
+                            alpha,
+                        ]),
+                    );
                 }
-                let tx = base_x + gx as i32;
-                let ty = top_y + gy as i32;
-                if tx < 0 || ty < 0 || tx >= width as i32 || ty >= height as i32 {
-                    continue;
-                }
+            }
+        }
+        if glyph.style.underline {
+            let y = (top_y + metrics.height as i32 + 1).clamp(0, height as i32 - 1);
+            for x in base_x.max(0)..(base_x + glyph.bounds.w.ceil() as i32).min(width as i32) {
                 text_image.put_pixel(
-                    tx as u32,
-                    ty as u32,
-                    Rgba([request.color.r, request.color.g, request.color.b, alpha]),
+                    x as u32,
+                    y as u32,
+                    Rgba([
+                        glyph.style.color.r,
+                        glyph.style.color.g,
+                        glyph.style.color.b,
+                        glyph.style.color.a,
+                    ]),
                 );
             }
         }
@@ -946,7 +1057,6 @@ fn rect_intersects_viewport(bounds: Rect, width: u32, height: u32) -> bool {
         && bounds.y < height as f32
         && bounds.y + bounds.h > 0.0
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DirtyBounds {
@@ -1095,31 +1205,68 @@ fn translate_command(command: DrawCommand, dx: f32, dy: f32) -> DrawCommand {
             color,
             shader,
         },
-        DrawCommand::Triangle { a, b, c, color, shader } => DrawCommand::Triangle {
-            a: Vec2 { x: a.x + dx, y: a.y + dy },
-            b: Vec2 { x: b.x + dx, y: b.y + dy },
-            c: Vec2 { x: c.x + dx, y: c.y + dy },
+        DrawCommand::Triangle {
+            a,
+            b,
+            c,
+            color,
+            shader,
+        } => DrawCommand::Triangle {
+            a: Vec2 {
+                x: a.x + dx,
+                y: a.y + dy,
+            },
+            b: Vec2 {
+                x: b.x + dx,
+                y: b.y + dy,
+            },
+            c: Vec2 {
+                x: c.x + dx,
+                y: c.y + dy,
+            },
             color,
             shader,
         },
-        DrawCommand::Circle { center, radius, color, shader } => DrawCommand::Circle {
-            center: Vec2 { x: center.x + dx, y: center.y + dy },
+        DrawCommand::Circle {
+            center,
+            radius,
+            color,
+            shader,
+        } => DrawCommand::Circle {
+            center: Vec2 {
+                x: center.x + dx,
+                y: center.y + dy,
+            },
             radius,
             color,
             shader,
         },
-        DrawCommand::Image { image, dest, source, rotation, pivot, tint, filter, shader } => {
-            DrawCommand::Image {
-                image,
-                dest: Rect { x: dest.x + dx, y: dest.y + dy, ..dest },
-                source,
-                rotation,
-                pivot: Vec2 { x: pivot.x + dx, y: pivot.y + dy },
-                tint,
-                filter,
-                shader,
-            }
-        }
+        DrawCommand::Image {
+            image,
+            dest,
+            source,
+            rotation,
+            pivot,
+            tint,
+            filter,
+            shader,
+        } => DrawCommand::Image {
+            image,
+            dest: Rect {
+                x: dest.x + dx,
+                y: dest.y + dy,
+                ..dest
+            },
+            source,
+            rotation,
+            pivot: Vec2 {
+                x: pivot.x + dx,
+                y: pivot.y + dy,
+            },
+            tint,
+            filter,
+            shader,
+        },
         DrawCommand::Text(mut request) => {
             request.bounds.x += dx;
             request.bounds.y += dy;
@@ -1138,7 +1285,8 @@ pub(crate) fn command_intersects_viewport(command: &DrawCommand, width: u32, hei
     let Some(bounds) = command_bounds(command) else {
         return false;
     };
-    if matches!(command, DrawCommand::Text(request) if request.bounds.w <= 0.0 || request.bounds.h <= 0.0) {
+    if matches!(command, DrawCommand::Text(request) if request.bounds.w <= 0.0 || request.bounds.h <= 0.0)
+    {
         // Content-sized text computes its real sprite bounds during layout/rasterization,
         // so pre-layout culling cannot safely reject it here.
         return true;
@@ -1607,7 +1755,12 @@ mod tests {
         };
 
         let sprite = rasterize_text_sprite(&request).expect("expected rasterized text sprite");
-        let max_alpha = sprite.image.pixels().map(|pixel| pixel.0[3]).max().unwrap_or(0);
+        let max_alpha = sprite
+            .image
+            .pixels()
+            .map(|pixel| pixel.0[3])
+            .max()
+            .unwrap_or(0);
 
         assert!(max_alpha > 0);
         assert!(max_alpha <= request.color.a);

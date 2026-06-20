@@ -2,10 +2,10 @@
 
 use crate::assets::ImageHandle;
 use crate::lua_error::protect_lua_call;
-use crate::platform::{lock_platform_state, Color, InputState, SharedPlatformState, WindowState};
+use crate::platform::{Color, InputState, SharedPlatformState, WindowState, lock_platform_state};
 use crate::renderer::{
     DrawCommand, FontHandle, Rect, RenderState, SharedRenderState, TextAlignX, TextAlignY,
-    TextRenderRequest, TextScaleMode, TextWrapMode, TextureFilter, Vec2,
+    TextRenderRequest, TextScaleMode, TextStyleRange, TextWrapMode, TextureFilter, Vec2,
 };
 use mlua::{AnyUserData, Function, Lua, Table, UserData, Value};
 use std::path::{Component, Path, PathBuf};
@@ -31,6 +31,51 @@ fn color4_to_color(color4: Table) -> mlua::Result<Color> {
         b.clamp(0.0, 255.0) as u8,
         a.clamp(0.0, 255.0) as u8,
     ))
+}
+
+fn rich_text_ranges_from_component(
+    root: &Path,
+    component: &Table,
+) -> mlua::Result<Vec<TextStyleRange>> {
+    let Ok(ranges) = component.get::<Table>("__rich_text_ranges") else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for pair in ranges.sequence_values::<Table>() {
+        let range = pair?;
+        let start = range.get::<usize>("start").unwrap_or(0);
+        let end = range.get::<usize>("end").unwrap_or(start);
+        if end <= start {
+            continue;
+        }
+        let color = match range.get::<Table>("color") {
+            Ok(c) => Some([
+                c.get::<f32>("r")?.clamp(0.0, 255.0) as u8,
+                c.get::<f32>("g")?.clamp(0.0, 255.0) as u8,
+                c.get::<f32>("b")?.clamp(0.0, 255.0) as u8,
+                c.get::<f32>("a").unwrap_or(255.0).clamp(0.0, 255.0) as u8,
+            ]),
+            Err(_) => None,
+        };
+        let font = match range.get::<String>("font") {
+            Ok(path) => resolve_font_path(root, &path)
+                .map(FontHandle::Path)
+                .or(Some(FontHandle::Default))
+                .filter(|_| !path.trim().is_empty()),
+            Err(_) => None,
+        };
+        out.push(TextStyleRange {
+            start,
+            end,
+            bold: range.get::<bool>("bold").unwrap_or(false),
+            italic: range.get::<bool>("italic").unwrap_or(false),
+            underline: range.get::<bool>("underline").unwrap_or(false),
+            color,
+            size: range.get::<f32>("size").ok().map(f32::to_bits),
+            font,
+        });
+    }
+    Ok(out)
 }
 
 fn shader_from_component(component: &Table) -> mlua::Result<Option<crate::shader::ShaderHandle>> {
@@ -745,7 +790,10 @@ fn sprite_source_rect(component: &Table, image: &ImageHandle) -> mlua::Result<Re
         .unwrap_or(image_bounds))
 }
 
-fn find_spritebox_source(entity: &Table, spritebox: &Table) -> mlua::Result<Option<SpriteboxSource>> {
+fn find_spritebox_source(
+    entity: &Table,
+    spritebox: &Table,
+) -> mlua::Result<Option<SpriteboxSource>> {
     let components: Table = entity.get("components")?;
     for component in components.sequence_values::<Table>() {
         let component = component?;
@@ -924,7 +972,9 @@ fn read_spritebox_shape(component: &Table) -> mlua::Result<Option<SpriteboxShape
         return Ok(Some(shape.shape.clone()));
     }
 
-    let Some(rect_table) = component.get::<Option<Table>>("__spritebox_rects").unwrap_or(None)
+    let Some(rect_table) = component
+        .get::<Option<Table>>("__spritebox_rects")
+        .unwrap_or(None)
     else {
         return Ok(None);
     };
@@ -1122,7 +1172,9 @@ fn build_world_spritebox_shape(
     if width <= 0.0 || height <= 0.0 {
         return Ok(Some(SpriteboxWorldShape::default()));
     }
-    let revision = component.raw_get::<i64>("__spritebox_revision").unwrap_or(0);
+    let revision = component
+        .raw_get::<i64>("__spritebox_revision")
+        .unwrap_or(0);
 
     if spritebox_world_cache_matches(
         component, origin_x, origin_y, rotation, width, height, revision,
@@ -1233,9 +1285,10 @@ fn point_in_spritebox_shape(component: &Table, point: Vec2) -> mlua::Result<bool
         return Ok(false);
     }
 
-    Ok(shape.rects.iter().any(|rect| {
-        nx >= rect.x && nx <= rect.x + rect.w && ny >= rect.y && ny <= rect.y + rect.h
-    }))
+    Ok(shape
+        .rects
+        .iter()
+        .any(|rect| nx >= rect.x && nx <= rect.x + rect.w && ny >= rect.y && ny <= rect.y + rect.h))
 }
 
 fn parse_icon_side(raw: &str) -> UiIconSide {
@@ -1653,6 +1706,7 @@ fn build_text_request(
         letter_spacing: component.get::<f32>("letter_spacing").unwrap_or(0.0),
         stretch_width: 0.0,
         stretch_height: 0.0,
+        rich_text: Vec::new(),
     }
 }
 
@@ -2098,13 +2152,180 @@ pub fn add_core_components(
                 component.set("dx", 0.0)?;
                 component.set("dy", 0.0)?;
                 component.set("line_count", 0)?;
+                component.set("__rich_text_ranges", ctx.create_table()?)?;
+                component.set("__letter_bounds", ctx.create_table()?)?;
                 Ok(())
+            })?,
+        )?;
+
+        let add_rich_method =
+            |name: &'static str, key: &'static str, has_value: bool| -> mlua::Result<()> {
+                let text_root = text_root.clone();
+                textbox.set(
+                    name,
+                    lua.create_function(move |ctx, args: mlua::Variadic<Value>| {
+                        let component = match args.get(0) {
+                            Some(Value::Table(t)) => t.clone(),
+                            _ => return Ok(()),
+                        };
+                        let start = match args.get(1) {
+                            Some(Value::Integer(v)) => (*v).max(0) as usize,
+                            Some(Value::Number(v)) => v.max(0.0) as usize,
+                            _ => 0,
+                        };
+                        let end = match args.get(2) {
+                            Some(Value::Integer(v)) => (*v).max(0) as usize,
+                            Some(Value::Number(v)) => v.max(0.0) as usize,
+                            _ => start,
+                        };
+                        let ranges =
+                            component.get::<Table>("__rich_text_ranges").or_else(|_| {
+                                let t = ctx.create_table()?;
+                                component.set("__rich_text_ranges", t.clone())?;
+                                Ok::<_, mlua::Error>(t)
+                            })?;
+                        let r = ctx.create_table()?;
+                        r.set("start", start)?;
+                        r.set("end", end)?;
+                        if has_value {
+                            if let Some(v) = args.get(3) {
+                                r.set(key, v.clone())?;
+                            }
+                        } else {
+                            r.set(key, true)?;
+                        }
+                        ranges.set(ranges.raw_len() + 1, r)?;
+                        let _ = &text_root;
+                        Ok(())
+                    })?,
+                )
+            };
+        add_rich_method("setBold", "bold", false)?;
+        add_rich_method("setItalic", "italic", false)?;
+        add_rich_method("setUnderline", "underline", false)?;
+        add_rich_method("setColor", "color", true)?;
+        add_rich_method("setSize", "size", true)?;
+        add_rich_method("setFont", "font", true)?;
+        textbox.set(
+            "clearAllFormatting",
+            lua.create_function(|ctx, component: Table| {
+                component.set("__rich_text_ranges", ctx.create_table()?)
+            })?,
+        )?;
+
+        textbox.set(
+            "getLetterCount",
+            lua.create_function(|_ctx, component: Table| {
+                Ok(component
+                    .get::<String>("text")
+                    .unwrap_or_default()
+                    .chars()
+                    .count())
+            })?,
+        )?;
+        textbox.set(
+            "getLetterBounds",
+            lua.create_function(|_ctx, (component, index): (Table, usize)| {
+                let bounds = component.get::<Table>("__letter_bounds").ok();
+                let Some(bounds) = bounds else {
+                    return Ok((Value::Nil, Value::Nil, Value::Nil, Value::Nil));
+                };
+                let entry = bounds.get::<Table>(index + 1).ok();
+                let Some(entry) = entry else {
+                    return Ok((Value::Nil, Value::Nil, Value::Nil, Value::Nil));
+                };
+                Ok((
+                    Value::Number(entry.get::<f64>("x")?),
+                    Value::Number(entry.get::<f64>("y")?),
+                    Value::Number(entry.get::<f64>("w")?),
+                    Value::Number(entry.get::<f64>("h")?),
+                ))
+            })?,
+        )?;
+        textbox.set(
+            "getLetterPosition",
+            lua.create_function(|_ctx, (component, index): (Table, usize)| {
+                let bounds = component.get::<Table>("__letter_bounds").ok();
+                let Some(bounds) = bounds else {
+                    return Ok((Value::Nil, Value::Nil));
+                };
+                let entry = bounds.get::<Table>(index + 1).ok();
+                let Some(entry) = entry else {
+                    return Ok((Value::Nil, Value::Nil));
+                };
+                Ok((
+                    Value::Number(entry.get::<f64>("x")?),
+                    Value::Number(entry.get::<f64>("y")?),
+                ))
+            })?,
+        )?;
+
+        textbox.set(
+            "clearFormatting",
+            lua.create_function(|ctx, args: mlua::Variadic<Value>| {
+                let component = match args.get(0) {
+                    Some(Value::Table(t)) => t.clone(),
+                    _ => return Ok(()),
+                };
+                if args.len() < 3 {
+                    component.set("__rich_text_ranges", ctx.create_table()?)?;
+                    return Ok(());
+                }
+                let start = match args.get(1) {
+                    Some(Value::Integer(v)) => (*v).max(0) as usize,
+                    Some(Value::Number(v)) => v.max(0.0) as usize,
+                    _ => 0,
+                };
+                let end = match args.get(2) {
+                    Some(Value::Integer(v)) => (*v).max(0) as usize,
+                    Some(Value::Number(v)) => v.max(0.0) as usize,
+                    _ => start,
+                };
+                let old = component
+                    .get::<Table>("__rich_text_ranges")
+                    .or_else(|_| ctx.create_table())?;
+                let new_ranges = ctx.create_table()?;
+                let mut idx = 1;
+                for r in old.sequence_values::<Table>() {
+                    let r = r?;
+                    let rs = r.get::<usize>("start").unwrap_or(0);
+                    let re = r.get::<usize>("end").unwrap_or(rs);
+                    if re <= start || rs >= end {
+                        new_ranges.set(idx, r)?;
+                        idx += 1;
+                        continue;
+                    }
+
+                    if rs < start {
+                        let left = ctx.create_table()?;
+                        for pair in r.clone().pairs::<Value, Value>() {
+                            let (key, value) = pair?;
+                            left.set(key, value)?;
+                        }
+                        left.set("start", rs)?;
+                        left.set("end", start)?;
+                        new_ranges.set(idx, left)?;
+                        idx += 1;
+                    }
+                    if re > end {
+                        let right = ctx.create_table()?;
+                        for pair in r.pairs::<Value, Value>() {
+                            let (key, value) = pair?;
+                            right.set(key, value)?;
+                        }
+                        right.set("start", end)?;
+                        right.set("end", re)?;
+                        new_ranges.set(idx, right)?;
+                        idx += 1;
+                    }
+                }
+                component.set("__rich_text_ranges", new_ranges)
             })?,
         )?;
 
         textbox.set(
             "update",
-            lua.create_function(move |_ctx, (entity, component, _dt): (Table, Table, f32)| {
+            lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
                 if !component.get::<bool>("visible").unwrap_or(true) {
                     return Ok(());
                 }
@@ -2216,6 +2437,7 @@ pub fn add_core_components(
                     } else {
                         0.0
                     },
+                    rich_text: rich_text_ranges_from_component(&text_root, &component)?,
                 };
 
                 let metrics = crate::renderer::measure_text(&request).unwrap_or_default();
@@ -2223,6 +2445,17 @@ pub fn add_core_components(
                 component.set("dy", metrics.height)?;
                 component.set("used_scale", metrics.used_scale)?;
                 component.set("line_count", metrics.line_count)?;
+                let letter_bounds = crate::renderer::text_letter_bounds(&request);
+                let bounds_table = ctx.create_table()?;
+                for (i, rect) in letter_bounds.iter().enumerate() {
+                    let entry = ctx.create_table()?;
+                    entry.set("x", rect.x)?;
+                    entry.set("y", rect.y)?;
+                    entry.set("w", rect.w)?;
+                    entry.set("h", rect.h)?;
+                    bounds_table.set(i + 1, entry)?;
+                }
+                component.set("__letter_bounds", bounds_table)?;
 
                 let mut renderer = render_state
                     .lock()
@@ -2241,554 +2474,579 @@ pub fn add_core_components(
     // Legacy interactive UI components are intentionally disabled.
     #[cfg(any())]
     {
-    // Frame
-    // customizable UI panel with borders, rounded corners, and optional 9-slice background image
-    {
-        let frame = create_basic_drawable(lua)?;
-        frame.set(
-            "awake",
-            lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
-                component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
-                component.set("visible", true)?;
-                component.set("__neolove_component", "Frame")?;
-                component.set("background_color", color4(ctx, 32, 36, 44, 230)?)?;
-                component.set("border_color", color4(ctx, 92, 106, 130, 255)?)?;
-                component.set("border_width", 1.0)?;
-                component.set("corner_radius", 10.0)?;
-                component.set("background_image", Value::Nil)?;
-                component.set("slice_left", 0.0)?;
-                component.set("slice_right", 0.0)?;
-                component.set("slice_top", 0.0)?;
-                component.set("slice_bottom", 0.0)?;
-                Ok(())
-            })?,
-        )?;
+        // Frame
+        // customizable UI panel with borders, rounded corners, and optional 9-slice background image
+        {
+            let frame = create_basic_drawable(lua)?;
+            frame.set(
+                "awake",
+                lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
+                    component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
+                    component.set("visible", true)?;
+                    component.set("__neolove_component", "Frame")?;
+                    component.set("background_color", color4(ctx, 32, 36, 44, 230)?)?;
+                    component.set("border_color", color4(ctx, 92, 106, 130, 255)?)?;
+                    component.set("border_width", 1.0)?;
+                    component.set("corner_radius", 10.0)?;
+                    component.set("background_image", Value::Nil)?;
+                    component.set("slice_left", 0.0)?;
+                    component.set("slice_right", 0.0)?;
+                    component.set("slice_top", 0.0)?;
+                    component.set("slice_bottom", 0.0)?;
+                    Ok(())
+                })?,
+            )?;
 
-        let render_state = render_state.clone();
-        frame.set(
-            "update",
-            lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
-                if !component.get::<bool>("visible").unwrap_or(true) {
-                    return Ok(());
-                }
-
-                let draw = get_entity_draw_context(&entity)?;
-                let background_color = get_color_field(&component, "background_color")
-                    .unwrap_or(color4_to_color(component.get("color")?)?);
-                let border_color =
-                    get_color_field(&component, "border_color").unwrap_or(background_color);
-                let style = resolve_panel_style(ctx, &component, background_color, border_color)?;
-
-                let mut renderer = render_state
-                    .lock()
-                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
-                render_panel(
-                    &mut renderer,
-                    draw.bounds,
-                    draw.pivot,
-                    draw.rotation,
-                    &style,
-                )
-            })?,
-        )?;
-
-        core_components.set("Frame", frame)?;
-    }
-
-    // Button
-    // interactive UI button with customizable panel states and text rendering
-    {
-        let button = create_basic_drawable(lua)?;
-        button.set(
-            "awake",
-            lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
-                component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
-                component.set("visible", true)?;
-                component.set("__neolove_component", "Button")?;
-                component.set("text", "Button")?;
-                component.set("enabled", true)?;
-                component.set("hovered", false)?;
-                component.set("pressed", false)?;
-                component.set("scale", 18.0)?;
-                component.set("min_scale", 10.0)?;
-                component.set("align_x", "center")?;
-                component.set("align_y", "center")?;
-                component.set("text_scale", "fit")?;
-                component.set("wrap", "none")?;
-                component.set("padding", 8.0)?;
-                component.set("padding_x", 12.0)?;
-                component.set("padding_y", 8.0)?;
-                component.set("line_spacing", 1.0)?;
-                component.set("letter_spacing", 0.0)?;
-                component.set("font", Value::Nil)?;
-                component.set("background_color", color4(ctx, 52, 68, 94, 255)?)?;
-                component.set("hover_background_color", color4(ctx, 67, 86, 118, 255)?)?;
-                component.set("pressed_background_color", color4(ctx, 39, 51, 73, 255)?)?;
-                component.set("disabled_background_color", color4(ctx, 45, 48, 52, 190)?)?;
-                component.set("border_color", color4(ctx, 140, 164, 196, 255)?)?;
-                component.set("hover_border_color", color4(ctx, 180, 205, 235, 255)?)?;
-                component.set("pressed_border_color", color4(ctx, 110, 130, 158, 255)?)?;
-                component.set("disabled_border_color", color4(ctx, 80, 84, 92, 170)?)?;
-                component.set("text_color", color4(ctx, 242, 245, 250, 255)?)?;
-                component.set("hover_text_color", color4(ctx, 255, 255, 255, 255)?)?;
-                component.set("pressed_text_color", color4(ctx, 220, 228, 239, 255)?)?;
-                component.set("disabled_text_color", color4(ctx, 170, 175, 182, 210)?)?;
-                component.set("border_width", 1.0)?;
-                component.set("corner_radius", 8.0)?;
-                component.set("background_image", Value::Nil)?;
-                component.set("icon_image", Value::Nil)?;
-                component.set("icon_color", color4(ctx, 255, 255, 255, 255)?)?;
-                component.set("icon_size", 0.0)?;
-                component.set("icon_gap", 10.0)?;
-                component.set("icon_side", "left")?;
-                component.set("slice_left", 0.0)?;
-                component.set("slice_right", 0.0)?;
-                component.set("slice_top", 0.0)?;
-                component.set("slice_bottom", 0.0)?;
-                Ok(())
-            })?,
-        )?;
-
-        let button_platform = platform.clone();
-        let button_root = env_root.clone();
-        let render_state = render_state.clone();
-        button.set(
-            "update",
-            lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
-                if !component.get::<bool>("visible").unwrap_or(true) {
-                    return Ok(());
-                }
-
-                let draw = get_entity_draw_context(&entity)?;
-                let snapshot = current_input_snapshot(&button_platform)?;
-                let owner_key = component_owner_key(&entity, &component);
-                let enabled = component.get::<bool>("enabled").unwrap_or(true);
-                let hovered = enabled
-                    && point_in_bounds(snapshot.mouse, draw.bounds, draw.pivot, draw.rotation)
-                    && !point_blocked_by_popup(snapshot.mouse, &owner_key);
-                let was_hovered = component.get::<bool>("hovered").unwrap_or(false);
-                if hovered != was_hovered {
-                    component.set("hovered", hovered)?;
-                    if hovered {
-                        call_component_callback(&component, &entity, "onHoverEnter")?;
-                    } else {
-                        call_component_callback(&component, &entity, "onHoverLeave")?;
+            let render_state = render_state.clone();
+            frame.set(
+                "update",
+                lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
+                    if !component.get::<bool>("visible").unwrap_or(true) {
+                        return Ok(());
                     }
-                }
 
-                let left_pressed = snapshot.input.mouse_pressed.contains("left");
-                let left_released = snapshot.input.mouse_released.contains("left");
-                let was_pressed = component.get::<bool>("pressed").unwrap_or(false);
-                let mut pressed = was_pressed;
+                    let draw = get_entity_draw_context(&entity)?;
+                    let background_color = get_color_field(&component, "background_color")
+                        .unwrap_or(color4_to_color(component.get("color")?)?);
+                    let border_color =
+                        get_color_field(&component, "border_color").unwrap_or(background_color);
+                    let style =
+                        resolve_panel_style(ctx, &component, background_color, border_color)?;
 
-                if !enabled {
-                    pressed = false;
-                } else {
-                    if left_pressed {
+                    let mut renderer = render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
+                    render_panel(
+                        &mut renderer,
+                        draw.bounds,
+                        draw.pivot,
+                        draw.rotation,
+                        &style,
+                    )
+                })?,
+            )?;
+
+            core_components.set("Frame", frame)?;
+        }
+
+        // Button
+        // interactive UI button with customizable panel states and text rendering
+        {
+            let button = create_basic_drawable(lua)?;
+            button.set(
+                "awake",
+                lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
+                    component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
+                    component.set("visible", true)?;
+                    component.set("__neolove_component", "Button")?;
+                    component.set("text", "Button")?;
+                    component.set("enabled", true)?;
+                    component.set("hovered", false)?;
+                    component.set("pressed", false)?;
+                    component.set("scale", 18.0)?;
+                    component.set("min_scale", 10.0)?;
+                    component.set("align_x", "center")?;
+                    component.set("align_y", "center")?;
+                    component.set("text_scale", "fit")?;
+                    component.set("wrap", "none")?;
+                    component.set("padding", 8.0)?;
+                    component.set("padding_x", 12.0)?;
+                    component.set("padding_y", 8.0)?;
+                    component.set("line_spacing", 1.0)?;
+                    component.set("letter_spacing", 0.0)?;
+                    component.set("font", Value::Nil)?;
+                    component.set("background_color", color4(ctx, 52, 68, 94, 255)?)?;
+                    component.set("hover_background_color", color4(ctx, 67, 86, 118, 255)?)?;
+                    component.set("pressed_background_color", color4(ctx, 39, 51, 73, 255)?)?;
+                    component.set("disabled_background_color", color4(ctx, 45, 48, 52, 190)?)?;
+                    component.set("border_color", color4(ctx, 140, 164, 196, 255)?)?;
+                    component.set("hover_border_color", color4(ctx, 180, 205, 235, 255)?)?;
+                    component.set("pressed_border_color", color4(ctx, 110, 130, 158, 255)?)?;
+                    component.set("disabled_border_color", color4(ctx, 80, 84, 92, 170)?)?;
+                    component.set("text_color", color4(ctx, 242, 245, 250, 255)?)?;
+                    component.set("hover_text_color", color4(ctx, 255, 255, 255, 255)?)?;
+                    component.set("pressed_text_color", color4(ctx, 220, 228, 239, 255)?)?;
+                    component.set("disabled_text_color", color4(ctx, 170, 175, 182, 210)?)?;
+                    component.set("border_width", 1.0)?;
+                    component.set("corner_radius", 8.0)?;
+                    component.set("background_image", Value::Nil)?;
+                    component.set("icon_image", Value::Nil)?;
+                    component.set("icon_color", color4(ctx, 255, 255, 255, 255)?)?;
+                    component.set("icon_size", 0.0)?;
+                    component.set("icon_gap", 10.0)?;
+                    component.set("icon_side", "left")?;
+                    component.set("slice_left", 0.0)?;
+                    component.set("slice_right", 0.0)?;
+                    component.set("slice_top", 0.0)?;
+                    component.set("slice_bottom", 0.0)?;
+                    Ok(())
+                })?,
+            )?;
+
+            let button_platform = platform.clone();
+            let button_root = env_root.clone();
+            let render_state = render_state.clone();
+            button.set(
+                "update",
+                lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
+                    if !component.get::<bool>("visible").unwrap_or(true) {
+                        return Ok(());
+                    }
+
+                    let draw = get_entity_draw_context(&entity)?;
+                    let snapshot = current_input_snapshot(&button_platform)?;
+                    let owner_key = component_owner_key(&entity, &component);
+                    let enabled = component.get::<bool>("enabled").unwrap_or(true);
+                    let hovered = enabled
+                        && point_in_bounds(snapshot.mouse, draw.bounds, draw.pivot, draw.rotation)
+                        && !point_blocked_by_popup(snapshot.mouse, &owner_key);
+                    let was_hovered = component.get::<bool>("hovered").unwrap_or(false);
+                    if hovered != was_hovered {
+                        component.set("hovered", hovered)?;
                         if hovered {
-                            pressed = true;
-                            call_component_callback(&component, &entity, "onPress")?;
+                            call_component_callback(&component, &entity, "onHoverEnter")?;
                         } else {
+                            call_component_callback(&component, &entity, "onHoverLeave")?;
+                        }
+                    }
+
+                    let left_pressed = snapshot.input.mouse_pressed.contains("left");
+                    let left_released = snapshot.input.mouse_released.contains("left");
+                    let was_pressed = component.get::<bool>("pressed").unwrap_or(false);
+                    let mut pressed = was_pressed;
+
+                    if !enabled {
+                        pressed = false;
+                    } else {
+                        if left_pressed {
+                            if hovered {
+                                pressed = true;
+                                call_component_callback(&component, &entity, "onPress")?;
+                            } else {
+                                pressed = false;
+                            }
+                        }
+                        if left_released {
+                            if was_pressed {
+                                call_component_callback(&component, &entity, "onRelease")?;
+                                if hovered {
+                                    call_component_callback(&component, &entity, "onClick")?;
+                                }
+                            }
                             pressed = false;
                         }
                     }
-                    if left_released {
-                        if was_pressed {
-                            call_component_callback(&component, &entity, "onRelease")?;
-                            if hovered {
-                                call_component_callback(&component, &entity, "onClick")?;
-                            }
-                        }
-                        pressed = false;
+                    component.set("pressed", pressed)?;
+
+                    let background_color = if !enabled {
+                        get_color_field(&component, "disabled_background_color")
+                    } else if pressed {
+                        get_color_field(&component, "pressed_background_color")
+                    } else if hovered {
+                        get_color_field(&component, "hover_background_color")
+                    } else {
+                        get_color_field(&component, "background_color")
                     }
-                }
-                component.set("pressed", pressed)?;
+                    .unwrap_or(Color::rgba(48, 56, 72, 255));
+                    let border_color = if !enabled {
+                        get_color_field(&component, "disabled_border_color")
+                    } else if pressed {
+                        get_color_field(&component, "pressed_border_color")
+                    } else if hovered {
+                        get_color_field(&component, "hover_border_color")
+                    } else {
+                        get_color_field(&component, "border_color")
+                    }
+                    .unwrap_or(background_color);
+                    let text_color = if !enabled {
+                        get_color_field(&component, "disabled_text_color")
+                    } else if pressed {
+                        get_color_field(&component, "pressed_text_color")
+                    } else if hovered {
+                        get_color_field(&component, "hover_text_color")
+                    } else {
+                        get_color_field(&component, "text_color")
+                    }
+                    .unwrap_or(Color::WHITE);
 
-                let background_color = if !enabled {
-                    get_color_field(&component, "disabled_background_color")
-                } else if pressed {
-                    get_color_field(&component, "pressed_background_color")
-                } else if hovered {
-                    get_color_field(&component, "hover_background_color")
-                } else {
-                    get_color_field(&component, "background_color")
-                }
-                .unwrap_or(Color::rgba(48, 56, 72, 255));
-                let border_color = if !enabled {
-                    get_color_field(&component, "disabled_border_color")
-                } else if pressed {
-                    get_color_field(&component, "pressed_border_color")
-                } else if hovered {
-                    get_color_field(&component, "hover_border_color")
-                } else {
-                    get_color_field(&component, "border_color")
-                }
-                .unwrap_or(background_color);
-                let text_color = if !enabled {
-                    get_color_field(&component, "disabled_text_color")
-                } else if pressed {
-                    get_color_field(&component, "pressed_text_color")
-                } else if hovered {
-                    get_color_field(&component, "hover_text_color")
-                } else {
-                    get_color_field(&component, "text_color")
-                }
-                .unwrap_or(Color::WHITE);
+                    let style =
+                        resolve_panel_style(ctx, &component, background_color, border_color)?;
+                    let padding = component.get::<f32>("padding").unwrap_or(8.0).max(0.0);
+                    let padding_x = component
+                        .get::<f32>("padding_x")
+                        .unwrap_or(padding)
+                        .max(0.0);
+                    let padding_y = component
+                        .get::<f32>("padding_y")
+                        .unwrap_or(padding)
+                        .max(0.0);
+                    let content_bounds = Rect {
+                        x: draw.bounds.x + style.border_width + padding_x,
+                        y: draw.bounds.y + style.border_width + padding_y,
+                        w: (draw.bounds.w - (style.border_width + padding_x) * 2.0).max(0.0),
+                        h: (draw.bounds.h - (style.border_width + padding_y) * 2.0).max(0.0),
+                    };
+                    let (text_bounds, icon) = layout_inline_image(
+                        content_bounds,
+                        resolve_widget_icon(&component, content_bounds, text_color)?,
+                    );
+                    let mut text_request = build_text_request(
+                        &button_root,
+                        &component,
+                        component
+                            .get::<String>("text")
+                            .unwrap_or_else(|_| "Button".to_string()),
+                        text_bounds,
+                        draw.pivot,
+                        draw.rotation,
+                        text_color,
+                        18.0,
+                        TextAlignX::Center,
+                        TextAlignY::Center,
+                        TextScaleMode::Fit,
+                        TextWrapMode::None,
+                        0.0,
+                        0.0,
+                    );
+                    text_request.bounds = text_bounds;
 
-                let style = resolve_panel_style(ctx, &component, background_color, border_color)?;
-                let padding = component.get::<f32>("padding").unwrap_or(8.0).max(0.0);
-                let padding_x = component
-                    .get::<f32>("padding_x")
-                    .unwrap_or(padding)
-                    .max(0.0);
-                let padding_y = component
-                    .get::<f32>("padding_y")
-                    .unwrap_or(padding)
-                    .max(0.0);
-                let content_bounds = Rect {
-                    x: draw.bounds.x + style.border_width + padding_x,
-                    y: draw.bounds.y + style.border_width + padding_y,
-                    w: (draw.bounds.w - (style.border_width + padding_x) * 2.0).max(0.0),
-                    h: (draw.bounds.h - (style.border_width + padding_y) * 2.0).max(0.0),
-                };
-                let (text_bounds, icon) = layout_inline_image(
-                    content_bounds,
-                    resolve_widget_icon(&component, content_bounds, text_color)?,
-                );
-                let mut text_request = build_text_request(
-                    &button_root,
-                    &component,
-                    component
-                        .get::<String>("text")
-                        .unwrap_or_else(|_| "Button".to_string()),
-                    text_bounds,
-                    draw.pivot,
-                    draw.rotation,
-                    text_color,
-                    18.0,
-                    TextAlignX::Center,
-                    TextAlignY::Center,
-                    TextScaleMode::Fit,
-                    TextWrapMode::None,
-                    0.0,
-                    0.0,
-                );
-                text_request.bounds = text_bounds;
+                    let mut renderer = render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
+                    render_panel(
+                        &mut renderer,
+                        draw.bounds,
+                        draw.pivot,
+                        draw.rotation,
+                        &style,
+                    )?;
+                    if let Some(icon) = icon.as_ref() {
+                        queue_inline_image(&mut renderer, &draw, icon, style.filter);
+                    }
+                    renderer.queue(DrawCommand::Text(text_request));
+                    Ok(())
+                })?,
+            )?;
 
-                let mut renderer = render_state
-                    .lock()
-                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
-                render_panel(
-                    &mut renderer,
-                    draw.bounds,
-                    draw.pivot,
-                    draw.rotation,
-                    &style,
-                )?;
-                if let Some(icon) = icon.as_ref() {
-                    queue_inline_image(&mut renderer, &draw, icon, style.filter);
-                }
-                renderer.queue(DrawCommand::Text(text_request));
-                Ok(())
-            })?,
-        )?;
+            core_components.set("Button", button)?;
+        }
 
-        core_components.set("Button", button)?;
-    }
+        // TextInput
+        // single-line text field with focus, caret, placeholder, and submit/change callbacks
+        {
+            let text_input = create_basic_drawable(lua)?;
+            text_input.set(
+                "awake",
+                lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
+                    component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
+                    component.set("visible", true)?;
+                    component.set("__neolove_component", "TextInput")?;
+                    component.set("text", "")?;
+                    component.set("placeholder", "Type here")?;
+                    component.set("enabled", true)?;
+                    component.set("hovered", false)?;
+                    component.set("focused", false)?;
+                    component.set("password", false)?;
+                    component.set("max_length", 0)?;
+                    component.set("submit_on_enter", true)?;
+                    component.set("clear_on_submit", false)?;
+                    component.set("blur_on_submit", false)?;
+                    component.set("cursor_index", 0)?;
+                    component.set("view_start", 0)?;
+                    component.set("cursor_blink", 0.0)?;
+                    component.set("caret_width", 2.0)?;
+                    component.set("scale", 18.0)?;
+                    component.set("min_scale", 12.0)?;
+                    component.set("align_x", "left")?;
+                    component.set("align_y", "center")?;
+                    component.set("text_scale", "none")?;
+                    component.set("wrap", "none")?;
+                    component.set("padding", 8.0)?;
+                    component.set("padding_x", 10.0)?;
+                    component.set("padding_y", 8.0)?;
+                    component.set("line_spacing", 1.0)?;
+                    component.set("letter_spacing", 0.0)?;
+                    component.set("font", Value::Nil)?;
+                    component.set("background_color", color4(ctx, 22, 26, 33, 245)?)?;
+                    component.set("hover_background_color", color4(ctx, 26, 31, 40, 250)?)?;
+                    component.set("focus_background_color", color4(ctx, 18, 24, 34, 255)?)?;
+                    component.set("disabled_background_color", color4(ctx, 33, 35, 40, 200)?)?;
+                    component.set("border_color", color4(ctx, 86, 96, 116, 255)?)?;
+                    component.set("hover_border_color", color4(ctx, 124, 141, 170, 255)?)?;
+                    component.set("focus_border_color", color4(ctx, 166, 204, 255, 255)?)?;
+                    component.set("disabled_border_color", color4(ctx, 66, 72, 84, 180)?)?;
+                    component.set("text_color", color4(ctx, 235, 239, 244, 255)?)?;
+                    component.set("placeholder_color", color4(ctx, 138, 147, 162, 220)?)?;
+                    component.set("disabled_text_color", color4(ctx, 150, 154, 162, 210)?)?;
+                    component.set("caret_color", color4(ctx, 240, 244, 250, 255)?)?;
+                    component.set("border_width", 1.0)?;
+                    component.set("corner_radius", 8.0)?;
+                    component.set("background_image", Value::Nil)?;
+                    component.set("icon_image", Value::Nil)?;
+                    component.set("icon_color", color4(ctx, 255, 255, 255, 255)?)?;
+                    component.set("icon_size", 0.0)?;
+                    component.set("icon_gap", 8.0)?;
+                    component.set("icon_side", "left")?;
+                    component.set("slice_left", 0.0)?;
+                    component.set("slice_right", 0.0)?;
+                    component.set("slice_top", 0.0)?;
+                    component.set("slice_bottom", 0.0)?;
+                    Ok(())
+                })?,
+            )?;
 
-    // TextInput
-    // single-line text field with focus, caret, placeholder, and submit/change callbacks
-    {
-        let text_input = create_basic_drawable(lua)?;
-        text_input.set(
-            "awake",
-            lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
-                component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
-                component.set("visible", true)?;
-                component.set("__neolove_component", "TextInput")?;
-                component.set("text", "")?;
-                component.set("placeholder", "Type here")?;
-                component.set("enabled", true)?;
-                component.set("hovered", false)?;
-                component.set("focused", false)?;
-                component.set("password", false)?;
-                component.set("max_length", 0)?;
-                component.set("submit_on_enter", true)?;
-                component.set("clear_on_submit", false)?;
-                component.set("blur_on_submit", false)?;
-                component.set("cursor_index", 0)?;
-                component.set("view_start", 0)?;
-                component.set("cursor_blink", 0.0)?;
-                component.set("caret_width", 2.0)?;
-                component.set("scale", 18.0)?;
-                component.set("min_scale", 12.0)?;
-                component.set("align_x", "left")?;
-                component.set("align_y", "center")?;
-                component.set("text_scale", "none")?;
-                component.set("wrap", "none")?;
-                component.set("padding", 8.0)?;
-                component.set("padding_x", 10.0)?;
-                component.set("padding_y", 8.0)?;
-                component.set("line_spacing", 1.0)?;
-                component.set("letter_spacing", 0.0)?;
-                component.set("font", Value::Nil)?;
-                component.set("background_color", color4(ctx, 22, 26, 33, 245)?)?;
-                component.set("hover_background_color", color4(ctx, 26, 31, 40, 250)?)?;
-                component.set("focus_background_color", color4(ctx, 18, 24, 34, 255)?)?;
-                component.set("disabled_background_color", color4(ctx, 33, 35, 40, 200)?)?;
-                component.set("border_color", color4(ctx, 86, 96, 116, 255)?)?;
-                component.set("hover_border_color", color4(ctx, 124, 141, 170, 255)?)?;
-                component.set("focus_border_color", color4(ctx, 166, 204, 255, 255)?)?;
-                component.set("disabled_border_color", color4(ctx, 66, 72, 84, 180)?)?;
-                component.set("text_color", color4(ctx, 235, 239, 244, 255)?)?;
-                component.set("placeholder_color", color4(ctx, 138, 147, 162, 220)?)?;
-                component.set("disabled_text_color", color4(ctx, 150, 154, 162, 210)?)?;
-                component.set("caret_color", color4(ctx, 240, 244, 250, 255)?)?;
-                component.set("border_width", 1.0)?;
-                component.set("corner_radius", 8.0)?;
-                component.set("background_image", Value::Nil)?;
-                component.set("icon_image", Value::Nil)?;
-                component.set("icon_color", color4(ctx, 255, 255, 255, 255)?)?;
-                component.set("icon_size", 0.0)?;
-                component.set("icon_gap", 8.0)?;
-                component.set("icon_side", "left")?;
-                component.set("slice_left", 0.0)?;
-                component.set("slice_right", 0.0)?;
-                component.set("slice_top", 0.0)?;
-                component.set("slice_bottom", 0.0)?;
-                Ok(())
-            })?,
-        )?;
+            let input_platform = platform.clone();
+            let text_root = env_root.clone();
+            let render_state = render_state.clone();
+            text_input.set(
+                "update",
+                lua.create_function(move |ctx, (entity, component, dt): (Table, Table, f32)| {
+                    if !component.get::<bool>("visible").unwrap_or(true) {
+                        return Ok(());
+                    }
 
-        let input_platform = platform.clone();
-        let text_root = env_root.clone();
-        let render_state = render_state.clone();
-        text_input.set(
-            "update",
-            lua.create_function(move |ctx, (entity, component, dt): (Table, Table, f32)| {
-                if !component.get::<bool>("visible").unwrap_or(true) {
-                    return Ok(());
-                }
+                    let draw = get_entity_draw_context(&entity)?;
+                    let snapshot = current_input_snapshot(&input_platform)?;
+                    let owner_key = component_owner_key(&entity, &component);
+                    let enabled = component.get::<bool>("enabled").unwrap_or(true);
+                    let hovered = enabled
+                        && point_in_bounds(snapshot.mouse, draw.bounds, draw.pivot, draw.rotation)
+                        && !point_blocked_by_popup(snapshot.mouse, &owner_key);
+                    let was_focused = component.get::<bool>("focused").unwrap_or(false);
+                    let was_hovered = component.get::<bool>("hovered").unwrap_or(false);
+                    if hovered != was_hovered {
+                        component.set("hovered", hovered)?;
+                    }
 
-                let draw = get_entity_draw_context(&entity)?;
-                let snapshot = current_input_snapshot(&input_platform)?;
-                let owner_key = component_owner_key(&entity, &component);
-                let enabled = component.get::<bool>("enabled").unwrap_or(true);
-                let hovered = enabled
-                    && point_in_bounds(snapshot.mouse, draw.bounds, draw.pivot, draw.rotation)
-                    && !point_blocked_by_popup(snapshot.mouse, &owner_key);
-                let was_focused = component.get::<bool>("focused").unwrap_or(false);
-                let was_hovered = component.get::<bool>("hovered").unwrap_or(false);
-                if hovered != was_hovered {
-                    component.set("hovered", hovered)?;
-                }
-
-                let left_pressed = snapshot.input.mouse_pressed.contains("left");
-                let mut focused = was_focused;
-                if !enabled && focused {
-                    focused = false;
-                    call_component_callback(&component, &entity, "onBlur")?;
-                } else if left_pressed {
-                    if hovered {
-                        if !focused {
-                            focused = true;
-                            call_component_callback(&component, &entity, "onFocus")?;
-                        }
-                    } else if focused {
+                    let left_pressed = snapshot.input.mouse_pressed.contains("left");
+                    let mut focused = was_focused;
+                    if !enabled && focused {
                         focused = false;
                         call_component_callback(&component, &entity, "onBlur")?;
+                    } else if left_pressed {
+                        if hovered {
+                            if !focused {
+                                focused = true;
+                                call_component_callback(&component, &entity, "onFocus")?;
+                            }
+                        } else if focused {
+                            focused = false;
+                            call_component_callback(&component, &entity, "onBlur")?;
+                        }
                     }
-                }
 
-                let mut text = component.get::<String>("text").unwrap_or_default();
-                let mut cursor = component
-                    .get::<usize>("cursor_index")
-                    .unwrap_or_else(|_| char_count(&text))
-                    .min(char_count(&text));
-                let mut changed = false;
+                    let mut text = component.get::<String>("text").unwrap_or_default();
+                    let mut cursor = component
+                        .get::<usize>("cursor_index")
+                        .unwrap_or_else(|_| char_count(&text))
+                        .min(char_count(&text));
+                    let mut changed = false;
 
-                if focused && enabled {
-                    if let Some(key) = snapshot.input.last_key_pressed.clone() {
-                        match key.as_str() {
-                            "left" => cursor = cursor.saturating_sub(1),
-                            "right" => cursor = (cursor + 1).min(char_count(&text)),
-                            "home" => cursor = 0,
-                            "end" => cursor = char_count(&text),
-                            "backspace" => {
-                                if cursor > 0 {
-                                    text = replace_char_range(&text, cursor - 1, cursor, "");
-                                    cursor -= 1;
-                                    changed = true;
+                    if focused && enabled {
+                        if let Some(key) = snapshot.input.last_key_pressed.clone() {
+                            match key.as_str() {
+                                "left" => cursor = cursor.saturating_sub(1),
+                                "right" => cursor = (cursor + 1).min(char_count(&text)),
+                                "home" => cursor = 0,
+                                "end" => cursor = char_count(&text),
+                                "backspace" => {
+                                    if cursor > 0 {
+                                        text = replace_char_range(&text, cursor - 1, cursor, "");
+                                        cursor -= 1;
+                                        changed = true;
+                                    }
                                 }
-                            }
-                            "delete" => {
-                                if cursor < char_count(&text) {
-                                    text = replace_char_range(&text, cursor, cursor + 1, "");
-                                    changed = true;
+                                "delete" => {
+                                    if cursor < char_count(&text) {
+                                        text = replace_char_range(&text, cursor, cursor + 1, "");
+                                        changed = true;
+                                    }
                                 }
-                            }
-                            "escape" => {
-                                focused = false;
-                                call_component_callback(&component, &entity, "onBlur")?;
-                            }
-                            "enter" if component.get::<bool>("submit_on_enter").unwrap_or(true) => {
-                                call_component_string_callback(
-                                    &component, &entity, "onSubmit", &text,
-                                )?;
-                                if component.get::<bool>("clear_on_submit").unwrap_or(false) {
-                                    text.clear();
-                                    cursor = 0;
-                                    changed = true;
-                                }
-                                if component.get::<bool>("blur_on_submit").unwrap_or(false) {
+                                "escape" => {
                                     focused = false;
                                     call_component_callback(&component, &entity, "onBlur")?;
                                 }
+                                "enter"
+                                    if component.get::<bool>("submit_on_enter").unwrap_or(true) =>
+                                {
+                                    call_component_string_callback(
+                                        &component, &entity, "onSubmit", &text,
+                                    )?;
+                                    if component.get::<bool>("clear_on_submit").unwrap_or(false) {
+                                        text.clear();
+                                        cursor = 0;
+                                        changed = true;
+                                    }
+                                    if component.get::<bool>("blur_on_submit").unwrap_or(false) {
+                                        focused = false;
+                                        call_component_callback(&component, &entity, "onBlur")?;
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
+                        }
+
+                        if let Some(ch) = snapshot.input.char_pressed.clone() {
+                            let max_length = component.get::<usize>("max_length").unwrap_or(0);
+                            let text_len = char_count(&text);
+                            let insert_len = char_count(&ch);
+                            if insert_len > 0
+                                && (max_length == 0 || text_len + insert_len <= max_length)
+                            {
+                                text = replace_char_range(&text, cursor, cursor, &ch);
+                                cursor += insert_len;
+                                changed = true;
+                            }
                         }
                     }
 
-                    if let Some(ch) = snapshot.input.char_pressed.clone() {
-                        let max_length = component.get::<usize>("max_length").unwrap_or(0);
-                        let text_len = char_count(&text);
-                        let insert_len = char_count(&ch);
-                        if insert_len > 0
-                            && (max_length == 0 || text_len + insert_len <= max_length)
-                        {
-                            text = replace_char_range(&text, cursor, cursor, &ch);
-                            cursor += insert_len;
-                            changed = true;
-                        }
+                    if changed {
+                        component.set("text", text.clone())?;
+                        call_component_string_callback(&component, &entity, "onChanged", &text)?;
                     }
-                }
 
-                if changed {
-                    component.set("text", text.clone())?;
-                    call_component_string_callback(&component, &entity, "onChanged", &text)?;
-                }
-
-                component.set("focused", focused)?;
-                component.set("cursor_index", cursor)?;
-                let blink = if focused {
-                    component.get::<f32>("cursor_blink").unwrap_or(0.0) + dt.max(0.0)
-                } else {
-                    0.0
-                };
-                component.set("cursor_blink", blink)?;
-
-                let background_color = if !enabled {
-                    get_color_field(&component, "disabled_background_color")
-                } else if focused {
-                    get_color_field(&component, "focus_background_color")
-                } else if hovered {
-                    get_color_field(&component, "hover_background_color")
-                } else {
-                    get_color_field(&component, "background_color")
-                }
-                .unwrap_or(Color::rgba(24, 28, 36, 245));
-                let border_color = if !enabled {
-                    get_color_field(&component, "disabled_border_color")
-                } else if focused {
-                    get_color_field(&component, "focus_border_color")
-                } else if hovered {
-                    get_color_field(&component, "hover_border_color")
-                } else {
-                    get_color_field(&component, "border_color")
-                }
-                .unwrap_or(Color::rgba(96, 110, 132, 255));
-                let text_color = if !enabled {
-                    get_color_field(&component, "disabled_text_color")
-                } else {
-                    get_color_field(&component, "text_color")
-                }
-                .unwrap_or(Color::WHITE);
-                let placeholder_color =
-                    get_color_field(&component, "placeholder_color").unwrap_or(text_color);
-                let caret_color = get_color_field(&component, "caret_color").unwrap_or(text_color);
-                let style = resolve_panel_style(ctx, &component, background_color, border_color)?;
-                let padding = component.get::<f32>("padding").unwrap_or(8.0).max(0.0);
-                let padding_x = component
-                    .get::<f32>("padding_x")
-                    .unwrap_or(padding)
-                    .max(0.0);
-                let padding_y = component
-                    .get::<f32>("padding_y")
-                    .unwrap_or(padding)
-                    .max(0.0);
-                let inner_bounds = Rect {
-                    x: draw.bounds.x + style.border_width + padding_x,
-                    y: draw.bounds.y + style.border_width + padding_y,
-                    w: (draw.bounds.w - (style.border_width + padding_x) * 2.0).max(0.0),
-                    h: (draw.bounds.h - (style.border_width + padding_y) * 2.0).max(0.0),
-                };
-                let (text_bounds, icon) = layout_inline_image(
-                    inner_bounds,
-                    resolve_widget_icon(&component, inner_bounds, text_color)?,
-                );
-
-                let display_text = if component.get::<bool>("password").unwrap_or(false) {
-                    "*".repeat(char_count(&text))
-                } else {
-                    text.clone()
-                };
-                let mut view_start = component
-                    .get::<usize>("view_start")
-                    .unwrap_or(0)
-                    .min(cursor);
-                let available_width = text_bounds.w.max(0.0);
-                while view_start < cursor
-                    && measure_inline_text(
-                        &text_root,
-                        &component,
-                        &slice_chars(&display_text, view_start, cursor),
-                        None,
-                    ) > available_width
-                {
-                    view_start += 1;
-                }
-                let display_len = char_count(&display_text);
-                let mut visible_end = view_start;
-                let mut visible_text = String::new();
-                while visible_end < display_len {
-                    let candidate = slice_chars(&display_text, view_start, visible_end + 1);
-                    if visible_end == view_start
-                        || measure_inline_text(&text_root, &component, &candidate, None)
-                            <= available_width
-                    {
-                        visible_end += 1;
-                        visible_text = candidate;
+                    component.set("focused", focused)?;
+                    component.set("cursor_index", cursor)?;
+                    let blink = if focused {
+                        component.get::<f32>("cursor_blink").unwrap_or(0.0) + dt.max(0.0)
                     } else {
-                        break;
+                        0.0
+                    };
+                    component.set("cursor_blink", blink)?;
+
+                    let background_color = if !enabled {
+                        get_color_field(&component, "disabled_background_color")
+                    } else if focused {
+                        get_color_field(&component, "focus_background_color")
+                    } else if hovered {
+                        get_color_field(&component, "hover_background_color")
+                    } else {
+                        get_color_field(&component, "background_color")
                     }
-                }
-                component.set("view_start", view_start)?;
+                    .unwrap_or(Color::rgba(24, 28, 36, 245));
+                    let border_color = if !enabled {
+                        get_color_field(&component, "disabled_border_color")
+                    } else if focused {
+                        get_color_field(&component, "focus_border_color")
+                    } else if hovered {
+                        get_color_field(&component, "hover_border_color")
+                    } else {
+                        get_color_field(&component, "border_color")
+                    }
+                    .unwrap_or(Color::rgba(96, 110, 132, 255));
+                    let text_color = if !enabled {
+                        get_color_field(&component, "disabled_text_color")
+                    } else {
+                        get_color_field(&component, "text_color")
+                    }
+                    .unwrap_or(Color::WHITE);
+                    let placeholder_color =
+                        get_color_field(&component, "placeholder_color").unwrap_or(text_color);
+                    let caret_color =
+                        get_color_field(&component, "caret_color").unwrap_or(text_color);
+                    let style =
+                        resolve_panel_style(ctx, &component, background_color, border_color)?;
+                    let padding = component.get::<f32>("padding").unwrap_or(8.0).max(0.0);
+                    let padding_x = component
+                        .get::<f32>("padding_x")
+                        .unwrap_or(padding)
+                        .max(0.0);
+                    let padding_y = component
+                        .get::<f32>("padding_y")
+                        .unwrap_or(padding)
+                        .max(0.0);
+                    let inner_bounds = Rect {
+                        x: draw.bounds.x + style.border_width + padding_x,
+                        y: draw.bounds.y + style.border_width + padding_y,
+                        w: (draw.bounds.w - (style.border_width + padding_x) * 2.0).max(0.0),
+                        h: (draw.bounds.h - (style.border_width + padding_y) * 2.0).max(0.0),
+                    };
+                    let (text_bounds, icon) = layout_inline_image(
+                        inner_bounds,
+                        resolve_widget_icon(&component, inner_bounds, text_color)?,
+                    );
 
-                let mut renderer = render_state
-                    .lock()
-                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
-                render_panel(
-                    &mut renderer,
-                    draw.bounds,
-                    draw.pivot,
-                    draw.rotation,
-                    &style,
-                )?;
-                if let Some(icon) = icon.as_ref() {
-                    queue_inline_image(&mut renderer, &draw, icon, style.filter);
-                }
+                    let display_text = if component.get::<bool>("password").unwrap_or(false) {
+                        "*".repeat(char_count(&text))
+                    } else {
+                        text.clone()
+                    };
+                    let mut view_start = component
+                        .get::<usize>("view_start")
+                        .unwrap_or(0)
+                        .min(cursor);
+                    let available_width = text_bounds.w.max(0.0);
+                    while view_start < cursor
+                        && measure_inline_text(
+                            &text_root,
+                            &component,
+                            &slice_chars(&display_text, view_start, cursor),
+                            None,
+                        ) > available_width
+                    {
+                        view_start += 1;
+                    }
+                    let display_len = char_count(&display_text);
+                    let mut visible_end = view_start;
+                    let mut visible_text = String::new();
+                    while visible_end < display_len {
+                        let candidate = slice_chars(&display_text, view_start, visible_end + 1);
+                        if visible_end == view_start
+                            || measure_inline_text(&text_root, &component, &candidate, None)
+                                <= available_width
+                        {
+                            visible_end += 1;
+                            visible_text = candidate;
+                        } else {
+                            break;
+                        }
+                    }
+                    component.set("view_start", view_start)?;
 
-                if text.is_empty() {
-                    let placeholder = component.get::<String>("placeholder").unwrap_or_default();
-                    if !placeholder.is_empty() {
+                    let mut renderer = render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
+                    render_panel(
+                        &mut renderer,
+                        draw.bounds,
+                        draw.pivot,
+                        draw.rotation,
+                        &style,
+                    )?;
+                    if let Some(icon) = icon.as_ref() {
+                        queue_inline_image(&mut renderer, &draw, icon, style.filter);
+                    }
+
+                    if text.is_empty() {
+                        let placeholder =
+                            component.get::<String>("placeholder").unwrap_or_default();
+                        if !placeholder.is_empty() {
+                            renderer.queue(DrawCommand::Text(build_text_request(
+                                &text_root,
+                                &component,
+                                placeholder,
+                                text_bounds,
+                                draw.pivot,
+                                draw.rotation,
+                                placeholder_color,
+                                18.0,
+                                TextAlignX::Left,
+                                TextAlignY::Center,
+                                TextScaleMode::None,
+                                TextWrapMode::None,
+                                0.0,
+                                0.0,
+                            )));
+                        }
+                    } else {
                         renderer.queue(DrawCommand::Text(build_text_request(
                             &text_root,
                             &component,
-                            placeholder,
+                            visible_text.clone(),
                             text_bounds,
                             draw.pivot,
                             draw.rotation,
-                            placeholder_color,
+                            text_color,
                             18.0,
                             TextAlignX::Left,
                             TextAlignY::Center,
@@ -2798,11 +3056,368 @@ pub fn add_core_components(
                             0.0,
                         )));
                     }
-                } else {
+
+                    if focused && ((blink * 1.6).floor() as i32 % 2 == 0) {
+                        let caret_prefix = slice_chars(&display_text, view_start, cursor);
+                        let caret_offset =
+                            measure_inline_text(&text_root, &component, &caret_prefix, None);
+                        let caret_width =
+                            component.get::<f32>("caret_width").unwrap_or(2.0).max(1.0);
+                        let caret_bounds = Rect {
+                            x: text_bounds.x + caret_offset,
+                            y: text_bounds.y + 3.0,
+                            w: caret_width,
+                            h: (text_bounds.h - 6.0).max(4.0),
+                        };
+                        queue_rect_fill(
+                            &mut renderer,
+                            caret_bounds,
+                            draw.pivot,
+                            draw.rotation,
+                            caret_color,
+                        );
+                    }
+
+                    Ok(())
+                })?,
+            )?;
+
+            core_components.set("TextInput", text_input)?;
+        }
+
+        // Dropdown
+        // selectable list with customizable closed/open state styling
+        {
+            let dropdown = create_basic_drawable(lua)?;
+            dropdown.set(
+                "awake",
+                lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
+                    component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
+                    component.set("visible", true)?;
+                    component.set("__neolove_component", "Dropdown")?;
+                    component.set("enabled", true)?;
+                    component.set("open", false)?;
+                    component.set("hovered", false)?;
+                    component.set("hover_index", 0)?;
+                    component.set("selected_index", 0)?;
+                    component.set("selected_text", "")?;
+                    component.set("selected_value", "")?;
+                    component.set("scroll_index", 0)?;
+                    component.set("wheel_scroll_accumulator", 0.0)?;
+                    component.set("placeholder", "Select...")?;
+                    component.set("options", ctx.create_table()?)?;
+                    component.set("item_height", 32.0)?;
+                    component.set("item_corner_radius", 6.0)?;
+                    component.set("item_icon_size", 0.0)?;
+                    component.set("item_icon_gap", 8.0)?;
+                    component.set("menu_gap", 4.0)?;
+                    component.set("max_visible_items", 8)?;
+                    component.set("open_upwards", false)?;
+                    component.set("scale", 18.0)?;
+                    component.set("min_scale", 12.0)?;
+                    component.set("align_x", "left")?;
+                    component.set("align_y", "center")?;
+                    component.set("text_scale", "fit_width")?;
+                    component.set("wrap", "none")?;
+                    component.set("padding", 8.0)?;
+                    component.set("padding_x", 10.0)?;
+                    component.set("padding_y", 8.0)?;
+                    component.set("line_spacing", 1.0)?;
+                    component.set("letter_spacing", 0.0)?;
+                    component.set("font", Value::Nil)?;
+                    component.set("background_color", color4(ctx, 34, 40, 52, 255)?)?;
+                    component.set("hover_background_color", color4(ctx, 43, 52, 67, 255)?)?;
+                    component.set("open_background_color", color4(ctx, 28, 36, 48, 255)?)?;
+                    component.set("disabled_background_color", color4(ctx, 42, 44, 48, 200)?)?;
+                    component.set("border_color", color4(ctx, 112, 126, 151, 255)?)?;
+                    component.set("hover_border_color", color4(ctx, 154, 173, 205, 255)?)?;
+                    component.set("open_border_color", color4(ctx, 180, 210, 255, 255)?)?;
+                    component.set("disabled_border_color", color4(ctx, 76, 80, 90, 180)?)?;
+                    component.set("text_color", color4(ctx, 240, 244, 250, 255)?)?;
+                    component.set("disabled_text_color", color4(ctx, 168, 172, 180, 210)?)?;
+                    component.set("menu_background_color", color4(ctx, 20, 24, 30, 250)?)?;
+                    component.set("menu_border_color", color4(ctx, 112, 126, 151, 255)?)?;
+                    component.set("item_background_color", color4(ctx, 20, 24, 30, 0)?)?;
+                    component.set(
+                        "item_hover_background_color",
+                        color4(ctx, 56, 74, 104, 240)?,
+                    )?;
+                    component.set(
+                        "item_selected_background_color",
+                        color4(ctx, 42, 58, 84, 235)?,
+                    )?;
+                    component.set("item_text_color", color4(ctx, 234, 238, 244, 255)?)?;
+                    component.set("item_hover_text_color", color4(ctx, 255, 255, 255, 255)?)?;
+                    component.set("item_selected_text_color", color4(ctx, 255, 255, 255, 255)?)?;
+                    component.set("border_width", 1.0)?;
+                    component.set("corner_radius", 8.0)?;
+                    component.set("background_image", Value::Nil)?;
+                    component.set("icon_image", Value::Nil)?;
+                    component.set("icon_color", color4(ctx, 255, 255, 255, 255)?)?;
+                    component.set("icon_size", 0.0)?;
+                    component.set("icon_gap", 8.0)?;
+                    component.set("icon_side", "left")?;
+                    component.set("slice_left", 0.0)?;
+                    component.set("slice_right", 0.0)?;
+                    component.set("slice_top", 0.0)?;
+                    component.set("slice_bottom", 0.0)?;
+                    Ok(())
+                })?,
+            )?;
+
+            let dropdown_platform = platform.clone();
+            let dropdown_root = env_root.clone();
+            let render_state = render_state.clone();
+            dropdown.set(
+                "update",
+                lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
+                    if !component.get::<bool>("visible").unwrap_or(true) {
+                        return Ok(());
+                    }
+
+                    let draw = get_entity_draw_context(&entity)?;
+                    let snapshot = current_input_snapshot(&dropdown_platform)?;
+                    let owner_key = component_owner_key(&entity, &component);
+                    let enabled = component.get::<bool>("enabled").unwrap_or(true);
+                    let items = read_ui_list_items(
+                        component.get::<Option<Table>>("options").ok().flatten(),
+                    )?;
+                    let option_count = items.len();
+                    let mut selected_index = component.get::<usize>("selected_index").unwrap_or(0);
+                    if option_count == 0 {
+                        selected_index = 0;
+                    } else {
+                        selected_index = selected_index.clamp(1, option_count);
+                    }
+                    let mut open = component.get::<bool>("open").unwrap_or(false) && enabled;
+                    let hovered = enabled
+                        && point_in_bounds(snapshot.mouse, draw.bounds, draw.pivot, draw.rotation)
+                        && !point_blocked_by_popup(snapshot.mouse, &owner_key);
+
+                    let item_height = component.get::<f32>("item_height").unwrap_or(32.0).max(1.0);
+                    let item_corner_radius = component
+                        .get::<f32>("item_corner_radius")
+                        .unwrap_or(6.0)
+                        .max(0.0);
+                    let item_icon_size = component
+                        .get::<f32>("item_icon_size")
+                        .unwrap_or(0.0)
+                        .max(0.0);
+                    let item_icon_gap = component
+                        .get::<f32>("item_icon_gap")
+                        .unwrap_or(8.0)
+                        .max(0.0);
+                    let menu_gap = component.get::<f32>("menu_gap").unwrap_or(4.0).max(0.0);
+                    let max_visible = component
+                        .get::<usize>("max_visible_items")
+                        .unwrap_or(option_count.max(1))
+                        .max(1);
+                    let visible_count = option_count.min(max_visible);
+                    let mut scroll_index = component.get::<usize>("scroll_index").unwrap_or(0);
+                    if option_count > visible_count {
+                        scroll_index = scroll_index.min(option_count - visible_count);
+                    } else {
+                        scroll_index = 0;
+                    }
+
+                    let menu_height = item_height * visible_count as f32;
+                    let wants_upwards = component.get::<bool>("open_upwards").unwrap_or(false);
+                    let open_upwards = wants_upwards
+                        || (draw.bounds.y + draw.bounds.h + menu_gap + menu_height
+                            > snapshot.window.height
+                            && draw.bounds.y >= menu_height + menu_gap);
+                    let menu_bounds = Rect {
+                        x: draw.bounds.x,
+                        y: if open_upwards {
+                            draw.bounds.y - menu_gap - menu_height
+                        } else {
+                            draw.bounds.y + draw.bounds.h + menu_gap
+                        },
+                        w: draw.bounds.w,
+                        h: menu_height,
+                    };
+                    if open && visible_count > 0 {
+                        register_popup(owner_key.clone(), menu_bounds, draw.pivot, draw.rotation);
+                    }
+
+                    let menu_hovered = open
+                        && visible_count > 0
+                        && point_in_bounds(snapshot.mouse, menu_bounds, draw.pivot, draw.rotation)
+                        && !point_blocked_by_popup(snapshot.mouse, &owner_key);
+
+                    let mut hovered_index = 0usize;
+                    if menu_hovered {
+                        for visible_index in 0..visible_count {
+                            let item_bounds = Rect {
+                                x: menu_bounds.x,
+                                y: menu_bounds.y + visible_index as f32 * item_height,
+                                w: menu_bounds.w,
+                                h: item_height,
+                            };
+                            if point_in_bounds(
+                                snapshot.mouse,
+                                item_bounds,
+                                draw.pivot,
+                                draw.rotation,
+                            ) {
+                                hovered_index = scroll_index + visible_index + 1;
+                                break;
+                            }
+                        }
+                    }
+
+                    if menu_hovered && option_count > visible_count {
+                        let wheel_steps = consume_wheel_steps(
+                            &component,
+                            "wheel_scroll_accumulator",
+                            snapshot.input.wheel_y,
+                            3,
+                        )?;
+                        if wheel_steps > 0 {
+                            scroll_index = scroll_index.saturating_sub(wheel_steps as usize);
+                        } else if wheel_steps < 0 {
+                            scroll_index = (scroll_index + (-wheel_steps) as usize)
+                                .min(option_count - visible_count);
+                        }
+                    }
+
+                    if snapshot.input.mouse_pressed.contains("left") {
+                        if hovered {
+                            open = !open;
+                        } else if open && hovered_index > 0 && menu_hovered {
+                            selected_index = hovered_index;
+                            if let Some(item) = items.get(selected_index - 1) {
+                                call_component_selection_callback(
+                                    &component,
+                                    &entity,
+                                    "onChanged",
+                                    selected_index,
+                                    &item.value,
+                                )?;
+                            }
+                            open = false;
+                        } else if open {
+                            open = false;
+                        }
+                    }
+
+                    let selected_item = items.get(selected_index.saturating_sub(1)).cloned();
+                    let selected_text = selected_item
+                        .as_ref()
+                        .map(|item| item.text.clone())
+                        .unwrap_or_else(|| {
+                            component
+                                .get::<String>("placeholder")
+                                .unwrap_or_else(|_| "Select...".to_string())
+                        });
+                    let selected_value = selected_item
+                        .as_ref()
+                        .map(|item| item.value.clone())
+                        .unwrap_or_default();
+                    component.set("hovered", hovered)?;
+                    component.set("open", open)?;
+                    component.set("hover_index", hovered_index)?;
+                    component.set("selected_index", selected_index)?;
+                    component.set("selected_text", selected_text.clone())?;
+                    component.set("selected_value", selected_value)?;
+                    component.set("scroll_index", scroll_index)?;
+
+                    let background_color = if !enabled {
+                        get_color_field(&component, "disabled_background_color")
+                    } else if open {
+                        get_color_field(&component, "open_background_color")
+                    } else if hovered {
+                        get_color_field(&component, "hover_background_color")
+                    } else {
+                        get_color_field(&component, "background_color")
+                    }
+                    .unwrap_or(Color::rgba(36, 42, 54, 255));
+                    let border_color = if !enabled {
+                        get_color_field(&component, "disabled_border_color")
+                    } else if open {
+                        get_color_field(&component, "open_border_color")
+                    } else if hovered {
+                        get_color_field(&component, "hover_border_color")
+                    } else {
+                        get_color_field(&component, "border_color")
+                    }
+                    .unwrap_or(Color::rgba(112, 126, 151, 255));
+                    let text_color = if !enabled {
+                        get_color_field(&component, "disabled_text_color")
+                    } else {
+                        get_color_field(&component, "text_color")
+                    }
+                    .unwrap_or(Color::WHITE);
+                    let style =
+                        resolve_panel_style(ctx, &component, background_color, border_color)?;
+                    let padding = component.get::<f32>("padding").unwrap_or(8.0).max(0.0);
+                    let padding_x = component
+                        .get::<f32>("padding_x")
+                        .unwrap_or(padding)
+                        .max(0.0);
+                    let padding_y = component
+                        .get::<f32>("padding_y")
+                        .unwrap_or(padding)
+                        .max(0.0);
+                    let arrow_width = 18.0;
+                    let content_bounds = Rect {
+                        x: draw.bounds.x + style.border_width + padding_x,
+                        y: draw.bounds.y + style.border_width + padding_y,
+                        w: (draw.bounds.w - (style.border_width + padding_x) * 2.0 - arrow_width)
+                            .max(0.0),
+                        h: (draw.bounds.h - (style.border_width + padding_y) * 2.0).max(0.0),
+                    };
+                    let selected_item_icon = selected_item.as_ref().and_then(|item| {
+                        item.image.clone().and_then(|image| {
+                            let icon_extent = if item_icon_size > 0.0 {
+                                item_icon_size.min(content_bounds.h)
+                            } else {
+                                content_bounds.h.max(0.0)
+                            };
+                            build_inline_image(
+                                content_bounds,
+                                image,
+                                item.image_tint,
+                                item.image_source,
+                                UiIconSide::Left,
+                                icon_extent,
+                                icon_extent,
+                                item_icon_gap,
+                            )
+                        })
+                    });
+                    let (text_bounds, selected_icon) = layout_inline_image(
+                        content_bounds,
+                        resolve_widget_icon(&component, content_bounds, text_color)?
+                            .or(selected_item_icon),
+                    );
+                    let arrow_bounds = Rect {
+                        x: draw.bounds.x + draw.bounds.w
+                            - style.border_width
+                            - padding_x
+                            - arrow_width,
+                        y: draw.bounds.y + style.border_width + padding_y,
+                        w: arrow_width,
+                        h: (draw.bounds.h - (style.border_width + padding_y) * 2.0).max(0.0),
+                    };
+
+                    let mut renderer = render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
+                    render_panel(
+                        &mut renderer,
+                        draw.bounds,
+                        draw.pivot,
+                        draw.rotation,
+                        &style,
+                    )?;
+                    if let Some(icon) = selected_icon.as_ref() {
+                        queue_inline_image(&mut renderer, &draw, icon, style.filter);
+                    }
                     renderer.queue(DrawCommand::Text(build_text_request(
-                        &text_root,
+                        &dropdown_root,
                         &component,
-                        visible_text.clone(),
+                        selected_text,
                         text_bounds,
                         draw.pivot,
                         draw.rotation,
@@ -2810,422 +3425,672 @@ pub fn add_core_components(
                         18.0,
                         TextAlignX::Left,
                         TextAlignY::Center,
-                        TextScaleMode::None,
+                        TextScaleMode::FitWidth,
                         TextWrapMode::None,
                         0.0,
                         0.0,
                     )));
-                }
-
-                if focused && ((blink * 1.6).floor() as i32 % 2 == 0) {
-                    let caret_prefix = slice_chars(&display_text, view_start, cursor);
-                    let caret_offset =
-                        measure_inline_text(&text_root, &component, &caret_prefix, None);
-                    let caret_width = component.get::<f32>("caret_width").unwrap_or(2.0).max(1.0);
-                    let caret_bounds = Rect {
-                        x: text_bounds.x + caret_offset,
-                        y: text_bounds.y + 3.0,
-                        w: caret_width,
-                        h: (text_bounds.h - 6.0).max(4.0),
-                    };
-                    queue_rect_fill(
-                        &mut renderer,
-                        caret_bounds,
-                        draw.pivot,
-                        draw.rotation,
-                        caret_color,
-                    );
-                }
-
-                Ok(())
-            })?,
-        )?;
-
-        core_components.set("TextInput", text_input)?;
-    }
-
-    // Dropdown
-    // selectable list with customizable closed/open state styling
-    {
-        let dropdown = create_basic_drawable(lua)?;
-        dropdown.set(
-            "awake",
-            lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
-                component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
-                component.set("visible", true)?;
-                component.set("__neolove_component", "Dropdown")?;
-                component.set("enabled", true)?;
-                component.set("open", false)?;
-                component.set("hovered", false)?;
-                component.set("hover_index", 0)?;
-                component.set("selected_index", 0)?;
-                component.set("selected_text", "")?;
-                component.set("selected_value", "")?;
-                component.set("scroll_index", 0)?;
-                component.set("wheel_scroll_accumulator", 0.0)?;
-                component.set("placeholder", "Select...")?;
-                component.set("options", ctx.create_table()?)?;
-                component.set("item_height", 32.0)?;
-                component.set("item_corner_radius", 6.0)?;
-                component.set("item_icon_size", 0.0)?;
-                component.set("item_icon_gap", 8.0)?;
-                component.set("menu_gap", 4.0)?;
-                component.set("max_visible_items", 8)?;
-                component.set("open_upwards", false)?;
-                component.set("scale", 18.0)?;
-                component.set("min_scale", 12.0)?;
-                component.set("align_x", "left")?;
-                component.set("align_y", "center")?;
-                component.set("text_scale", "fit_width")?;
-                component.set("wrap", "none")?;
-                component.set("padding", 8.0)?;
-                component.set("padding_x", 10.0)?;
-                component.set("padding_y", 8.0)?;
-                component.set("line_spacing", 1.0)?;
-                component.set("letter_spacing", 0.0)?;
-                component.set("font", Value::Nil)?;
-                component.set("background_color", color4(ctx, 34, 40, 52, 255)?)?;
-                component.set("hover_background_color", color4(ctx, 43, 52, 67, 255)?)?;
-                component.set("open_background_color", color4(ctx, 28, 36, 48, 255)?)?;
-                component.set("disabled_background_color", color4(ctx, 42, 44, 48, 200)?)?;
-                component.set("border_color", color4(ctx, 112, 126, 151, 255)?)?;
-                component.set("hover_border_color", color4(ctx, 154, 173, 205, 255)?)?;
-                component.set("open_border_color", color4(ctx, 180, 210, 255, 255)?)?;
-                component.set("disabled_border_color", color4(ctx, 76, 80, 90, 180)?)?;
-                component.set("text_color", color4(ctx, 240, 244, 250, 255)?)?;
-                component.set("disabled_text_color", color4(ctx, 168, 172, 180, 210)?)?;
-                component.set("menu_background_color", color4(ctx, 20, 24, 30, 250)?)?;
-                component.set("menu_border_color", color4(ctx, 112, 126, 151, 255)?)?;
-                component.set("item_background_color", color4(ctx, 20, 24, 30, 0)?)?;
-                component.set(
-                    "item_hover_background_color",
-                    color4(ctx, 56, 74, 104, 240)?,
-                )?;
-                component.set(
-                    "item_selected_background_color",
-                    color4(ctx, 42, 58, 84, 235)?,
-                )?;
-                component.set("item_text_color", color4(ctx, 234, 238, 244, 255)?)?;
-                component.set("item_hover_text_color", color4(ctx, 255, 255, 255, 255)?)?;
-                component.set("item_selected_text_color", color4(ctx, 255, 255, 255, 255)?)?;
-                component.set("border_width", 1.0)?;
-                component.set("corner_radius", 8.0)?;
-                component.set("background_image", Value::Nil)?;
-                component.set("icon_image", Value::Nil)?;
-                component.set("icon_color", color4(ctx, 255, 255, 255, 255)?)?;
-                component.set("icon_size", 0.0)?;
-                component.set("icon_gap", 8.0)?;
-                component.set("icon_side", "left")?;
-                component.set("slice_left", 0.0)?;
-                component.set("slice_right", 0.0)?;
-                component.set("slice_top", 0.0)?;
-                component.set("slice_bottom", 0.0)?;
-                Ok(())
-            })?,
-        )?;
-
-        let dropdown_platform = platform.clone();
-        let dropdown_root = env_root.clone();
-        let render_state = render_state.clone();
-        dropdown.set(
-            "update",
-            lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
-                if !component.get::<bool>("visible").unwrap_or(true) {
-                    return Ok(());
-                }
-
-                let draw = get_entity_draw_context(&entity)?;
-                let snapshot = current_input_snapshot(&dropdown_platform)?;
-                let owner_key = component_owner_key(&entity, &component);
-                let enabled = component.get::<bool>("enabled").unwrap_or(true);
-                let items =
-                    read_ui_list_items(component.get::<Option<Table>>("options").ok().flatten())?;
-                let option_count = items.len();
-                let mut selected_index = component.get::<usize>("selected_index").unwrap_or(0);
-                if option_count == 0 {
-                    selected_index = 0;
-                } else {
-                    selected_index = selected_index.clamp(1, option_count);
-                }
-                let mut open = component.get::<bool>("open").unwrap_or(false) && enabled;
-                let hovered = enabled
-                    && point_in_bounds(snapshot.mouse, draw.bounds, draw.pivot, draw.rotation)
-                    && !point_blocked_by_popup(snapshot.mouse, &owner_key);
-
-                let item_height = component.get::<f32>("item_height").unwrap_or(32.0).max(1.0);
-                let item_corner_radius = component
-                    .get::<f32>("item_corner_radius")
-                    .unwrap_or(6.0)
-                    .max(0.0);
-                let item_icon_size = component
-                    .get::<f32>("item_icon_size")
-                    .unwrap_or(0.0)
-                    .max(0.0);
-                let item_icon_gap = component
-                    .get::<f32>("item_icon_gap")
-                    .unwrap_or(8.0)
-                    .max(0.0);
-                let menu_gap = component.get::<f32>("menu_gap").unwrap_or(4.0).max(0.0);
-                let max_visible = component
-                    .get::<usize>("max_visible_items")
-                    .unwrap_or(option_count.max(1))
-                    .max(1);
-                let visible_count = option_count.min(max_visible);
-                let mut scroll_index = component.get::<usize>("scroll_index").unwrap_or(0);
-                if option_count > visible_count {
-                    scroll_index = scroll_index.min(option_count - visible_count);
-                } else {
-                    scroll_index = 0;
-                }
-
-                let menu_height = item_height * visible_count as f32;
-                let wants_upwards = component.get::<bool>("open_upwards").unwrap_or(false);
-                let open_upwards = wants_upwards
-                    || (draw.bounds.y + draw.bounds.h + menu_gap + menu_height
-                        > snapshot.window.height
-                        && draw.bounds.y >= menu_height + menu_gap);
-                let menu_bounds = Rect {
-                    x: draw.bounds.x,
-                    y: if open_upwards {
-                        draw.bounds.y - menu_gap - menu_height
-                    } else {
-                        draw.bounds.y + draw.bounds.h + menu_gap
-                    },
-                    w: draw.bounds.w,
-                    h: menu_height,
-                };
-                if open && visible_count > 0 {
-                    register_popup(owner_key.clone(), menu_bounds, draw.pivot, draw.rotation);
-                }
-
-                let menu_hovered = open
-                    && visible_count > 0
-                    && point_in_bounds(snapshot.mouse, menu_bounds, draw.pivot, draw.rotation)
-                    && !point_blocked_by_popup(snapshot.mouse, &owner_key);
-
-                let mut hovered_index = 0usize;
-                if menu_hovered {
-                    for visible_index in 0..visible_count {
-                        let item_bounds = Rect {
-                            x: menu_bounds.x,
-                            y: menu_bounds.y + visible_index as f32 * item_height,
-                            w: menu_bounds.w,
-                            h: item_height,
-                        };
-                        if point_in_bounds(snapshot.mouse, item_bounds, draw.pivot, draw.rotation) {
-                            hovered_index = scroll_index + visible_index + 1;
-                            break;
-                        }
-                    }
-                }
-
-                if menu_hovered && option_count > visible_count {
-                    let wheel_steps = consume_wheel_steps(
+                    renderer.queue(DrawCommand::Text(build_text_request(
+                        &dropdown_root,
                         &component,
-                        "wheel_scroll_accumulator",
-                        snapshot.input.wheel_y,
-                        3,
-                    )?;
-                    if wheel_steps > 0 {
-                        scroll_index = scroll_index.saturating_sub(wheel_steps as usize);
-                    } else if wheel_steps < 0 {
-                        scroll_index = (scroll_index + (-wheel_steps) as usize)
-                            .min(option_count - visible_count);
-                    }
-                }
-
-                if snapshot.input.mouse_pressed.contains("left") {
-                    if hovered {
-                        open = !open;
-                    } else if open && hovered_index > 0 && menu_hovered {
-                        selected_index = hovered_index;
-                        if let Some(item) = items.get(selected_index - 1) {
-                            call_component_selection_callback(
-                                &component,
-                                &entity,
-                                "onChanged",
-                                selected_index,
-                                &item.value,
-                            )?;
-                        }
-                        open = false;
-                    } else if open {
-                        open = false;
-                    }
-                }
-
-                let selected_item = items.get(selected_index.saturating_sub(1)).cloned();
-                let selected_text = selected_item
-                    .as_ref()
-                    .map(|item| item.text.clone())
-                    .unwrap_or_else(|| {
-                        component
-                            .get::<String>("placeholder")
-                            .unwrap_or_else(|_| "Select...".to_string())
-                    });
-                let selected_value = selected_item
-                    .as_ref()
-                    .map(|item| item.value.clone())
-                    .unwrap_or_default();
-                component.set("hovered", hovered)?;
-                component.set("open", open)?;
-                component.set("hover_index", hovered_index)?;
-                component.set("selected_index", selected_index)?;
-                component.set("selected_text", selected_text.clone())?;
-                component.set("selected_value", selected_value)?;
-                component.set("scroll_index", scroll_index)?;
-
-                let background_color = if !enabled {
-                    get_color_field(&component, "disabled_background_color")
-                } else if open {
-                    get_color_field(&component, "open_background_color")
-                } else if hovered {
-                    get_color_field(&component, "hover_background_color")
-                } else {
-                    get_color_field(&component, "background_color")
-                }
-                .unwrap_or(Color::rgba(36, 42, 54, 255));
-                let border_color = if !enabled {
-                    get_color_field(&component, "disabled_border_color")
-                } else if open {
-                    get_color_field(&component, "open_border_color")
-                } else if hovered {
-                    get_color_field(&component, "hover_border_color")
-                } else {
-                    get_color_field(&component, "border_color")
-                }
-                .unwrap_or(Color::rgba(112, 126, 151, 255));
-                let text_color = if !enabled {
-                    get_color_field(&component, "disabled_text_color")
-                } else {
-                    get_color_field(&component, "text_color")
-                }
-                .unwrap_or(Color::WHITE);
-                let style = resolve_panel_style(ctx, &component, background_color, border_color)?;
-                let padding = component.get::<f32>("padding").unwrap_or(8.0).max(0.0);
-                let padding_x = component
-                    .get::<f32>("padding_x")
-                    .unwrap_or(padding)
-                    .max(0.0);
-                let padding_y = component
-                    .get::<f32>("padding_y")
-                    .unwrap_or(padding)
-                    .max(0.0);
-                let arrow_width = 18.0;
-                let content_bounds = Rect {
-                    x: draw.bounds.x + style.border_width + padding_x,
-                    y: draw.bounds.y + style.border_width + padding_y,
-                    w: (draw.bounds.w - (style.border_width + padding_x) * 2.0 - arrow_width)
-                        .max(0.0),
-                    h: (draw.bounds.h - (style.border_width + padding_y) * 2.0).max(0.0),
-                };
-                let selected_item_icon = selected_item.as_ref().and_then(|item| {
-                    item.image.clone().and_then(|image| {
-                        let icon_extent = if item_icon_size > 0.0 {
-                            item_icon_size.min(content_bounds.h)
+                        if open {
+                            "^".to_string()
                         } else {
-                            content_bounds.h.max(0.0)
-                        };
-                        build_inline_image(
-                            content_bounds,
-                            image,
-                            item.image_tint,
-                            item.image_source,
-                            UiIconSide::Left,
-                            icon_extent,
-                            icon_extent,
-                            item_icon_gap,
-                        )
-                    })
-                });
-                let (text_bounds, selected_icon) = layout_inline_image(
-                    content_bounds,
-                    resolve_widget_icon(&component, content_bounds, text_color)?
-                        .or(selected_item_icon),
-                );
-                let arrow_bounds = Rect {
-                    x: draw.bounds.x + draw.bounds.w - style.border_width - padding_x - arrow_width,
-                    y: draw.bounds.y + style.border_width + padding_y,
-                    w: arrow_width,
-                    h: (draw.bounds.h - (style.border_width + padding_y) * 2.0).max(0.0),
-                };
-
-                let mut renderer = render_state
-                    .lock()
-                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
-                render_panel(
-                    &mut renderer,
-                    draw.bounds,
-                    draw.pivot,
-                    draw.rotation,
-                    &style,
-                )?;
-                if let Some(icon) = selected_icon.as_ref() {
-                    queue_inline_image(&mut renderer, &draw, icon, style.filter);
-                }
-                renderer.queue(DrawCommand::Text(build_text_request(
-                    &dropdown_root,
-                    &component,
-                    selected_text,
-                    text_bounds,
-                    draw.pivot,
-                    draw.rotation,
-                    text_color,
-                    18.0,
-                    TextAlignX::Left,
-                    TextAlignY::Center,
-                    TextScaleMode::FitWidth,
-                    TextWrapMode::None,
-                    0.0,
-                    0.0,
-                )));
-                renderer.queue(DrawCommand::Text(build_text_request(
-                    &dropdown_root,
-                    &component,
-                    if open {
-                        "^".to_string()
-                    } else {
-                        "v".to_string()
-                    },
-                    arrow_bounds,
-                    draw.pivot,
-                    draw.rotation,
-                    text_color,
-                    16.0,
-                    TextAlignX::Center,
-                    TextAlignY::Center,
-                    TextScaleMode::FitWidth,
-                    TextWrapMode::None,
-                    0.0,
-                    0.0,
-                )));
-
-                if open && visible_count > 0 {
-                    let menu_background = get_color_field(&component, "menu_background_color")
-                        .unwrap_or(background_color);
-                    let menu_border =
-                        get_color_field(&component, "menu_border_color").unwrap_or(border_color);
-                    let menu_style =
-                        resolve_panel_style(ctx, &component, menu_background, menu_border)?;
-                    let mut overlay = RenderState::default();
-                    render_panel(
-                        &mut overlay,
-                        menu_bounds,
+                            "v".to_string()
+                        },
+                        arrow_bounds,
                         draw.pivot,
                         draw.rotation,
-                        &menu_style,
+                        text_color,
+                        16.0,
+                        TextAlignX::Center,
+                        TextAlignY::Center,
+                        TextScaleMode::FitWidth,
+                        TextWrapMode::None,
+                        0.0,
+                        0.0,
+                    )));
+
+                    if open && visible_count > 0 {
+                        let menu_background = get_color_field(&component, "menu_background_color")
+                            .unwrap_or(background_color);
+                        let menu_border = get_color_field(&component, "menu_border_color")
+                            .unwrap_or(border_color);
+                        let menu_style =
+                            resolve_panel_style(ctx, &component, menu_background, menu_border)?;
+                        let mut overlay = RenderState::default();
+                        render_panel(
+                            &mut overlay,
+                            menu_bounds,
+                            draw.pivot,
+                            draw.rotation,
+                            &menu_style,
+                        )?;
+
+                        for visible_index in 0..visible_count {
+                            let option_index = scroll_index + visible_index + 1;
+                            let item_bounds = Rect {
+                                x: menu_bounds.x + menu_style.border_width,
+                                y: menu_bounds.y
+                                    + visible_index as f32 * item_height
+                                    + menu_style.border_width,
+                                w: (menu_bounds.w - menu_style.border_width * 2.0).max(0.0),
+                                h: (item_height - menu_style.border_width).max(0.0),
+                            };
+                            let item_background = if option_index == selected_index {
+                                get_color_field(&component, "item_selected_background_color")
+                            } else if option_index == hovered_index {
+                                get_color_field(&component, "item_hover_background_color")
+                            } else {
+                                get_color_field(&component, "item_background_color")
+                            }
+                            .unwrap_or(Color::rgba(0, 0, 0, 0));
+                            if item_background.a > 0 {
+                                queue_rounded_rect_fill(
+                                    &mut overlay,
+                                    item_bounds,
+                                    draw.pivot,
+                                    draw.rotation,
+                                    item_background,
+                                    item_corner_radius,
+                                );
+                            }
+                            let item_text = if option_index == selected_index {
+                                get_color_field(&component, "item_selected_text_color")
+                            } else if option_index == hovered_index {
+                                get_color_field(&component, "item_hover_text_color")
+                            } else {
+                                get_color_field(&component, "item_text_color")
+                            }
+                            .unwrap_or(text_color);
+                            if let Some(item) = items.get(option_index - 1) {
+                                let item_content_bounds = Rect {
+                                    x: item_bounds.x + padding_x,
+                                    y: item_bounds.y + padding_y.min(item_height * 0.25),
+                                    w: (item_bounds.w - padding_x * 2.0).max(0.0),
+                                    h: (item_bounds.h - padding_y * 2.0).max(0.0),
+                                };
+                                let item_icon = item.image.clone().and_then(|image| {
+                                    let icon_extent = if item_icon_size > 0.0 {
+                                        item_icon_size.min(item_content_bounds.h)
+                                    } else {
+                                        item_content_bounds.h.max(0.0)
+                                    };
+                                    build_inline_image(
+                                        item_content_bounds,
+                                        image,
+                                        item.image_tint,
+                                        item.image_source,
+                                        UiIconSide::Left,
+                                        icon_extent,
+                                        icon_extent,
+                                        item_icon_gap,
+                                    )
+                                });
+                                let (item_text_bounds, item_icon) =
+                                    layout_inline_image(item_content_bounds, item_icon);
+                                if let Some(item_icon) = item_icon.as_ref() {
+                                    queue_inline_image(
+                                        &mut overlay,
+                                        &draw,
+                                        item_icon,
+                                        menu_style.filter,
+                                    );
+                                }
+                                overlay.queue(DrawCommand::Text(build_text_request(
+                                    &dropdown_root,
+                                    &component,
+                                    item.text.clone(),
+                                    item_text_bounds,
+                                    draw.pivot,
+                                    draw.rotation,
+                                    item_text,
+                                    18.0,
+                                    TextAlignX::Left,
+                                    TextAlignY::Center,
+                                    TextScaleMode::FitWidth,
+                                    TextWrapMode::None,
+                                    0.0,
+                                    0.0,
+                                )));
+                            }
+                        }
+
+                        renderer.extend_overlay(overlay.drain());
+                    }
+
+                    Ok(())
+                })?,
+            )?;
+
+            core_components.set("Dropdown", dropdown)?;
+        }
+
+        // ScrollList
+        // scrolling list view with selection, keyboard navigation, and customizable item styling
+        {
+            let scroll_list = create_basic_drawable(lua)?;
+            scroll_list.set(
+                "awake",
+                lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
+                    component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
+                    component.set("visible", true)?;
+                    component.set("__neolove_component", "ScrollList")?;
+                    component.set("enabled", true)?;
+                    component.set("hovered", false)?;
+                    component.set("focused", false)?;
+                    component.set("hover_index", 0)?;
+                    component.set("selected_index", 0)?;
+                    component.set("selected_text", "")?;
+                    component.set("selected_value", "")?;
+                    component.set("scroll_index", 0)?;
+                    component.set("wheel_scroll_accumulator", 0.0)?;
+                    component.set("options", ctx.create_table()?)?;
+                    component.set("empty_text", "No items")?;
+                    component.set("item_height", 32.0)?;
+                    component.set("item_spacing", 4.0)?;
+                    component.set("item_corner_radius", 6.0)?;
+                    component.set("item_icon_size", 0.0)?;
+                    component.set("item_icon_gap", 8.0)?;
+                    component.set("item_padding_x", 10.0)?;
+                    component.set("item_padding_y", 6.0)?;
+                    component.set("show_scrollbar", true)?;
+                    component.set("scrollbar_width", 8.0)?;
+                    component.set("scrollbar_dragging", false)?;
+                    component.set("scrollbar_drag_offset", 0.0)?;
+                    component.set("scale", 18.0)?;
+                    component.set("min_scale", 12.0)?;
+                    component.set("align_x", "left")?;
+                    component.set("align_y", "center")?;
+                    component.set("text_scale", "fit_width")?;
+                    component.set("wrap", "none")?;
+                    component.set("padding", 8.0)?;
+                    component.set("padding_x", 10.0)?;
+                    component.set("padding_y", 10.0)?;
+                    component.set("line_spacing", 1.0)?;
+                    component.set("letter_spacing", 0.0)?;
+                    component.set("font", Value::Nil)?;
+                    component.set("background_color", color4(ctx, 24, 29, 36, 245)?)?;
+                    component.set("hover_background_color", color4(ctx, 28, 34, 42, 250)?)?;
+                    component.set("focus_background_color", color4(ctx, 18, 24, 34, 255)?)?;
+                    component.set("disabled_background_color", color4(ctx, 34, 36, 40, 200)?)?;
+                    component.set("border_color", color4(ctx, 92, 106, 128, 255)?)?;
+                    component.set("hover_border_color", color4(ctx, 126, 146, 176, 255)?)?;
+                    component.set("focus_border_color", color4(ctx, 176, 214, 255, 255)?)?;
+                    component.set("disabled_border_color", color4(ctx, 74, 78, 88, 180)?)?;
+                    component.set("text_color", color4(ctx, 234, 239, 246, 255)?)?;
+                    component.set("empty_text_color", color4(ctx, 146, 156, 170, 220)?)?;
+                    component.set("disabled_text_color", color4(ctx, 164, 168, 176, 210)?)?;
+                    component.set("item_background_color", color4(ctx, 0, 0, 0, 0)?)?;
+                    component.set(
+                        "item_hover_background_color",
+                        color4(ctx, 60, 78, 107, 235)?,
                     )?;
+                    component.set(
+                        "item_selected_background_color",
+                        color4(ctx, 42, 58, 84, 245)?,
+                    )?;
+                    component.set("item_text_color", color4(ctx, 234, 239, 246, 255)?)?;
+                    component.set("item_hover_text_color", color4(ctx, 255, 255, 255, 255)?)?;
+                    component.set("item_selected_text_color", color4(ctx, 255, 255, 255, 255)?)?;
+                    component.set("scrollbar_color", color4(ctx, 56, 64, 78, 180)?)?;
+                    component.set("scrollbar_thumb_color", color4(ctx, 176, 214, 255, 235)?)?;
+                    component.set("border_width", 1.0)?;
+                    component.set("corner_radius", 8.0)?;
+                    component.set("background_image", Value::Nil)?;
+                    component.set("slice_left", 0.0)?;
+                    component.set("slice_right", 0.0)?;
+                    component.set("slice_top", 0.0)?;
+                    component.set("slice_bottom", 0.0)?;
+                    Ok(())
+                })?,
+            )?;
+
+            let scroll_list_platform = platform.clone();
+            let scroll_list_root = env_root.clone();
+            let render_state = render_state.clone();
+            scroll_list.set(
+                "update",
+                lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
+                    if !component.get::<bool>("visible").unwrap_or(true) {
+                        return Ok(());
+                    }
+
+                    let draw = get_entity_draw_context(&entity)?;
+                    let snapshot = current_input_snapshot(&scroll_list_platform)?;
+                    let owner_key = component_owner_key(&entity, &component);
+                    let enabled = component.get::<bool>("enabled").unwrap_or(true);
+                    let hovered = enabled
+                        && point_in_bounds(snapshot.mouse, draw.bounds, draw.pivot, draw.rotation)
+                        && !point_blocked_by_popup(snapshot.mouse, &owner_key);
+                    let was_focused = component.get::<bool>("focused").unwrap_or(false);
+                    let mut focused = was_focused;
+                    if !enabled {
+                        focused = false;
+                    } else if snapshot.input.mouse_pressed.contains("left") {
+                        focused = hovered;
+                    }
+                    let focus_changed = focused != was_focused;
+
+                    let items = read_ui_list_items(
+                        component.get::<Option<Table>>("options").ok().flatten(),
+                    )?;
+                    let option_count = items.len();
+                    let mut selected_index = component.get::<usize>("selected_index").unwrap_or(0);
+                    if selected_index > option_count {
+                        selected_index = option_count;
+                    }
+
+                    let padding = component.get::<f32>("padding").unwrap_or(8.0).max(0.0);
+                    let padding_x = component
+                        .get::<f32>("padding_x")
+                        .unwrap_or(padding)
+                        .max(0.0);
+                    let padding_y = component
+                        .get::<f32>("padding_y")
+                        .unwrap_or(padding)
+                        .max(0.0);
+                    let item_height = component.get::<f32>("item_height").unwrap_or(32.0).max(1.0);
+                    let item_spacing = component.get::<f32>("item_spacing").unwrap_or(4.0).max(0.0);
+                    let item_corner_radius = component
+                        .get::<f32>("item_corner_radius")
+                        .unwrap_or(6.0)
+                        .max(0.0);
+                    let item_icon_size = component
+                        .get::<f32>("item_icon_size")
+                        .unwrap_or(0.0)
+                        .max(0.0);
+                    let item_icon_gap = component
+                        .get::<f32>("item_icon_gap")
+                        .unwrap_or(8.0)
+                        .max(0.0);
+                    let item_padding_x = component
+                        .get::<f32>("item_padding_x")
+                        .unwrap_or(10.0)
+                        .max(0.0);
+                    let item_padding_y = component
+                        .get::<f32>("item_padding_y")
+                        .unwrap_or(6.0)
+                        .max(0.0);
+                    let show_scrollbar = component.get::<bool>("show_scrollbar").unwrap_or(true);
+                    let scrollbar_width = component
+                        .get::<f32>("scrollbar_width")
+                        .unwrap_or(8.0)
+                        .max(0.0);
+                    let row_stride = item_height + item_spacing;
+                    let left_pressed = snapshot.input.mouse_pressed.contains("left");
+                    let left_down = snapshot.input.mouse_down.contains("left");
+
+                    let background_color = if !enabled {
+                        get_color_field(&component, "disabled_background_color")
+                    } else if focused {
+                        get_color_field(&component, "focus_background_color")
+                    } else if hovered {
+                        get_color_field(&component, "hover_background_color")
+                    } else {
+                        get_color_field(&component, "background_color")
+                    }
+                    .unwrap_or(Color::rgba(24, 29, 36, 245));
+                    let border_color = if !enabled {
+                        get_color_field(&component, "disabled_border_color")
+                    } else if focused {
+                        get_color_field(&component, "focus_border_color")
+                    } else if hovered {
+                        get_color_field(&component, "hover_border_color")
+                    } else {
+                        get_color_field(&component, "border_color")
+                    }
+                    .unwrap_or(Color::rgba(92, 106, 128, 255));
+                    let text_color = if !enabled {
+                        get_color_field(&component, "disabled_text_color")
+                    } else {
+                        get_color_field(&component, "text_color")
+                    }
+                    .unwrap_or(Color::WHITE);
+                    let empty_text_color = if !enabled {
+                        get_color_field(&component, "disabled_text_color")
+                    } else {
+                        get_color_field(&component, "empty_text_color")
+                    }
+                    .unwrap_or(text_color);
+                    let scrollbar_color =
+                        get_color_field(&component, "scrollbar_color").unwrap_or(border_color);
+                    let scrollbar_thumb_color =
+                        get_color_field(&component, "scrollbar_thumb_color")
+                            .unwrap_or(Color::rgba(176, 214, 255, 235));
+                    let style =
+                        resolve_panel_style(ctx, &component, background_color, border_color)?;
+                    let inner_bounds = Rect {
+                        x: draw.bounds.x + style.border_width + padding_x,
+                        y: draw.bounds.y + style.border_width + padding_y,
+                        w: (draw.bounds.w - (style.border_width + padding_x) * 2.0).max(0.0),
+                        h: (draw.bounds.h - (style.border_width + padding_y) * 2.0).max(0.0),
+                    };
+
+                    let visible_capacity = if inner_bounds.h <= 0.0 || row_stride <= 0.0 {
+                        0
+                    } else {
+                        (((inner_bounds.h + item_spacing) / row_stride).floor() as usize).max(1)
+                    };
+                    let visible_count = option_count.min(visible_capacity);
+                    let mut scroll_index = component.get::<usize>("scroll_index").unwrap_or(0);
+                    if option_count > visible_count && visible_count > 0 {
+                        scroll_index = scroll_index.min(option_count - visible_count);
+                    } else {
+                        scroll_index = 0;
+                    }
+
+                    let overflow = option_count > visible_count && visible_count > 0;
+                    let scrollbar_gap = if overflow && show_scrollbar && scrollbar_width > 0.0 {
+                        item_spacing.max(4.0)
+                    } else {
+                        0.0
+                    };
+                    let mut list_bounds = inner_bounds;
+                    if overflow && show_scrollbar && scrollbar_width > 0.0 {
+                        list_bounds.w = (list_bounds.w - scrollbar_width - scrollbar_gap).max(0.0);
+                    }
+
+                    let max_scroll = option_count.saturating_sub(visible_count);
+                    let local_mouse =
+                        world_point_to_local(snapshot.mouse, draw.pivot, draw.rotation);
+                    let track_bounds = if overflow && show_scrollbar && scrollbar_width > 0.0 {
+                        Some(Rect {
+                            x: inner_bounds.x + inner_bounds.w - scrollbar_width,
+                            y: inner_bounds.y,
+                            w: scrollbar_width,
+                            h: inner_bounds.h,
+                        })
+                    } else {
+                        None
+                    };
+                    let thumb_bounds = track_bounds.map(|track_bounds| {
+                        let thumb_height = (track_bounds.h * visible_count as f32
+                            / option_count as f32)
+                            .max((item_height * 0.75).min(track_bounds.h))
+                            .min(track_bounds.h);
+                        let thumb_y = if max_scroll == 0 {
+                            track_bounds.y
+                        } else {
+                            track_bounds.y
+                                + (track_bounds.h - thumb_height)
+                                    * (scroll_index as f32 / max_scroll as f32)
+                        };
+                        Rect {
+                            x: track_bounds.x,
+                            y: thumb_y,
+                            w: track_bounds.w,
+                            h: thumb_height,
+                        }
+                    });
+                    let track_hovered = track_bounds
+                        .map(|track_bounds| {
+                            point_in_bounds(snapshot.mouse, track_bounds, draw.pivot, draw.rotation)
+                                && !point_blocked_by_popup(snapshot.mouse, &owner_key)
+                        })
+                        .unwrap_or(false);
+                    let thumb_hovered = thumb_bounds
+                        .map(|thumb_bounds| {
+                            point_in_bounds(snapshot.mouse, thumb_bounds, draw.pivot, draw.rotation)
+                                && !point_blocked_by_popup(snapshot.mouse, &owner_key)
+                        })
+                        .unwrap_or(false);
+                    let mut scrollbar_dragging =
+                        component.get::<bool>("scrollbar_dragging").unwrap_or(false) && enabled;
+                    let mut scrollbar_drag_offset = component
+                        .get::<f32>("scrollbar_drag_offset")
+                        .unwrap_or(0.0)
+                        .max(0.0);
+                    if !left_down {
+                        scrollbar_dragging = false;
+                    }
+
+                    if enabled && left_pressed {
+                        if let Some(thumb_bounds) = thumb_bounds {
+                            if thumb_hovered {
+                                scrollbar_dragging = true;
+                                scrollbar_drag_offset = (local_mouse.y - thumb_bounds.y)
+                                    .clamp(0.0, thumb_bounds.h.max(0.0));
+                                focused = true;
+                            } else if track_hovered {
+                                scrollbar_dragging = true;
+                                scrollbar_drag_offset = thumb_bounds.h * 0.5;
+                                focused = true;
+                            }
+                        }
+                    }
+
+                    if overflow && scrollbar_dragging && left_down {
+                        if let (Some(track_bounds), Some(thumb_bounds)) =
+                            (track_bounds, thumb_bounds)
+                        {
+                            let available = (track_bounds.h - thumb_bounds.h).max(0.0);
+                            let thumb_top = if available <= 0.0 {
+                                track_bounds.y
+                            } else {
+                                (local_mouse.y - scrollbar_drag_offset)
+                                    .clamp(track_bounds.y, track_bounds.y + available)
+                            };
+                            scroll_index = if max_scroll == 0 || available <= 0.0 {
+                                0
+                            } else {
+                                (((thumb_top - track_bounds.y) / available) * max_scroll as f32)
+                                    .round() as usize
+                            }
+                            .min(max_scroll);
+                        }
+                    } else if overflow && hovered {
+                        let wheel_steps = consume_wheel_steps(
+                            &component,
+                            "wheel_scroll_accumulator",
+                            snapshot.input.wheel_y,
+                            4,
+                        )?;
+                        if wheel_steps > 0 {
+                            scroll_index = scroll_index.saturating_sub(wheel_steps as usize);
+                        } else if wheel_steps < 0 {
+                            scroll_index = (scroll_index + (-wheel_steps) as usize).min(max_scroll);
+                        }
+                    }
+
+                    let mut selection_changed = false;
+                    if focused && enabled && option_count > 0 {
+                        if let Some(key) = snapshot.input.last_key_pressed.clone() {
+                            let mut next_selected = selected_index;
+                            match key.as_str() {
+                                "up" => {
+                                    next_selected = if selected_index > 1 {
+                                        selected_index - 1
+                                    } else {
+                                        1
+                                    };
+                                }
+                                "down" => {
+                                    next_selected = if selected_index == 0 {
+                                        1
+                                    } else {
+                                        (selected_index + 1).min(option_count)
+                                    };
+                                }
+                                "pageup" => {
+                                    let step = visible_count.max(1);
+                                    next_selected = if selected_index == 0 {
+                                        1
+                                    } else {
+                                        selected_index.saturating_sub(step).max(1)
+                                    };
+                                }
+                                "pagedown" => {
+                                    let step = visible_count.max(1);
+                                    next_selected = if selected_index == 0 {
+                                        1
+                                    } else {
+                                        (selected_index + step).min(option_count)
+                                    };
+                                }
+                                "home" => next_selected = 1,
+                                "end" => next_selected = option_count,
+                                _ => {}
+                            }
+
+                            if next_selected != selected_index {
+                                selected_index = next_selected;
+                                selection_changed = true;
+                            }
+                        }
+                    }
+
+                    let mut hovered_index = 0usize;
+                    if enabled && option_count > 0 && visible_count > 0 && list_bounds.w > 0.0 {
+                        for visible_index in 0..visible_count {
+                            let item_y = list_bounds.y + visible_index as f32 * row_stride;
+                            let item_bounds = Rect {
+                                x: list_bounds.x,
+                                y: item_y,
+                                w: list_bounds.w,
+                                h: item_height
+                                    .min((list_bounds.y + list_bounds.h - item_y).max(0.0)),
+                            };
+                            if item_bounds.h <= 0.0 {
+                                continue;
+                            }
+                            if point_in_bounds(
+                                snapshot.mouse,
+                                item_bounds,
+                                draw.pivot,
+                                draw.rotation,
+                            ) && !point_blocked_by_popup(snapshot.mouse, &owner_key)
+                            {
+                                hovered_index = scroll_index + visible_index + 1;
+                                break;
+                            }
+                        }
+                    }
+
+                    if enabled
+                        && left_pressed
+                        && !scrollbar_dragging
+                        && hovered_index > 0
+                        && hovered_index != selected_index
+                    {
+                        selected_index = hovered_index;
+                        selection_changed = true;
+                    }
+
+                    if selected_index > 0 && visible_count > 0 {
+                        if selected_index <= scroll_index {
+                            scroll_index = selected_index - 1;
+                        } else if selected_index > scroll_index + visible_count {
+                            scroll_index = selected_index - visible_count;
+                        }
+                    }
+                    scroll_index = scroll_index.min(max_scroll);
+                    let thumb_bounds = track_bounds.map(|track_bounds| {
+                        let thumb_height = (track_bounds.h * visible_count as f32
+                            / option_count as f32)
+                            .max((item_height * 0.75).min(track_bounds.h))
+                            .min(track_bounds.h);
+                        let thumb_y = if max_scroll == 0 {
+                            track_bounds.y
+                        } else {
+                            track_bounds.y
+                                + (track_bounds.h - thumb_height)
+                                    * (scroll_index as f32 / max_scroll as f32)
+                        };
+                        Rect {
+                            x: track_bounds.x,
+                            y: thumb_y,
+                            w: track_bounds.w,
+                            h: thumb_height,
+                        }
+                    });
+
+                    let selected_item = items.get(selected_index.saturating_sub(1)).cloned();
+                    let selected_text = selected_item
+                        .as_ref()
+                        .map(|item| item.text.clone())
+                        .unwrap_or_default();
+                    let selected_value = selected_item
+                        .as_ref()
+                        .map(|item| item.value.clone())
+                        .unwrap_or_default();
+
+                    component.set("hovered", hovered)?;
+                    component.set("focused", focused)?;
+                    component.set("hover_index", hovered_index)?;
+                    component.set("selected_index", selected_index)?;
+                    component.set("selected_text", selected_text.clone())?;
+                    component.set("selected_value", selected_value.clone())?;
+                    component.set("scroll_index", scroll_index)?;
+                    component.set("scrollbar_dragging", scrollbar_dragging)?;
+                    component.set("scrollbar_drag_offset", scrollbar_drag_offset)?;
+
+                    if focus_changed {
+                        if focused {
+                            call_component_callback(&component, &entity, "onFocus")?;
+                        } else {
+                            call_component_callback(&component, &entity, "onBlur")?;
+                        }
+                    }
+                    if selection_changed && selected_index > 0 {
+                        call_component_selection_callback(
+                            &component,
+                            &entity,
+                            "onChanged",
+                            selected_index,
+                            &selected_value,
+                        )?;
+                    }
+
+                    let mut renderer = render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
+                    render_panel(
+                        &mut renderer,
+                        draw.bounds,
+                        draw.pivot,
+                        draw.rotation,
+                        &style,
+                    )?;
+
+                    if option_count == 0 {
+                        let empty_text = component
+                            .get::<String>("empty_text")
+                            .unwrap_or_else(|_| "No items".to_string());
+                        if !empty_text.is_empty() {
+                            renderer.queue(DrawCommand::Text(build_text_request(
+                                &scroll_list_root,
+                                &component,
+                                empty_text,
+                                inner_bounds,
+                                draw.pivot,
+                                draw.rotation,
+                                empty_text_color,
+                                18.0,
+                                TextAlignX::Left,
+                                TextAlignY::Center,
+                                TextScaleMode::FitWidth,
+                                TextWrapMode::None,
+                                0.0,
+                                0.0,
+                            )));
+                        }
+                        return Ok(());
+                    }
 
                     for visible_index in 0..visible_count {
                         let option_index = scroll_index + visible_index + 1;
+                        let item_y = list_bounds.y + visible_index as f32 * row_stride;
                         let item_bounds = Rect {
-                            x: menu_bounds.x + menu_style.border_width,
-                            y: menu_bounds.y
-                                + visible_index as f32 * item_height
-                                + menu_style.border_width,
-                            w: (menu_bounds.w - menu_style.border_width * 2.0).max(0.0),
-                            h: (item_height - menu_style.border_width).max(0.0),
+                            x: list_bounds.x,
+                            y: item_y,
+                            w: list_bounds.w,
+                            h: item_height.min((list_bounds.y + list_bounds.h - item_y).max(0.0)),
                         };
+                        if item_bounds.w <= 0.0 || item_bounds.h <= 0.0 {
+                            continue;
+                        }
+
                         let item_background = if option_index == selected_index {
                             get_color_field(&component, "item_selected_background_color")
                         } else if option_index == hovered_index {
@@ -3236,7 +4101,7 @@ pub fn add_core_components(
                         .unwrap_or(Color::rgba(0, 0, 0, 0));
                         if item_background.a > 0 {
                             queue_rounded_rect_fill(
-                                &mut overlay,
+                                &mut renderer,
                                 item_bounds,
                                 draw.pivot,
                                 draw.rotation,
@@ -3244,7 +4109,10 @@ pub fn add_core_components(
                                 item_corner_radius,
                             );
                         }
-                        let item_text = if option_index == selected_index {
+
+                        let item_text_color = if !enabled {
+                            get_color_field(&component, "disabled_text_color")
+                        } else if option_index == selected_index {
                             get_color_field(&component, "item_selected_text_color")
                         } else if option_index == hovered_index {
                             get_color_field(&component, "item_hover_text_color")
@@ -3252,12 +4120,13 @@ pub fn add_core_components(
                             get_color_field(&component, "item_text_color")
                         }
                         .unwrap_or(text_color);
+
                         if let Some(item) = items.get(option_index - 1) {
                             let item_content_bounds = Rect {
-                                x: item_bounds.x + padding_x,
-                                y: item_bounds.y + padding_y.min(item_height * 0.25),
-                                w: (item_bounds.w - padding_x * 2.0).max(0.0),
-                                h: (item_bounds.h - padding_y * 2.0).max(0.0),
+                                x: item_bounds.x + item_padding_x,
+                                y: item_bounds.y + item_padding_y,
+                                w: (item_bounds.w - item_padding_x * 2.0).max(0.0),
+                                h: (item_bounds.h - item_padding_y * 2.0).max(0.0),
                             };
                             let item_icon = item.image.clone().and_then(|image| {
                                 let icon_extent = if item_icon_size > 0.0 {
@@ -3279,21 +4148,16 @@ pub fn add_core_components(
                             let (item_text_bounds, item_icon) =
                                 layout_inline_image(item_content_bounds, item_icon);
                             if let Some(item_icon) = item_icon.as_ref() {
-                                queue_inline_image(
-                                    &mut overlay,
-                                    &draw,
-                                    item_icon,
-                                    menu_style.filter,
-                                );
+                                queue_inline_image(&mut renderer, &draw, item_icon, style.filter);
                             }
-                            overlay.queue(DrawCommand::Text(build_text_request(
-                                &dropdown_root,
+                            renderer.queue(DrawCommand::Text(build_text_request(
+                                &scroll_list_root,
                                 &component,
                                 item.text.clone(),
                                 item_text_bounds,
                                 draw.pivot,
                                 draw.rotation,
-                                item_text,
+                                item_text_color,
                                 18.0,
                                 TextAlignX::Left,
                                 TextAlignY::Center,
@@ -3305,633 +4169,31 @@ pub fn add_core_components(
                         }
                     }
 
-                    renderer.extend_overlay(overlay.drain());
-                }
-
-                Ok(())
-            })?,
-        )?;
-
-        core_components.set("Dropdown", dropdown)?;
-    }
-
-    // ScrollList
-    // scrolling list view with selection, keyboard navigation, and customizable item styling
-    {
-        let scroll_list = create_basic_drawable(lua)?;
-        scroll_list.set(
-            "awake",
-            lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
-                component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
-                component.set("visible", true)?;
-                component.set("__neolove_component", "ScrollList")?;
-                component.set("enabled", true)?;
-                component.set("hovered", false)?;
-                component.set("focused", false)?;
-                component.set("hover_index", 0)?;
-                component.set("selected_index", 0)?;
-                component.set("selected_text", "")?;
-                component.set("selected_value", "")?;
-                component.set("scroll_index", 0)?;
-                component.set("wheel_scroll_accumulator", 0.0)?;
-                component.set("options", ctx.create_table()?)?;
-                component.set("empty_text", "No items")?;
-                component.set("item_height", 32.0)?;
-                component.set("item_spacing", 4.0)?;
-                component.set("item_corner_radius", 6.0)?;
-                component.set("item_icon_size", 0.0)?;
-                component.set("item_icon_gap", 8.0)?;
-                component.set("item_padding_x", 10.0)?;
-                component.set("item_padding_y", 6.0)?;
-                component.set("show_scrollbar", true)?;
-                component.set("scrollbar_width", 8.0)?;
-                component.set("scrollbar_dragging", false)?;
-                component.set("scrollbar_drag_offset", 0.0)?;
-                component.set("scale", 18.0)?;
-                component.set("min_scale", 12.0)?;
-                component.set("align_x", "left")?;
-                component.set("align_y", "center")?;
-                component.set("text_scale", "fit_width")?;
-                component.set("wrap", "none")?;
-                component.set("padding", 8.0)?;
-                component.set("padding_x", 10.0)?;
-                component.set("padding_y", 10.0)?;
-                component.set("line_spacing", 1.0)?;
-                component.set("letter_spacing", 0.0)?;
-                component.set("font", Value::Nil)?;
-                component.set("background_color", color4(ctx, 24, 29, 36, 245)?)?;
-                component.set("hover_background_color", color4(ctx, 28, 34, 42, 250)?)?;
-                component.set("focus_background_color", color4(ctx, 18, 24, 34, 255)?)?;
-                component.set("disabled_background_color", color4(ctx, 34, 36, 40, 200)?)?;
-                component.set("border_color", color4(ctx, 92, 106, 128, 255)?)?;
-                component.set("hover_border_color", color4(ctx, 126, 146, 176, 255)?)?;
-                component.set("focus_border_color", color4(ctx, 176, 214, 255, 255)?)?;
-                component.set("disabled_border_color", color4(ctx, 74, 78, 88, 180)?)?;
-                component.set("text_color", color4(ctx, 234, 239, 246, 255)?)?;
-                component.set("empty_text_color", color4(ctx, 146, 156, 170, 220)?)?;
-                component.set("disabled_text_color", color4(ctx, 164, 168, 176, 210)?)?;
-                component.set("item_background_color", color4(ctx, 0, 0, 0, 0)?)?;
-                component.set(
-                    "item_hover_background_color",
-                    color4(ctx, 60, 78, 107, 235)?,
-                )?;
-                component.set(
-                    "item_selected_background_color",
-                    color4(ctx, 42, 58, 84, 245)?,
-                )?;
-                component.set("item_text_color", color4(ctx, 234, 239, 246, 255)?)?;
-                component.set("item_hover_text_color", color4(ctx, 255, 255, 255, 255)?)?;
-                component.set("item_selected_text_color", color4(ctx, 255, 255, 255, 255)?)?;
-                component.set("scrollbar_color", color4(ctx, 56, 64, 78, 180)?)?;
-                component.set("scrollbar_thumb_color", color4(ctx, 176, 214, 255, 235)?)?;
-                component.set("border_width", 1.0)?;
-                component.set("corner_radius", 8.0)?;
-                component.set("background_image", Value::Nil)?;
-                component.set("slice_left", 0.0)?;
-                component.set("slice_right", 0.0)?;
-                component.set("slice_top", 0.0)?;
-                component.set("slice_bottom", 0.0)?;
-                Ok(())
-            })?,
-        )?;
-
-        let scroll_list_platform = platform.clone();
-        let scroll_list_root = env_root.clone();
-        let render_state = render_state.clone();
-        scroll_list.set(
-            "update",
-            lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
-                if !component.get::<bool>("visible").unwrap_or(true) {
-                    return Ok(());
-                }
-
-                let draw = get_entity_draw_context(&entity)?;
-                let snapshot = current_input_snapshot(&scroll_list_platform)?;
-                let owner_key = component_owner_key(&entity, &component);
-                let enabled = component.get::<bool>("enabled").unwrap_or(true);
-                let hovered = enabled
-                    && point_in_bounds(snapshot.mouse, draw.bounds, draw.pivot, draw.rotation)
-                    && !point_blocked_by_popup(snapshot.mouse, &owner_key);
-                let was_focused = component.get::<bool>("focused").unwrap_or(false);
-                let mut focused = was_focused;
-                if !enabled {
-                    focused = false;
-                } else if snapshot.input.mouse_pressed.contains("left") {
-                    focused = hovered;
-                }
-                let focus_changed = focused != was_focused;
-
-                let items =
-                    read_ui_list_items(component.get::<Option<Table>>("options").ok().flatten())?;
-                let option_count = items.len();
-                let mut selected_index = component.get::<usize>("selected_index").unwrap_or(0);
-                if selected_index > option_count {
-                    selected_index = option_count;
-                }
-
-                let padding = component.get::<f32>("padding").unwrap_or(8.0).max(0.0);
-                let padding_x = component
-                    .get::<f32>("padding_x")
-                    .unwrap_or(padding)
-                    .max(0.0);
-                let padding_y = component
-                    .get::<f32>("padding_y")
-                    .unwrap_or(padding)
-                    .max(0.0);
-                let item_height = component.get::<f32>("item_height").unwrap_or(32.0).max(1.0);
-                let item_spacing = component.get::<f32>("item_spacing").unwrap_or(4.0).max(0.0);
-                let item_corner_radius = component
-                    .get::<f32>("item_corner_radius")
-                    .unwrap_or(6.0)
-                    .max(0.0);
-                let item_icon_size = component
-                    .get::<f32>("item_icon_size")
-                    .unwrap_or(0.0)
-                    .max(0.0);
-                let item_icon_gap = component
-                    .get::<f32>("item_icon_gap")
-                    .unwrap_or(8.0)
-                    .max(0.0);
-                let item_padding_x = component
-                    .get::<f32>("item_padding_x")
-                    .unwrap_or(10.0)
-                    .max(0.0);
-                let item_padding_y = component
-                    .get::<f32>("item_padding_y")
-                    .unwrap_or(6.0)
-                    .max(0.0);
-                let show_scrollbar = component.get::<bool>("show_scrollbar").unwrap_or(true);
-                let scrollbar_width = component
-                    .get::<f32>("scrollbar_width")
-                    .unwrap_or(8.0)
-                    .max(0.0);
-                let row_stride = item_height + item_spacing;
-                let left_pressed = snapshot.input.mouse_pressed.contains("left");
-                let left_down = snapshot.input.mouse_down.contains("left");
-
-                let background_color = if !enabled {
-                    get_color_field(&component, "disabled_background_color")
-                } else if focused {
-                    get_color_field(&component, "focus_background_color")
-                } else if hovered {
-                    get_color_field(&component, "hover_background_color")
-                } else {
-                    get_color_field(&component, "background_color")
-                }
-                .unwrap_or(Color::rgba(24, 29, 36, 245));
-                let border_color = if !enabled {
-                    get_color_field(&component, "disabled_border_color")
-                } else if focused {
-                    get_color_field(&component, "focus_border_color")
-                } else if hovered {
-                    get_color_field(&component, "hover_border_color")
-                } else {
-                    get_color_field(&component, "border_color")
-                }
-                .unwrap_or(Color::rgba(92, 106, 128, 255));
-                let text_color = if !enabled {
-                    get_color_field(&component, "disabled_text_color")
-                } else {
-                    get_color_field(&component, "text_color")
-                }
-                .unwrap_or(Color::WHITE);
-                let empty_text_color = if !enabled {
-                    get_color_field(&component, "disabled_text_color")
-                } else {
-                    get_color_field(&component, "empty_text_color")
-                }
-                .unwrap_or(text_color);
-                let scrollbar_color =
-                    get_color_field(&component, "scrollbar_color").unwrap_or(border_color);
-                let scrollbar_thumb_color = get_color_field(&component, "scrollbar_thumb_color")
-                    .unwrap_or(Color::rgba(176, 214, 255, 235));
-                let style = resolve_panel_style(ctx, &component, background_color, border_color)?;
-                let inner_bounds = Rect {
-                    x: draw.bounds.x + style.border_width + padding_x,
-                    y: draw.bounds.y + style.border_width + padding_y,
-                    w: (draw.bounds.w - (style.border_width + padding_x) * 2.0).max(0.0),
-                    h: (draw.bounds.h - (style.border_width + padding_y) * 2.0).max(0.0),
-                };
-
-                let visible_capacity = if inner_bounds.h <= 0.0 || row_stride <= 0.0 {
-                    0
-                } else {
-                    (((inner_bounds.h + item_spacing) / row_stride).floor() as usize).max(1)
-                };
-                let visible_count = option_count.min(visible_capacity);
-                let mut scroll_index = component.get::<usize>("scroll_index").unwrap_or(0);
-                if option_count > visible_count && visible_count > 0 {
-                    scroll_index = scroll_index.min(option_count - visible_count);
-                } else {
-                    scroll_index = 0;
-                }
-
-                let overflow = option_count > visible_count && visible_count > 0;
-                let scrollbar_gap = if overflow && show_scrollbar && scrollbar_width > 0.0 {
-                    item_spacing.max(4.0)
-                } else {
-                    0.0
-                };
-                let mut list_bounds = inner_bounds;
-                if overflow && show_scrollbar && scrollbar_width > 0.0 {
-                    list_bounds.w = (list_bounds.w - scrollbar_width - scrollbar_gap).max(0.0);
-                }
-
-                let max_scroll = option_count.saturating_sub(visible_count);
-                let local_mouse = world_point_to_local(snapshot.mouse, draw.pivot, draw.rotation);
-                let track_bounds = if overflow && show_scrollbar && scrollbar_width > 0.0 {
-                    Some(Rect {
-                        x: inner_bounds.x + inner_bounds.w - scrollbar_width,
-                        y: inner_bounds.y,
-                        w: scrollbar_width,
-                        h: inner_bounds.h,
-                    })
-                } else {
-                    None
-                };
-                let thumb_bounds = track_bounds.map(|track_bounds| {
-                    let thumb_height = (track_bounds.h * visible_count as f32
-                        / option_count as f32)
-                        .max((item_height * 0.75).min(track_bounds.h))
-                        .min(track_bounds.h);
-                    let thumb_y = if max_scroll == 0 {
-                        track_bounds.y
-                    } else {
-                        track_bounds.y
-                            + (track_bounds.h - thumb_height)
-                                * (scroll_index as f32 / max_scroll as f32)
-                    };
-                    Rect {
-                        x: track_bounds.x,
-                        y: thumb_y,
-                        w: track_bounds.w,
-                        h: thumb_height,
-                    }
-                });
-                let track_hovered = track_bounds
-                    .map(|track_bounds| {
-                        point_in_bounds(snapshot.mouse, track_bounds, draw.pivot, draw.rotation)
-                            && !point_blocked_by_popup(snapshot.mouse, &owner_key)
-                    })
-                    .unwrap_or(false);
-                let thumb_hovered = thumb_bounds
-                    .map(|thumb_bounds| {
-                        point_in_bounds(snapshot.mouse, thumb_bounds, draw.pivot, draw.rotation)
-                            && !point_blocked_by_popup(snapshot.mouse, &owner_key)
-                    })
-                    .unwrap_or(false);
-                let mut scrollbar_dragging =
-                    component.get::<bool>("scrollbar_dragging").unwrap_or(false) && enabled;
-                let mut scrollbar_drag_offset = component
-                    .get::<f32>("scrollbar_drag_offset")
-                    .unwrap_or(0.0)
-                    .max(0.0);
-                if !left_down {
-                    scrollbar_dragging = false;
-                }
-
-                if enabled && left_pressed {
-                    if let Some(thumb_bounds) = thumb_bounds {
-                        if thumb_hovered {
-                            scrollbar_dragging = true;
-                            scrollbar_drag_offset = (local_mouse.y - thumb_bounds.y)
-                                .clamp(0.0, thumb_bounds.h.max(0.0));
-                            focused = true;
-                        } else if track_hovered {
-                            scrollbar_dragging = true;
-                            scrollbar_drag_offset = thumb_bounds.h * 0.5;
-                            focused = true;
-                        }
-                    }
-                }
-
-                if overflow && scrollbar_dragging && left_down {
                     if let (Some(track_bounds), Some(thumb_bounds)) = (track_bounds, thumb_bounds) {
-                        let available = (track_bounds.h - thumb_bounds.h).max(0.0);
-                        let thumb_top = if available <= 0.0 {
-                            track_bounds.y
-                        } else {
-                            (local_mouse.y - scrollbar_drag_offset)
-                                .clamp(track_bounds.y, track_bounds.y + available)
-                        };
-                        scroll_index = if max_scroll == 0 || available <= 0.0 {
-                            0
-                        } else {
-                            (((thumb_top - track_bounds.y) / available) * max_scroll as f32).round()
-                                as usize
-                        }
-                        .min(max_scroll);
-                    }
-                } else if overflow && hovered {
-                    let wheel_steps = consume_wheel_steps(
-                        &component,
-                        "wheel_scroll_accumulator",
-                        snapshot.input.wheel_y,
-                        4,
-                    )?;
-                    if wheel_steps > 0 {
-                        scroll_index = scroll_index.saturating_sub(wheel_steps as usize);
-                    } else if wheel_steps < 0 {
-                        scroll_index = (scroll_index + (-wheel_steps) as usize).min(max_scroll);
-                    }
-                }
-
-                let mut selection_changed = false;
-                if focused && enabled && option_count > 0 {
-                    if let Some(key) = snapshot.input.last_key_pressed.clone() {
-                        let mut next_selected = selected_index;
-                        match key.as_str() {
-                            "up" => {
-                                next_selected = if selected_index > 1 {
-                                    selected_index - 1
-                                } else {
-                                    1
-                                };
-                            }
-                            "down" => {
-                                next_selected = if selected_index == 0 {
-                                    1
-                                } else {
-                                    (selected_index + 1).min(option_count)
-                                };
-                            }
-                            "pageup" => {
-                                let step = visible_count.max(1);
-                                next_selected = if selected_index == 0 {
-                                    1
-                                } else {
-                                    selected_index.saturating_sub(step).max(1)
-                                };
-                            }
-                            "pagedown" => {
-                                let step = visible_count.max(1);
-                                next_selected = if selected_index == 0 {
-                                    1
-                                } else {
-                                    (selected_index + step).min(option_count)
-                                };
-                            }
-                            "home" => next_selected = 1,
-                            "end" => next_selected = option_count,
-                            _ => {}
-                        }
-
-                        if next_selected != selected_index {
-                            selected_index = next_selected;
-                            selection_changed = true;
-                        }
-                    }
-                }
-
-                let mut hovered_index = 0usize;
-                if enabled && option_count > 0 && visible_count > 0 && list_bounds.w > 0.0 {
-                    for visible_index in 0..visible_count {
-                        let item_y = list_bounds.y + visible_index as f32 * row_stride;
-                        let item_bounds = Rect {
-                            x: list_bounds.x,
-                            y: item_y,
-                            w: list_bounds.w,
-                            h: item_height.min((list_bounds.y + list_bounds.h - item_y).max(0.0)),
-                        };
-                        if item_bounds.h <= 0.0 {
-                            continue;
-                        }
-                        if point_in_bounds(snapshot.mouse, item_bounds, draw.pivot, draw.rotation)
-                            && !point_blocked_by_popup(snapshot.mouse, &owner_key)
-                        {
-                            hovered_index = scroll_index + visible_index + 1;
-                            break;
-                        }
-                    }
-                }
-
-                if enabled
-                    && left_pressed
-                    && !scrollbar_dragging
-                    && hovered_index > 0
-                    && hovered_index != selected_index
-                {
-                    selected_index = hovered_index;
-                    selection_changed = true;
-                }
-
-                if selected_index > 0 && visible_count > 0 {
-                    if selected_index <= scroll_index {
-                        scroll_index = selected_index - 1;
-                    } else if selected_index > scroll_index + visible_count {
-                        scroll_index = selected_index - visible_count;
-                    }
-                }
-                scroll_index = scroll_index.min(max_scroll);
-                let thumb_bounds = track_bounds.map(|track_bounds| {
-                    let thumb_height = (track_bounds.h * visible_count as f32
-                        / option_count as f32)
-                        .max((item_height * 0.75).min(track_bounds.h))
-                        .min(track_bounds.h);
-                    let thumb_y = if max_scroll == 0 {
-                        track_bounds.y
-                    } else {
-                        track_bounds.y
-                            + (track_bounds.h - thumb_height)
-                                * (scroll_index as f32 / max_scroll as f32)
-                    };
-                    Rect {
-                        x: track_bounds.x,
-                        y: thumb_y,
-                        w: track_bounds.w,
-                        h: thumb_height,
-                    }
-                });
-
-                let selected_item = items.get(selected_index.saturating_sub(1)).cloned();
-                let selected_text = selected_item
-                    .as_ref()
-                    .map(|item| item.text.clone())
-                    .unwrap_or_default();
-                let selected_value = selected_item
-                    .as_ref()
-                    .map(|item| item.value.clone())
-                    .unwrap_or_default();
-
-                component.set("hovered", hovered)?;
-                component.set("focused", focused)?;
-                component.set("hover_index", hovered_index)?;
-                component.set("selected_index", selected_index)?;
-                component.set("selected_text", selected_text.clone())?;
-                component.set("selected_value", selected_value.clone())?;
-                component.set("scroll_index", scroll_index)?;
-                component.set("scrollbar_dragging", scrollbar_dragging)?;
-                component.set("scrollbar_drag_offset", scrollbar_drag_offset)?;
-
-                if focus_changed {
-                    if focused {
-                        call_component_callback(&component, &entity, "onFocus")?;
-                    } else {
-                        call_component_callback(&component, &entity, "onBlur")?;
-                    }
-                }
-                if selection_changed && selected_index > 0 {
-                    call_component_selection_callback(
-                        &component,
-                        &entity,
-                        "onChanged",
-                        selected_index,
-                        &selected_value,
-                    )?;
-                }
-
-                let mut renderer = render_state
-                    .lock()
-                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
-                render_panel(
-                    &mut renderer,
-                    draw.bounds,
-                    draw.pivot,
-                    draw.rotation,
-                    &style,
-                )?;
-
-                if option_count == 0 {
-                    let empty_text = component
-                        .get::<String>("empty_text")
-                        .unwrap_or_else(|_| "No items".to_string());
-                    if !empty_text.is_empty() {
-                        renderer.queue(DrawCommand::Text(build_text_request(
-                            &scroll_list_root,
-                            &component,
-                            empty_text,
-                            inner_bounds,
-                            draw.pivot,
-                            draw.rotation,
-                            empty_text_color,
-                            18.0,
-                            TextAlignX::Left,
-                            TextAlignY::Center,
-                            TextScaleMode::FitWidth,
-                            TextWrapMode::None,
-                            0.0,
-                            0.0,
-                        )));
-                    }
-                    return Ok(());
-                }
-
-                for visible_index in 0..visible_count {
-                    let option_index = scroll_index + visible_index + 1;
-                    let item_y = list_bounds.y + visible_index as f32 * row_stride;
-                    let item_bounds = Rect {
-                        x: list_bounds.x,
-                        y: item_y,
-                        w: list_bounds.w,
-                        h: item_height.min((list_bounds.y + list_bounds.h - item_y).max(0.0)),
-                    };
-                    if item_bounds.w <= 0.0 || item_bounds.h <= 0.0 {
-                        continue;
-                    }
-
-                    let item_background = if option_index == selected_index {
-                        get_color_field(&component, "item_selected_background_color")
-                    } else if option_index == hovered_index {
-                        get_color_field(&component, "item_hover_background_color")
-                    } else {
-                        get_color_field(&component, "item_background_color")
-                    }
-                    .unwrap_or(Color::rgba(0, 0, 0, 0));
-                    if item_background.a > 0 {
                         queue_rounded_rect_fill(
                             &mut renderer,
-                            item_bounds,
+                            track_bounds,
                             draw.pivot,
                             draw.rotation,
-                            item_background,
-                            item_corner_radius,
+                            scrollbar_color,
+                            scrollbar_width * 0.5,
+                        );
+                        queue_rounded_rect_fill(
+                            &mut renderer,
+                            thumb_bounds,
+                            draw.pivot,
+                            draw.rotation,
+                            scrollbar_thumb_color,
+                            scrollbar_width * 0.5,
                         );
                     }
 
-                    let item_text_color = if !enabled {
-                        get_color_field(&component, "disabled_text_color")
-                    } else if option_index == selected_index {
-                        get_color_field(&component, "item_selected_text_color")
-                    } else if option_index == hovered_index {
-                        get_color_field(&component, "item_hover_text_color")
-                    } else {
-                        get_color_field(&component, "item_text_color")
-                    }
-                    .unwrap_or(text_color);
+                    Ok(())
+                })?,
+            )?;
 
-                    if let Some(item) = items.get(option_index - 1) {
-                        let item_content_bounds = Rect {
-                            x: item_bounds.x + item_padding_x,
-                            y: item_bounds.y + item_padding_y,
-                            w: (item_bounds.w - item_padding_x * 2.0).max(0.0),
-                            h: (item_bounds.h - item_padding_y * 2.0).max(0.0),
-                        };
-                        let item_icon = item.image.clone().and_then(|image| {
-                            let icon_extent = if item_icon_size > 0.0 {
-                                item_icon_size.min(item_content_bounds.h)
-                            } else {
-                                item_content_bounds.h.max(0.0)
-                            };
-                            build_inline_image(
-                                item_content_bounds,
-                                image,
-                                item.image_tint,
-                                item.image_source,
-                                UiIconSide::Left,
-                                icon_extent,
-                                icon_extent,
-                                item_icon_gap,
-                            )
-                        });
-                        let (item_text_bounds, item_icon) =
-                            layout_inline_image(item_content_bounds, item_icon);
-                        if let Some(item_icon) = item_icon.as_ref() {
-                            queue_inline_image(&mut renderer, &draw, item_icon, style.filter);
-                        }
-                        renderer.queue(DrawCommand::Text(build_text_request(
-                            &scroll_list_root,
-                            &component,
-                            item.text.clone(),
-                            item_text_bounds,
-                            draw.pivot,
-                            draw.rotation,
-                            item_text_color,
-                            18.0,
-                            TextAlignX::Left,
-                            TextAlignY::Center,
-                            TextScaleMode::FitWidth,
-                            TextWrapMode::None,
-                            0.0,
-                            0.0,
-                        )));
-                    }
-                }
-
-                if let (Some(track_bounds), Some(thumb_bounds)) = (track_bounds, thumb_bounds) {
-                    queue_rounded_rect_fill(
-                        &mut renderer,
-                        track_bounds,
-                        draw.pivot,
-                        draw.rotation,
-                        scrollbar_color,
-                        scrollbar_width * 0.5,
-                    );
-                    queue_rounded_rect_fill(
-                        &mut renderer,
-                        thumb_bounds,
-                        draw.pivot,
-                        draw.rotation,
-                        scrollbar_thumb_color,
-                        scrollbar_width * 0.5,
-                    );
-                }
-
-                Ok(())
-            })?,
-        )?;
-
-        core_components.set("ScrollList", scroll_list)?;
-    }
+            core_components.set("ScrollList", scroll_list)?;
+        }
     }
 
     // Image2D
@@ -4145,51 +4407,53 @@ pub fn add_core_components(
         spritebox2d.set("ComputeSpritebox", compute_spritebox.clone())?;
         spritebox2d.set("computeSpritebox", compute_spritebox)?;
 
-        let is_inside = lua.create_function(move |_ctx, (component, x, y): (Table, f32, f32)| {
-            point_in_spritebox_shape(&component, Vec2 { x, y })
-        })?;
+        let is_inside =
+            lua.create_function(move |_ctx, (component, x, y): (Table, f32, f32)| {
+                point_in_spritebox_shape(&component, Vec2 { x, y })
+            })?;
         spritebox2d.set("IsInside", is_inside.clone())?;
         spritebox2d.set("isInside", is_inside)?;
 
-        let is_intersecting = lua.create_function(move |lua, (component, other): (Table, Value)| {
-            let Some(other) = resolve_spritebox_component(other)? else {
-                return Ok(false);
-            };
+        let is_intersecting =
+            lua.create_function(move |lua, (component, other): (Table, Value)| {
+                let Some(other) = resolve_spritebox_component(other)? else {
+                    return Ok(false);
+                };
 
-            let Some(a) = build_world_spritebox_shape(lua, &component)? else {
-                return Ok(false);
-            };
-            let Some(b) = build_world_spritebox_shape(lua, &other)? else {
-                return Ok(false);
-            };
-            if a.rects.is_empty()
-                || b.rects.is_empty()
-                || !rect_aabb_intersects(a.bounds, b.bounds)
-            {
-                return Ok(false);
-            }
-
-            for a_rect in &a.rects {
-                if !rect_aabb_intersects(a_rect.bounds, b.bounds) {
-                    continue;
+                let Some(a) = build_world_spritebox_shape(lua, &component)? else {
+                    return Ok(false);
+                };
+                let Some(b) = build_world_spritebox_shape(lua, &other)? else {
+                    return Ok(false);
+                };
+                if a.rects.is_empty()
+                    || b.rects.is_empty()
+                    || !rect_aabb_intersects(a.bounds, b.bounds)
+                {
+                    return Ok(false);
                 }
-                for b_rect in &b.rects {
-                    if spritebox_rects_intersect(a_rect, b_rect) {
-                        return Ok(true);
+
+                for a_rect in &a.rects {
+                    if !rect_aabb_intersects(a_rect.bounds, b.bounds) {
+                        continue;
+                    }
+                    for b_rect in &b.rects {
+                        if spritebox_rects_intersect(a_rect, b_rect) {
+                            return Ok(true);
+                        }
                     }
                 }
-            }
 
-            Ok(false)
-        })?;
+                Ok(false)
+            })?;
         spritebox2d.set("IsIntersecting", is_intersecting.clone())?;
         spritebox2d.set("isIntersecting", is_intersecting)?;
 
         spritebox2d.set(
             "update",
-            lua.create_function(move |_ctx, (_entity, _component, _dt): (Table, Table, f32)| {
-                Ok(())
-            })?,
+            lua.create_function(
+                move |_ctx, (_entity, _component, _dt): (Table, Table, f32)| Ok(()),
+            )?,
         )?;
 
         core_components.set("Spritebox2D", spritebox2d)?;
