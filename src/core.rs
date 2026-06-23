@@ -1683,6 +1683,10 @@ fn build_text_request(
         Some(value @ Value::Boolean(_)) | Some(value @ Value::String(_)) => parse_wrap_mode(value),
         _ => default_wrap,
     };
+    let tab_size = component
+        .get::<f32>("tab_size")
+        .or_else(|_| component.get::<f32>("tab_width"))
+        .unwrap_or(4.0);
 
     TextRenderRequest {
         text,
@@ -1704,6 +1708,7 @@ fn build_text_request(
         padding_y: padding_y.max(0.0),
         line_spacing: component.get::<f32>("line_spacing").unwrap_or(1.0),
         letter_spacing: component.get::<f32>("letter_spacing").unwrap_or(0.0),
+        tab_size,
         stretch_width: 0.0,
         stretch_height: 0.0,
         rich_text: Vec::new(),
@@ -1756,6 +1761,553 @@ fn slice_chars(text: &str, start: usize, end: usize) -> String {
     let start_byte = char_to_byte_index(text, start);
     let end_byte = char_to_byte_index(text, end);
     text[start_byte..end_byte].to_string()
+}
+
+fn build_textbox_render_request(
+    root: &Path,
+    entity: &Table,
+    component: &Table,
+) -> mlua::Result<TextRenderRequest> {
+    let (x, y, rotation) = crate::window::get_global_transform(entity)?;
+    let text = component
+        .get::<String>("text")
+        .unwrap_or_else(|_| String::new());
+    let scale = component.get::<f32>("scale").unwrap_or(32.0).max(1.0);
+    let min_scale = component.get::<f32>("min_scale").unwrap_or(1.0).max(1.0);
+    let color: Color = color4_to_color(component.get("color")?)?;
+    let padding = component.get::<f32>("padding").unwrap_or(0.0).max(0.0);
+    let padding_x = component.get::<f32>("padding_x").unwrap_or(padding).max(0.0);
+    let padding_y = component.get::<f32>("padding_y").unwrap_or(padding).max(0.0);
+    let line_spacing = component.get::<f32>("line_spacing").unwrap_or(1.0);
+    let letter_spacing = component.get::<f32>("letter_spacing").unwrap_or(0.0);
+    let tab_size = component
+        .get::<f32>("tab_size")
+        .or_else(|_| component.get::<f32>("tab_width"))
+        .unwrap_or(4.0);
+    let align_x = parse_align_x(
+        &component
+            .get::<String>("align_x")
+            .or_else(|_| component.get::<String>("align"))
+            .unwrap_or_else(|_| "left".to_string()),
+    );
+    let align_y = parse_align_y(
+        &component
+            .get::<String>("align_y")
+            .or_else(|_| component.get::<String>("vertical_align"))
+            .unwrap_or_else(|_| "top".to_string()),
+    );
+    let text_scale = parse_text_scale_mode(
+        &component
+            .get::<String>("text_scale")
+            .or_else(|_| component.get::<String>("textScale"))
+            .unwrap_or_else(|_| "none".to_string()),
+    );
+    let wrap = parse_wrap_mode(component.get::<Value>("wrap").unwrap_or(Value::Nil));
+    let size_mode_uses_entity = uses_entity_text_bounds(component);
+    let legacy_scale_x = component.get::<f32>("scale_x").unwrap_or(0.0);
+    let legacy_scale_y = component.get::<f32>("scale_y").unwrap_or(0.0);
+    let use_legacy_stretch =
+        !size_mode_uses_entity && legacy_scale_x > 0.0 && legacy_scale_y > 0.0;
+    let font = parse_font_handle(root, component.get::<Value>("font").unwrap_or(Value::Nil));
+    let effective_scale = if use_legacy_stretch {
+        legacy_scale_y.max(1.0)
+    } else {
+        scale
+    };
+
+    let (bounds, pivot) = if size_mode_uses_entity {
+        let (w, h) = crate::window::get_global_size(entity)?;
+        if crate::window::uses_middle_pivot(entity) {
+            let (px, py) = crate::window::get_global_rotation_pivot(entity)?;
+            (
+                Rect {
+                    x: px - w * 0.5,
+                    y: py - h * 0.5,
+                    w,
+                    h,
+                },
+                Vec2 { x: px, y: py },
+            )
+        } else {
+            (Rect { x, y, w, h }, Vec2 { x, y })
+        }
+    } else {
+        (
+            Rect {
+                x,
+                y,
+                w: 0.0,
+                h: 0.0,
+            },
+            Vec2 { x, y },
+        )
+    };
+
+    Ok(TextRenderRequest {
+        text,
+        bounds,
+        rotation,
+        pivot,
+        color,
+        font,
+        scale: effective_scale,
+        min_scale,
+        text_scale,
+        align_x,
+        align_y,
+        wrap,
+        padding_x,
+        padding_y,
+        line_spacing,
+        letter_spacing,
+        tab_size,
+        stretch_width: if use_legacy_stretch {
+            legacy_scale_x
+        } else {
+            0.0
+        },
+        stretch_height: if use_legacy_stretch {
+            legacy_scale_y
+        } else {
+            0.0
+        },
+        rich_text: rich_text_ranges_from_component(root, component)?,
+    })
+}
+
+fn write_textbox_letter_bounds(
+    lua: &Lua,
+    component: &Table,
+    request: &TextRenderRequest,
+    letter_bounds: &[Rect],
+    empty_height: f32,
+) -> mlua::Result<()> {
+    let bounds_table = lua.create_table()?;
+    for (i, rect) in letter_bounds.iter().enumerate() {
+        let entry = lua.create_table()?;
+        entry.set("x", rect.x)?;
+        entry.set("y", rect.y)?;
+        entry.set("w", rect.w)?;
+        entry.set("h", rect.h)?;
+        bounds_table.set(i + 1, entry)?;
+    }
+    component.set("__letter_bounds", bounds_table)?;
+
+    let (start, end) = match (letter_bounds.first(), letter_bounds.last()) {
+        (Some(first), Some(last)) => (
+            Rect {
+                x: first.x,
+                y: first.y,
+                w: 0.0,
+                h: first.h,
+            },
+            Rect {
+                x: last.x + last.w,
+                y: last.y,
+                w: 0.0,
+                h: last.h,
+            },
+        ),
+        _ => {
+            let rect = Rect {
+                x: request.bounds.x + request.padding_x.max(0.0),
+                y: request.bounds.y + request.padding_y.max(0.0),
+                w: 0.0,
+                h: empty_height.max(request.scale.max(1.0)),
+            };
+            (rect, rect)
+        }
+    };
+
+    let start_table = lua.create_table()?;
+    start_table.set("x", start.x)?;
+    start_table.set("y", start.y)?;
+    start_table.set("w", start.w)?;
+    start_table.set("h", start.h)?;
+    component.set("__letter_caret_start", start_table)?;
+
+    let end_table = lua.create_table()?;
+    end_table.set("x", end.x)?;
+    end_table.set("y", end.y)?;
+    end_table.set("w", end.w)?;
+    end_table.set("h", end.h)?;
+    component.set("__letter_caret_end", end_table)
+}
+
+fn refresh_textbox_layout_cache(
+    lua: &Lua,
+    root: &Path,
+    entity: &Table,
+    component: &Table,
+) -> mlua::Result<TextRenderRequest> {
+    let request = build_textbox_render_request(root, entity, component)?;
+    let cache_id = crate::renderer::text_render_request_cache_id(&request).to_string();
+    let has_cached_bounds = component.get::<Table>("__letter_bounds").is_ok()
+        && component.get::<Table>("__letter_caret_start").is_ok()
+        && component.get::<Table>("__letter_caret_end").is_ok();
+    if has_cached_bounds
+        && component
+            .get::<String>("__layout_cache_id")
+            .ok()
+            .is_some_and(|previous| previous == cache_id)
+    {
+        return Ok(request);
+    }
+
+    let metrics = crate::renderer::measure_text(&request).unwrap_or_default();
+    let letter_bounds = metrics.letter_bounds.clone();
+    component.set("dx", metrics.width)?;
+    component.set("dy", metrics.height)?;
+    component.set("used_scale", metrics.used_scale)?;
+    component.set("line_count", metrics.line_count)?;
+    let empty_height = metrics.height.max(metrics.used_scale);
+    write_textbox_letter_bounds(lua, component, &request, &letter_bounds, empty_height)?;
+    component.set("__layout_cache_id", cache_id)?;
+    Ok(request)
+}
+
+fn letter_bounds_table_key(index: Value) -> Option<i64> {
+    match index {
+        Value::Integer(index) => {
+            if index < -1 {
+                return None;
+            }
+            (index as i64).checked_add(1)
+        }
+        Value::Number(index) => {
+            if !index.is_finite() || index < -1.0 || index.fract() != 0.0 {
+                return None;
+            }
+            let number = index;
+            let index = number as i64;
+            if index < -1 || index as f64 != number {
+                return None;
+            }
+            index.checked_add(1)
+        }
+        _ => None,
+    }
+}
+
+fn missing_letter_bounds() -> (Value, Value, Value, Value) {
+    (Value::Nil, Value::Nil, Value::Nil, Value::Nil)
+}
+
+fn missing_letter_position() -> (Value, Value) {
+    (Value::Nil, Value::Nil)
+}
+
+fn missing_letter_index() -> Value {
+    Value::Nil
+}
+
+fn letter_bounds_call_target(
+    bound_component: Option<&Table>,
+    args: mlua::Variadic<Value>,
+) -> Option<(Table, Value)> {
+    match args.get(0) {
+        Some(Value::Table(component)) => {
+            let index = args.get(1).cloned().unwrap_or(Value::Nil);
+            Some((component.clone(), index))
+        }
+        Some(index) => bound_component.map(|component| (component.clone(), index.clone())),
+        None => None,
+    }
+}
+
+fn parse_finite_lua_number(value: Option<&Value>) -> Option<f64> {
+    let value = match value? {
+        Value::Integer(value) => *value as f64,
+        Value::Number(value) => *value,
+        _ => return None,
+    };
+    value.is_finite().then_some(value)
+}
+
+fn closest_letter_call_target(
+    bound_component: Option<&Table>,
+    args: mlua::Variadic<Value>,
+) -> Option<(Table, f64, f64)> {
+    match args.get(0) {
+        Some(Value::Table(component)) => {
+            let x = parse_finite_lua_number(args.get(1))?;
+            let y = parse_finite_lua_number(args.get(2))?;
+            Some((component.clone(), x, y))
+        }
+        Some(_) => {
+            let component = bound_component?.clone();
+            let x = parse_finite_lua_number(args.get(0))?;
+            let y = parse_finite_lua_number(args.get(1))?;
+            Some((component, x, y))
+        }
+        None => None,
+    }
+}
+
+fn cached_letter_bounds_entry(component: &Table, key: i64) -> Option<Table> {
+    let bounds = component.get::<Table>("__letter_bounds").ok()?;
+    bounds.get::<Table>(key).ok()
+}
+
+fn caret_letter_bounds_entry(component: &Table, key: i64) -> Option<Table> {
+    let bounds = component.get::<Table>("__letter_bounds").ok()?;
+    let len = bounds.raw_len() as i64;
+    if key <= 0 {
+        component.get::<Table>("__letter_caret_start").ok()
+    } else if key == len + 1 {
+        component.get::<Table>("__letter_caret_end").ok()
+    } else {
+        None
+    }
+}
+
+fn refresh_letter_bounds_if_available(
+    lua: &Lua,
+    root: Option<&Path>,
+    component: &Table,
+) -> mlua::Result<()> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    let Some(entity) = component.get::<Option<Table>>("entity")? else {
+        return Ok(());
+    };
+    refresh_textbox_layout_cache(lua, root, &entity, component)?;
+    Ok(())
+}
+
+fn get_letter_bounds_values(
+    lua: &Lua,
+    root: Option<&Path>,
+    component: Table,
+    index: Value,
+) -> mlua::Result<(Value, Value, Value, Value)> {
+    let Some(key) = letter_bounds_table_key(index) else {
+        return Ok(missing_letter_bounds());
+    };
+    let entry = cached_letter_bounds_entry(&component, key);
+    let entry = if entry.is_none() {
+        refresh_letter_bounds_if_available(lua, root, &component)?;
+        cached_letter_bounds_entry(&component, key)
+    } else {
+        entry
+    };
+    let entry = entry.or_else(|| caret_letter_bounds_entry(&component, key));
+    let Some(entry) = entry else {
+        return Ok(missing_letter_bounds());
+    };
+    Ok((
+        Value::Number(entry.get::<f64>("x")?),
+        Value::Number(entry.get::<f64>("y")?),
+        Value::Number(entry.get::<f64>("w")?),
+        Value::Number(entry.get::<f64>("h")?),
+    ))
+}
+
+fn get_letter_position_values(
+    lua: &Lua,
+    root: Option<&Path>,
+    component: Table,
+    index: Value,
+) -> mlua::Result<(Value, Value)> {
+    let Some(key) = letter_bounds_table_key(index) else {
+        return Ok(missing_letter_position());
+    };
+    let entry = cached_letter_bounds_entry(&component, key);
+    let entry = if entry.is_none() {
+        refresh_letter_bounds_if_available(lua, root, &component)?;
+        cached_letter_bounds_entry(&component, key)
+    } else {
+        entry
+    };
+    let entry = entry.or_else(|| caret_letter_bounds_entry(&component, key));
+    let Some(entry) = entry else {
+        return Ok(missing_letter_position());
+    };
+    Ok((
+        Value::Number(entry.get::<f64>("x")?),
+        Value::Number(entry.get::<f64>("y")?),
+    ))
+}
+
+fn rect_from_table(table: &Table) -> mlua::Result<Rect> {
+    Ok(Rect {
+        x: table.get::<f32>("x")?,
+        y: table.get::<f32>("y")?,
+        w: table.get::<f32>("w")?,
+        h: table.get::<f32>("h")?,
+    })
+}
+
+fn caret_distance_sq(x: f64, y: f64, caret_x: f64, top: f64, bottom: f64) -> f64 {
+    let dx = x - caret_x;
+    let dy = if y < top {
+        top - y
+    } else if y > bottom {
+        y - bottom
+    } else {
+        0.0
+    };
+    dx * dx + dy * dy
+}
+
+fn consider_caret_candidate(
+    best: &mut Option<(usize, f64)>,
+    index: usize,
+    x: f64,
+    y: f64,
+    caret_x: f64,
+    top: f64,
+    bottom: f64,
+) {
+    let distance = caret_distance_sq(x, y, caret_x, top, bottom);
+    if best.is_none_or(|(_, best_distance)| distance < best_distance) {
+        *best = Some((index, distance));
+    }
+}
+
+fn get_closest_letter_index_value(
+    lua: &Lua,
+    root: Option<&Path>,
+    component: Table,
+    x: f64,
+    y: f64,
+) -> mlua::Result<Value> {
+    refresh_letter_bounds_if_available(lua, root, &component)?;
+    let Some(bounds) = component.get::<Table>("__letter_bounds").ok() else {
+        return Ok(Value::Integer(0));
+    };
+
+    let len = bounds.raw_len();
+    if len == 0 {
+        return Ok(Value::Integer(0));
+    }
+
+    let mut best = None;
+    for index in 1..=len {
+        let Ok(entry) = bounds.get::<Table>(index) else {
+            continue;
+        };
+        let rect = rect_from_table(&entry)?;
+        let top = rect.y as f64;
+        let bottom = (rect.y + rect.h) as f64;
+        consider_caret_candidate(
+            &mut best,
+            index - 1,
+            x,
+            y,
+            rect.x as f64,
+            top,
+            bottom,
+        );
+        consider_caret_candidate(
+            &mut best,
+            index,
+            x,
+            y,
+            (rect.x + rect.w) as f64,
+            top,
+            bottom,
+        );
+    }
+
+    Ok(Value::Integer(best.map(|(index, _)| index as mlua::Integer).unwrap_or(0)))
+}
+
+fn get_closest_letter_index_from_args(
+    lua: &Lua,
+    root: Option<&Path>,
+    bound_component: Option<&Table>,
+    args: mlua::Variadic<Value>,
+) -> mlua::Result<Value> {
+    let Some((component, x, y)) = closest_letter_call_target(bound_component, args) else {
+        return Ok(missing_letter_index());
+    };
+    get_closest_letter_index_value(lua, root, component, x, y)
+}
+
+fn get_letter_bounds_from_args(
+    lua: &Lua,
+    root: Option<&Path>,
+    bound_component: Option<&Table>,
+    args: mlua::Variadic<Value>,
+) -> mlua::Result<(Value, Value, Value, Value)> {
+    let Some((component, index)) = letter_bounds_call_target(bound_component, args) else {
+        return Ok(missing_letter_bounds());
+    };
+    get_letter_bounds_values(lua, root, component, index)
+}
+
+fn get_letter_position_from_args(
+    lua: &Lua,
+    root: Option<&Path>,
+    bound_component: Option<&Table>,
+    args: mlua::Variadic<Value>,
+) -> mlua::Result<(Value, Value)> {
+    let Some((component, index)) = letter_bounds_call_target(bound_component, args) else {
+        return Ok(missing_letter_position());
+    };
+    get_letter_position_values(lua, root, component, index)
+}
+
+fn install_unbound_textbox_letter_lookup_methods(
+    lua: &Lua,
+    table: &Table,
+    root: PathBuf,
+) -> mlua::Result<()> {
+    let bounds_root = root.clone();
+    table.set(
+        "getLetterBounds",
+        lua.create_function(move |ctx, args: mlua::Variadic<Value>| {
+            get_letter_bounds_from_args(ctx, Some(&bounds_root), None, args)
+        })?,
+    )?;
+    let closest_root = root.clone();
+    let position_root = root;
+    table.set(
+        "getLetterPosition",
+        lua.create_function(move |ctx, args: mlua::Variadic<Value>| {
+            get_letter_position_from_args(ctx, Some(&position_root), None, args)
+        })?,
+    )?;
+    let closest = lua.create_function(move |ctx, args: mlua::Variadic<Value>| {
+        get_closest_letter_index_from_args(ctx, Some(&closest_root), None, args)
+    })?;
+    table.set("getClosestLetterIndex", closest.clone())?;
+    table.set("getClosestCharacterIndex", closest)?;
+    Ok(())
+}
+
+fn bind_textbox_letter_lookup_methods(lua: &Lua, component: &Table) -> mlua::Result<()> {
+    let bind: Function = lua
+        .load(
+            r#"
+            return function(component, raw)
+                return function(first, ...)
+                    if type(first) == "table" then
+                        return raw(first, ...)
+                    end
+                    return raw(component, first, ...)
+                end
+            end
+            "#,
+        )
+        .eval()?;
+
+    let raw_bounds: Function = component.get("getLetterBounds")?;
+    let bound_bounds: Function = bind.call((component.clone(), raw_bounds))?;
+    component.set("getLetterBounds", bound_bounds)?;
+
+    let raw_position: Function = component.get("getLetterPosition")?;
+    let bound_position: Function = bind.call((component.clone(), raw_position))?;
+    component.set("getLetterPosition", bound_position)?;
+
+    let raw_closest: Function = component.get("getClosestLetterIndex")?;
+    let bound_closest: Function = bind.call((component.clone(), raw_closest))?;
+    component.set("getClosestLetterIndex", bound_closest.clone())?;
+    component.set("getClosestCharacterIndex", bound_closest)?;
+
+    Ok(())
 }
 
 fn replace_char_range(text: &str, start: usize, end: usize, replacement: &str) -> String {
@@ -2146,6 +2698,7 @@ pub fn add_core_components(
                 component.set("padding_y", 0.0)?;
                 component.set("line_spacing", 1.0)?;
                 component.set("letter_spacing", 0.0)?;
+                component.set("tab_size", 4.0)?;
                 component.set("font", Value::Nil)?;
                 component.set("scale_x", 0.0)?;
                 component.set("scale_y", 0.0)?;
@@ -2154,6 +2707,8 @@ pub fn add_core_components(
                 component.set("line_count", 0)?;
                 component.set("__rich_text_ranges", ctx.create_table()?)?;
                 component.set("__letter_bounds", ctx.create_table()?)?;
+                component.set("__layout_cache_id", "")?;
+                bind_textbox_letter_lookup_methods(ctx, &component)?;
                 Ok(())
             })?,
         )?;
@@ -2223,42 +2778,7 @@ pub fn add_core_components(
                     .count())
             })?,
         )?;
-        textbox.set(
-            "getLetterBounds",
-            lua.create_function(|_ctx, (component, index): (Table, usize)| {
-                let bounds = component.get::<Table>("__letter_bounds").ok();
-                let Some(bounds) = bounds else {
-                    return Ok((Value::Nil, Value::Nil, Value::Nil, Value::Nil));
-                };
-                let entry = bounds.get::<Table>(index + 1).ok();
-                let Some(entry) = entry else {
-                    return Ok((Value::Nil, Value::Nil, Value::Nil, Value::Nil));
-                };
-                Ok((
-                    Value::Number(entry.get::<f64>("x")?),
-                    Value::Number(entry.get::<f64>("y")?),
-                    Value::Number(entry.get::<f64>("w")?),
-                    Value::Number(entry.get::<f64>("h")?),
-                ))
-            })?,
-        )?;
-        textbox.set(
-            "getLetterPosition",
-            lua.create_function(|_ctx, (component, index): (Table, usize)| {
-                let bounds = component.get::<Table>("__letter_bounds").ok();
-                let Some(bounds) = bounds else {
-                    return Ok((Value::Nil, Value::Nil));
-                };
-                let entry = bounds.get::<Table>(index + 1).ok();
-                let Some(entry) = entry else {
-                    return Ok((Value::Nil, Value::Nil));
-                };
-                Ok((
-                    Value::Number(entry.get::<f64>("x")?),
-                    Value::Number(entry.get::<f64>("y")?),
-                ))
-            })?,
-        )?;
+        install_unbound_textbox_letter_lookup_methods(lua, &textbox, text_root.clone())?;
 
         textbox.set(
             "clearFormatting",
@@ -2330,132 +2850,7 @@ pub fn add_core_components(
                     return Ok(());
                 }
 
-                let (x, y, rotation) = crate::window::get_global_transform(&entity)?;
-                let text = component
-                    .get::<String>("text")
-                    .unwrap_or_else(|_| String::new());
-                let scale = component.get::<f32>("scale").unwrap_or(32.0).max(1.0);
-                let min_scale = component.get::<f32>("min_scale").unwrap_or(1.0).max(1.0);
-                let color: Color = color4_to_color(component.get("color")?)?;
-                let padding = component.get::<f32>("padding").unwrap_or(0.0).max(0.0);
-                let padding_x = component
-                    .get::<f32>("padding_x")
-                    .unwrap_or(padding)
-                    .max(0.0);
-                let padding_y = component
-                    .get::<f32>("padding_y")
-                    .unwrap_or(padding)
-                    .max(0.0);
-                let line_spacing = component.get::<f32>("line_spacing").unwrap_or(1.0);
-                let letter_spacing = component.get::<f32>("letter_spacing").unwrap_or(0.0);
-                let align_x = parse_align_x(
-                    &component
-                        .get::<String>("align_x")
-                        .or_else(|_| component.get::<String>("align"))
-                        .unwrap_or_else(|_| "left".to_string()),
-                );
-                let align_y = parse_align_y(
-                    &component
-                        .get::<String>("align_y")
-                        .or_else(|_| component.get::<String>("vertical_align"))
-                        .unwrap_or_else(|_| "top".to_string()),
-                );
-                let text_scale = parse_text_scale_mode(
-                    &component
-                        .get::<String>("text_scale")
-                        .or_else(|_| component.get::<String>("textScale"))
-                        .unwrap_or_else(|_| "none".to_string()),
-                );
-                let wrap = parse_wrap_mode(component.get::<Value>("wrap").unwrap_or(Value::Nil));
-                let size_mode_uses_entity = uses_entity_text_bounds(&component);
-                let legacy_scale_x = component.get::<f32>("scale_x").unwrap_or(0.0);
-                let legacy_scale_y = component.get::<f32>("scale_y").unwrap_or(0.0);
-                let use_legacy_stretch =
-                    !size_mode_uses_entity && legacy_scale_x > 0.0 && legacy_scale_y > 0.0;
-                let font = parse_font_handle(
-                    &text_root,
-                    component.get::<Value>("font").unwrap_or(Value::Nil),
-                );
-                let effective_scale = if use_legacy_stretch {
-                    legacy_scale_y.max(1.0)
-                } else {
-                    scale
-                };
-
-                let (bounds, pivot) = if size_mode_uses_entity {
-                    let (w, h) = crate::window::get_global_size(&entity)?;
-                    if crate::window::uses_middle_pivot(&entity) {
-                        let (px, py) = crate::window::get_global_rotation_pivot(&entity)?;
-                        (
-                            Rect {
-                                x: px - w * 0.5,
-                                y: py - h * 0.5,
-                                w,
-                                h,
-                            },
-                            Vec2 { x: px, y: py },
-                        )
-                    } else {
-                        (Rect { x, y, w, h }, Vec2 { x, y })
-                    }
-                } else {
-                    (
-                        Rect {
-                            x,
-                            y,
-                            w: 0.0,
-                            h: 0.0,
-                        },
-                        Vec2 { x, y },
-                    )
-                };
-
-                let request = TextRenderRequest {
-                    text,
-                    bounds,
-                    rotation,
-                    pivot,
-                    color,
-                    font,
-                    scale: effective_scale,
-                    min_scale,
-                    text_scale,
-                    align_x,
-                    align_y,
-                    wrap,
-                    padding_x,
-                    padding_y,
-                    line_spacing,
-                    letter_spacing,
-                    stretch_width: if use_legacy_stretch {
-                        legacy_scale_x
-                    } else {
-                        0.0
-                    },
-                    stretch_height: if use_legacy_stretch {
-                        legacy_scale_y
-                    } else {
-                        0.0
-                    },
-                    rich_text: rich_text_ranges_from_component(&text_root, &component)?,
-                };
-
-                let metrics = crate::renderer::measure_text(&request).unwrap_or_default();
-                component.set("dx", metrics.width)?;
-                component.set("dy", metrics.height)?;
-                component.set("used_scale", metrics.used_scale)?;
-                component.set("line_count", metrics.line_count)?;
-                let letter_bounds = crate::renderer::text_letter_bounds(&request);
-                let bounds_table = ctx.create_table()?;
-                for (i, rect) in letter_bounds.iter().enumerate() {
-                    let entry = ctx.create_table()?;
-                    entry.set("x", rect.x)?;
-                    entry.set("y", rect.y)?;
-                    entry.set("w", rect.w)?;
-                    entry.set("h", rect.h)?;
-                    bounds_table.set(i + 1, entry)?;
-                }
-                component.set("__letter_bounds", bounds_table)?;
+                let request = refresh_textbox_layout_cache(ctx, &text_root, &entity, &component)?;
 
                 let mut renderer = render_state
                     .lock()
@@ -4863,6 +5258,60 @@ pub fn add_core_components(
         core_components.set("Rigidbody2D", rigidbody2d)?;
     }
 
+    // Bolt2D / LegacyBolt2D
+    // pins this entity's pivot to another entity at a local offset from that entity's pivot
+    {
+        for component_name in ["Bolt2D", "LegacyBolt2D"] {
+            let bolt2d = lua.create_table()?;
+
+            bolt2d.set(
+                "awake",
+                lua.create_function(move |_ctx, (_entity, component): (Table, Table)| {
+                    component.set("__neolove_component", component_name)?;
+                    component.set("enabled", true)?;
+                    component.set("target_entity", Value::Nil)?;
+                    component.set("target", Value::Nil)?;
+                    component.set("x", 0.0)?;
+                    component.set("y", 0.0)?;
+                    component.set("offset_x", 0.0)?;
+                    component.set("offset_y", 0.0)?;
+                    component.set("strength", 1.0)?;
+                    component.set("contacts_enabled", true)?;
+                    component.set("current_force", 0.0)?;
+                    component.set("force", 0.0)?;
+                    Ok(())
+                })?,
+            )?;
+
+            bolt2d.set(
+                "attach",
+                lua.create_function(move |_ctx, (component, target_entity): (Table, Table)| {
+                    component.set("target_entity", target_entity.clone())?;
+                    component.set("target", target_entity)?;
+                    Ok(())
+                })?,
+            )?;
+
+            bolt2d.set(
+                "link",
+                lua.create_function(move |_ctx, (component, target_entity): (Table, Table)| {
+                    component.set("target_entity", target_entity.clone())?;
+                    component.set("target", target_entity)?;
+                    Ok(())
+                })?,
+            )?;
+
+            bolt2d.set(
+                "update",
+                lua.create_function(
+                    move |_ctx, (_entity, _component, _dt): (Table, Table, f32)| Ok(()),
+                )?,
+            )?;
+
+            core_components.set(component_name, bolt2d)?;
+        }
+    }
+
     // Rope2D / String2D
     // distance constraint between two entities, solved globally each frame
     {
@@ -4912,4 +5361,142 @@ pub fn add_core_components(
 
     lua.globals().set("core", core_components)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn component_with_letter_bounds(lua: &Lua) -> mlua::Result<Table> {
+        let component = lua.create_table()?;
+        let bounds = lua.create_table()?;
+        let entry = lua.create_table()?;
+        entry.set("x", 10.0)?;
+        entry.set("y", 20.0)?;
+        entry.set("w", 30.0)?;
+        entry.set("h", 40.0)?;
+        bounds.set(1, entry)?;
+        component.set("__letter_bounds", bounds)?;
+        Ok(component)
+    }
+
+    fn assert_nil4(values: (Value, Value, Value, Value)) {
+        assert!(matches!(values.0, Value::Nil));
+        assert!(matches!(values.1, Value::Nil));
+        assert!(matches!(values.2, Value::Nil));
+        assert!(matches!(values.3, Value::Nil));
+    }
+
+    fn assert_nil2(values: (Value, Value)) {
+        assert!(matches!(values.0, Value::Nil));
+        assert!(matches!(values.1, Value::Nil));
+    }
+
+    fn assert_lua_number(value: &Value, expected: f64) {
+        match value {
+            Value::Integer(value) => assert_eq!(*value as f64, expected),
+            Value::Number(value) => assert_eq!(*value, expected),
+            other => panic!("expected numeric Lua value, got {}", other.type_name()),
+        }
+    }
+
+    #[test]
+    fn letter_bounds_lookup_uses_zero_based_index() -> mlua::Result<()> {
+        let lua = Lua::new();
+        let component = component_with_letter_bounds(&lua)?;
+
+        let bounds = get_letter_bounds_values(&lua, None, component.clone(), Value::Integer(0))?;
+        assert_lua_number(&bounds.0, 10.0);
+        assert_lua_number(&bounds.1, 20.0);
+        assert_lua_number(&bounds.2, 30.0);
+        assert_lua_number(&bounds.3, 40.0);
+
+        let position = get_letter_position_values(&lua, None, component, Value::Integer(0))?;
+        assert_lua_number(&position.0, 10.0);
+        assert_lua_number(&position.1, 20.0);
+        Ok(())
+    }
+
+    #[test]
+    fn letter_bounds_lookup_rejects_invalid_indexes() -> mlua::Result<()> {
+        let lua = Lua::new();
+        let component = component_with_letter_bounds(&lua)?;
+        let invalid = vec![
+            Value::Integer(-1),
+            Value::Integer(i64::MAX),
+            Value::Number(-1.0),
+            Value::Number(1.5),
+            Value::Number(f64::NAN),
+            Value::String(lua.create_string("0")?),
+        ];
+
+        for index in invalid {
+            assert_nil4(get_letter_bounds_values(
+                &lua,
+                None,
+                component.clone(),
+                index.clone(),
+            )?);
+            assert_nil2(get_letter_position_values(
+                &lua,
+                None,
+                component.clone(),
+                index,
+            )?);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_letter_bounds_callback_rejects_dot_call_without_panicking() -> mlua::Result<()> {
+        let lua = Lua::new();
+        let component = component_with_letter_bounds(&lua)?;
+        let get_letter_bounds =
+            lua.create_function(|ctx, args: mlua::Variadic<Value>| {
+                get_letter_bounds_from_args(ctx, None, None, args)
+            })?;
+        component.set("getLetterBounds", get_letter_bounds)?;
+
+        let script = r#"
+            local x, y, w, h = component.getLetterBounds(0)
+            return x, y, w, h
+        "#;
+        lua.globals().set("component", component)?;
+        let values: (Value, Value, Value, Value) = lua.load(script).eval()?;
+        assert_nil4(values);
+        Ok(())
+    }
+
+    #[test]
+    fn bound_letter_bounds_callback_accepts_dot_call() -> mlua::Result<()> {
+        let lua = Lua::new();
+        let component = component_with_letter_bounds(&lua)?;
+        install_unbound_textbox_letter_lookup_methods(&lua, &component, PathBuf::new())?;
+        bind_textbox_letter_lookup_methods(&lua, &component)?;
+
+        lua.globals().set("component", component.clone())?;
+        let bounds: (Value, Value, Value, Value) = lua
+            .load(
+                r#"
+                return component.getLetterBounds(0)
+                "#,
+            )
+            .eval()?;
+        assert_lua_number(&bounds.0, 10.0);
+        assert_lua_number(&bounds.1, 20.0);
+        assert_lua_number(&bounds.2, 30.0);
+        assert_lua_number(&bounds.3, 40.0);
+
+        let position: (Value, Value) = lua
+            .load(
+                r#"
+                return component:getLetterPosition(0)
+                "#,
+            )
+            .eval()?;
+        assert_lua_number(&position.0, 10.0);
+        assert_lua_number(&position.1, 20.0);
+        Ok(())
+    }
 }

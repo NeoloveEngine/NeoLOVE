@@ -188,7 +188,7 @@ async task examples.
 The [`samples`](samples) directory includes projects covering:
 
 - [`dodge`](samples/dodge) and [`blackjack`](samples/blackjack)
-- [`rigidbody2d`](samples/rigidbody2d) and
+- [`rigidbody2d`](samples/rigidbody2d), [`bolt2d`](samples/bolt2d), and
   [`raycasting`](samples/raycasting)
 - [`spriteboxes`](samples/spriteboxes) and [`shaders`](samples/shaders)
 - [`tweening`](samples/tweening) and [`webasm_smoke`](samples/webasm_smoke)
