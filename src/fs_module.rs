@@ -98,7 +98,10 @@ fn picked_path_to_string(path: PathBuf) -> String {
 }
 
 fn is_webasm_target() -> bool {
-    cfg!(target_arch = "wasm32")
+    // Windows builds run inside the same web-style sandbox semantics as the
+    // wasm runtime (no terminal, bundled assets), so games detect them the same
+    // way through `fs.isWebasm()`.
+    cfg!(target_arch = "wasm32") || cfg!(target_os = "windows")
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -488,10 +491,12 @@ mod tests {
         add_fs_module_with_data_root(&lua, resource_root.clone(), data_root.clone())?;
         lua.globals()
             .set("absoluteFile", absolute_file.to_string_lossy().into_owned())?;
+        lua.globals()
+            .set("expectedWebasm", is_webasm_target())?;
         lua.load(
             r#"
-            assert(fs.isWebasm() == false)
-            assert(fs.isWebAssembly() == false)
+            assert(fs.isWebasm() == expectedWebasm)
+            assert(fs.isWebAssembly() == expectedWebasm)
             assert(fs.getDataDirectory() ~= "")
             assert(fs.readFile("bundled.txt") == "bundled")
             fs.writeFile("save/state.txt", "saved")

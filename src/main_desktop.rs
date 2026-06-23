@@ -742,6 +742,37 @@ fn project_output_stem(project_root: &Path) -> String {
     sanitize_executable_name(&name_seed)
 }
 
+/// Rewrite the PE `Subsystem` field of a Windows executable image in place,
+/// switching it from the console subsystem (used by the `neolove` CLI) to the
+/// GUI subsystem so a compiled game launches without spawning a terminal window.
+///
+/// The dev `neolove.exe` stays a console application; only the copy we hand to
+/// players is patched. Field offsets follow the PE/COFF specification and are
+/// identical for PE32 and PE32+ images.
+#[cfg(windows)]
+fn patch_subsystem_to_gui(image: &mut [u8]) -> Result<(), String> {
+    const IMAGE_SUBSYSTEM_WINDOWS_GUI: u16 = 2;
+
+    if image.len() < 0x40 || &image[0..2] != b"MZ" {
+        return Err("engine executable is not a valid PE image (missing MZ header)".to_string());
+    }
+
+    let e_lfanew = u32::from_le_bytes(image[0x3C..0x40].try_into().unwrap()) as usize;
+    // PE signature (4) + COFF file header (20) precede the optional header.
+    let opt_header = e_lfanew
+        .checked_add(24)
+        .ok_or_else(|| "engine executable PE header offset overflowed".to_string())?;
+    // Subsystem is a 16-bit field at offset 68 within the optional header.
+    let subsystem = opt_header + 68;
+
+    if image.len() < subsystem + 2 || &image[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
+        return Err("engine executable is not a valid PE image (truncated headers)".to_string());
+    }
+
+    image[subsystem..subsystem + 2].copy_from_slice(&IMAGE_SUBSYSTEM_WINDOWS_GUI.to_le_bytes());
+    Ok(())
+}
+
 fn build_executable(project_root: &Path) -> Result<PathBuf, String> {
     let output_stem = project_output_stem(project_root);
 
@@ -760,12 +791,19 @@ fn build_executable(project_root: &Path) -> Result<PathBuf, String> {
 
     let current_exe = env::current_exe()
         .map_err(|e| format!("failed to resolve current executable path: {e}"))?;
-    let engine_bytes = fs::read(&current_exe).map_err(|e| {
+    #[allow(unused_mut)]
+    let mut engine_bytes = fs::read(&current_exe).map_err(|e| {
         format!(
             "failed to read engine executable {}: {e}",
             current_exe.display()
         )
     })?;
+
+    // Compiled games should not pop up a console window; flip the copied image to
+    // the GUI subsystem before embedding the payload.
+    #[cfg(windows)]
+    patch_subsystem_to_gui(&mut engine_bytes)
+        .map_err(|e| format!("failed to prepare windowed game executable: {e}"))?;
 
     let output_dir = project_root.join("dist");
     fs::create_dir_all(&output_dir).map_err(|e| {
@@ -1704,8 +1742,76 @@ fn with_platform_state<R>(
     Ok(f(&mut platform))
 }
 
+/// Set once we launch a game compiled with `neolove build`. Such games run
+/// without an attached terminal on Windows (the executable is linked against the
+/// GUI subsystem), so fatal errors have to surface through a native dialog
+/// instead of stderr.
+#[cfg(windows)]
+static GAME_ERROR_DIALOGS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn enable_native_error_dialogs() {
+    #[cfg(windows)]
+    GAME_ERROR_DIALOGS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn native_error_dialogs_enabled() -> bool {
+    #[cfg(windows)]
+    {
+        GAME_ERROR_DIALOGS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Show `message` in a native OS error dialog. Only does anything on Windows,
+/// where a compiled game has no console to print to.
+#[cfg(windows)]
+fn show_native_error(title: &str, message: &str) {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBoxW(
+            hwnd: *mut std::ffi::c_void,
+            text: *const u16,
+            caption: *const u16,
+            utype: u32,
+        ) -> i32;
+    }
+
+    fn to_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    const MB_OK: u32 = 0x0000_0000;
+    const MB_ICONERROR: u32 = 0x0000_0010;
+
+    let caption = title.trim_end_matches(':').trim();
+    let caption = if caption.is_empty() { "NeoLOVE" } else { caption };
+    let caption = to_wide(caption);
+    let body = to_wide(message);
+
+    // SAFETY: both pointers reference NUL-terminated UTF-16 buffers that outlive
+    // the modal call, and a null owner HWND is valid for a top-level dialog.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_native_error(_title: &str, _message: &str) {}
+
 fn report_runtime_failure(title: &str, message: &str) {
     eprintln!("\x1b[31m{title}\x1b[0m\n{message}");
+    if native_error_dialogs_enabled() {
+        show_native_error(title, message);
+    }
 }
 
 fn exit_runtime_failure(control_flow: &mut ControlFlow, title: &str, message: &str) {
@@ -2138,6 +2244,9 @@ fn run_cli() -> Result<(), String> {
 
     if let Some(payload) = embedded_payload {
         if args.len() == 1 {
+            // A compiled game runs without a console on Windows, so route fatal
+            // errors to a native dialog instead of stderr.
+            enable_native_error_dialogs();
             let project_root = extract_embedded_project(&payload)
                 .map_err(|error| format!("failed to extract embedded project: {error}"))?;
             let data_root = embedded_data_root(&current_exe)?;
@@ -2257,13 +2366,18 @@ fn main() -> ExitCode {
         Ok(Ok(())) => ExitCode::SUCCESS,
         Ok(Err(error)) => {
             eprintln!("{error}");
+            if native_error_dialogs_enabled() {
+                show_native_error("NeoLOVE", &error);
+            }
             ExitCode::FAILURE
         }
         Err(payload) => {
-            eprintln!(
-                "{}",
-                describe_desktop_panic("neolove encountered an internal panic", payload.as_ref())
-            );
+            let message =
+                describe_desktop_panic("neolove encountered an internal panic", payload.as_ref());
+            eprintln!("{message}");
+            if native_error_dialogs_enabled() {
+                show_native_error("NeoLOVE", &message);
+            }
             ExitCode::FAILURE
         }
     }
