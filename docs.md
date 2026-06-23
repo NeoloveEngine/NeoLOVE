@@ -313,6 +313,9 @@ Edges:
 Global: `fs`
 
 ```luau
+local runningOnWeb = fs.isWebasm()
+local filePath = fs.openFilePicker()
+local folderPath = fs.openFolderPicker()
 local dataDirectory = fs.getDataDirectory()
 local savePath = fs.dataPath("data/save.txt")
 local text = fs.readFile("data/save.txt")
@@ -332,6 +335,11 @@ fs.removeFile("data/c.txt")
 
 Edges:
 
+- `fs.isWebasm()` and `fs.isWebAssembly()` return whether the game is running
+  in the WebAssembly/browser build.
+- `fs.openFilePicker()` and `fs.openFolderPicker()` return an absolute path
+  string selected by the user, or `nil` when cancelled or unavailable. They use
+  native desktop dialogs and return `nil` on WebAssembly.
 - Relative writes use the writable game data directory.
 - Relative reads check writable game data first, then bundled project
   resources. Packaged games can therefore load embedded defaults and override
@@ -775,6 +783,7 @@ Fields:
 - `padding`, `padding_x`, `padding_y`
 - `line_spacing`
 - `letter_spacing`
+- `tab_size`: number of spaces a tab character advances by, default `4`; `tab_width` is accepted as an alias
 - `font`
 - `scale_x`, `scale_y`, `dx`, `dy`, `line_count`
 
@@ -791,6 +800,7 @@ Rich text methods use zero-based, end-exclusive character ranges. Formatting is 
 - `getLetterCount()`
 - `getLetterPosition(charIndex)` returns `x, y` or nils when unavailable/out of range
 - `getLetterBounds(charIndex)` returns `x, y, w, h` or nils when unavailable/out of range
+- `getClosestLetterIndex(x, y)` returns the nearest zero-based cursor/insertion index for a world-space point, or nil when unavailable. `getClosestCharacterIndex` is an alias.
 
 Aliases: `core.TextLabel`, `core.RudimentaryTextLabel`.
 
@@ -1012,6 +1022,44 @@ Edges:
 - Static bodies force linear and angular velocity to zero.
 - `collision_enabled = false` disables Rigidbody collision solving for that body.
 - `bounds_mode = "window"` constrains bodies to the window bounds.
+
+## `core.Bolt2D`
+
+Pins the entity's rotation pivot to another entity. Low strength keeps the pivot attached while allowing the entity to rotate around the bolt point; high strength increasingly resists that rotation.
+
+Fields:
+
+- `enabled`
+- `target_entity`, `target`
+- `x`, `y`
+- `offset_x`, `offset_y`
+- `strength`
+- `contacts_enabled`
+- `current_force`, `force`
+
+Method:
+
+```luau
+bolt:attach(targetEntity)
+```
+
+Edges:
+
+- Add `Bolt2D` to the entity being pinned.
+- `x` and `y` are target-local offsets from the target entity's rotation pivot. `offset_x` and `offset_y` are aliases.
+- The bolted entity's own rotation pivot is the attached point.
+- `strength` is clamped to `0..1`; `0` disables the bolt, low values allow free rotation around the attached point, and `1` locks rotation as well as position.
+- `link(targetEntity)` is an alias for `attach(targetEntity)`.
+
+## `core.LegacyBolt2D`
+
+Previous Bolt2D behavior: soft spring-like positional following.
+
+Fields and methods match `core.Bolt2D`.
+
+Edges:
+
+- `strength` is clamped to `0..1`; `0` disables the legacy bolt, `1` creates a hard positional pin, and values between use soft linear motors that can lag behind the target point.
 
 ## `core.Rope2D` and `core.String2D`
 

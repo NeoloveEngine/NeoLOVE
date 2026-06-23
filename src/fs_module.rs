@@ -93,6 +93,39 @@ fn path_to_project_string(root: &Path, path: &Path) -> String {
     }
 }
 
+fn picked_path_to_string(path: PathBuf) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn is_webasm_target() -> bool {
+    // Windows builds run inside the same web-style sandbox semantics as the
+    // wasm runtime (no terminal, bundled assets), so games detect them the same
+    // way through `fs.isWebasm()`.
+    cfg!(target_arch = "wasm32") || cfg!(target_os = "windows")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_file() -> Option<String> {
+    rfd::FileDialog::new().pick_file().map(picked_path_to_string)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn pick_file() -> Option<String> {
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_folder() -> Option<String> {
+    rfd::FileDialog::new()
+        .pick_folder()
+        .map(picked_path_to_string)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn pick_folder() -> Option<String> {
+    None
+}
+
 fn create_walk_entry(lua: &Lua, root: &Path, path: &Path) -> mlua::Result<Table> {
     let metadata = fs::metadata(path).map_err(|error| io_error("stat", path, &error))?;
     let entry = lua.create_table()?;
@@ -195,6 +228,23 @@ pub(crate) fn add_fs_module_with_data_root(
     data_root: PathBuf,
 ) -> mlua::Result<()> {
     let module = lua.create_table()?;
+
+    module.set(
+        "isWebasm",
+        lua.create_function(|_lua, ()| Ok(is_webasm_target()))?,
+    )?;
+    module.set(
+        "isWebAssembly",
+        lua.create_function(|_lua, ()| Ok(is_webasm_target()))?,
+    )?;
+    module.set(
+        "openFilePicker",
+        lua.create_function(|_lua, ()| Ok(pick_file()))?,
+    )?;
+    module.set(
+        "openFolderPicker",
+        lua.create_function(|_lua, ()| Ok(pick_folder()))?,
+    )?;
 
     module.set(
         "getDataDirectory",
@@ -441,8 +491,12 @@ mod tests {
         add_fs_module_with_data_root(&lua, resource_root.clone(), data_root.clone())?;
         lua.globals()
             .set("absoluteFile", absolute_file.to_string_lossy().into_owned())?;
+        lua.globals()
+            .set("expectedWebasm", is_webasm_target())?;
         lua.load(
             r#"
+            assert(fs.isWebasm() == expectedWebasm)
+            assert(fs.isWebAssembly() == expectedWebasm)
             assert(fs.getDataDirectory() ~= "")
             assert(fs.readFile("bundled.txt") == "bundled")
             fs.writeFile("save/state.txt", "saved")

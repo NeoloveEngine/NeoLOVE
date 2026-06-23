@@ -4,7 +4,9 @@ use crate::assets::ImageHandle;
 use crate::platform::{Color, SharedPlatformState, lock_platform_state};
 use fontdue::Font;
 use image::{ImageBuffer, Rgba, RgbaImage};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -97,6 +99,7 @@ pub(crate) struct TextRenderRequest {
     pub padding_y: f32,
     pub line_spacing: f32,
     pub letter_spacing: f32,
+    pub tab_size: f32,
     pub stretch_width: f32,
     pub stretch_height: f32,
     pub rich_text: Vec<TextStyleRange>,
@@ -197,6 +200,7 @@ struct TextSpriteCacheKey {
     padding_y: u32,
     line_spacing: u32,
     letter_spacing: u32,
+    tab_size: u32,
     stretch_width: u32,
     stretch_height: u32,
     rich_text: Vec<TextStyleRange>,
@@ -277,10 +281,52 @@ fn text_sprite_cache_key(request: &TextRenderRequest) -> TextSpriteCacheKey {
         padding_y: f32_cache_key(request.padding_y),
         line_spacing: f32_cache_key(request.line_spacing),
         letter_spacing: f32_cache_key(request.letter_spacing),
+        tab_size: f32_cache_key(normalize_tab_size(request.tab_size)),
         stretch_width: f32_cache_key(request.stretch_width),
         stretch_height: f32_cache_key(request.stretch_height),
         rich_text: request.rich_text.clone(),
     }
+}
+
+pub(crate) fn text_render_request_cache_id(request: &TextRenderRequest) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    request.text.hash(&mut hasher);
+    [
+        f32_cache_key(request.bounds.x),
+        f32_cache_key(request.bounds.y),
+        f32_cache_key(request.bounds.w),
+        f32_cache_key(request.bounds.h),
+    ]
+    .hash(&mut hasher);
+    f32_cache_key(request.rotation).hash(&mut hasher);
+    [
+        f32_cache_key(request.pivot.x),
+        f32_cache_key(request.pivot.y),
+    ]
+    .hash(&mut hasher);
+    [
+        request.color.r,
+        request.color.g,
+        request.color.b,
+        request.color.a,
+    ]
+    .hash(&mut hasher);
+    request.font.hash(&mut hasher);
+    f32_cache_key(request.scale).hash(&mut hasher);
+    f32_cache_key(request.min_scale).hash(&mut hasher);
+    request.text_scale.hash(&mut hasher);
+    request.align_x.hash(&mut hasher);
+    request.align_y.hash(&mut hasher);
+    request.wrap.hash(&mut hasher);
+    f32_cache_key(request.padding_x).hash(&mut hasher);
+    f32_cache_key(request.padding_y).hash(&mut hasher);
+    f32_cache_key(request.line_spacing).hash(&mut hasher);
+    f32_cache_key(request.letter_spacing).hash(&mut hasher);
+    f32_cache_key(normalize_tab_size(request.tab_size)).hash(&mut hasher);
+    f32_cache_key(request.stretch_width).hash(&mut hasher);
+    f32_cache_key(request.stretch_height).hash(&mut hasher);
+    request.rich_text.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn warn_font_once(key: &str, message: impl FnOnce() -> String) {
@@ -407,7 +453,37 @@ fn line_metrics_for(font: &Font, px: f32) -> fontdue::LineMetrics {
         })
 }
 
-fn measure_line_width(font: &Font, text: &str, px: f32, letter_spacing: f32) -> f32 {
+fn normalize_tab_size(tab_size: f32) -> f32 {
+    if tab_size.is_finite() {
+        tab_size.clamp(1.0, 32.0)
+    } else {
+        4.0
+    }
+}
+
+fn glyph_advance_width(font: &Font, ch: char, px: f32, tab_size: f32) -> f32 {
+    if ch == '\t' {
+        font.metrics(' ', px).advance_width * normalize_tab_size(tab_size)
+    } else {
+        font.metrics(ch, px).advance_width
+    }
+}
+
+fn horizontal_kern(font: &Font, previous: char, ch: char, px: f32) -> f32 {
+    if previous == '\t' || ch == '\t' {
+        0.0
+    } else {
+        font.horizontal_kern(previous, ch, px).unwrap_or(0.0)
+    }
+}
+
+fn measure_line_width(
+    font: &Font,
+    text: &str,
+    px: f32,
+    letter_spacing: f32,
+    tab_size: f32,
+) -> f32 {
     let mut width = 0.0f32;
     let mut previous = None;
     let spacing = letter_spacing;
@@ -417,9 +493,9 @@ fn measure_line_width(font: &Font, text: &str, px: f32, letter_spacing: f32) -> 
             width += spacing;
         }
         if let Some(prev) = previous {
-            width += font.horizontal_kern(prev, ch, px).unwrap_or(0.0);
+            width += horizontal_kern(font, prev, ch, px);
         }
-        width += font.metrics(ch, px).advance_width;
+        width += glyph_advance_width(font, ch, px, tab_size);
         previous = Some(ch);
     }
 
@@ -432,6 +508,7 @@ fn wrap_paragraph_char(
     px: f32,
     limit: f32,
     letter_spacing: f32,
+    tab_size: f32,
 ) -> Vec<String> {
     if limit <= 0.0 || !limit.is_finite() {
         return vec![text.to_string()];
@@ -445,9 +522,9 @@ fn wrap_paragraph_char(
 
     for ch in text.chars() {
         let kern = previous
-            .and_then(|prev| font.horizontal_kern(prev, ch, px))
+            .map(|prev| horizontal_kern(font, prev, ch, px))
             .unwrap_or(0.0);
-        let char_width = font.metrics(ch, px).advance_width;
+        let char_width = glyph_advance_width(font, ch, px, tab_size);
         let next_width = if current.is_empty() {
             char_width
         } else {
@@ -480,44 +557,70 @@ fn wrap_paragraph_char(
     lines
 }
 
+fn whitespace_preserving_tokens(text: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut start = 0usize;
+    let mut current_is_whitespace = None;
+
+    for (byte_index, ch) in text.char_indices() {
+        let is_whitespace = ch.is_whitespace();
+        match current_is_whitespace {
+            Some(previous) if previous != is_whitespace => {
+                tokens.push(&text[start..byte_index]);
+                start = byte_index;
+                current_is_whitespace = Some(is_whitespace);
+            }
+            Some(_) => {}
+            None => current_is_whitespace = Some(is_whitespace),
+        }
+    }
+
+    if start < text.len() {
+        tokens.push(&text[start..]);
+    }
+
+    tokens
+}
+
 fn wrap_paragraph_word(
     font: &Font,
     text: &str,
     px: f32,
     limit: f32,
     letter_spacing: f32,
+    tab_size: f32,
 ) -> Vec<String> {
     if limit <= 0.0 || !limit.is_finite() {
         return vec![text.to_string()];
     }
 
-    let words: Vec<&str> = text.split_whitespace().collect();
-    if words.is_empty() {
+    let tokens = whitespace_preserving_tokens(text);
+    if tokens.is_empty() {
         return vec![String::new()];
     }
 
     let mut lines = Vec::new();
     let mut current = String::new();
 
-    for word in words {
-        let candidate = if current.is_empty() {
-            word.to_string()
-        } else {
-            format!("{current} {word}")
-        };
-        let candidate_width = measure_line_width(font, &candidate, px, letter_spacing);
+    for token in tokens {
+        let mut candidate = String::with_capacity(current.len() + token.len());
+        candidate.push_str(&current);
+        candidate.push_str(token);
+        let candidate_width = measure_line_width(font, &candidate, px, letter_spacing, tab_size);
         if !current.is_empty() && candidate_width > limit {
             lines.push(current);
-            let word_width = measure_line_width(font, word, px, letter_spacing);
-            if word_width > limit {
-                let mut wrapped = wrap_paragraph_char(font, word, px, limit, letter_spacing);
-                current = wrapped.pop().unwrap_or_default();
-                lines.extend(wrapped);
-            } else {
-                current = word.to_string();
-            }
+            current = String::new();
+        }
+
+        let token_width = measure_line_width(font, token, px, letter_spacing, tab_size);
+        let token_is_word = token.chars().any(|ch| !ch.is_whitespace());
+        if current.is_empty() && token_is_word && token_width > limit {
+            let mut wrapped =
+                wrap_paragraph_char(font, token, px, limit, letter_spacing, tab_size);
+            current = wrapped.pop().unwrap_or_default();
+            lines.extend(wrapped);
         } else {
-            current = candidate;
+            current.push_str(token);
         }
     }
 
@@ -537,6 +640,7 @@ fn layout_lines_for(
     wrap: TextWrapMode,
     width_limit: Option<f32>,
     letter_spacing: f32,
+    tab_size: f32,
 ) -> Vec<PreparedTextLine> {
     if text.is_empty() {
         return Vec::new();
@@ -547,14 +651,14 @@ fn layout_lines_for(
         let wrapped = match (wrap, width_limit) {
             (TextWrapMode::None, _) | (_, None) => vec![paragraph.to_string()],
             (TextWrapMode::Word, Some(limit)) => {
-                wrap_paragraph_word(font, paragraph, px, limit, letter_spacing)
+                wrap_paragraph_word(font, paragraph, px, limit, letter_spacing, tab_size)
             }
             (TextWrapMode::Char, Some(limit)) => {
-                wrap_paragraph_char(font, paragraph, px, limit, letter_spacing)
+                wrap_paragraph_char(font, paragraph, px, limit, letter_spacing, tab_size)
             }
         };
         for line in wrapped {
-            let width = measure_line_width(font, &line, px, letter_spacing);
+            let width = measure_line_width(font, &line, px, letter_spacing, tab_size);
             lines.push(PreparedTextLine { text: line, width });
         }
     }
@@ -632,6 +736,7 @@ fn prepare_text_layout_uncached(request: &TextRenderRequest) -> Option<PreparedT
             request.wrap,
             wrap_limit,
             request.letter_spacing,
+            request.tab_size,
         );
         let width = lines.iter().map(|line| line.width).fold(0.0f32, f32::max);
         let height = if lines.is_empty() {
@@ -689,7 +794,7 @@ fn prepare_text_layout_uncached(request: &TextRenderRequest) -> Option<PreparedT
         measured = best_measured;
     }
 
-    let (lines, block_width, block_height, line_metrics, _base_line_height, line_advance) =
+    let (lines, block_width, block_height, line_metrics, base_line_height, line_advance) =
         measured;
     let padded_origin_x = request.bounds.x + request.padding_x.max(0.0);
     let padded_origin_y = request.bounds.y + request.padding_y.max(0.0);
@@ -708,6 +813,7 @@ fn prepare_text_layout_uncached(request: &TextRenderRequest) -> Option<PreparedT
     let mut min_y = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
     let mut max_y = f32::NEG_INFINITY;
+    let mut letter_bounds = Vec::new();
     let spacing = request.letter_spacing;
     let _px = used_scale.max(1.0);
 
@@ -732,12 +838,15 @@ fn prepare_text_layout_uncached(request: &TextRenderRequest) -> Option<PreparedT
                 pen_x += spacing;
             }
             if let Some(prev) = previous {
-                pen_x += glyph_font
-                    .horizontal_kern(prev, ch, glyph_px)
-                    .unwrap_or(0.0);
+                pen_x += horizontal_kern(&glyph_font, prev, ch, glyph_px);
             }
-            let metrics = glyph_font.metrics(ch, glyph_px);
+            let render_ch = if ch == '\t' { ' ' } else { ch };
+            let metrics = glyph_font.metrics(render_ch, glyph_px);
+            let advance_width = glyph_advance_width(&glyph_font, ch, glyph_px, request.tab_size);
             let italic_slant = if style.italic { glyph_px * 0.18 } else { 0.0 };
+            let cell_x = line_start_x + pen_x;
+            let cell_y = start_y + line_advance * line_index as f32;
+            let cell_w = advance_width.max(0.0);
             let glyph_x = line_start_x + pen_x + metrics.xmin as f32;
             let glyph_y = baseline_y - metrics.height as f32 - metrics.ymin as f32;
             let bounds = Rect {
@@ -746,18 +855,24 @@ fn prepare_text_layout_uncached(request: &TextRenderRequest) -> Option<PreparedT
                 w: metrics.width as f32 + italic_slant + if style.bold { 1.0 } else { 0.0 },
                 h: metrics.height as f32,
             };
+            letter_bounds.push(Rect {
+                x: cell_x,
+                y: cell_y,
+                w: cell_w,
+                h: base_line_height.max(1.0),
+            });
             min_x = min_x.min(bounds.x.floor());
             min_y = min_y.min(bounds.y.floor());
             max_x = max_x.max((bounds.x + bounds.w).ceil());
             max_y = max_y.max((bounds.y + bounds.h).ceil());
             glyphs.push(PreparedGlyph {
-                ch,
+                ch: render_ch,
                 x: glyph_x,
                 y: glyph_y,
                 style,
                 bounds,
             });
-            pen_x += metrics.advance_width;
+            pen_x += advance_width;
             previous = Some(ch);
         }
     }
@@ -777,7 +892,7 @@ fn prepare_text_layout_uncached(request: &TextRenderRequest) -> Option<PreparedT
             .unwrap_or(block_height),
         used_scale,
         line_count: lines.len(),
-        letter_bounds: glyphs.iter().map(|glyph| glyph.bounds).collect(),
+        letter_bounds,
     };
     if request.stretch_width > 0.0 && request.stretch_height > 0.0 {
         metrics.width = request.stretch_width;
@@ -815,9 +930,18 @@ pub(crate) fn measure_text(request: &TextRenderRequest) -> Option<TextMetrics> {
         let widest_line = request
             .text
             .lines()
-            .map(|line| line.chars().count())
-            .max()
-            .unwrap_or(0) as f32;
+            .map(|line| {
+                line.chars()
+                    .map(|ch| {
+                        if ch == '\t' {
+                            normalize_tab_size(request.tab_size)
+                        } else {
+                            1.0
+                        }
+                    })
+                    .sum::<f32>()
+            })
+            .fold(0.0f32, f32::max);
         let used_scale = request.scale.max(1.0);
         Some(TextMetrics {
             width: widest_line * used_scale * 0.6,
@@ -1524,6 +1648,15 @@ impl SoftwareRenderer {
         tint: Color,
         filter: TextureFilter,
     ) -> Result<(), String> {
+        if dest.w <= 0.0 || dest.h <= 0.0 || source.w <= 0.0 || source.h <= 0.0 || tint.a == 0 {
+            return Ok(());
+        }
+
+        if rotation.abs() <= 0.0001 {
+            self.draw_axis_aligned_image_pixels(source_image, dest, source, tint, filter);
+            return Ok(());
+        }
+
         let corners = [
             self.to_world(dest.x, dest.y, pivot.x, pivot.y, rotation),
             self.to_world(dest.x + dest.w, dest.y, pivot.x, pivot.y, rotation),
@@ -1575,6 +1708,72 @@ impl SoftwareRenderer {
             }
         }
         Ok(())
+    }
+
+    fn draw_axis_aligned_image_pixels(
+        &mut self,
+        source_image: &RgbaImage,
+        dest: Rect,
+        source: Rect,
+        tint: Color,
+        filter: TextureFilter,
+    ) {
+        let start_x = dest.x.floor().max(0.0) as i32;
+        let end_x = (dest.x + dest.w).ceil().min(self.width as f32) as i32;
+        let start_y = dest.y.floor().max(0.0) as i32;
+        let end_y = (dest.y + dest.h).ceil().min(self.height as f32) as i32;
+        if end_x <= start_x || end_y <= start_y {
+            return;
+        }
+
+        let src_max_x = source_image.width().saturating_sub(1) as f32;
+        let src_max_y = source_image.height().saturating_sub(1) as f32;
+        let tint_is_white = tint == Color::WHITE;
+
+        for py in start_y..end_y {
+            let v = (py as f32 + 0.5 - dest.y) / dest.h;
+            if !(0.0..=1.0).contains(&v) {
+                continue;
+            }
+            let src_y = source.y + source.h * v;
+            let row_start = py as usize * self.width as usize * 4;
+
+            for px in start_x..end_x {
+                let u = (px as f32 + 0.5 - dest.x) / dest.w;
+                if !(0.0..=1.0).contains(&u) {
+                    continue;
+                }
+                let src_x = source.x + source.w * u;
+                let sample = match filter {
+                    TextureFilter::Nearest => {
+                        let sx = src_x.floor().clamp(0.0, src_max_x) as u32;
+                        let sy = src_y.floor().clamp(0.0, src_max_y) as u32;
+                        let [r, g, b, a] = source_image.get_pixel(sx, sy).0;
+                        Color::rgba(r, g, b, a)
+                    }
+                    TextureFilter::Linear => sample_rgba(source_image, src_x, src_y, filter),
+                };
+                let color = if tint_is_white {
+                    sample
+                } else {
+                    modulate(sample, tint)
+                };
+                if color.a == 0 {
+                    continue;
+                }
+
+                let index = row_start + px as usize * 4;
+                let dest_pixel = &mut self.pixels[index..index + 4];
+                if color.a == 255 {
+                    dest_pixel[0] = color.r;
+                    dest_pixel[1] = color.g;
+                    dest_pixel[2] = color.b;
+                    dest_pixel[3] = color.a;
+                } else {
+                    blend(dest_pixel, color);
+                }
+            }
+        }
     }
 
     fn draw_text(&mut self, request: &TextRenderRequest) -> Result<(), String> {
@@ -1680,8 +1879,10 @@ mod tests {
             padding_y: 0.0,
             line_spacing: 1.0,
             letter_spacing: 0.0,
+            tab_size: 4.0,
             stretch_width: 0.0,
             stretch_height: 0.0,
+            rich_text: Vec::new(),
         };
 
         assert!(command_intersects_viewport(
@@ -1715,8 +1916,10 @@ mod tests {
             padding_y: 0.0,
             line_spacing: 1.0,
             letter_spacing: 0.0,
+            tab_size: 4.0,
             stretch_width: 0.0,
             stretch_height: 0.0,
+            rich_text: Vec::new(),
         };
 
         let sprite = rasterize_text_sprite(&request).expect("expected rasterized text sprite");
@@ -1724,6 +1927,118 @@ mod tests {
         assert!(sprite.dest.h > 0.0);
         assert!(sprite.image.width() > 0);
         assert!(sprite.image.height() > 0);
+    }
+
+    #[test]
+    fn letter_bounds_use_stable_line_box_for_punctuation() {
+        let request = TextRenderRequest {
+            text: "a,a".to_string(),
+            bounds: Rect {
+                x: 24.0,
+                y: 32.0,
+                w: 0.0,
+                h: 0.0,
+            },
+            rotation: 0.0,
+            pivot: Vec2::default(),
+            color: Color::WHITE,
+            font: FontHandle::Default,
+            scale: 16.0,
+            min_scale: 16.0,
+            text_scale: TextScaleMode::None,
+            align_x: TextAlignX::Left,
+            align_y: TextAlignY::Top,
+            wrap: TextWrapMode::None,
+            padding_x: 0.0,
+            padding_y: 0.0,
+            line_spacing: 1.0,
+            letter_spacing: 0.0,
+            tab_size: 4.0,
+            stretch_width: 0.0,
+            stretch_height: 0.0,
+            rich_text: Vec::new(),
+        };
+
+        let metrics = measure_text(&request).expect("expected text metrics");
+        assert_eq!(metrics.letter_bounds.len(), 3);
+        assert_eq!(metrics.letter_bounds[0].y, metrics.letter_bounds[1].y);
+        assert_eq!(metrics.letter_bounds[0].h, metrics.letter_bounds[1].h);
+        assert_eq!(metrics.letter_bounds[1].y, metrics.letter_bounds[2].y);
+        assert_eq!(metrics.letter_bounds[1].h, metrics.letter_bounds[2].h);
+    }
+
+    #[test]
+    fn word_wrap_preserves_trailing_space_letter_bounds() {
+        let request = TextRenderRequest {
+            text: "abc ".to_string(),
+            bounds: Rect {
+                x: 24.0,
+                y: 32.0,
+                w: 180.0,
+                h: 0.0,
+            },
+            rotation: 0.0,
+            pivot: Vec2::default(),
+            color: Color::WHITE,
+            font: FontHandle::Default,
+            scale: 16.0,
+            min_scale: 16.0,
+            text_scale: TextScaleMode::None,
+            align_x: TextAlignX::Left,
+            align_y: TextAlignY::Top,
+            wrap: TextWrapMode::Word,
+            padding_x: 0.0,
+            padding_y: 0.0,
+            line_spacing: 1.0,
+            letter_spacing: 0.0,
+            tab_size: 4.0,
+            stretch_width: 0.0,
+            stretch_height: 0.0,
+            rich_text: Vec::new(),
+        };
+
+        let metrics = measure_text(&request).expect("expected text metrics");
+        assert_eq!(metrics.letter_bounds.len(), 4);
+        assert!(metrics.letter_bounds[3].w > 0.0);
+    }
+
+    #[test]
+    fn tab_size_controls_tab_advance() {
+        let mut narrow = TextRenderRequest {
+            text: "\t".to_string(),
+            bounds: Rect {
+                x: 24.0,
+                y: 32.0,
+                w: 0.0,
+                h: 0.0,
+            },
+            rotation: 0.0,
+            pivot: Vec2::default(),
+            color: Color::WHITE,
+            font: FontHandle::Default,
+            scale: 16.0,
+            min_scale: 16.0,
+            text_scale: TextScaleMode::None,
+            align_x: TextAlignX::Left,
+            align_y: TextAlignY::Top,
+            wrap: TextWrapMode::None,
+            padding_x: 0.0,
+            padding_y: 0.0,
+            line_spacing: 1.0,
+            letter_spacing: 0.0,
+            tab_size: 2.0,
+            stretch_width: 0.0,
+            stretch_height: 0.0,
+            rich_text: Vec::new(),
+        };
+        let narrow_metrics = measure_text(&narrow).expect("expected text metrics");
+
+        narrow.tab_size = 4.0;
+        let wide_metrics = measure_text(&narrow).expect("expected text metrics");
+
+        assert_eq!(narrow_metrics.letter_bounds.len(), 1);
+        assert_eq!(wide_metrics.letter_bounds.len(), 1);
+        assert!(wide_metrics.letter_bounds[0].w > narrow_metrics.letter_bounds[0].w * 1.9);
     }
 
     #[test]
@@ -1750,8 +2065,10 @@ mod tests {
             padding_y: 0.0,
             line_spacing: 1.0,
             letter_spacing: 0.0,
+            tab_size: 4.0,
             stretch_width: 0.0,
             stretch_height: 0.0,
+            rich_text: Vec::new(),
         };
 
         let sprite = rasterize_text_sprite(&request).expect("expected rasterized text sprite");

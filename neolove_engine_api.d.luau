@@ -223,6 +223,10 @@ export type FsWalkEntry = {
 }
 
 export type FsModule = {
+	isWebasm: () -> boolean,
+	isWebAssembly: () -> boolean,
+	openFilePicker: () -> string?,
+	openFolderPicker: () -> string?,
 	getDataDirectory: () -> string,
 	dataPath: (path: string) -> string,
 	readFile: (path: string) -> string,
@@ -545,6 +549,8 @@ export type UiTextStyle = {
 	padding_y: number,
 	line_spacing: number,
 	letter_spacing: number,
+	tab_size: number,
+	tab_width: number?,
 	font: TextFont?,
 }
 
@@ -568,6 +574,8 @@ export type TextBox = BaseDrawableComponent & UiTextStyle & {
 	getLetterCount: (self: TextBox) -> number,
 	getLetterPosition: (self: TextBox, charIndex: number) -> (number?, number?),
 	getLetterBounds: (self: TextBox, charIndex: number) -> (number?, number?, number?, number?),
+	getClosestLetterIndex: (self: TextBox, x: number, y: number) -> number?,
+	getClosestCharacterIndex: (self: TextBox, x: number, y: number) -> number?,
 }
 
 export type TextLabel = TextBox
@@ -713,6 +721,40 @@ export type Rigidbody2D = ComponentInstance & {
 	setGravity: (self: Rigidbody2D, gx: number, gy: number) -> (),
 }
 
+export type Bolt2D = ComponentInstance & {
+	__neolove_component: "Bolt2D",
+	enabled: boolean,
+	target_entity: Entity?,
+	target: Entity?,
+	x: number,
+	y: number,
+	offset_x: number,
+	offset_y: number,
+	strength: number,
+	contacts_enabled: boolean,
+	current_force: number,
+	force: number,
+	attach: (self: Bolt2D, targetEntity: Entity) -> (),
+	link: (self: Bolt2D, targetEntity: Entity) -> (),
+}
+
+export type LegacyBolt2D = ComponentInstance & {
+	__neolove_component: "LegacyBolt2D",
+	enabled: boolean,
+	target_entity: Entity?,
+	target: Entity?,
+	x: number,
+	y: number,
+	offset_x: number,
+	offset_y: number,
+	strength: number,
+	contacts_enabled: boolean,
+	current_force: number,
+	force: number,
+	attach: (self: LegacyBolt2D, targetEntity: Entity) -> (),
+	link: (self: LegacyBolt2D, targetEntity: Entity) -> (),
+}
+
 export type Rope2D = ComponentInstance & {
 	__neolove_component: "Rope2D",
 	enabled: boolean,
@@ -743,6 +785,8 @@ export type CoreModule = {
 	Spritebox2D: Spritebox2D,
 	Collider2D: Collider2D,
 	Rigidbody2D: Rigidbody2D,
+	Bolt2D: Bolt2D,
+	LegacyBolt2D: LegacyBolt2D,
 	Rope2D: Rope2D,
 	String2D: Rope2D,
 }

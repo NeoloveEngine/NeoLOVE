@@ -4,9 +4,10 @@ use mlua::{
 };
 use rapier2d::prelude::{
     nalgebra, point, vector, CCDSolver, ColliderBuilder, ColliderHandle, ColliderSet,
-    DefaultBroadPhase, ImpulseJointHandle, ImpulseJointSet, IntegrationParameters, IslandManager,
-    MultibodyJointSet, NarrowPhase, PhysicsPipeline, RigidBodyBuilder, RigidBodyHandle,
-    RigidBodySet, RopeJointBuilder,
+    DefaultBroadPhase, GenericJointBuilder, ImpulseJointHandle, ImpulseJointSet,
+    IntegrationParameters, IslandManager, JointAxesMask, JointAxis, MultibodyJointSet,
+    NarrowPhase, PhysicsPipeline, RigidBodyBuilder, RigidBodyHandle, RigidBodySet,
+    RopeJointBuilder,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -1014,6 +1015,11 @@ struct RapierRopeSync {
     joint_handle: ImpulseJointHandle,
 }
 
+struct RapierBoltSync {
+    bolt: Table,
+    joint_handle: ImpulseJointHandle,
+}
+
 struct PhysicsWorld {
     islands: IslandManager,
     broad_phase: DefaultBroadPhase,
@@ -1027,6 +1033,7 @@ struct PhysicsWorld {
     collider_sync: Vec<RapierColliderSync>,
     collider_map: HashMap<ColliderHandle, usize>,
     body_by_entity_id: HashMap<usize, RigidBodyHandle>,
+    body_sync_by_entity_id: HashMap<usize, usize>,
     entity_by_id: HashMap<usize, Table>,
 }
 
@@ -1036,14 +1043,18 @@ struct EntityPhysicsInfo {
     rigidbody: Option<Table>,
     collider: Option<Table>,
     ropes: Vec<Table>,
+    bolts: Vec<Table>,
+    legacy_bolts: Vec<Table>,
 }
 
 fn extract_physics_components(
     components: &Table,
-) -> mlua::Result<(Option<Table>, Option<Table>, Vec<Table>)> {
+) -> mlua::Result<(Option<Table>, Option<Table>, Vec<Table>, Vec<Table>, Vec<Table>)> {
     let mut rigidbody: Option<Table> = None;
     let mut collider: Option<Table> = None;
     let mut ropes: Vec<Table> = Vec::new();
+    let mut bolts: Vec<Table> = Vec::new();
+    let mut legacy_bolts: Vec<Table> = Vec::new();
 
     for component in components.sequence_values::<Table>() {
         let component = match component {
@@ -1066,15 +1077,20 @@ fn extract_physics_components(
                 }
             }
             "Rope2D" => ropes.push(component),
+            "Bolt2D" => bolts.push(component),
+            "LegacyBolt2D" => legacy_bolts.push(component),
             _ => {}
         }
     }
 
-    Ok((rigidbody, collider, ropes))
+    Ok((rigidbody, collider, ropes, bolts, legacy_bolts))
 }
 
 fn is_physics_component_name(name: &str) -> bool {
-    matches!(name, "Rigidbody2D" | "Collider2D" | "Rope2D")
+    matches!(
+        name,
+        "Rigidbody2D" | "Collider2D" | "Rope2D" | "Bolt2D" | "LegacyBolt2D"
+    )
 }
 
 fn physics_topology_signature(physics_infos: &[EntityPhysicsInfo]) -> u64 {
@@ -1157,9 +1173,31 @@ fn physics_topology_signature(physics_infos: &[EntityPhysicsInfo]) -> u64 {
                 .to_bits()
                 .hash(&mut hasher);
         }
+
+        info.bolts.len().hash(&mut hasher);
+        info.legacy_bolts.len().hash(&mut hasher);
     }
 
     hasher.finish()
+}
+
+fn physics_pivot_local_from_center(entity: &Table, width: f32, height: f32) -> (f32, f32) {
+    let pivot_x = read_optional_f32(entity, "rotation_pivot_x", "rotationPivotX")
+        .or_else(|| read_optional_f32(entity, "pivot_x", "pivotX"))
+        .unwrap_or(if uses_middle_rotation_pivot(entity) {
+            0.5
+        } else {
+            0.0
+        });
+    let pivot_y = read_optional_f32(entity, "rotation_pivot_y", "rotationPivotY")
+        .or_else(|| read_optional_f32(entity, "pivot_y", "pivotY"))
+        .unwrap_or(if uses_middle_rotation_pivot(entity) {
+            0.5
+        } else {
+            0.0
+        });
+
+    (width * (pivot_x - 0.5), height * (pivot_y - 0.5))
 }
 
 fn triangle_local_points(
@@ -2578,6 +2616,7 @@ impl Runtime {
         let mut collider_sync: Vec<RapierColliderSync> = Vec::new();
         let mut collider_map: HashMap<ColliderHandle, usize> = HashMap::new();
         let mut body_by_entity_id: HashMap<usize, RigidBodyHandle> = HashMap::new();
+        let mut body_sync_by_entity_id: HashMap<usize, usize> = HashMap::new();
         let mut entity_by_id: HashMap<usize, Table> = HashMap::new();
 
         for info in physics_infos {
@@ -2652,6 +2691,7 @@ impl Runtime {
 
             let body_handle = bodies.insert(builder.build());
             body_by_entity_id.insert(entity_id, body_handle);
+            body_sync_by_entity_id.insert(entity_id, body_sync.len());
             body_sync.push(RapierBodySync {
                 entity_id,
                 entity: entity.clone(),
@@ -2802,6 +2842,7 @@ impl Runtime {
             collider_sync,
             collider_map,
             body_by_entity_id,
+            body_sync_by_entity_id,
             entity_by_id,
         });
 
@@ -2863,6 +2904,7 @@ impl Runtime {
         let mut rigidbody_count = 0usize;
         let mut collider_count = 0usize;
         let mut rope_count = 0usize;
+        let mut bolt_count = 0usize;
         {
             let entities = self.entities.borrow();
             physics_infos
@@ -2882,11 +2924,11 @@ impl Runtime {
                         continue;
                     }
                     let entity_id = entity.get::<usize>("id").unwrap_or(0);
-                    let (rigidbody, collider, ropes) =
+                    let (rigidbody, collider, ropes, bolts, legacy_bolts) =
                         if let Ok(components) = entity.get::<Table>("components") {
                             extract_physics_components(&components)?
                         } else {
-                            (None, None, Vec::new())
+                            (None, None, Vec::new(), Vec::new(), Vec::new())
                         };
                     if rigidbody.is_some() {
                         rigidbody_count += 1;
@@ -2895,7 +2937,13 @@ impl Runtime {
                         collider_count += 1;
                     }
                     rope_count += ropes.len();
-                    if rigidbody.is_some() || collider.is_some() || !ropes.is_empty() {
+                    bolt_count += bolts.len() + legacy_bolts.len();
+                    if rigidbody.is_some()
+                        || collider.is_some()
+                        || !ropes.is_empty()
+                        || !bolts.is_empty()
+                        || !legacy_bolts.is_empty()
+                    {
                         has_physics_work = true;
                     }
                     physics_infos.push(EntityPhysicsInfo {
@@ -2904,6 +2952,8 @@ impl Runtime {
                         rigidbody,
                         collider,
                         ropes,
+                        bolts,
+                        legacy_bolts,
                     });
                 }
             }
@@ -2912,11 +2962,12 @@ impl Runtime {
         physics_infos.sort_by_key(|info| info.entity_id);
         if let Some(trace) = web_trace {
             web_debug_log(&format!(
-                "runtime.update {trace}: rapier scan results infos={} rigidbodies={} colliders={} ropes={} has_work={has_physics_work}",
+                "runtime.update {trace}: rapier scan results infos={} rigidbodies={} colliders={} ropes={} bolts={} has_work={has_physics_work}",
                 physics_infos.len(),
                 rigidbody_count,
                 collider_count,
                 rope_count,
+                bolt_count,
             ));
         }
 
@@ -2958,6 +3009,7 @@ impl Runtime {
         }
 
         let mut rope_sync: Vec<RapierRopeSync> = Vec::new();
+        let mut bolt_sync: Vec<RapierBoltSync> = Vec::new();
         let mut current_collision_ids: HashMap<usize, HashSet<usize>> = HashMap::new();
         let mut current_trigger_ids: HashMap<usize, HashSet<usize>> = HashMap::new();
 
@@ -3105,14 +3157,150 @@ impl Runtime {
             }
         }
 
+        for info in &physics_infos {
+            for (bolt, legacy_mode) in info
+                .bolts
+                .iter()
+                .map(|bolt| (bolt, false))
+                .chain(info.legacy_bolts.iter().map(|bolt| (bolt, true)))
+            {
+                bolt.set("current_force", 0.0)?;
+                bolt.set("force", 0.0)?;
+
+                if !bolt.get::<bool>("enabled").unwrap_or(true) {
+                    continue;
+                }
+
+                let strength = bolt.get::<f32>("strength").unwrap_or(1.0).clamp(0.0, 1.0);
+                if strength <= 0.0 {
+                    continue;
+                }
+
+                let Some(target_entity) = bolt
+                    .get::<Option<Table>>("target_entity")
+                    .ok()
+                    .flatten()
+                    .or_else(|| bolt.get::<Option<Table>>("target").ok().flatten())
+                else {
+                    continue;
+                };
+
+                let target_entity_id = target_entity.get::<usize>("id").unwrap_or(0);
+                let Some(&owner_body) = world.body_by_entity_id.get(&info.entity_id) else {
+                    continue;
+                };
+                let Some(&target_body) = world.body_by_entity_id.get(&target_entity_id) else {
+                    continue;
+                };
+                if owner_body == target_body {
+                    continue;
+                }
+
+                let Some(&owner_sync_index) = world.body_sync_by_entity_id.get(&info.entity_id)
+                else {
+                    continue;
+                };
+                let Some(&target_sync_index) =
+                    world.body_sync_by_entity_id.get(&target_entity_id)
+                else {
+                    continue;
+                };
+                let Some(owner_sync) = world.body_sync.get(owner_sync_index) else {
+                    continue;
+                };
+                let Some(target_sync) = world.body_sync.get(target_sync_index) else {
+                    continue;
+                };
+
+                let (owner_pivot_x, owner_pivot_y) = physics_pivot_local_from_center(
+                    &owner_sync.entity,
+                    owner_sync.size_x,
+                    owner_sync.size_y,
+                );
+                let (target_pivot_x, target_pivot_y) = physics_pivot_local_from_center(
+                    &target_sync.entity,
+                    target_sync.size_x,
+                    target_sync.size_y,
+                );
+                let x = bolt.get::<f32>("x").unwrap_or(0.0);
+                let y = bolt.get::<f32>("y").unwrap_or(0.0);
+                let offset_x_alias = bolt.get::<f32>("offset_x").unwrap_or(0.0);
+                let offset_y_alias = bolt.get::<f32>("offset_y").unwrap_or(0.0);
+                let offset_x = if x != 0.0 || offset_x_alias == 0.0 {
+                    x
+                } else {
+                    offset_x_alias
+                };
+                let offset_y = if y != 0.0 || offset_y_alias == 0.0 {
+                    y
+                } else {
+                    offset_y_alias
+                };
+                let contacts_enabled = bolt.get::<bool>("contacts_enabled").unwrap_or(true);
+
+                let builder = if legacy_mode {
+                    if strength >= 0.999 {
+                        GenericJointBuilder::new(JointAxesMask::LIN_AXES)
+                            .local_anchor1(point![
+                                target_pivot_x + offset_x,
+                                target_pivot_y + offset_y
+                            ])
+                            .local_anchor2(point![owner_pivot_x, owner_pivot_y])
+                            .contacts_enabled(contacts_enabled)
+                    } else {
+                        let stiffness = 80.0 + strength * strength * 5000.0;
+                        let damping = 2.0 * stiffness.sqrt();
+                        let max_force = 20000.0 * strength;
+                        GenericJointBuilder::new(JointAxesMask::empty())
+                            .local_anchor1(point![
+                                target_pivot_x + offset_x,
+                                target_pivot_y + offset_y
+                            ])
+                            .local_anchor2(point![owner_pivot_x, owner_pivot_y])
+                            .contacts_enabled(contacts_enabled)
+                            .motor_position(JointAxis::LinX, 0.0, stiffness, damping)
+                            .motor_position(JointAxis::LinY, 0.0, stiffness, damping)
+                            .motor_max_force(JointAxis::LinX, max_force)
+                            .motor_max_force(JointAxis::LinY, max_force)
+                    }
+                } else if strength >= 0.999 {
+                    GenericJointBuilder::new(JointAxesMask::LIN_AXES | JointAxesMask::ANG_AXES)
+                        .local_anchor1(point![target_pivot_x + offset_x, target_pivot_y + offset_y])
+                        .local_anchor2(point![owner_pivot_x, owner_pivot_y])
+                        .contacts_enabled(contacts_enabled)
+                } else {
+                    let angular_stiffness = strength * strength * 2400.0;
+                    let angular_damping = 2.0 * angular_stiffness.sqrt();
+                    let max_torque = 9000.0 * strength;
+                    GenericJointBuilder::new(JointAxesMask::LIN_AXES)
+                        .local_anchor1(point![target_pivot_x + offset_x, target_pivot_y + offset_y])
+                        .local_anchor2(point![owner_pivot_x, owner_pivot_y])
+                        .contacts_enabled(contacts_enabled)
+                        .motor_position(JointAxis::AngX, 0.0, angular_stiffness, angular_damping)
+                        .motor_max_force(JointAxis::AngX, max_torque)
+                };
+
+                let joint_handle =
+                    world
+                        .impulse_joints
+                        .insert(target_body, owner_body, builder, true);
+                bolt_sync.push(RapierBoltSync {
+                    bolt: bolt.clone(),
+                    joint_handle,
+                });
+            }
+        }
+
         let mut pipeline = PhysicsPipeline::new();
         let mut integration_parameters = IntegrationParameters::default();
         integration_parameters.dt = step_dt;
         if let Some(trace) = web_trace {
             web_debug_log(&format!(
-                "runtime.update {trace}: before rapier pipeline step dt={step_dt:.6} bodies={} colliders={} rope_joints={}",
+                "runtime.update {trace}: before rapier pipeline step dt={step_dt:.6} bodies={} colliders={} rope_joints={} bolt_joints={} total_joints={}",
                 world.bodies.len(),
                 world.colliders.len(),
+                rope_sync.len(),
+                bolt_sync.len(),
                 world.impulse_joints.len(),
             ));
         }
@@ -3475,6 +3663,15 @@ impl Runtime {
                 rope.rope.set("enabled", false)?;
                 rope.rope.set("snapped", true)?;
             }
+        }
+
+        for bolt in bolt_sync {
+            let mut force = 0.0f32;
+            if let Some(joint) = world.impulse_joints.get(bolt.joint_handle) {
+                force = joint.impulses.norm() / step_dt.max(0.0001);
+            }
+            bolt.bolt.set("current_force", force)?;
+            bolt.bolt.set("force", force)?;
         }
 
         Ok(())
@@ -4241,6 +4438,32 @@ mod tests {
     }
 
     #[test]
+    fn bolt2d_sample_starts_and_queues_draw_commands() -> mlua::Result<()> {
+        let (mut runtime, root) = start_sample_runtime("bolt2d_sample", "samples/bolt2d")?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        let commands =
+            crate::renderer::drain_commands(&runtime.render_state()).map_err(mlua::Error::external)?;
+
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, crate::renderer::DrawCommand::Rect { .. })),
+            "expected the Bolt2D sample to queue rectangle draw commands"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, crate::renderer::DrawCommand::Text(_))),
+            "expected the Bolt2D sample to queue text draw commands"
+        );
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
     fn feature_lab_sample_starts_and_queues_draw_commands() -> mlua::Result<()> {
         let (mut runtime, root) =
             start_sample_runtime("feature_lab_sample", "samples/feature_lab")?;
@@ -4397,6 +4620,52 @@ mod tests {
         runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
         assert_eq!(instance.get::<i64>("counter")?, 2);
         assert_eq!(instance.get::<String>("label")?, "step-2");
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn textbox_letter_bounds_dot_call_refreshes_before_layout() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("textbox_letter_bounds_dot")?;
+
+        runtime
+            .lua
+            .load(
+                r#"
+                local entity = ecs.newEntity("text", ecs.root, 24, 32)
+                local text = entity:AddComponent(core.TextBox)
+                text.text = "abc"
+
+                local probe = {
+                    charPosition = 0,
+                    awake = function(_entity, component)
+                        component.__neolove_component = "LetterBoundsDotProbe"
+                        component.ctb = text
+                    end,
+                    update = function(_entity, component, _dt)
+                        local x, y, w, h = component.ctb.getLetterBounds(component.charPosition - 1)
+                        letterBoundsDotResult = { x = x, y = y, w = w, h = h }
+                        local firstX, firstY, firstW, firstH = component.ctb.getLetterBounds(0)
+                        closestLetterStart = component.ctb.getClosestLetterIndex(firstX + firstW * 0.25, firstY + firstH * 0.5)
+                        closestLetterEnd = component.ctb.getClosestCharacterIndex(firstX + firstW * 0.75, firstY + firstH * 0.5)
+                    end,
+                }
+
+                entity:AddComponent(probe)
+                "#,
+            )
+            .exec()?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+
+        let result: Table = runtime.lua.globals().get("letterBoundsDotResult")?;
+        result.get::<f64>("x")?;
+        result.get::<f64>("y")?;
+        assert_eq!(result.get::<f64>("w")?, 0.0);
+        assert!(result.get::<f64>("h")? > 0.0);
+        assert_eq!(runtime.lua.globals().get::<i64>("closestLetterStart")?, 0);
+        assert_eq!(runtime.lua.globals().get::<i64>("closestLetterEnd")?, 1);
 
         std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())
