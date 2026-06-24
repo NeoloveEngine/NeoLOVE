@@ -292,6 +292,10 @@ impl EditorApp {
         // no left/right press this frame.
         let raw_left = ui.input.mouse_pressed;
         let raw_right = ui.input.right_pressed;
+        // A popup only reacts to clicks if it already existed at the start of
+        // this frame; otherwise the very click that opened it would register as
+        // an "outside click" and close it instantly.
+        let popup_interactive = self.popup.is_some();
         if self.popup.is_some() {
             ui.input.mouse_pressed = false;
             ui.input.right_pressed = false;
@@ -391,7 +395,7 @@ impl EditorApp {
         // Restore the real press for popup handling, then render the overlay.
         ui.input.mouse_pressed = raw_left;
         ui.input.right_pressed = raw_right;
-        self.handle_popup(ui, w, h);
+        self.handle_popup(ui, w, h, popup_interactive);
 
         ui.draw_tooltip();
     }
@@ -1660,27 +1664,28 @@ impl EditorApp {
         self.popup = Some(Popup::Prompt { title: title.to_string(), action });
     }
 
-    fn handle_popup(&mut self, ui: &mut Ui, w: f32, h: f32) {
+    fn handle_popup(&mut self, ui: &mut Ui, w: f32, h: f32, interactive: bool) {
         let popup = match self.popup.take() {
             Some(p) => p,
             None => return,
         };
-        // Escape closes any popup.
-        if ui.input.escape {
+        // Escape closes any popup (but not on the frame it just opened).
+        if interactive && ui.input.escape {
             if matches!(popup, Popup::Prompt { .. }) {
                 self.focus = None;
             }
             return;
         }
         match popup {
-            Popup::Menu { x, y, items } => self.draw_menu(ui, x, y, items, w, h),
-            Popup::Color { target, x, y } => self.draw_color_picker(ui, target, x, y, w, h),
-            Popup::Confirm { message, action } => self.draw_confirm(ui, message, action, w, h),
-            Popup::Prompt { title, action } => self.draw_prompt(ui, title, action, w, h),
+            Popup::Menu { x, y, items } => self.draw_menu(ui, x, y, items, w, h, interactive),
+            Popup::Color { target, x, y } => self.draw_color_picker(ui, target, x, y, w, h, interactive),
+            Popup::Confirm { message, action } => self.draw_confirm(ui, message, action, w, h, interactive),
+            Popup::Prompt { title, action } => self.draw_prompt(ui, title, action, w, h, interactive),
         }
     }
 
-    fn draw_menu(&mut self, ui: &mut Ui, x: f32, y: f32, items: Vec<MenuItem>, w: f32, h: f32) {
+    #[allow(clippy::too_many_arguments)]
+    fn draw_menu(&mut self, ui: &mut Ui, x: f32, y: f32, items: Vec<MenuItem>, w: f32, h: f32, interactive: bool) {
         let item_h = 26.0;
         let width = 200.0_f32;
         let height = items.len() as f32 * item_h + 8.0;
@@ -1700,17 +1705,20 @@ impl EditorApp {
             iy += item_h;
         }
 
-        // Click outside closes.
-        let clicked_outside = ui.input.mouse_pressed && !rect.contains(ui.input.mouse_x, ui.input.mouse_y);
-        if let Some(action) = chosen {
+        // On the opening frame (`!interactive`) ignore clicks entirely so the
+        // click that opened the menu does not immediately close it.
+        let clicked_outside = interactive
+            && ui.input.mouse_pressed
+            && !rect.contains(ui.input.mouse_x, ui.input.mouse_y);
+        if let Some(action) = chosen.filter(|_| interactive) {
             self.perform(action);
         } else if !clicked_outside {
-            // Keep the menu open until a choice or an outside click.
             self.popup = Some(Popup::Menu { x, y, items });
         }
     }
 
-    fn draw_color_picker(&mut self, ui: &mut Ui, target: ColorTarget, x: f32, y: f32, w: f32, h: f32) {
+    #[allow(clippy::too_many_arguments)]
+    fn draw_color_picker(&mut self, ui: &mut Ui, target: ColorTarget, x: f32, y: f32, w: f32, h: f32, interactive: bool) {
         let width = 220.0;
         let height = 150.0;
         let px = x.min(w - width - 4.0).max(2.0);
@@ -1746,13 +1754,16 @@ impl EditorApp {
             self.mark_dirty();
         }
 
-        let clicked_outside = ui.input.mouse_pressed && !rect.contains(ui.input.mouse_x, ui.input.mouse_y);
+        let clicked_outside = interactive
+            && ui.input.mouse_pressed
+            && !rect.contains(ui.input.mouse_x, ui.input.mouse_y);
         if !clicked_outside {
             self.popup = Some(Popup::Color { target, x, y });
         }
     }
 
-    fn draw_confirm(&mut self, ui: &mut Ui, message: String, action: Pending, w: f32, h: f32) {
+    #[allow(clippy::too_many_arguments)]
+    fn draw_confirm(&mut self, ui: &mut Ui, message: String, action: Pending, w: f32, h: f32, interactive: bool) {
         // Dim background.
         ui.painter.fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 120]);
         let width = 360.0;
@@ -1766,8 +1777,8 @@ impl EditorApp {
 
         let yes = Rect::new(px + width - 200.0, py + height - 36.0, 90.0, 26.0);
         let no = Rect::new(px + width - 104.0, py + height - 36.0, 90.0, 26.0);
-        let confirm = ui.button_colored(yes, "Yes", self.config.theme.danger, [255, 255, 255, 255]);
-        let cancel = ui.button(no, "Cancel");
+        let confirm = interactive && ui.button_colored(yes, "Yes", self.config.theme.danger, [255, 255, 255, 255]);
+        let cancel = interactive && ui.button(no, "Cancel");
         if confirm {
             self.perform_pending(action);
         } else if !cancel {
@@ -1775,7 +1786,8 @@ impl EditorApp {
         }
     }
 
-    fn draw_prompt(&mut self, ui: &mut Ui, title: String, action: Pending, w: f32, h: f32) {
+    #[allow(clippy::too_many_arguments)]
+    fn draw_prompt(&mut self, ui: &mut Ui, title: String, action: Pending, w: f32, h: f32, interactive: bool) {
         ui.painter.fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 120]);
         let width = 340.0;
         let height = 120.0;
@@ -1792,8 +1804,9 @@ impl EditorApp {
 
         let ok = Rect::new(px + width - 200.0, py + height - 34.0, 90.0, 24.0);
         let cancel = Rect::new(px + width - 104.0, py + height - 34.0, 90.0, 24.0);
-        let submit = ui.button_colored(ok, "OK", self.config.theme.button, self.config.theme.text) || ui.input.enter;
-        let cancelled = ui.button(cancel, "Cancel");
+        let submit = interactive
+            && (ui.button_colored(ok, "OK", self.config.theme.button, self.config.theme.text) || ui.input.enter);
+        let cancelled = interactive && ui.button(cancel, "Cancel");
         if submit {
             self.focus = None;
             self.perform_pending_with(action, value);
@@ -2290,6 +2303,19 @@ mod tests {
         // Escape closes it.
         h.frame(FrameInput { escape: true, ..Default::default() });
         assert!(h.app.popup.is_none());
+    }
+
+    #[test]
+    fn popup_survives_mouse_move_after_opening() {
+        let mut h = Harness::new(Scene::default());
+        let id = h.app.scene.entities[0].id;
+        // Open a menu the way a click would (mid-frame), with a press present.
+        h.app.open_entity_menu(id, 600.0, 300.0);
+        h.frame(FrameInput { mouse_x: 600.0, mouse_y: 300.0, mouse_pressed: true, mouse_down: true, ..Default::default() });
+        assert!(h.app.popup.is_some(), "menu closed on the frame it opened");
+        // A subsequent mouse-move (no press) must not close it.
+        h.frame(FrameInput { mouse_x: 620.0, mouse_y: 320.0, ..Default::default() });
+        assert!(h.app.popup.is_some(), "menu closed after a mouse move");
     }
 
     #[test]
