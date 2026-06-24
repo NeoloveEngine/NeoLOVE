@@ -758,7 +758,11 @@ fn patch_subsystem_to_gui(image: &mut [u8]) -> Result<(), String> {
         return Err("engine executable is not a valid PE image (missing MZ header)".to_string());
     }
 
-    let e_lfanew = u32::from_le_bytes(image[0x3C..0x40].try_into().unwrap()) as usize;
+    let e_lfanew = u32::from_le_bytes(
+        image[0x3C..0x40]
+            .try_into()
+            .expect("slice is 4 bytes after the length check above"),
+    ) as usize;
     // PE signature (4) + COFF file header (20) precede the optional header.
     let opt_header = e_lfanew
         .checked_add(24)
