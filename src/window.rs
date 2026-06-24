@@ -2433,6 +2433,24 @@ impl Runtime {
             ecs.set("removeComponent", remove_component)?;
         }
 
+        // Load a `.neoscene` file authored in the visual editor, instantiating
+        // its entities and components into the running world. This reuses the
+        // editor's exact Luau code generation, so what you build in the editor
+        // and what `loadScene` produces are guaranteed to match.
+        {
+            let load_scene = self.lua.create_function(|lua, path: String| {
+                let json = std::fs::read_to_string(&path).map_err(|e| {
+                    mlua::Error::RuntimeError(format!("loadScene: failed to read '{path}': {e}"))
+                })?;
+                let scene = crate::editor::scene::Scene::from_json(&json)
+                    .map_err(|e| mlua::Error::RuntimeError(format!("loadScene: {e}")))?;
+                lua.load(scene.to_luau())
+                    .set_name(format!("@{path}"))
+                    .exec()
+            })?;
+            ecs.set("loadScene", load_scene)?;
+        }
+
         self.lua.globals().set("ecs", ecs)?;
         self.lua.globals().set("transform", transforms.clone())?;
         self.lua.globals().set("transforms", transforms)?;

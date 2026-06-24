@@ -399,6 +399,7 @@ export type EcsModule = {
 	root: Entity,
 	addComponent: (entity: Entity, component: Component) -> ComponentInstance,
 	removeComponent: (entity: Entity, target: number | ComponentInstance) -> boolean,
+	loadScene: (path: string) -> (),
 }
 
 export type PrefabTemplate = {

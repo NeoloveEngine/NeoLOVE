@@ -12,7 +12,7 @@
 //! which defaults to a Visual Studio Code "Dark+" palette.
 
 mod app;
-mod scene;
+pub(crate) mod scene;
 mod ui;
 
 use std::num::NonZeroU32;
