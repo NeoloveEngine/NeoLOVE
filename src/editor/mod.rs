@@ -17,6 +17,7 @@ mod ui;
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use winit::dpi::LogicalSize;
 use winit::event::{
@@ -87,29 +88,66 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
         match event {
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => {
-                    editor.flush_config();
-                    *control_flow = ControlFlow::Exit;
+                    if editor.request_close() {
+                        editor.flush_config();
+                        *control_flow = ControlFlow::Exit;
+                    } else {
+                        // A save-confirmation dialog was opened; stay running.
+                        window.request_redraw();
+                    }
+                }
+                WindowEvent::ModifiersChanged(state) => {
+                    input.ctrl = state.ctrl() || state.logo();
                 }
                 WindowEvent::CursorMoved { position, .. } => {
-                    input.mouse_x = position.x as f32;
-                    input.mouse_y = position.y as f32;
-                    if input.mouse_down {
+                    let (nx, ny) = (position.x as f32, position.y as f32);
+                    input.delta_x += nx - input.mouse_x;
+                    input.delta_y += ny - input.mouse_y;
+                    input.mouse_x = nx;
+                    input.mouse_y = ny;
+                    if input.mouse_down || input.middle_down {
                         window.request_redraw();
                     }
                 }
                 WindowEvent::MouseInput { state, button, .. } => {
-                    if button == MouseButton::Left {
-                        match state {
-                            ElementState::Pressed => {
-                                input.mouse_down = true;
+                    let pressed = state == ElementState::Pressed;
+                    match button {
+                        MouseButton::Left => {
+                            input.mouse_down = pressed;
+                            if pressed {
                                 input.mouse_pressed = true;
-                            }
-                            ElementState::Released => {
-                                input.mouse_down = false;
+                                // Double-click detection.
+                                let now = Instant::now();
+                                if now.duration_since(input.last_click) < Duration::from_millis(400)
+                                    && (input.mouse_x - input.last_click_x).abs() < 4.0
+                                    && (input.mouse_y - input.last_click_y).abs() < 4.0
+                                {
+                                    input.double_click = true;
+                                }
+                                input.last_click = now;
+                                input.last_click_x = input.mouse_x;
+                                input.last_click_y = input.mouse_y;
                             }
                         }
-                        window.request_redraw();
+                        MouseButton::Right => {
+                            if pressed {
+                                input.right_pressed = true;
+                            }
+                        }
+                        MouseButton::Middle => input.middle_down = pressed,
+                        MouseButton::Other(1) => {
+                            if pressed {
+                                input.back_pressed = true;
+                            }
+                        }
+                        MouseButton::Other(2) => {
+                            if pressed {
+                                input.forward_pressed = true;
+                            }
+                        }
+                        _ => {}
                     }
+                    window.request_redraw();
                 }
                 WindowEvent::MouseWheel { delta, .. } => {
                     input.scroll += match delta {
@@ -138,6 +176,9 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                         VirtualKeyCode::Delete => input.delete = true,
                         VirtualKeyCode::Return | VirtualKeyCode::NumpadEnter => input.enter = true,
                         VirtualKeyCode::Escape => input.escape = true,
+                        VirtualKeyCode::C if input.ctrl => input.copy = true,
+                        VirtualKeyCode::V if input.ctrl => input.paste = true,
+                        VirtualKeyCode::S if input.ctrl => input.save = true,
                         _ => {}
                     }
                     window.request_redraw();
@@ -155,6 +196,11 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                     return;
                 }
                 editor.flush_config();
+                if editor.should_quit() {
+                    editor.flush_config();
+                    *control_flow = ControlFlow::Exit;
+                    return;
+                }
                 let title = editor.title();
                 if title != last_title {
                     window.set_title(&title);
@@ -170,18 +216,62 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
 }
 
 /// Retained input that survives between redraws, drained into a [`FrameInput`].
-#[derive(Default)]
 struct PendingInput {
     mouse_x: f32,
     mouse_y: f32,
     mouse_down: bool,
     mouse_pressed: bool,
+    middle_down: bool,
+    right_pressed: bool,
+    back_pressed: bool,
+    forward_pressed: bool,
+    double_click: bool,
+    delta_x: f32,
+    delta_y: f32,
     scroll: f32,
     typed: String,
     backspace: bool,
     enter: bool,
     escape: bool,
     delete: bool,
+    ctrl: bool,
+    copy: bool,
+    paste: bool,
+    save: bool,
+    last_click: Instant,
+    last_click_x: f32,
+    last_click_y: f32,
+}
+
+impl Default for PendingInput {
+    fn default() -> Self {
+        Self {
+            mouse_x: 0.0,
+            mouse_y: 0.0,
+            mouse_down: false,
+            mouse_pressed: false,
+            middle_down: false,
+            right_pressed: false,
+            back_pressed: false,
+            forward_pressed: false,
+            double_click: false,
+            delta_x: 0.0,
+            delta_y: 0.0,
+            scroll: 0.0,
+            typed: String::new(),
+            backspace: false,
+            enter: false,
+            escape: false,
+            delete: false,
+            ctrl: false,
+            copy: false,
+            paste: false,
+            save: false,
+            last_click: Instant::now() - Duration::from_secs(10),
+            last_click_x: 0.0,
+            last_click_y: 0.0,
+        }
+    }
 }
 
 impl PendingInput {
@@ -192,19 +282,38 @@ impl PendingInput {
             mouse_y: self.mouse_y,
             mouse_pressed: self.mouse_pressed,
             mouse_down: self.mouse_down,
+            double_click: self.double_click,
+            right_pressed: self.right_pressed,
+            middle_down: self.middle_down,
+            back_pressed: self.back_pressed,
+            forward_pressed: self.forward_pressed,
+            delta_x: self.delta_x,
+            delta_y: self.delta_y,
             scroll: self.scroll,
             typed: std::mem::take(&mut self.typed),
             backspace: self.backspace,
             enter: self.enter,
             escape: self.escape,
             delete: self.delete,
+            copy: self.copy,
+            paste: self.paste,
+            save: self.save,
         };
         self.mouse_pressed = false;
+        self.right_pressed = false;
+        self.back_pressed = false;
+        self.forward_pressed = false;
+        self.double_click = false;
+        self.delta_x = 0.0;
+        self.delta_y = 0.0;
         self.scroll = 0.0;
         self.backspace = false;
         self.enter = false;
         self.escape = false;
         self.delete = false;
+        self.copy = false;
+        self.paste = false;
+        self.save = false;
         frame
     }
 }

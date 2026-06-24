@@ -103,15 +103,22 @@ neolove editor my-game  # edit a specific project
 The editor opens a window with a dockable **Hierarchy**, a 2D **Viewport**, an
 **Inspector**, and a bottom **Project** file browser:
 
-- Build scenes from entities and components (`Rect2D`, `Text2D`, `Sprite`, and
-  `Script`). Drag entities in the viewport with optional grid snapping.
-- Attach a `Script` component to expose **public variables** that are edited in
-  the inspector and written out as field assignments — the editor's take on
-  Unity's serialized fields.
-- Edit the scene background (`app.bg`), which is also previewed in the viewport.
-- Dock the side panels left or right and resize every panel with draggable
-  splitters; the layout adapts to any window size.
-- Toggle the grid overlay and grid snapping, with hover tooltips throughout.
+- Build scenes from entities and the real engine components — `Rect2D`,
+  `Shape2D`, `TextBox`, `Sprite2D`, `NineSliceSprite2D`, `TileTexture2D`,
+  `Collider2D`, `Rigidbody2D`, `Bolt2D`, `Rope2D` — added from a dropdown, each
+  with its inspector-editable properties (advanced fields collapse away).
+- Nest entities into a hierarchy by dragging rows; set per-entity `z` order and
+  `scale`; reorder, duplicate, copy/paste and rename via right-click menus.
+- Attach a `Script` component to expose **public variables** edited in the
+  inspector — the editor's take on Unity's serialized fields.
+- Edit the scene background (`app.bg`) with a color picker; it previews live in
+  the viewport. Pan the viewport with the middle mouse button.
+- Dock the side panels left or right and resize every panel (and the project
+  bin) with draggable splitters; the layout adapts to any window size.
+- Browse, create, and open project files from the bottom Project panel; reveal
+  folders in your OS file manager. Toggle the grid overlay and grid snapping.
+- Right-click almost anything for a context menu; hover any control for a
+  tooltip; unsaved changes prompt before New/Load/Quit.
 
 Scenes are saved as `scene.neoscene` (JSON). **Export main.luau** generates a
 runnable entry point from the scene, and **Run** launches a live preview.

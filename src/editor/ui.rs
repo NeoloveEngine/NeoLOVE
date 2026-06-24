@@ -23,6 +23,7 @@ const ICON_FONT_BYTES: &[u8] = include_bytes!("assets/MaterialIcons-Regular.ttf"
 
 /// Named Google Material Icons codepoints used across the editor.
 pub mod icon {
+    pub const ADD: char = '\u{e145}';
     pub const SAVE: char = '\u{e161}';
     pub const FOLDER_OPEN: char = '\u{e2c8}';
     pub const DELETE: char = '\u{e872}';
@@ -42,6 +43,14 @@ pub mod icon {
     pub const VIEW_QUILT: char = '\u{e8f1}';
     pub const PLAYLIST_ADD: char = '\u{e03b}';
     pub const BORDER_ALL: char = '\u{e228}';
+    pub const EXPAND_MORE: char = '\u{e5cf}';
+    pub const CHEVRON_RIGHT: char = '\u{e5cc}';
+    pub const CHEVRON_LEFT: char = '\u{e5cb}';
+    pub const CONTENT_COPY: char = '\u{e14d}';
+    pub const CONTENT_PASTE: char = '\u{e14f}';
+    pub const CREATE_NEW_FOLDER: char = '\u{e2cc}';
+    pub const EDIT: char = '\u{e3c9}';
+    pub const OPEN_IN_NEW: char = '\u{e89e}';
     pub const FOLDER: char = '\u{e2c7}';
     pub const ARROW_UPWARD: char = '\u{e5d8}';
     pub const INSERT_DRIVE_FILE: char = '\u{e24d}';
@@ -449,6 +458,19 @@ pub struct FrameInput {
     pub mouse_pressed: bool,
     /// Left button is currently held.
     pub mouse_down: bool,
+    /// Left button double-clicked this frame.
+    pub double_click: bool,
+    /// Right button pressed this frame (opens context menus).
+    pub right_pressed: bool,
+    /// Middle button is currently held (pans the viewport).
+    pub middle_down: bool,
+    /// Back (mouse 4) pressed this frame.
+    pub back_pressed: bool,
+    /// Forward (mouse 5) pressed this frame.
+    pub forward_pressed: bool,
+    /// Mouse movement since last frame, in pixels.
+    pub delta_x: f32,
+    pub delta_y: f32,
     /// Accumulated vertical scroll for this frame (positive = scroll up).
     pub scroll: f32,
     /// Printable characters typed this frame.
@@ -458,6 +480,10 @@ pub struct FrameInput {
     pub escape: bool,
     /// The Delete key was pressed (used to remove the selection).
     pub delete: bool,
+    /// Ctrl/Cmd shortcut requests for this frame.
+    pub copy: bool,
+    pub paste: bool,
+    pub save: bool,
 }
 
 /// The result of running an editable text field for one frame.
@@ -513,6 +539,12 @@ impl<'a> Ui<'a> {
 
     pub fn has_focus(&self) -> bool {
         self.focus.is_some()
+    }
+
+    /// The current edit buffer (the text of whatever field is/was focused this
+    /// frame). Used by modal prompts to read their value reliably.
+    pub fn last_edit(&self) -> &str {
+        &self.edit_buffer
     }
 
     /// Restrict pointer interaction to `rect` until [`Ui::reset_input_clip`].
@@ -599,6 +631,91 @@ impl<'a> Ui<'a> {
     /// Draw a Material icon at a label position (no interaction).
     pub fn icon(&mut self, cx: f32, cy: f32, glyph: char, size: f32, color: Rgba) {
         self.painter.icon_centered(cx, cy, glyph, size, color);
+    }
+
+    /// A collapsing section header with a disclosure triangle. Returns the new
+    /// expanded state (toggles when clicked).
+    pub fn collapsing_header(&mut self, rect: Rect, label: &str, expanded: bool) -> bool {
+        let hovered = self.hovered(rect);
+        let bg = if hovered {
+            self.theme.panel_alt
+        } else {
+            self.theme.header
+        };
+        self.painter.fill_round_rect(rect, 3.0, bg);
+        let tri = if expanded { icon::EXPAND_MORE } else { icon::CHEVRON_RIGHT };
+        self.painter
+            .icon_centered(rect.x + 12.0, rect.y + rect.h / 2.0, tri, 16.0, self.theme.text);
+        self.painter.text(
+            rect.x + 24.0,
+            rect.y + (rect.h - 14.0) / 2.0,
+            label,
+            14.0,
+            self.theme.text,
+        );
+        if hovered && self.input.mouse_pressed {
+            !expanded
+        } else {
+            expanded
+        }
+    }
+
+    /// A row in a popup menu. Returns true when clicked. A leading icon is
+    /// optional (pass `'\0'` to omit).
+    pub fn menu_item(&mut self, rect: Rect, glyph: char, label: &str, danger: bool) -> bool {
+        let hovered = self.hovered(rect);
+        if hovered {
+            self.painter.fill_rect(rect, self.theme.button_active);
+        }
+        let color = if danger { self.theme.danger } else { self.theme.text };
+        let mut tx = rect.x + 10.0;
+        if glyph != '\0' {
+            self.painter
+                .icon_centered(rect.x + 14.0, rect.y + rect.h / 2.0, glyph, 15.0, color);
+            tx = rect.x + 28.0;
+        }
+        self.painter
+            .text(tx, rect.y + (rect.h - 14.0) / 2.0, label, 14.0, color);
+        hovered && self.input.mouse_pressed
+    }
+
+    /// A horizontal slider in `[min, max]`. Returns `Some(new)` when dragged.
+    pub fn slider(&mut self, rect: Rect, value: f32, min: f32, max: f32) -> Option<f32> {
+        let track = Rect::new(rect.x, rect.y + rect.h / 2.0 - 2.0, rect.w, 4.0);
+        self.painter.fill_round_rect(track, 2.0, self.theme.field);
+        let t = if (max - min).abs() < f32::EPSILON {
+            0.0
+        } else {
+            ((value - min) / (max - min)).clamp(0.0, 1.0)
+        };
+        let knob_x = rect.x + t * rect.w;
+        self.painter.fill_round_rect(
+            Rect::new(rect.x, rect.y + rect.h / 2.0 - 2.0, t * rect.w, 4.0),
+            2.0,
+            self.theme.accent,
+        );
+        self.painter
+            .fill_round_rect(Rect::new(knob_x - 5.0, rect.y + rect.h / 2.0 - 6.0, 10.0, 12.0), 5.0, self.theme.text);
+        if self.hovered(rect) && self.input.mouse_down {
+            let nt = ((self.input.mouse_x - rect.x) / rect.w.max(1.0)).clamp(0.0, 1.0);
+            self.wants_redraw = true;
+            Some(min + nt * (max - min))
+        } else {
+            None
+        }
+    }
+
+    /// A clickable color swatch (opens a picker). Returns true when clicked.
+    pub fn swatch_button(&mut self, rect: Rect, color: Rgba) -> bool {
+        self.painter
+            .fill_round_rect(rect, 3.0, [color[0], color[1], color[2], 255]);
+        let border = if self.hovered(rect) {
+            self.theme.accent
+        } else {
+            self.theme.border
+        };
+        self.painter.stroke_round_rect(rect, 3.0, border);
+        self.hovered(rect) && self.input.mouse_pressed
     }
 
     /// Register `text` as the tooltip to show this frame if `rect` is hovered.
