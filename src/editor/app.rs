@@ -157,6 +157,8 @@ pub struct EditorApp {
     config: EditorConfig,
     selected: Option<u64>,
     dragging: Option<(u64, f32, f32)>,
+    /// Active resize: (entity id, fixed anchor corner in world coords).
+    resizing: Option<(u64, f32, f32)>,
     active_splitter: Option<Splitter>,
     hierarchy_scroll: f32,
     inspector_scroll: f32,
@@ -201,6 +203,7 @@ impl EditorApp {
             config,
             selected: None,
             dragging: None,
+            resizing: None,
             active_splitter: None,
             hierarchy_scroll: 0.0,
             inspector_scroll: 0.0,
@@ -695,13 +698,22 @@ impl EditorApp {
             self.draw_entity(ui, entity, rect);
             if self.selected == Some(entity.id) {
                 ui.painter.stroke_rect(rect.shrink(-1.0), self.config.theme.selection);
+                let (mx, my) = (ui.input.mouse_x, ui.input.mouse_y);
                 for (hx, hy) in [
                     (rect.x, rect.y),
                     (rect.right(), rect.y),
                     (rect.x, rect.bottom()),
                     (rect.right(), rect.bottom()),
                 ] {
-                    ui.painter.fill_rect(Rect::new(hx - 3.0, hy - 3.0, 6.0, 6.0), self.config.theme.selection);
+                    // Larger, white-filled handles that brighten under the
+                    // cursor so it's clear they can be grabbed.
+                    let hot = (mx - hx).abs() <= 7.0 && (my - hy).abs() <= 7.0;
+                    let s = if hot { 5.0 } else { 4.0 };
+                    ui.painter.fill_rect(Rect::new(hx - s, hy - s, s * 2.0, s * 2.0), self.config.theme.selection);
+                    ui.painter.fill_rect(
+                        Rect::new(hx - s + 1.5, hy - s + 1.5, s * 2.0 - 3.0, s * 2.0 - 3.0),
+                        if hot { [255, 255, 255, 255] } else { [40, 40, 40, 255] },
+                    );
                 }
             }
         }
@@ -799,6 +811,71 @@ impl EditorApp {
                 None => self.open_viewport_menu(mx, my),
             }
             return;
+        }
+
+        // Resize handles: pressing one of the selected entity's four corners
+        // starts a resize anchored at the opposite corner.
+        if self.resizing.is_none()
+            && self.dragging.is_none()
+            && inside
+            && ui.input.mouse_pressed
+        {
+            if let Some(id) = self.selected {
+                if let Some(e) = self.scene.entity(id) {
+                    let w = e.size_x * e.scale;
+                    let h = e.size_y * e.scale;
+                    let ex = area.x + self.cam_x + e.x;
+                    let ey = area.y + self.cam_y + e.y;
+                    // (corner screen, opposite corner screen)
+                    let corners = [
+                        ((ex, ey), (ex + w, ey + h)),
+                        ((ex + w, ey), (ex, ey + h)),
+                        ((ex, ey + h), (ex + w, ey)),
+                        ((ex + w, ey + h), (ex, ey)),
+                    ];
+                    for ((csx, csy), (asx, asy)) in corners {
+                        if (mx - csx).abs() <= 7.0 && (my - csy).abs() <= 7.0 {
+                            let anchor_x = asx - (area.x + self.cam_x);
+                            let anchor_y = asy - (area.y + self.cam_y);
+                            self.resizing = Some((id, anchor_x, anchor_y));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((id, ax, ay)) = self.resizing {
+            if ui.input.mouse_down {
+                let snap = self.config.layout.snap;
+                let grid = self.config.layout.grid.max(1.0);
+                let mut wx = mx - (area.x + self.cam_x);
+                let mut wy = my - (area.y + self.cam_y);
+                if snap {
+                    wx = (wx / grid).round() * grid;
+                    wy = (wy / grid).round() * grid;
+                } else {
+                    wx = wx.round();
+                    wy = wy.round();
+                }
+                if let Some(e) = self.scene.entity_mut(id) {
+                    let scale = if e.scale.abs() < f32::EPSILON { 1.0 } else { e.scale };
+                    let nx = wx.min(ax);
+                    let ny = wy.min(ay);
+                    let nw = ((wx - ax).abs() / scale).max(1.0);
+                    let nh = ((wy - ay).abs() / scale).max(1.0);
+                    if e.x != nx || e.y != ny || e.size_x != nw || e.size_y != nh {
+                        e.x = nx;
+                        e.y = ny;
+                        e.size_x = nw;
+                        e.size_y = nh;
+                        self.scene_dirty = true;
+                    }
+                }
+                ui.wants_redraw = true;
+                return;
+            }
+            self.resizing = None;
         }
 
         if inside && ui.input.mouse_pressed {
@@ -2259,6 +2336,24 @@ mod tests {
         h.app.perform(Action::AddComponent(id, "TextBox".to_string()));
         let e = h.app.scene.entity(id).expect("entity");
         assert!(matches!(e.components.last(), Some(Component::Core { name, .. }) if name == "TextBox"));
+    }
+
+    #[test]
+    fn dragging_a_corner_handle_resizes_the_entity() {
+        // Default entity sits at world (200,150) sized 100x100. With the left
+        // panel 240px wide and body starting at y=40, its screen rect is
+        // (440,190)-(540,290); the bottom-right handle is at (540,290).
+        let mut h = Harness::new(Scene::default());
+        h.app.config.layout.snap = false;
+        let id = h.app.scene.entities[0].id;
+        h.app.selected = Some(id);
+        // Press the bottom-right handle, drag +40,+40, release.
+        h.frame(FrameInput { mouse_x: 540.0, mouse_y: 290.0, mouse_pressed: true, mouse_down: true, ..Default::default() });
+        h.frame(FrameInput { mouse_x: 580.0, mouse_y: 330.0, mouse_down: true, ..Default::default() });
+        h.frame(FrameInput { mouse_x: 580.0, mouse_y: 330.0, ..Default::default() });
+        let e = h.app.scene.entity(id).expect("entity");
+        assert!((e.size_x - 140.0).abs() < 2.0, "size_x was {}", e.size_x);
+        assert!((e.size_y - 140.0).abs() < 2.0, "size_y was {}", e.size_y);
     }
 
     #[test]
