@@ -3,5 +3,5 @@
 samples/**
 !samples/**/
 !samples/**/*.*
-editor
+/editor
 samples/demo

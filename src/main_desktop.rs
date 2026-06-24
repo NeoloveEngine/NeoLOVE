@@ -2,6 +2,7 @@ mod assets;
 mod audio_system;
 mod commands;
 mod core;
+mod editor;
 mod fs_module;
 #[cfg(feature = "vulkan")]
 mod gpu_renderer;
@@ -2176,6 +2177,7 @@ fn print_usage() {
     println!("Usage:");
     println!("  neolove new <project-name>");
     println!("  neolove run [project-dir]");
+    println!("  neolove editor [project-dir]");
     println!("  neolove build [project-dir] [--webasm]");
     println!("  neolove api [project-dir]");
     println!("  neolove setup-path");
@@ -2303,6 +2305,22 @@ fn run_cli() -> Result<(), String> {
             let project_root = resolve_target_project_root(args.get(2).map(String::as_str))?;
             validate_project_root(&project_root).map_err(|error| format!("run failed: {error}"))?;
             run_project_window(project_root, None).map_err(|error| format!("run failed: {error}"))?;
+        }
+        "editor" => {
+            if args.len() > 3 {
+                return Err(format!(
+                    "editor failed: expected at most one project directory, got {}",
+                    args.len().saturating_sub(2)
+                ));
+            }
+            let project_root = resolve_target_project_root(args.get(2).map(String::as_str))?;
+            if !project_root.is_dir() {
+                return Err(format!(
+                    "editor failed: project directory does not exist: {}",
+                    project_root.display()
+                ));
+            }
+            editor::run_editor(project_root).map_err(|error| format!("editor failed: {error}"))?;
         }
         "build" => {
             let mut project_arg: Option<&str> = None;

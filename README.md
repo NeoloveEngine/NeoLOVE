@@ -20,6 +20,7 @@ optional `neolove.toml` configuration file.
 - Shapes, text, sprites, nine-slice sprites, tile textures, and custom shaders
 - Rigidbody, collider, rope, raycasting, and pixel-shaped sprite queries
 - Keyboard, mouse, audio, image, file system, HTTP, and server APIs
+- A built-in visual scene editor inspired by Unity and Godot
 - Standalone desktop executables with embedded game assets
 - Itch.io-ready WebAssembly bundles
 - External writable data directories for packaged desktop games
@@ -89,12 +90,43 @@ rectangle.color = Color4(80, 140, 255)
 
 `run` and `build` require `main.luau` at the project root.
 
+## Visual Editor
+
+NeoLOVE ships with a built-in visual scene editor, similar in spirit to the
+Unity or Godot editors:
+
+```bash
+neolove editor          # edit the project in the current directory
+neolove editor my-game  # edit a specific project
+```
+
+The editor opens a window with a dockable **Hierarchy**, a 2D **Viewport**, an
+**Inspector**, and a bottom **Project** file browser:
+
+- Build scenes from entities and components (`Rect2D`, `Text2D`, `Sprite`, and
+  `Script`). Drag entities in the viewport with optional grid snapping.
+- Attach a `Script` component to expose **public variables** that are edited in
+  the inspector and written out as field assignments — the editor's take on
+  Unity's serialized fields.
+- Edit the scene background (`app.bg`), which is also previewed in the viewport.
+- Dock the side panels left or right and resize every panel with draggable
+  splitters; the layout adapts to any window size.
+- Toggle the grid overlay and grid snapping, with hover tooltips throughout.
+
+Scenes are saved as `scene.neoscene` (JSON). **Export main.luau** generates a
+runnable entry point from the scene, and **Run** launches a live preview.
+
+The editor's appearance and dock layout are stored in `editor.json`, created on
+first launch with a Visual Studio Code "Dark+" theme. Edit the `theme` section
+to recolor the editor.
+
 ## CLI
 
 | Command | Description |
 | --- | --- |
 | `neolove new <project-name>` | Create a new project |
 | `neolove run [project-dir]` | Run a project |
+| `neolove editor [project-dir]` | Open the visual scene editor |
 | `neolove build [project-dir]` | Build a standalone desktop executable |
 | `neolove build [project-dir] --webasm` | Build an HTML5 bundle and upload zip |
 | `neolove api [project-dir]` | Refresh the Luau API type definitions |
