@@ -352,11 +352,19 @@ pub struct Entity {
     /// Optional parent entity id for hierarchy nesting.
     #[serde(default)]
     pub parent: Option<u64>,
+    /// Active entities are exported and drawn solid; inactive ones are skipped
+    /// on export and dimmed in the viewport (like Unity's GameObject checkbox).
+    #[serde(default = "tru")]
+    pub enabled: bool,
     pub components: Vec<Component>,
 }
 
 fn one() -> f32 {
     1.0
+}
+
+fn tru() -> bool {
+    true
 }
 
 impl Entity {
@@ -374,6 +382,7 @@ impl Entity {
             anchor_x: 0.0,
             anchor_y: 0.0,
             parent: None,
+            enabled: true,
             components: Vec::new(),
         }
     }
@@ -515,6 +524,10 @@ impl Scene {
             let Some(entity) = self.entity(*id) else {
                 continue;
             };
+            // Skip inactive entities and anything beneath an inactive ancestor.
+            if !self.is_active_in_tree(*id) {
+                continue;
+            }
             let var = format!("ent_{index}");
             var_of.insert(*id, var.clone());
             let parent_expr = entity
@@ -584,6 +597,18 @@ impl Scene {
             out.push('\n');
         }
         out
+    }
+
+    /// True if this entity and all of its ancestors are enabled.
+    pub fn is_active_in_tree(&self, id: u64) -> bool {
+        let mut cur = Some(id);
+        while let Some(c) = cur {
+            match self.entity(c) {
+                Some(e) if e.enabled => cur = e.parent,
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// Entity ids ordered so every parent precedes its children.

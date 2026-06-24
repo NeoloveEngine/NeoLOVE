@@ -58,6 +58,11 @@ pub mod icon {
     pub const FONT_DOWNLOAD: char = '\u{e167}';
     pub const ARTICLE: char = '\u{ef42}';
     pub const PALETTE: char = '\u{e40a}';
+    pub const SEARCH: char = '\u{e8b6}';
+    pub const VISIBILITY: char = '\u{e8f4}';
+    pub const VISIBILITY_OFF: char = '\u{e8f5}';
+    pub const RESTART_ALT: char = '\u{f053}';
+    pub const CENTER_FOCUS: char = '\u{e3b4}';
     /// Used for the "swap dock side" affordance on a panel header.
     pub const SWAP: char = '\u{e8f1}';
 }
@@ -484,6 +489,17 @@ pub struct FrameInput {
     pub copy: bool,
     pub paste: bool,
     pub save: bool,
+    pub duplicate: bool,
+    pub undo: bool,
+    pub redo: bool,
+    /// `F` frames the selection; `F2` renames it; `0` resets the view.
+    pub focus_selection: bool,
+    pub rename: bool,
+    pub reset_view: bool,
+    /// Arrow-key nudge direction (-1/0/1); `nudge_big` uses the grid step.
+    pub nudge_x: f32,
+    pub nudge_y: f32,
+    pub nudge_big: bool,
 }
 
 /// The result of running an editable text field for one frame.

@@ -114,6 +114,9 @@ enum Action {
     Delete(u64),
     Paste,
     Unparent(u64),
+    ResetTransform(u64),
+    FrameSelected(u64),
+    ToggleActive(u64),
     NewFolder,
     NewScript,
     RevealInExplorer,
@@ -169,9 +172,19 @@ pub struct EditorApp {
     bin_forward: Vec<PathBuf>,
     bin_scroll: f32,
     bin_content_h: f32,
-    /// Viewport pan offset (middle-mouse drag).
+    /// Viewport pan offset (middle-mouse drag) and zoom (scroll wheel).
     cam_x: f32,
     cam_y: f32,
+    cam_zoom: f32,
+    /// The viewport rect from the last frame (for framing the selection).
+    last_viewport: Rect,
+    /// Hierarchy name filter (search box).
+    hierarchy_filter: String,
+    /// Undo/redo stacks of serialized scene snapshots, plus the baseline used
+    /// to coalesce a continuous edit (a drag, a typing session) into one entry.
+    undo_stack: Vec<String>,
+    redo_stack: Vec<String>,
+    undo_baseline: String,
     /// Collapsed section keys (component bodies / advanced groups).
     collapsed: HashSet<String>,
     clipboard: Option<Entity>,
@@ -194,6 +207,7 @@ impl EditorApp {
         config: EditorConfig,
     ) -> Self {
         let config_path = project_root.join("editor.json");
+        let scene_json = scene.to_json().unwrap_or_default();
         Self {
             bin_dir: project_root.clone(),
             project_root,
@@ -215,6 +229,12 @@ impl EditorApp {
             bin_content_h: 0.0,
             cam_x: 0.0,
             cam_y: 0.0,
+            cam_zoom: 1.0,
+            last_viewport: Rect::new(0.0, 0.0, 0.0, 0.0),
+            hierarchy_filter: String::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            undo_baseline: scene_json,
             collapsed: HashSet::new(),
             clipboard: None,
             reparent_drag: None,
@@ -281,6 +301,79 @@ impl EditorApp {
         self.scene_dirty = true;
     }
 
+    /// Once an interaction settles (no mouse button held, no field focused),
+    /// coalesce any change since the last baseline into a single undo entry.
+    fn commit_undo_if_settled(&mut self, ui: &Ui) {
+        let settled = !ui.input.mouse_down && !ui.has_focus() && self.dragging.is_none() && self.resizing.is_none();
+        if !settled {
+            return;
+        }
+        if let Ok(cur) = self.scene.to_json() {
+            if cur != self.undo_baseline {
+                self.undo_stack.push(std::mem::replace(&mut self.undo_baseline, cur));
+                if self.undo_stack.len() > 100 {
+                    self.undo_stack.remove(0);
+                }
+                self.redo_stack.clear();
+            }
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some(prev) = self.undo_stack.pop() {
+            if let Ok(scene) = Scene::from_json(&prev) {
+                self.redo_stack.push(std::mem::replace(&mut self.undo_baseline, prev));
+                self.scene = scene;
+                self.selected = None;
+                self.scene_dirty = true;
+                self.status = "Undo".to_string();
+            }
+        } else {
+            self.status = "Nothing to undo".to_string();
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            if let Ok(scene) = Scene::from_json(&next) {
+                self.undo_stack.push(std::mem::replace(&mut self.undo_baseline, next));
+                self.scene = scene;
+                self.selected = None;
+                self.scene_dirty = true;
+                self.status = "Redo".to_string();
+            }
+        } else {
+            self.status = "Nothing to redo".to_string();
+        }
+    }
+
+    /// Center the viewport on the selected entity at a comfortable zoom.
+    fn frame_selected(&mut self) {
+        let area = self.last_viewport;
+        if area.w <= 0.0 {
+            return;
+        }
+        if let Some(id) = self.selected {
+            if let Some(e) = self.scene.entity(id) {
+                let w = (e.size_x * e.scale).max(1.0);
+                let h = (e.size_y * e.scale).max(1.0);
+                let zoom = ((area.w * 0.5 / w).min(area.h * 0.5 / h)).clamp(0.2, 4.0);
+                let cx = e.x + w * 0.5;
+                let cy = e.y + h * 0.5;
+                self.cam_zoom = zoom;
+                self.cam_x = area.w * 0.5 - cx * zoom;
+                self.cam_y = area.h * 0.5 - cy * zoom;
+                self.status = "Framed selection".to_string();
+            }
+        }
+    }
+
+    fn reset_view(&mut self) {
+        self.cam_x = 0.0;
+        self.cam_y = 0.0;
+        self.cam_zoom = 1.0;
+    }
+
     // ---- Frame -------------------------------------------------------------
 
     pub fn frame(&mut self, ui: &mut Ui) {
@@ -303,6 +396,12 @@ impl EditorApp {
 
         // Global shortcuts (only when no text field is focused).
         if !ui.has_focus() && self.popup.is_none() {
+            if ui.input.undo {
+                self.undo();
+            }
+            if ui.input.redo {
+                self.redo();
+            }
             if ui.input.copy {
                 if let Some(id) = self.selected {
                     self.copy_entity(id);
@@ -311,8 +410,35 @@ impl EditorApp {
             if ui.input.paste {
                 self.paste_entity();
             }
+            if ui.input.duplicate {
+                if let Some(id) = self.selected {
+                    self.duplicate_entity(id);
+                }
+            }
             if ui.input.save {
                 self.save();
+            }
+            if ui.input.focus_selection {
+                self.frame_selected();
+            }
+            if ui.input.reset_view {
+                self.reset_view();
+            }
+            if ui.input.rename {
+                if let Some(id) = self.selected {
+                    let cur = self.scene.entity(id).map(|e| e.name.clone()).unwrap_or_default();
+                    self.open_prompt("Rename entity", Pending::RenameEntity(id), &cur);
+                }
+            }
+            // Arrow-key nudge.
+            if (ui.input.nudge_x != 0.0 || ui.input.nudge_y != 0.0) && self.selected.is_some() {
+                let step = if ui.input.nudge_big { self.config.layout.grid.max(1.0) } else { 1.0 };
+                let id = self.selected.expect("selected");
+                if let Some(e) = self.scene.entity_mut(id) {
+                    e.x += ui.input.nudge_x * step;
+                    e.y += ui.input.nudge_y * step;
+                }
+                self.mark_dirty();
             }
             if ui.input.delete {
                 if let Some(id) = self.selected.take() {
@@ -397,6 +523,7 @@ impl EditorApp {
         ui.input.right_pressed = raw_right;
         self.handle_popup(ui, w, h, popup_interactive);
 
+        self.commit_undo_if_settled(ui);
         ui.draw_tooltip();
     }
 
@@ -580,14 +707,43 @@ impl EditorApp {
 
     fn hierarchy_content(&mut self, ui: &mut Ui, area: Rect, start_y: f32) -> f32 {
         let mut y = start_y;
+
+        // Search box.
+        let filter = self.hierarchy_filter.clone();
+        ui.icon(area.x + 12.0, y + FIELD_H / 2.0, icon::SEARCH, 14.0, self.config.theme.text_dim);
+        let resp = ui.text_field("hier_filter", Rect::new(area.x + 22.0, y, area.w - 30.0, FIELD_H), &filter);
+        if resp.changed {
+            self.hierarchy_filter = resp.text;
+        }
+        y += FIELD_H + 6.0;
+        let query = self.hierarchy_filter.trim().to_lowercase();
+
         if self.scene.entities.is_empty() {
             ui.label(area.x + PAD, y, "No entities.", self.config.theme.text_dim);
             ui.label(area.x + PAD, y + 18.0, "Right-click or use + Entity.", self.config.theme.text_dim);
-            // Right-click empty space opens the viewport-style menu.
             if area.contains(ui.input.mouse_x, ui.input.mouse_y) && ui.input.right_pressed {
                 self.open_hierarchy_empty_menu(ui.input.mouse_x, ui.input.mouse_y);
             }
             return y + 40.0;
+        }
+
+        if !query.is_empty() {
+            // Filtered: flat list of matching entities, no tree.
+            let ids: Vec<u64> = self
+                .scene
+                .entities
+                .iter()
+                .filter(|e| e.name.to_lowercase().contains(&query))
+                .map(|e| e.id)
+                .collect();
+            if ids.is_empty() {
+                ui.label(area.x + PAD, y, "No matches.", self.config.theme.text_dim);
+                return y + 24.0;
+            }
+            for id in ids {
+                y = self.hierarchy_node(ui, area, id, 0, y);
+            }
+            return y + PAD;
         }
 
         // Render the tree depth-first.
@@ -633,13 +789,28 @@ impl EditorApp {
             ui.painter.stroke_rect(row, self.config.theme.accent);
         }
 
-        if ui.list_row(row, &name, selected, indent) {
-            self.selected = Some(id);
-            // Begin a potential reparent drag.
-            self.reparent_drag = Some(id);
+        let enabled = self.scene.entity(id).map(|e| e.enabled).unwrap_or(true);
+        let eye = Rect::new(row.right() - 22.0, y + 3.0, 18.0, ROW_H - 6.0);
+        let eye_hit = eye.contains(ui.input.mouse_x, ui.input.mouse_y);
+        let clicked = ui.list_row(row, &name, selected, indent);
+        if !enabled {
+            // Dim disabled rows like Unity greys out inactive objects.
+            let d = self.config.theme.panel;
+            ui.painter.fill_rect(row, [d[0], d[1], d[2], 130]);
         }
         if has_children {
             ui.icon(area.x + indent - 2.0, y + ROW_H / 2.0, icon::CHEVRON_RIGHT, 14.0, self.config.theme.text_dim);
+        }
+        let eye_glyph = if enabled { icon::VISIBILITY } else { icon::VISIBILITY_OFF };
+        ui.icon(eye.x + eye.w / 2.0, eye.y + eye.h / 2.0, eye_glyph, 14.0, self.config.theme.text_dim);
+        if eye_hit && ui.input.mouse_pressed {
+            if let Some(e) = self.scene.entity_mut(id) {
+                e.enabled = !e.enabled;
+            }
+            self.mark_dirty();
+        } else if clicked {
+            self.selected = Some(id);
+            self.reparent_drag = Some(id);
         }
         if hovering && ui.input.right_pressed {
             self.selected = Some(id);
@@ -673,8 +844,29 @@ impl EditorApp {
         if area.w <= 0.0 {
             return;
         }
+        self.last_viewport = area;
         let prev = ui.painter.push_clip(area);
         ui.set_input_clip(area);
+
+        let inside = area.contains(ui.input.mouse_x, ui.input.mouse_y);
+
+        // Middle-mouse pan.
+        if inside && ui.input.middle_down {
+            self.cam_x += ui.input.delta_x;
+            self.cam_y += ui.input.delta_y;
+            ui.wants_redraw = true;
+        }
+        // Scroll-wheel zoom, anchored at the cursor.
+        if inside && ui.input.scroll != 0.0 {
+            let old = self.cam_zoom;
+            let new = (old * (1.0 + ui.input.scroll * 0.12)).clamp(0.2, 5.0);
+            let wx = (ui.input.mouse_x - (area.x + self.cam_x)) / old;
+            let wy = (ui.input.mouse_y - (area.y + self.cam_y)) / old;
+            self.cam_x = ui.input.mouse_x - area.x - wx * new;
+            self.cam_y = ui.input.mouse_y - area.y - wy * new;
+            self.cam_zoom = new;
+            ui.wants_redraw = true;
+        }
 
         ui.painter.fill_rect(area, self.config.theme.viewport_bg);
         let [br, bg, bb, _] = self.scene.background;
@@ -684,13 +876,7 @@ impl EditorApp {
             self.draw_grid(ui, bg_frame);
         }
 
-        // Middle-mouse pan.
-        if area.contains(ui.input.mouse_x, ui.input.mouse_y) && ui.input.middle_down {
-            self.cam_x += ui.input.delta_x;
-            self.cam_y += ui.input.delta_y;
-            ui.wants_redraw = true;
-        }
-
+        let z = self.cam_zoom;
         let ox = area.x + self.cam_x;
         let oy = area.y + self.cam_y;
 
@@ -698,8 +884,13 @@ impl EditorApp {
         let mut entities: Vec<Entity> = self.scene.entities.clone();
         entities.sort_by(|a, b| a.z.partial_cmp(&b.z).unwrap_or(std::cmp::Ordering::Equal));
         for entity in &entities {
-            let rect = Rect::new(ox + entity.x, oy + entity.y, entity.size_x * entity.scale, entity.size_y * entity.scale);
-            self.draw_entity(ui, entity, rect);
+            let rect = Rect::new(ox + entity.x * z, oy + entity.y * z, entity.size_x * entity.scale * z, entity.size_y * entity.scale * z);
+            let active = self.scene.is_active_in_tree(entity.id);
+            self.draw_entity(ui, entity, rect, z);
+            if !active {
+                // Dim inactive entities, like Unity greys out disabled objects.
+                ui.painter.fill_rect(rect, [30, 30, 30, 150]);
+            }
             if self.selected == Some(entity.id) {
                 ui.painter.stroke_rect(rect.shrink(-1.0), self.config.theme.selection);
                 let (mx, my) = (ui.input.mouse_x, ui.input.mouse_y);
@@ -724,12 +915,31 @@ impl EditorApp {
 
         self.handle_viewport_input(ui, area);
 
+        // Transform/zoom HUD overlay (Unity-style), bottom-left of the viewport.
+        let hud = if let Some(e) = self.selected.and_then(|id| self.scene.entity(id)) {
+            format!(
+                "{}   x {} y {}   w {} h {}   zoom {}%",
+                e.name,
+                format_num(e.x),
+                format_num(e.y),
+                format_num(e.size_x),
+                format_num(e.size_y),
+                (self.cam_zoom * 100.0).round() as i32,
+            )
+        } else {
+            format!("zoom {}%   (scroll to zoom, middle-drag to pan, F to frame)", (self.cam_zoom * 100.0).round() as i32)
+        };
+        let hud_w = ui.painter.text_width(&hud, 13.0) + 16.0;
+        let hud_rect = Rect::new(area.x + 6.0, area.bottom() - 26.0, hud_w.min(area.w - 12.0), 20.0);
+        ui.painter.fill_round_rect(hud_rect, 4.0, [0, 0, 0, 150]);
+        ui.painter.text_clipped(hud_rect.x + 8.0, hud_rect.y + 3.0, &hud, 13.0, self.config.theme.text, hud_rect.w - 12.0);
+
         ui.reset_input_clip();
         ui.painter.set_clip_raw(prev);
     }
 
     fn draw_grid(&self, ui: &mut Ui, area: Rect) {
-        let step = self.config.layout.grid.max(2.0);
+        let step = (self.config.layout.grid.max(2.0) * self.cam_zoom).max(4.0);
         let line = self.config.theme.grid;
         // Offset grid by the pan so it scrolls with the scene.
         let start_x = area.x + (self.cam_x % step);
@@ -750,7 +960,7 @@ impl EditorApp {
         }
     }
 
-    fn draw_entity(&self, ui: &mut Ui, entity: &Entity, rect: Rect) {
+    fn draw_entity(&self, ui: &mut Ui, entity: &Entity, rect: Rect, zoom: f32) {
         let mut drew = false;
         for component in &entity.components {
             if let Component::Core { name, props } = component {
@@ -772,7 +982,7 @@ impl EditorApp {
                                     _ => None,
                                 })
                                 .unwrap_or(20.0);
-                            ui.painter.text(rect.x, rect.y, t, size.clamp(6.0, 96.0), color);
+                            ui.painter.text(rect.x, rect.y, t, (size * zoom).clamp(6.0, 200.0), color);
                             drew = true;
                         }
                     }
@@ -801,6 +1011,7 @@ impl EditorApp {
     fn handle_viewport_input(&mut self, ui: &mut Ui, area: Rect) {
         let mx = ui.input.mouse_x;
         let my = ui.input.mouse_y;
+        let z = self.cam_zoom;
         let inside = area.contains(mx, my);
 
         if inside && ui.input.right_pressed {
@@ -826,10 +1037,10 @@ impl EditorApp {
         {
             if let Some(id) = self.selected {
                 if let Some(e) = self.scene.entity(id) {
-                    let w = e.size_x * e.scale;
-                    let h = e.size_y * e.scale;
-                    let ex = area.x + self.cam_x + e.x;
-                    let ey = area.y + self.cam_y + e.y;
+                    let w = e.size_x * e.scale * z;
+                    let h = e.size_y * e.scale * z;
+                    let ex = area.x + self.cam_x + e.x * z;
+                    let ey = area.y + self.cam_y + e.y * z;
                     // (corner screen, opposite corner screen)
                     let corners = [
                         ((ex, ey), (ex + w, ey + h)),
@@ -839,8 +1050,9 @@ impl EditorApp {
                     ];
                     for ((csx, csy), (asx, asy)) in corners {
                         if (mx - csx).abs() <= 7.0 && (my - csy).abs() <= 7.0 {
-                            let anchor_x = asx - (area.x + self.cam_x);
-                            let anchor_y = asy - (area.y + self.cam_y);
+                            // Anchor stored in world units (entity coordinates).
+                            let anchor_x = (asx - (area.x + self.cam_x)) / z;
+                            let anchor_y = (asy - (area.y + self.cam_y)) / z;
                             self.resizing = Some((id, anchor_x, anchor_y));
                             break;
                         }
@@ -853,8 +1065,8 @@ impl EditorApp {
             if ui.input.mouse_down {
                 let snap = self.config.layout.snap;
                 let grid = self.config.layout.grid.max(1.0);
-                let mut wx = mx - (area.x + self.cam_x);
-                let mut wy = my - (area.y + self.cam_y);
+                let mut wx = (mx - (area.x + self.cam_x)) / z;
+                let mut wy = (my - (area.y + self.cam_y)) / z;
                 if snap {
                     wx = (wx / grid).round() * grid;
                     wy = (wy / grid).round() * grid;
@@ -888,7 +1100,7 @@ impl EditorApp {
                     self.selected = Some(id);
                     let e = self.scene.entity(id);
                     if let Some(e) = e {
-                        self.dragging = Some((id, mx - (area.x + self.cam_x + e.x), my - (area.y + self.cam_y + e.y)));
+                        self.dragging = Some((id, mx - (area.x + self.cam_x + e.x * z), my - (area.y + self.cam_y + e.y * z)));
                     }
                 }
                 None => self.selected = None,
@@ -899,8 +1111,8 @@ impl EditorApp {
             if ui.input.mouse_down {
                 let snap = self.config.layout.snap;
                 let grid = self.config.layout.grid.max(1.0);
-                let world_x = mx - (area.x + self.cam_x) - gx;
-                let world_y = my - (area.y + self.cam_y) - gy;
+                let world_x = (mx - gx - (area.x + self.cam_x)) / z;
+                let world_y = (my - gy - (area.y + self.cam_y)) / z;
                 if let Some(e) = self.scene.entity_mut(id) {
                     let (mut nx, mut ny) = (world_x, world_y);
                     if snap {
@@ -924,14 +1136,15 @@ impl EditorApp {
     }
 
     fn viewport_hit(&self, area: Rect, mx: f32, my: f32) -> Option<u64> {
+        let z = self.cam_zoom;
         let mut order: Vec<&Entity> = self.scene.entities.iter().collect();
         order.sort_by(|a, b| b.z.partial_cmp(&a.z).unwrap_or(std::cmp::Ordering::Equal));
         for e in order {
             let r = Rect::new(
-                area.x + self.cam_x + e.x,
-                area.y + self.cam_y + e.y,
-                e.size_x * e.scale,
-                e.size_y * e.scale,
+                area.x + self.cam_x + e.x * z,
+                area.y + self.cam_y + e.y * z,
+                e.size_x * e.scale * z,
+                e.size_y * e.scale * z,
             );
             if r.contains(mx, my) {
                 return Some(e.id);
@@ -1054,7 +1267,12 @@ impl EditorApp {
         };
         let mut dirty = false;
 
-        let r = ui.text_field("ent_name", Rect::new(x, y, width, FIELD_H), &entity.name);
+        // Active checkbox + name (like Unity's header row).
+        if let Some(nv) = ui.checkbox(Rect::new(x, y, FIELD_H, FIELD_H), entity.enabled) {
+            entity.enabled = nv;
+            dirty = true;
+        }
+        let r = ui.text_field("ent_name", Rect::new(x + FIELD_H + 6.0, y, width - FIELD_H - 6.0, FIELD_H), &entity.name);
         if r.changed {
             entity.name = r.text;
             dirty = true;
@@ -1605,11 +1823,20 @@ impl EditorApp {
     }
 
     fn open_entity_menu(&mut self, id: u64, x: f32, y: f32) {
+        let active = self.scene.entity(id).map(|e| e.enabled).unwrap_or(true);
         let items = vec![
             MenuItem { action: Action::Rename(id), glyph: icon::EDIT, label: "Rename".into(), danger: false },
             MenuItem { action: Action::Duplicate(id), glyph: icon::CONTENT_COPY, label: "Duplicate".into(), danger: false },
             MenuItem { action: Action::Copy(id), glyph: icon::CONTENT_COPY, label: "Copy".into(), danger: false },
             MenuItem { action: Action::Paste, glyph: icon::CONTENT_PASTE, label: "Paste".into(), danger: false },
+            MenuItem {
+                action: Action::ToggleActive(id),
+                glyph: if active { icon::VISIBILITY_OFF } else { icon::VISIBILITY },
+                label: if active { "Deactivate".into() } else { "Activate".into() },
+                danger: false,
+            },
+            MenuItem { action: Action::FrameSelected(id), glyph: icon::CENTER_FOCUS, label: "Frame Selected".into(), danger: false },
+            MenuItem { action: Action::ResetTransform(id), glyph: icon::RESTART_ALT, label: "Reset Transform".into(), danger: false },
             MenuItem { action: Action::Unparent(id), glyph: icon::CHEVRON_LEFT, label: "Unparent".into(), danger: false },
             MenuItem { action: Action::AddEntity(Some(id)), glyph: icon::ADD, label: "Add Child".into(), danger: false },
             MenuItem { action: Action::Delete(id), glyph: icon::DELETE, label: "Delete".into(), danger: true },
@@ -1850,6 +2077,29 @@ impl EditorApp {
             Action::Unparent(id) => {
                 if let Some(e) = self.scene.entity_mut(id) {
                     e.parent = None;
+                }
+                self.mark_dirty();
+            }
+            Action::ResetTransform(id) => {
+                if let Some(e) = self.scene.entity_mut(id) {
+                    e.x = 0.0;
+                    e.y = 0.0;
+                    e.z = 0.0;
+                    e.rotation = 0.0;
+                    e.scale = 1.0;
+                    e.anchor_x = 0.0;
+                    e.anchor_y = 0.0;
+                }
+                self.mark_dirty();
+                self.status = "Reset transform".to_string();
+            }
+            Action::FrameSelected(id) => {
+                self.selected = Some(id);
+                self.frame_selected();
+            }
+            Action::ToggleActive(id) => {
+                if let Some(e) = self.scene.entity_mut(id) {
+                    e.enabled = !e.enabled;
                 }
                 self.mark_dirty();
             }
@@ -2380,6 +2630,42 @@ mod tests {
         let e = h.app.scene.entity(id).expect("entity");
         assert!((e.size_x - 140.0).abs() < 2.0, "size_x was {}", e.size_x);
         assert!((e.size_y - 140.0).abs() < 2.0, "size_y was {}", e.size_y);
+    }
+
+    #[test]
+    fn undo_redo_round_trips_an_edit() {
+        let mut h = Harness::new(Scene::default());
+        let before = h.app.scene.entities.len();
+        // Add an entity (settles on the release frame, recording one undo step).
+        h.app.add_entity(None);
+        h.frame(FrameInput::default());
+        assert_eq!(h.app.scene.entities.len(), before + 1);
+        h.app.undo();
+        assert_eq!(h.app.scene.entities.len(), before, "undo did not revert add");
+        h.app.redo();
+        assert_eq!(h.app.scene.entities.len(), before + 1, "redo did not re-apply");
+    }
+
+    #[test]
+    fn inactive_entities_are_excluded_from_export() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        scene.entity_mut(id).expect("e").components.push(Component::core("Rect2D"));
+        scene.entity_mut(id).expect("e").name = "Hidden".into();
+        scene.entity_mut(id).expect("e").enabled = false;
+        let luau = scene.to_luau();
+        assert!(!luau.contains("\"Hidden\""), "disabled entity was exported");
+    }
+
+    #[test]
+    fn zoom_keeps_hit_testing_consistent() {
+        let mut h = Harness::new(Scene::default());
+        let id = h.app.scene.entities[0].id;
+        h.app.cam_zoom = 2.0;
+        // Entity at world (200,150); at zoom 2 with viewport x=240,y=40 its
+        // center maps to screen (240+400+100, 40+300+100) = (740, 440).
+        let hit = h.app.viewport_hit(Rect::new(240.0, 40.0, 800.0, 600.0), 740.0, 440.0);
+        assert_eq!(hit, Some(id));
     }
 
     #[test]

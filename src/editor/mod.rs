@@ -98,6 +98,7 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                 }
                 WindowEvent::ModifiersChanged(state) => {
                     input.ctrl = state.ctrl() || state.logo();
+                    input.shift = state.shift();
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     let (nx, ny) = (position.x as f32, position.y as f32);
@@ -179,6 +180,17 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                         VirtualKeyCode::C if input.ctrl => input.copy = true,
                         VirtualKeyCode::V if input.ctrl => input.paste = true,
                         VirtualKeyCode::S if input.ctrl => input.save = true,
+                        VirtualKeyCode::D if input.ctrl => input.duplicate = true,
+                        VirtualKeyCode::Y if input.ctrl => input.redo = true,
+                        VirtualKeyCode::Z if input.ctrl && input.shift => input.redo = true,
+                        VirtualKeyCode::Z if input.ctrl => input.undo = true,
+                        VirtualKeyCode::F2 => input.rename = true,
+                        VirtualKeyCode::F => input.focus_selection = true,
+                        VirtualKeyCode::Key0 | VirtualKeyCode::Numpad0 => input.reset_view = true,
+                        VirtualKeyCode::Left => input.nudge_x = -1.0,
+                        VirtualKeyCode::Right => input.nudge_x = 1.0,
+                        VirtualKeyCode::Up => input.nudge_y = -1.0,
+                        VirtualKeyCode::Down => input.nudge_y = 1.0,
                         _ => {}
                     }
                     window.request_redraw();
@@ -235,9 +247,18 @@ struct PendingInput {
     escape: bool,
     delete: bool,
     ctrl: bool,
+    shift: bool,
     copy: bool,
     paste: bool,
     save: bool,
+    duplicate: bool,
+    undo: bool,
+    redo: bool,
+    focus_selection: bool,
+    rename: bool,
+    reset_view: bool,
+    nudge_x: f32,
+    nudge_y: f32,
     last_click: Instant,
     last_click_x: f32,
     last_click_y: f32,
@@ -264,9 +285,18 @@ impl Default for PendingInput {
             escape: false,
             delete: false,
             ctrl: false,
+            shift: false,
             copy: false,
             paste: false,
             save: false,
+            duplicate: false,
+            undo: false,
+            redo: false,
+            focus_selection: false,
+            rename: false,
+            reset_view: false,
+            nudge_x: 0.0,
+            nudge_y: 0.0,
             last_click: Instant::now() - Duration::from_secs(10),
             last_click_x: 0.0,
             last_click_y: 0.0,
@@ -298,6 +328,15 @@ impl PendingInput {
             copy: self.copy,
             paste: self.paste,
             save: self.save,
+            duplicate: self.duplicate,
+            undo: self.undo,
+            redo: self.redo,
+            focus_selection: self.focus_selection,
+            rename: self.rename,
+            reset_view: self.reset_view,
+            nudge_x: self.nudge_x,
+            nudge_y: self.nudge_y,
+            nudge_big: self.shift,
         };
         self.mouse_pressed = false;
         self.right_pressed = false;
@@ -314,6 +353,14 @@ impl PendingInput {
         self.copy = false;
         self.paste = false;
         self.save = false;
+        self.duplicate = false;
+        self.undo = false;
+        self.redo = false;
+        self.focus_selection = false;
+        self.rename = false;
+        self.reset_view = false;
+        self.nudge_x = 0.0;
+        self.nudge_y = 0.0;
         frame
     }
 }

@@ -119,6 +119,17 @@ The editor opens a window with a dockable **Hierarchy**, a 2D **Viewport**, an
   folders in your OS file manager. Toggle the grid overlay and grid snapping.
 - Right-click almost anything for a context menu; hover any control for a
   tooltip; unsaved changes prompt before New/Load/Quit.
+- Unity-style quality-of-life: undo/redo (Ctrl+Z / Ctrl+Y), duplicate (Ctrl+D),
+  frame-selected (F), reset view (0), rename (F2), arrow-key nudge (Shift =
+  grid step), scroll-wheel zoom, a hierarchy search box, per-entity active
+  toggles (excluded from export), Reset-Transform, and a live transform/zoom
+  overlay in the viewport.
+
+Scenes can also be loaded at runtime from Luau:
+
+```luau
+ecs.loadScene("scene.neoscene")
+```
 
 Scenes are saved as `scene.neoscene` (JSON). **Export main.luau** generates a
 runnable entry point from the scene, and **Run** launches a live preview.
