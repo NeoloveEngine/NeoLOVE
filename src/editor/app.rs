@@ -6,11 +6,18 @@
 //! context menus, dropdowns, the color picker and modal dialogs.
 
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
+
+use crate::platform::Color;
+use crate::renderer::{
+    self, FontHandle, Rect as RenderRect, TextAlignX, TextAlignY, TextRenderRequest,
+    TextScaleMode, TextWrapMode, Vec2 as RenderVec2,
+};
 
 use super::scene::{
     Component, Entity, Prop, PropValue, Scene, ScriptVar, VarValue, ADVANCED_COMPONENTS,
@@ -395,11 +402,16 @@ impl EditorApp {
         }
         if let Some(id) = self.selected {
             if let Some(e) = self.scene.entity(id) {
-                let w = (e.size_x * e.scale).max(1.0);
-                let h = (e.size_y * e.scale).max(1.0);
+                let world = self.entity_world_transform(id).unwrap_or(EditorWorldTransform {
+                    x: e.x,
+                    y: e.y,
+                    scale: editor_entity_scale(e),
+                });
+                let w = (e.size_x * world.scale).max(1.0);
+                let h = (e.size_y * world.scale).max(1.0);
                 let zoom = ((area.w * 0.5 / w).min(area.h * 0.5 / h)).clamp(0.2, 4.0);
-                let cx = e.x + w * 0.5;
-                let cy = e.y + h * 0.5;
+                let cx = world.x + w * 0.5;
+                let cy = world.y + h * 0.5;
                 self.cam_zoom = zoom;
                 self.cam_x = area.w * 0.5 - cx * zoom;
                 self.cam_y = area.h * 0.5 - cy * zoom;
@@ -935,14 +947,14 @@ impl EditorApp {
         }
 
         let z = self.cam_zoom;
-        let ox = area.x + self.cam_x;
-        let oy = area.y + self.cam_y;
 
         // Draw entities sorted by z (lower first).
         let mut entities: Vec<Entity> = self.scene.entities.clone();
-        entities.sort_by(|a, b| a.z.partial_cmp(&b.z).unwrap_or(std::cmp::Ordering::Equal));
+        entities.sort_by(compare_editor_entity_order);
         for entity in &entities {
-            let rect = Rect::new(ox + entity.x * z, oy + entity.y * z, entity.size_x * entity.scale * z, entity.size_y * entity.scale * z);
+            let Some(rect) = self.entity_screen_rect(entity, area) else {
+                continue;
+            };
             let active = self.scene.is_active_in_tree(entity.id);
             self.draw_entity(ui, entity, rect, z);
             if !active {
@@ -969,7 +981,11 @@ impl EditorApp {
                     );
                 }
                 // Collider2D preview — its shape/size can differ from the entity.
-                self.draw_collider_preview(ui, entity, rect, z);
+                let world_scale = self
+                    .entity_world_transform(entity.id)
+                    .map(|transform| transform.scale)
+                    .unwrap_or_else(|| editor_entity_scale(entity));
+                self.draw_collider_preview(ui, entity, rect, z, world_scale);
             }
         }
 
@@ -1036,6 +1052,30 @@ impl EditorApp {
         loaded
     }
 
+    fn entity_world_transform(&self, id: u64) -> Option<EditorWorldTransform> {
+        scene_world_transform(&self.scene, id)
+    }
+
+    fn entity_screen_rect(&self, entity: &Entity, area: Rect) -> Option<Rect> {
+        let transform = self.entity_world_transform(entity.id)?;
+        let z = self.cam_zoom;
+        Some(Rect::new(
+            area.x + self.cam_x + transform.x * z,
+            area.y + self.cam_y + transform.y * z,
+            entity.size_x * transform.scale * z,
+            entity.size_y * transform.scale * z,
+        ))
+    }
+
+    fn world_origin_to_local_position(
+        &self,
+        entity_id: u64,
+        world_x: f32,
+        world_y: f32,
+    ) -> Option<(f32, f32)> {
+        scene_world_origin_to_local_position(&self.scene, entity_id, world_x, world_y)
+    }
+
     fn draw_entity(&self, ui: &mut Ui, entity: &Entity, rect: Rect, zoom: f32) {
         let mut drew = false;
         for component in &entity.components {
@@ -1046,12 +1086,6 @@ impl EditorApp {
                         PropValue::Number(v) => Some(v),
                         _ => None,
                     }).unwrap_or(d)
-                };
-                let prop_str = |n: &str| {
-                    props.iter().find(|p| p.name == n).and_then(|p| match &p.value {
-                        PropValue::Text(s) => Some(s.clone()),
-                        _ => None,
-                    })
                 };
                 let prop_img = |n: &str| {
                     props.iter().find(|p| p.name == n).and_then(|p| match &p.value {
@@ -1068,18 +1102,55 @@ impl EditorApp {
                     "Button" | "Dropdown" | "TextInput" => {
                         let radius = prop_num("corner_radius", 6.0) * zoom;
                         ui.painter.fill_round_rect(rect, radius, color);
-                        if let Some(t) = prop_str("text") {
-                            let size = (prop_num("scale", 18.0) * zoom).clamp(6.0, 200.0);
-                            ui.painter.text(rect.x + 6.0, rect.y + (rect.h - size) / 2.0, &t, size, [20, 20, 20, 255]);
+                        let defaults = match name.as_str() {
+                            "Button" => TextPreviewDefaults {
+                                default_scale: 18.0,
+                                default_align_x: TextAlignX::Center,
+                                default_align_y: TextAlignY::Center,
+                                default_text_scale: TextScaleMode::Fit,
+                                default_wrap: TextWrapMode::None,
+                                default_size_mode_uses_entity: true,
+                                color_names: &["text_color", "textColor"],
+                                fallback_color: [20, 20, 20, 255],
+                            },
+                            "TextInput" => TextPreviewDefaults {
+                                default_scale: 18.0,
+                                default_align_x: TextAlignX::Left,
+                                default_align_y: TextAlignY::Center,
+                                default_text_scale: TextScaleMode::None,
+                                default_wrap: TextWrapMode::None,
+                                default_size_mode_uses_entity: true,
+                                color_names: &["text_color", "textColor"],
+                                fallback_color: [20, 20, 20, 255],
+                            },
+                            _ => TextPreviewDefaults {
+                                default_scale: 18.0,
+                                default_align_x: TextAlignX::Left,
+                                default_align_y: TextAlignY::Center,
+                                default_text_scale: TextScaleMode::FitWidth,
+                                default_wrap: TextWrapMode::None,
+                                default_size_mode_uses_entity: true,
+                                color_names: &["text_color", "textColor"],
+                                fallback_color: [20, 20, 20, 255],
+                            },
+                        };
+                        if prop_string_like(props, &["text"]).is_some() {
+                            self.draw_text_preview(ui, props, rect, zoom, defaults);
                         }
                         drew = true;
                     }
                     "TextBox" | "TextLabel" | "RudimentaryTextLabel" => {
-                        if let Some(t) = prop_str("text") {
-                            let size = (prop_num("scale", 20.0) * zoom).clamp(6.0, 200.0);
-                            ui.painter.text(rect.x, rect.y, &t, size, color);
-                            drew = true;
-                        }
+                        let defaults = TextPreviewDefaults {
+                            default_scale: 32.0,
+                            default_align_x: TextAlignX::Left,
+                            default_align_y: TextAlignY::Top,
+                            default_text_scale: TextScaleMode::None,
+                            default_wrap: TextWrapMode::None,
+                            default_size_mode_uses_entity: false,
+                            color_names: &["color"],
+                            fallback_color: color,
+                        };
+                        drew |= self.draw_text_preview(ui, props, rect, zoom, defaults);
                     }
                     "Sprite2D" | "Image2D" => {
                         if let Some(img) = prop_img("image").and_then(|p| self.load_image(&p)) {
@@ -1122,6 +1193,29 @@ impl EditorApp {
         }
     }
 
+    fn draw_text_preview(
+        &self,
+        ui: &mut Ui,
+        props: &[Prop],
+        rect: Rect,
+        zoom: f32,
+        defaults: TextPreviewDefaults,
+    ) -> bool {
+        let Some(request) = text_preview_request(&self.project_root, props, rect, zoom, defaults) else {
+            return false;
+        };
+        let Some(sprite) = renderer::rasterize_text_sprite(&request) else {
+            return false;
+        };
+        ui.painter.draw_image(
+            sprite.image.as_ref(),
+            Rect::new(sprite.dest.x, sprite.dest.y, sprite.dest.w, sprite.dest.h),
+            None,
+            [255, 255, 255, 255],
+        );
+        true
+    }
+
     /// Placeholder for an image component whose asset is missing/unset.
     fn draw_missing_image(&self, ui: &mut Ui, rect: Rect, tint: [u8; 4]) {
         ui.painter.fill_rect(rect, [tint[0] / 3, tint[1] / 3, tint[2] / 3, 255]);
@@ -1137,7 +1231,14 @@ impl EditorApp {
 
     /// Draw a green outline for a selected entity's Collider2D, since the
     /// collider's shape/size/offset often differ from the entity bounds.
-    fn draw_collider_preview(&self, ui: &mut Ui, entity: &Entity, rect: Rect, z: f32) {
+    fn draw_collider_preview(
+        &self,
+        ui: &mut Ui,
+        entity: &Entity,
+        rect: Rect,
+        z: f32,
+        world_scale: f32,
+    ) {
         for component in &entity.components {
             if let Component::Core { name, props } = component {
                 if name != "Collider2D" {
@@ -1157,15 +1258,15 @@ impl EditorApp {
                         _ => None,
                     })
                     .unwrap_or_else(|| "box".to_string());
-                let ox = num("offset_x").unwrap_or(0.0) * z;
-                let oy = num("offset_y").unwrap_or(0.0) * z;
+                let ox = num("offset_x").unwrap_or(0.0) * world_scale * z;
+                let oy = num("offset_y").unwrap_or(0.0) * world_scale * z;
                 // Size 0 means "use the entity bounds".
                 let cw = match num("size_x") {
-                    Some(v) if v > 0.0 => v * z,
+                    Some(v) if v > 0.0 => v * world_scale * z,
                     _ => rect.w,
                 };
                 let ch = match num("size_y") {
-                    Some(v) if v > 0.0 => v * z,
+                    Some(v) if v > 0.0 => v * world_scale * z,
                     _ => rect.h,
                 };
                 let cr = Rect::new(rect.x + ox, rect.y + oy, cw, ch);
@@ -1276,20 +1377,19 @@ impl EditorApp {
         {
             if let Some(id) = self.selected {
                 if let Some(e) = self.scene.entity(id) {
-                    let w = e.size_x * e.scale * z;
-                    let h = e.size_y * e.scale * z;
-                    let ex = area.x + self.cam_x + e.x * z;
-                    let ey = area.y + self.cam_y + e.y * z;
+                    let Some(rect) = self.entity_screen_rect(e, area) else {
+                        return;
+                    };
                     // (corner screen, opposite corner screen)
                     let corners = [
-                        ((ex, ey), (ex + w, ey + h)),
-                        ((ex + w, ey), (ex, ey + h)),
-                        ((ex, ey + h), (ex + w, ey)),
-                        ((ex + w, ey + h), (ex, ey)),
+                        ((rect.x, rect.y), (rect.right(), rect.bottom())),
+                        ((rect.right(), rect.y), (rect.x, rect.bottom())),
+                        ((rect.x, rect.bottom()), (rect.right(), rect.y)),
+                        ((rect.right(), rect.bottom()), (rect.x, rect.y)),
                     ];
                     for ((csx, csy), (asx, asy)) in corners {
                         if (mx - csx).abs() <= 7.0 && (my - csy).abs() <= 7.0 {
-                            // Anchor stored in world units (entity coordinates).
+                            // Anchor stored in scene/world units.
                             let anchor_x = (asx - (area.x + self.cam_x)) / z;
                             let anchor_y = (asy - (area.y + self.cam_y)) / z;
                             self.resizing = Some((id, anchor_x, anchor_y));
@@ -1313,15 +1413,31 @@ impl EditorApp {
                     wx = wx.round();
                     wy = wy.round();
                 }
+                let fallback_scale = self
+                    .scene
+                    .entity(id)
+                    .map(editor_entity_scale)
+                    .unwrap_or(1.0);
+                let world_scale = self
+                    .entity_world_transform(id)
+                    .map(|transform| transform.scale)
+                    .unwrap_or(fallback_scale);
+                let scale = if world_scale.abs() < f32::EPSILON {
+                    1.0
+                } else {
+                    world_scale
+                };
+                let nx = wx.min(ax);
+                let ny = wy.min(ay);
+                let nw = ((wx - ax).abs() / scale).max(1.0);
+                let nh = ((wy - ay).abs() / scale).max(1.0);
+                let (local_x, local_y) = self
+                    .world_origin_to_local_position(id, nx, ny)
+                    .unwrap_or((nx, ny));
                 if let Some(e) = self.scene.entity_mut(id) {
-                    let scale = if e.scale.abs() < f32::EPSILON { 1.0 } else { e.scale };
-                    let nx = wx.min(ax);
-                    let ny = wy.min(ay);
-                    let nw = ((wx - ax).abs() / scale).max(1.0);
-                    let nh = ((wy - ay).abs() / scale).max(1.0);
-                    if e.x != nx || e.y != ny || e.size_x != nw || e.size_y != nh {
-                        e.x = nx;
-                        e.y = ny;
+                    if e.x != local_x || e.y != local_y || e.size_x != nw || e.size_y != nh {
+                        e.x = local_x;
+                        e.y = local_y;
                         e.size_x = nw;
                         e.size_y = nh;
                         self.scene_dirty = true;
@@ -1339,7 +1455,9 @@ impl EditorApp {
                     self.selected = Some(id);
                     let e = self.scene.entity(id);
                     if let Some(e) = e {
-                        self.dragging = Some((id, mx - (area.x + self.cam_x + e.x * z), my - (area.y + self.cam_y + e.y * z)));
+                        if let Some(rect) = self.entity_screen_rect(e, area) {
+                            self.dragging = Some((id, mx - rect.x, my - rect.y));
+                        }
                     }
                 }
                 None => self.selected = None,
@@ -1352,18 +1470,21 @@ impl EditorApp {
                 let grid = self.config.layout.grid.max(1.0);
                 let world_x = (mx - gx - (area.x + self.cam_x)) / z;
                 let world_y = (my - gy - (area.y + self.cam_y)) / z;
+                let (mut nx, mut ny) = (world_x, world_y);
+                if snap {
+                    nx = (nx / grid).round() * grid;
+                    ny = (ny / grid).round() * grid;
+                } else {
+                    nx = nx.round();
+                    ny = ny.round();
+                }
+                let (local_x, local_y) = self
+                    .world_origin_to_local_position(id, nx, ny)
+                    .unwrap_or((nx, ny));
                 if let Some(e) = self.scene.entity_mut(id) {
-                    let (mut nx, mut ny) = (world_x, world_y);
-                    if snap {
-                        nx = (nx / grid).round() * grid;
-                        ny = (ny / grid).round() * grid;
-                    } else {
-                        nx = nx.round();
-                        ny = ny.round();
-                    }
-                    if e.x != nx || e.y != ny {
-                        e.x = nx;
-                        e.y = ny;
+                    if e.x != local_x || e.y != local_y {
+                        e.x = local_x;
+                        e.y = local_y;
                         self.scene_dirty = true;
                     }
                 }
@@ -1375,16 +1496,12 @@ impl EditorApp {
     }
 
     fn viewport_hit(&self, area: Rect, mx: f32, my: f32) -> Option<u64> {
-        let z = self.cam_zoom;
         let mut order: Vec<&Entity> = self.scene.entities.iter().collect();
-        order.sort_by(|a, b| b.z.partial_cmp(&a.z).unwrap_or(std::cmp::Ordering::Equal));
+        order.sort_by(|a, b| compare_editor_entity_order(a, b).reverse());
         for e in order {
-            let r = Rect::new(
-                area.x + self.cam_x + e.x * z,
-                area.y + self.cam_y + e.y * z,
-                e.size_x * e.scale * z,
-                e.size_y * e.scale * z,
-            );
+            let Some(r) = self.entity_screen_rect(e, area) else {
+                continue;
+            };
             if r.contains(mx, my) {
                 return Some(e.id);
             }
@@ -2863,6 +2980,352 @@ impl EditorApp {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct EditorWorldTransform {
+    x: f32,
+    y: f32,
+    scale: f32,
+}
+
+fn editor_entity_scale(entity: &Entity) -> f32 {
+    if entity.scale.is_finite() {
+        entity.scale.max(0.0)
+    } else {
+        1.0
+    }
+}
+
+fn editor_parent_anchor_offset(scene: &Scene, entity: &Entity) -> (f32, f32) {
+    let Some(parent_id) = entity.parent else {
+        return (0.0, 0.0);
+    };
+    let Some(parent) = scene.entity(parent_id) else {
+        return (0.0, 0.0);
+    };
+    (
+        parent.size_x * entity.anchor_x,
+        parent.size_y * entity.anchor_y,
+    )
+}
+
+fn scene_world_transform(scene: &Scene, id: u64) -> Option<EditorWorldTransform> {
+    let mut visiting = HashSet::new();
+    scene_world_transform_inner(scene, id, &mut visiting)
+}
+
+fn scene_world_transform_inner(
+    scene: &Scene,
+    id: u64,
+    visiting: &mut HashSet<u64>,
+) -> Option<EditorWorldTransform> {
+    if !visiting.insert(id) {
+        return None;
+    }
+
+    let entity = scene.entity(id)?;
+    let parent_transform = entity
+        .parent
+        .and_then(|parent| scene_world_transform_inner(scene, parent, visiting))
+        .unwrap_or(EditorWorldTransform {
+            x: 0.0,
+            y: 0.0,
+            scale: 1.0,
+        });
+    let (anchor_x, anchor_y) = editor_parent_anchor_offset(scene, entity);
+    let transform = EditorWorldTransform {
+        x: parent_transform.x + (anchor_x + entity.x) * parent_transform.scale,
+        y: parent_transform.y + (anchor_y + entity.y) * parent_transform.scale,
+        scale: parent_transform.scale * editor_entity_scale(entity),
+    };
+    visiting.remove(&id);
+    Some(transform)
+}
+
+fn scene_world_origin_to_local_position(
+    scene: &Scene,
+    entity_id: u64,
+    world_x: f32,
+    world_y: f32,
+) -> Option<(f32, f32)> {
+    let entity = scene.entity(entity_id)?;
+    let parent_transform = entity
+        .parent
+        .and_then(|parent| scene_world_transform(scene, parent))
+        .unwrap_or(EditorWorldTransform {
+            x: 0.0,
+            y: 0.0,
+            scale: 1.0,
+        });
+    let parent_scale = if parent_transform.scale.abs() < f32::EPSILON {
+        1.0
+    } else {
+        parent_transform.scale
+    };
+    let (anchor_x, anchor_y) = editor_parent_anchor_offset(scene, entity);
+    Some((
+        (world_x - parent_transform.x) / parent_scale - anchor_x,
+        (world_y - parent_transform.y) / parent_scale - anchor_y,
+    ))
+}
+
+#[derive(Clone, Copy)]
+struct TextPreviewDefaults {
+    default_scale: f32,
+    default_align_x: TextAlignX,
+    default_align_y: TextAlignY,
+    default_text_scale: TextScaleMode,
+    default_wrap: TextWrapMode,
+    default_size_mode_uses_entity: bool,
+    color_names: &'static [&'static str],
+    fallback_color: [u8; 4],
+}
+
+fn compare_editor_entity_order(a: &Entity, b: &Entity) -> Ordering {
+    match a.z.partial_cmp(&b.z).unwrap_or(Ordering::Equal) {
+        Ordering::Equal => a.id.cmp(&b.id),
+        other => other,
+    }
+}
+
+fn text_preview_request(
+    project_root: &Path,
+    props: &[Prop],
+    rect: Rect,
+    zoom: f32,
+    defaults: TextPreviewDefaults,
+) -> Option<TextRenderRequest> {
+    let text = prop_string_like(props, &["text"])?;
+    if text.is_empty() {
+        return None;
+    }
+
+    let zoom = zoom.max(0.01);
+    let padding = prop_number(props, &["padding"]).unwrap_or(0.0).max(0.0);
+    let padding_x = prop_number(props, &["padding_x", "paddingX"])
+        .unwrap_or(padding)
+        .max(0.0)
+        * zoom;
+    let padding_y = prop_number(props, &["padding_y", "paddingY"])
+        .unwrap_or(padding)
+        .max(0.0)
+        * zoom;
+    let size_mode_uses_entity =
+        text_size_mode_uses_entity(props, defaults.default_size_mode_uses_entity);
+    let legacy_scale_x = prop_number(props, &["scale_x", "scaleX"]).unwrap_or(0.0);
+    let legacy_scale_y = prop_number(props, &["scale_y", "scaleY"]).unwrap_or(0.0);
+    let use_legacy_stretch =
+        !size_mode_uses_entity && legacy_scale_x > 0.0 && legacy_scale_y > 0.0;
+
+    let scale = if use_legacy_stretch {
+        legacy_scale_y.max(1.0)
+    } else {
+        prop_number(props, &["scale"]).unwrap_or(defaults.default_scale).max(1.0)
+    } * zoom;
+    let min_scale = (prop_number(props, &["min_scale", "minScale"])
+        .unwrap_or(1.0)
+        .max(1.0)
+        * zoom)
+        .max(1.0)
+        .min(scale.max(1.0));
+
+    let bounds = if size_mode_uses_entity {
+        RenderRect {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w.max(0.0),
+            h: rect.h.max(0.0),
+        }
+    } else {
+        RenderRect {
+            x: rect.x,
+            y: rect.y,
+            w: 0.0,
+            h: 0.0,
+        }
+    };
+    let color = prop_color_value(props, defaults.color_names).unwrap_or(defaults.fallback_color);
+
+    Some(TextRenderRequest {
+        text,
+        bounds,
+        // The editor viewport preview is axis-aligned today, like the rest of
+        // its component preview path. Reuse runtime layout/rasterization while
+        // leaving full transform rotation to the game runtime.
+        rotation: 0.0,
+        pivot: RenderVec2 {
+            x: rect.x,
+            y: rect.y,
+        },
+        color: Color::rgba(color[0], color[1], color[2], color[3]),
+        font: prop_string_like(props, &["font"])
+            .map(|font| resolve_editor_font_path(project_root, &font))
+            .unwrap_or(FontHandle::Default),
+        scale: scale.max(1.0),
+        min_scale,
+        text_scale: prop_string_like(props, &["text_scale", "textScale"])
+            .map(|value| parse_preview_text_scale(&value))
+            .unwrap_or(defaults.default_text_scale),
+        align_x: prop_string_like(props, &["align_x", "alignX", "align"])
+            .map(|value| parse_preview_align_x(&value))
+            .unwrap_or(defaults.default_align_x),
+        align_y: prop_string_like(props, &["align_y", "alignY", "vertical_align", "verticalAlign"])
+            .map(|value| parse_preview_align_y(&value))
+            .unwrap_or(defaults.default_align_y),
+        wrap: prop_wrap_mode(props).unwrap_or(defaults.default_wrap),
+        padding_x,
+        padding_y,
+        line_spacing: prop_number(props, &["line_spacing", "lineSpacing"]).unwrap_or(1.0),
+        letter_spacing: prop_number(props, &["letter_spacing", "letterSpacing"])
+            .unwrap_or(0.0)
+            * zoom,
+        tab_size: prop_number(props, &["tab_size", "tabSize", "tab_width", "tabWidth"])
+            .unwrap_or(4.0),
+        stretch_width: if use_legacy_stretch {
+            legacy_scale_x * zoom
+        } else {
+            0.0
+        },
+        stretch_height: if use_legacy_stretch {
+            legacy_scale_y * zoom
+        } else {
+            0.0
+        },
+        rich_text: Vec::new(),
+    })
+}
+
+fn prop_by_name<'a>(props: &'a [Prop], names: &[&str]) -> Option<&'a Prop> {
+    props
+        .iter()
+        .find(|prop| names.iter().any(|name| prop.name == *name))
+}
+
+fn prop_number(props: &[Prop], names: &[&str]) -> Option<f32> {
+    prop_by_name(props, names).and_then(|prop| match &prop.value {
+        PropValue::Number(value) => Some(*value),
+        PropValue::Int(value) => Some(*value as f32),
+        PropValue::Text(value) => value.trim().parse::<f32>().ok(),
+        _ => None,
+    })
+}
+
+fn prop_bool(props: &[Prop], names: &[&str]) -> Option<bool> {
+    prop_by_name(props, names).and_then(|prop| match &prop.value {
+        PropValue::Bool(value) => Some(*value),
+        PropValue::Text(value) => value.trim().parse::<bool>().ok(),
+        _ => None,
+    })
+}
+
+fn prop_string_like(props: &[Prop], names: &[&str]) -> Option<String> {
+    prop_by_name(props, names).and_then(|prop| match &prop.value {
+        PropValue::Text(value) | PropValue::Image(value) => Some(value.clone()),
+        PropValue::Enum { value, .. } => Some(value.clone()),
+        PropValue::Number(value) => Some(format_num(*value)),
+        PropValue::Int(value) => Some(value.to_string()),
+        PropValue::Bool(value) => Some(value.to_string()),
+        PropValue::Color(_) => None,
+    })
+}
+
+fn prop_color_value(props: &[Prop], names: &[&str]) -> Option<[u8; 4]> {
+    prop_by_name(props, names).and_then(|prop| match &prop.value {
+        PropValue::Color(color) => Some(*color),
+        _ => None,
+    })
+}
+
+fn prop_wrap_mode(props: &[Prop]) -> Option<TextWrapMode> {
+    prop_by_name(props, &["wrap"]).and_then(|prop| match &prop.value {
+        PropValue::Bool(true) => Some(TextWrapMode::Word),
+        PropValue::Bool(false) => Some(TextWrapMode::None),
+        PropValue::Text(value) | PropValue::Enum { value, .. } => {
+            Some(parse_preview_wrap(value))
+        }
+        _ => None,
+    })
+}
+
+fn text_size_mode_uses_entity(props: &[Prop], default_uses_entity: bool) -> bool {
+    match prop_string_like(props, &["size_mode", "sizeMode", "bounds_mode", "boundsMode"]) {
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "entity" | "box" | "bounds" => true,
+            "content" | "label" => false,
+            _ => !prop_bool(props, &["auto_size", "autoSize"]).unwrap_or(true),
+        },
+        None => default_uses_entity,
+    }
+}
+
+fn parse_preview_text_scale(raw: &str) -> TextScaleMode {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "fit" | "contain" => TextScaleMode::Fit,
+        "fit_width" | "fitwidth" | "width" => TextScaleMode::FitWidth,
+        "fit_height" | "fitheight" | "height" => TextScaleMode::FitHeight,
+        _ => TextScaleMode::None,
+    }
+}
+
+fn parse_preview_align_x(raw: &str) -> TextAlignX {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "center" | "centre" | "middle" => TextAlignX::Center,
+        "right" | "end" => TextAlignX::Right,
+        _ => TextAlignX::Left,
+    }
+}
+
+fn parse_preview_align_y(raw: &str) -> TextAlignY {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "center" | "centre" | "middle" => TextAlignY::Center,
+        "bottom" | "end" => TextAlignY::Bottom,
+        _ => TextAlignY::Top,
+    }
+}
+
+fn parse_preview_wrap(raw: &str) -> TextWrapMode {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "word" | "words" => TextWrapMode::Word,
+        "char" | "character" | "characters" => TextWrapMode::Char,
+        _ => TextWrapMode::None,
+    }
+}
+
+fn normalize_editor_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                normalized.push(component.as_os_str())
+            }
+        }
+    }
+    normalized
+}
+
+fn resolve_editor_font_path(root: &Path, input: &str) -> FontHandle {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+        return FontHandle::Default;
+    }
+
+    let path = PathBuf::from(trimmed);
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    let resolved = normalize_editor_path(&candidate);
+    if !resolved.starts_with(root) {
+        return FontHandle::Default;
+    }
+    FontHandle::Path(resolved.to_string_lossy().into_owned())
+}
+
 /// Draw a 9-slice image into `dest`: corners keep their (zoom-scaled) size
 /// while edges and the center stretch — matching the engine's renderer.
 fn draw_nine_slice(p: &mut Painter, img: &image::RgbaImage, dest: Rect, l: f32, r: f32, t: f32, b: f32, tint: [u8; 4], z: f32) {
@@ -3456,6 +3919,224 @@ mod tests {
         // center maps to screen (240+400+100, 40+300+100) = (740, 440).
         let hit = h.app.viewport_hit(Rect::new(240.0, 40.0, 800.0, 600.0), 740.0, 440.0);
         assert_eq!(hit, Some(id));
+    }
+
+    #[test]
+    fn child_screen_rect_uses_parent_relative_transform() {
+        let mut scene = Scene::default();
+        let parent = scene.entities[0].id;
+        {
+            let entity = scene.entity_mut(parent).expect("parent");
+            entity.x = 100.0;
+            entity.y = 50.0;
+            entity.size_x = 100.0;
+            entity.size_y = 100.0;
+            entity.scale = 2.0;
+        }
+        let child = scene.add_entity("child", 10.0, 5.0).id;
+        {
+            let entity = scene.entity_mut(child).expect("child");
+            entity.parent = Some(parent);
+            entity.size_x = 20.0;
+            entity.size_y = 30.0;
+            entity.scale = 1.5;
+        }
+
+        let h = Harness::new(scene);
+        let rect = h
+            .app
+            .entity_screen_rect(
+                h.app.scene.entity(child).expect("child"),
+                Rect::new(0.0, 0.0, 400.0, 300.0),
+            )
+            .expect("screen rect");
+        assert_eq!(rect.x, 120.0);
+        assert_eq!(rect.y, 60.0);
+        assert_eq!(rect.w, 60.0);
+        assert_eq!(rect.h, 90.0);
+    }
+
+    #[test]
+    fn viewport_hit_uses_parent_relative_transform() {
+        let mut scene = Scene::default();
+        let parent = scene.entities[0].id;
+        {
+            let entity = scene.entity_mut(parent).expect("parent");
+            entity.x = 100.0;
+            entity.y = 50.0;
+            entity.size_x = 10.0;
+            entity.size_y = 10.0;
+        }
+        let child = scene.add_entity("child", 20.0, 30.0).id;
+        {
+            let entity = scene.entity_mut(child).expect("child");
+            entity.parent = Some(parent);
+            entity.size_x = 20.0;
+            entity.size_y = 20.0;
+            entity.z = 5.0;
+        }
+
+        let h = Harness::new(scene);
+        let viewport = Rect::new(0.0, 0.0, 400.0, 300.0);
+        assert_eq!(h.app.viewport_hit(viewport, 121.0, 81.0), Some(child));
+        assert_ne!(
+            h.app.viewport_hit(viewport, 21.0, 31.0),
+            Some(child),
+            "child local coordinates should not be treated as viewport world coordinates"
+        );
+    }
+
+    #[test]
+    fn world_to_local_conversion_preserves_child_local_coordinates() {
+        let mut scene = Scene::default();
+        let parent = scene.entities[0].id;
+        {
+            let entity = scene.entity_mut(parent).expect("parent");
+            entity.x = 100.0;
+            entity.y = 50.0;
+            entity.scale = 2.0;
+        }
+        let child = scene.add_entity("child", 10.0, 5.0).id;
+        scene.entity_mut(child).expect("child").parent = Some(parent);
+
+        let (local_x, local_y) =
+            scene_world_origin_to_local_position(&scene, child, 150.0, 70.0)
+                .expect("local position");
+        assert_eq!(local_x, 25.0);
+        assert_eq!(local_y, 10.0);
+    }
+
+    #[test]
+    fn viewport_hit_prefers_frontmost_draw_order() {
+        let mut scene = Scene::default();
+        let back = scene.entities[0].id;
+        {
+            let entity = scene.entity_mut(back).expect("back");
+            entity.x = 0.0;
+            entity.y = 0.0;
+            entity.size_x = 100.0;
+            entity.size_y = 100.0;
+            entity.z = 1.0;
+        }
+        let front = scene.add_entity("front", 0.0, 0.0).id;
+        {
+            let entity = scene.entity_mut(front).expect("front");
+            entity.size_x = 100.0;
+            entity.size_y = 100.0;
+            entity.z = 5.0;
+        }
+
+        let mut h = Harness::new(scene);
+        let viewport = Rect::new(0.0, 0.0, 400.0, 300.0);
+        assert_eq!(h.app.viewport_hit(viewport, 20.0, 20.0), Some(front));
+
+        h.app.scene.entity_mut(front).expect("front").z = 1.0;
+        assert_eq!(
+            h.app.viewport_hit(viewport, 20.0, 20.0),
+            Some(front),
+            "equal z should use the runtime entity-id tie-breaker"
+        );
+    }
+
+    #[test]
+    fn text_preview_request_uses_runtime_compatible_fields() {
+        let props = vec![
+            Prop {
+                name: "text".into(),
+                label: "Text".into(),
+                value: PropValue::Text("Hello".into()),
+                advanced: false,
+                optional: false,
+            },
+            Prop {
+                name: "font".into(),
+                label: "Font".into(),
+                value: PropValue::Text("assets/game.ttf".into()),
+                advanced: false,
+                optional: false,
+            },
+            Prop {
+                name: "alignX".into(),
+                label: "Align X".into(),
+                value: PropValue::Enum {
+                    value: "centre".into(),
+                    options: vec![],
+                },
+                advanced: false,
+                optional: false,
+            },
+            Prop {
+                name: "verticalAlign".into(),
+                label: "Align Y".into(),
+                value: PropValue::Enum {
+                    value: "end".into(),
+                    options: vec![],
+                },
+                advanced: false,
+                optional: false,
+            },
+            Prop {
+                name: "textScale".into(),
+                label: "Text Scale".into(),
+                value: PropValue::Enum {
+                    value: "fitwidth".into(),
+                    options: vec![],
+                },
+                advanced: false,
+                optional: false,
+            },
+            Prop {
+                name: "wrap".into(),
+                label: "Wrap".into(),
+                value: PropValue::Enum {
+                    value: "characters".into(),
+                    options: vec![],
+                },
+                advanced: false,
+                optional: false,
+            },
+            Prop {
+                name: "scale".into(),
+                label: "Scale".into(),
+                value: PropValue::Number(12.0),
+                advanced: false,
+                optional: false,
+            },
+            Prop {
+                name: "padding_x".into(),
+                label: "Padding X".into(),
+                value: PropValue::Number(3.0),
+                advanced: false,
+                optional: false,
+            },
+        ];
+        let defaults = TextPreviewDefaults {
+            default_scale: 32.0,
+            default_align_x: TextAlignX::Left,
+            default_align_y: TextAlignY::Top,
+            default_text_scale: TextScaleMode::None,
+            default_wrap: TextWrapMode::None,
+            default_size_mode_uses_entity: true,
+            color_names: &["color"],
+            fallback_color: [1, 2, 3, 255],
+        };
+
+        let request = text_preview_request(
+            Path::new("/tmp/neolove-test-project"),
+            &props,
+            Rect::new(10.0, 20.0, 100.0, 50.0),
+            2.0,
+            defaults,
+        )
+        .expect("text request");
+
+        assert_eq!(request.align_x, TextAlignX::Center);
+        assert_eq!(request.align_y, TextAlignY::Bottom);
+        assert_eq!(request.text_scale, TextScaleMode::FitWidth);
+        assert_eq!(request.wrap, TextWrapMode::Char);
+        assert_eq!(request.scale, 24.0);
+        assert_eq!(request.padding_x, 6.0);
+        assert!(matches!(request.font, FontHandle::Path(ref path) if path.ends_with("/tmp/neolove-test-project/assets/game.ttf")));
     }
 
     #[test]
