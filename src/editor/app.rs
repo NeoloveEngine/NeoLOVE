@@ -14,7 +14,7 @@ use super::scene::{
     Component, Entity, Prop, PropValue, Scene, ScriptVar, VarValue, ADVANCED_COMPONENTS,
     CORE_COMPONENTS,
 };
-use super::ui::{icon, Rect, Theme, Ui};
+use super::ui::{icon, Painter, Rect, Theme, Ui};
 
 const TOOLBAR_H: f32 = 40.0;
 const STATUS_H: f32 = 24.0;
@@ -115,6 +115,8 @@ enum Action {
     AddComponent(u64, String),
     OpenAdvancedComponents(u64, f32, f32),
     AddEntity(Option<u64>),
+    /// Add an entity at a specific world position (viewport context menu).
+    AddEntityAt(f32, f32),
     Rename(u64),
     Duplicate(u64),
     Copy(u64),
@@ -165,6 +167,8 @@ enum Popup {
     },
     Confirm { message: String, action: Pending },
     Prompt { title: String, action: Pending },
+    /// A runtime error captured from a failed `Run`, with a copy button.
+    Error { message: String, copied: bool },
 }
 
 pub struct EditorApp {
@@ -210,6 +214,8 @@ pub struct EditorApp {
     /// Hierarchy drag-to-reparent: the entity being dragged.
     reparent_drag: Option<u64>,
     popup: Option<Popup>,
+    /// Receiver for the outcome of a launched `Run` (None when finished).
+    run_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
     status: String,
     scene_dirty: bool,
     should_quit: bool,
@@ -259,6 +265,7 @@ impl EditorApp {
             clipboard: None,
             reparent_drag: None,
             popup: None,
+            run_rx: None,
             status: "Ready".to_string(),
             scene_dirty: false,
             should_quit: false,
@@ -1121,7 +1128,11 @@ impl EditorApp {
                     self.selected = Some(id);
                     self.open_entity_menu(id, mx, my);
                 }
-                None => self.open_viewport_menu(mx, my),
+                None => {
+                    let wx = ((mx - (area.x + self.cam_x)) / z).round();
+                    let wy = ((my - (area.y + self.cam_y)) / z).round();
+                    self.open_viewport_menu(mx, my, wx, wy);
+                }
             }
             return;
         }
@@ -1983,9 +1994,9 @@ impl EditorApp {
         self.popup = Some(Popup::Menu { x, y, items });
     }
 
-    fn open_viewport_menu(&mut self, x: f32, y: f32) {
+    fn open_viewport_menu(&mut self, x: f32, y: f32, world_x: f32, world_y: f32) {
         let items = vec![
-            MenuItem { action: Action::AddEntity(None), glyph: icon::ADD, label: "Add Entity".into(), danger: false },
+            MenuItem { action: Action::AddEntityAt(world_x, world_y), glyph: icon::ADD, label: "Add Entity".into(), danger: false },
             MenuItem { action: Action::Paste, glyph: icon::CONTENT_PASTE, label: "Paste".into(), danger: false },
         ];
         self.popup = Some(Popup::Menu { x, y, items });
@@ -2039,6 +2050,56 @@ impl EditorApp {
             Popup::Color { target, x, y, rgba, hue } => self.draw_color_picker(ui, target, x, y, rgba, hue, w, h, interactive),
             Popup::Confirm { message, action } => self.draw_confirm(ui, message, action, w, h, interactive),
             Popup::Prompt { title, action } => self.draw_prompt(ui, title, action, w, h, interactive),
+            Popup::Error { message, copied } => self.draw_error(ui, message, copied, w, h, interactive),
+        }
+    }
+
+    fn draw_error(&mut self, ui: &mut Ui, message: String, mut copied: bool, w: f32, h: f32, interactive: bool) {
+        ui.painter.fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 140]);
+        let width = (w * 0.7).clamp(420.0, 760.0);
+        let height = (h * 0.6).clamp(220.0, 460.0);
+        let px = (w - width) / 2.0;
+        let py = (h - height) / 2.0;
+        let rect = Rect::new(px, py, width, height);
+        ui.painter.fill_round_rect(rect, 6.0, self.config.theme.panel);
+        ui.painter.stroke_round_rect(rect, 6.0, self.config.theme.danger);
+        ui.icon(px + 18.0, py + 18.0, icon::DELETE, 16.0, self.config.theme.danger);
+        ui.painter.text(px + 32.0, py + 11.0, "Runtime Error", 16.0, self.config.theme.danger);
+
+        // Message body, wrapped to the panel and clipped.
+        let body = Rect::new(px + 12.0, py + 36.0, width - 24.0, height - 84.0);
+        ui.painter.fill_rect(body, self.config.theme.field);
+        let prev = ui.painter.push_clip(body);
+        let mut ty = body.y + 6.0;
+        let max_w = body.w - 12.0;
+        for raw_line in message.lines() {
+            for wrapped in wrap_line(&ui.painter, raw_line, 13.0, max_w) {
+                if ty > body.bottom() - 14.0 {
+                    break;
+                }
+                ui.painter.text(body.x + 6.0, ty, &wrapped, 13.0, self.config.theme.text);
+                ty += 16.0;
+            }
+        }
+        ui.painter.set_clip_raw(prev);
+
+        let copy = Rect::new(px + width - 200.0, py + height - 36.0, 90.0, 26.0);
+        let close = Rect::new(px + width - 104.0, py + height - 36.0, 90.0, 26.0);
+        let copy_label = if copied { "Copied!" } else { "Copy" };
+        let do_copy = interactive && ui.icon_button(copy, icon::CONTENT_COPY, copy_label);
+        let do_close = interactive && (ui.button(close, "Close") || ui.input.escape);
+        if do_copy {
+            copied = copy_to_clipboard(&message);
+            if !copied {
+                // Fall back to a file the user can open.
+                let path = self.project_root.join("last_error.txt");
+                let _ = std::fs::write(&path, &message);
+                self.status = format!("Clipboard unavailable; wrote {}", path.display());
+                copied = true;
+            }
+        }
+        if !do_close {
+            self.popup = Some(Popup::Error { message, copied });
         }
     }
 
@@ -2260,6 +2321,7 @@ impl EditorApp {
             }
             Action::OpenAdvancedComponents(id, x, y) => self.open_advanced_component_menu(id, x, y),
             Action::AddEntity(parent) => self.add_entity(parent),
+            Action::AddEntityAt(x, y) => self.add_entity_at(None, x, y),
             Action::Rename(id) => {
                 let cur = self.scene.entity(id).map(|e| e.name.clone()).unwrap_or_default();
                 self.open_prompt("Rename entity", Pending::RenameEntity(id), &cur);
@@ -2341,8 +2403,12 @@ impl EditorApp {
     }
 
     fn add_entity(&mut self, parent: Option<u64>) {
+        self.add_entity_at(parent, 96.0, 96.0);
+    }
+
+    fn add_entity_at(&mut self, parent: Option<u64>, x: f32, y: f32) {
         let n = self.scene.entities.len() + 1;
-        let mut e = self.scene.add_entity(format!("Entity {n}"), 96.0, 96.0);
+        let mut e = self.scene.add_entity(format!("Entity {n}"), x, y);
         e.parent = parent;
         let id = e.id;
         self.scene.replace_entity(id, e);
@@ -2572,11 +2638,126 @@ impl EditorApp {
                 return;
             }
         };
-        match std::process::Command::new(exe).arg("run").arg(&self.project_root).spawn() {
-            Ok(_) => self.status = "Launched preview".to_string(),
-            Err(e) => self.status = format!("Run failed: {e}"),
+        let root = self.project_root.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Run the game on a worker thread, capturing its output, so the editor
+        // stays responsive and can surface a startup error when it exits.
+        std::thread::spawn(move || {
+            let outcome = match std::process::Command::new(exe).arg("run").arg(&root).output() {
+                Ok(out) if out.status.success() => None,
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    Some(if stderr.is_empty() {
+                        format!("The game exited with {}.", out.status)
+                    } else {
+                        stderr
+                    })
+                }
+                Err(e) => Some(format!("Failed to launch the game: {e}")),
+            };
+            let _ = tx.send(outcome);
+        });
+        self.run_rx = Some(rx);
+        self.status = "Running preview…".to_string();
+    }
+
+    /// True while a launched preview is still running.
+    pub fn run_pending(&self) -> bool {
+        self.run_rx.is_some()
+    }
+
+    /// Poll the running preview; returns true if it just finished (so the
+    /// caller should redraw). On a failure an error popup is opened.
+    pub fn poll_run(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let result = match &self.run_rx {
+            Some(rx) => rx.try_recv(),
+            None => return false,
+        };
+        match result {
+            Ok(outcome) => {
+                self.run_rx = None;
+                match outcome {
+                    Some(message) => {
+                        self.status = "Preview exited with an error".to_string();
+                        self.popup = Some(Popup::Error { message, copied: false });
+                    }
+                    None => self.status = "Preview closed".to_string(),
+                }
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.run_rx = None;
+                true
+            }
         }
     }
+}
+
+/// Word-wrap one line to `max_w` pixels, hard-breaking over-long words.
+fn wrap_line(painter: &Painter, text: &str, size: f32, max_w: f32) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split(' ') {
+        let candidate = if cur.is_empty() {
+            word.to_string()
+        } else {
+            format!("{cur} {word}")
+        };
+        if painter.text_width(&candidate, size) <= max_w || cur.is_empty() {
+            // Hard-break a single word that is itself too wide.
+            if cur.is_empty() && painter.text_width(word, size) > max_w {
+                let mut chunk = String::new();
+                for ch in word.chars() {
+                    if painter.text_width(&format!("{chunk}{ch}"), size) > max_w && !chunk.is_empty() {
+                        lines.push(std::mem::take(&mut chunk));
+                    }
+                    chunk.push(ch);
+                }
+                cur = chunk;
+            } else {
+                cur = candidate;
+            }
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur = word.to_string();
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Copy text to the OS clipboard via the first available helper tool.
+fn copy_to_clipboard(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let candidates: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+        ("pbcopy", &[]),
+        ("clip", &[]),
+    ];
+    for (cmd, args) in candidates {
+        if let Ok(mut child) = Command::new(cmd).args(*args).stdin(Stdio::piped()).spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if child.wait().map(|s| s.success()).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn component_icon(component: &Component) -> char {
@@ -2886,6 +3067,36 @@ mod tests {
         let e = h.app.scene.entity(id).expect("entity");
         assert!((e.size_x - 140.0).abs() < 2.0, "size_x was {}", e.size_x);
         assert!((e.size_y - 140.0).abs() < 2.0, "size_y was {}", e.size_y);
+    }
+
+    #[test]
+    fn add_entity_at_uses_world_position() {
+        let mut h = Harness::new(Scene::default());
+        let before = h.app.scene.entities.len();
+        h.app.perform(Action::AddEntityAt(320.0, 240.0));
+        assert_eq!(h.app.scene.entities.len(), before + 1);
+        let e = h.app.scene.entities.last().expect("entity");
+        assert_eq!((e.x, e.y), (320.0, 240.0));
+    }
+
+    #[test]
+    fn ui_widget_components_not_offered() {
+        // The crash-prone UI widgets must not appear in the picker lists.
+        for c in ["Button", "Dropdown", "TextInput", "Frame", "ScrollList"] {
+            assert!(!CORE_COMPONENTS.contains(&c), "{c} still offered");
+            assert!(!ADVANCED_COMPONENTS.contains(&c), "{c} still advanced");
+        }
+    }
+
+    #[test]
+    fn error_popup_renders_without_panicking() {
+        let mut h = Harness::new(Scene::default());
+        h.app.popup = Some(Popup::Error {
+            message: "thread 'main' panicked\n".repeat(40),
+            copied: false,
+        });
+        h.frame(FrameInput { mouse_x: 10.0, mouse_y: 10.0, ..Default::default() });
+        assert!(h.app.popup.is_some());
     }
 
     #[test]

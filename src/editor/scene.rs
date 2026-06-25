@@ -198,11 +198,6 @@ pub const CORE_COMPONENTS: &[&str] = &[
     "Image2D",
     "NineSliceSprite2D",
     "TileTexture2D",
-    "Frame",
-    "Button",
-    "TextInput",
-    "Dropdown",
-    "ScrollList",
     "Collider2D",
     "Rigidbody2D",
 ];

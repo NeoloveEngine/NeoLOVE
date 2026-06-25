@@ -85,6 +85,14 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
 
+        // While a preview is running, poll for its outcome on a timer so a
+        // startup error can surface as a popup.
+        if let Event::NewEvents(_) = event {
+            if editor.poll_run() {
+                window.request_redraw();
+            }
+        }
+
         match event {
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => {
@@ -222,6 +230,11 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                 }
             }
             _ => {}
+        }
+
+        // Keep waking on a short timer while a preview run is in flight.
+        if *control_flow != ControlFlow::Exit && editor.run_pending() {
+            *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(250));
         }
     });
 }
