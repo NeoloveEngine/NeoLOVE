@@ -72,6 +72,8 @@ pub struct Layout {
     pub grid: f32,
     pub show_grid: bool,
     pub bin_h: f32,
+    /// Use the HSV square/hue-strip color picker instead of plain RGBA sliders.
+    pub hsv_picker: bool,
 }
 
 impl Default for Layout {
@@ -87,6 +89,7 @@ impl Default for Layout {
             grid: 32.0,
             show_grid: true,
             bin_h: 170.0,
+            hsv_picker: true,
         }
     }
 }
@@ -151,7 +154,15 @@ enum Pending {
 /// An overlay drawn above everything, with input precedence.
 enum Popup {
     Menu { x: f32, y: f32, items: Vec<MenuItem> },
-    Color { target: ColorTarget, x: f32, y: f32 },
+    Color {
+        target: ColorTarget,
+        x: f32,
+        y: f32,
+        rgba: [u8; 4],
+        /// Cached hue (0..360) so dragging stays stable at greys where hue is
+        /// otherwise undefined.
+        hue: f32,
+    },
     Confirm { message: String, action: Pending },
     Prompt { title: String, action: Pending },
 }
@@ -1672,7 +1683,8 @@ impl EditorApp {
         let mut dirty = false;
         let swatch = Rect::new(fx, y, 22.0, FIELD_H);
         if ui.swatch_button(swatch, *color) {
-            self.popup = Some(Popup::Color { target, x: fx, y: y + FIELD_H + 2.0 });
+            let hue = rgb_to_hsv(*color).0;
+            self.popup = Some(Popup::Color { target, x: fx, y: y + FIELD_H + 2.0, rgba: *color, hue });
         }
         ui.tooltip(swatch, "Open color picker");
         let cells_x = fx + 28.0;
@@ -1733,6 +1745,19 @@ impl EditorApp {
             self.open_prompt("New script name", Pending::CreateScript, "script.luau");
         }
         ui.painter.stroke_rect(area, self.config.theme.border);
+
+        // Drag an entity from the hierarchy into the bin to save it as a prefab.
+        if let Some(drag) = self.reparent_drag {
+            if area.contains(ui.input.mouse_x, ui.input.mouse_y) {
+                ui.painter.stroke_round_rect(area.shrink(2.0), 4.0, self.config.theme.accent);
+                let name = self.scene.entity(drag).map(|e| e.name.clone()).unwrap_or_default();
+                ui.painter.text(area.x + 210.0, area.y + 6.0, &format!("Drop to save \"{name}\" as a prefab"), 13.0, self.config.theme.accent);
+                if !ui.input.mouse_down {
+                    self.save_prefab(drag);
+                    self.reparent_drag = None;
+                }
+            }
+        }
 
         let content = Rect::new(area.x, area.y + HEADER_H, area.w, (area.h - HEADER_H).max(0.0));
         let (mut dirs, mut files) = (Vec::new(), Vec::new());
@@ -2011,7 +2036,7 @@ impl EditorApp {
         }
         match popup {
             Popup::Menu { x, y, items } => self.draw_menu(ui, x, y, items, w, h, interactive),
-            Popup::Color { target, x, y } => self.draw_color_picker(ui, target, x, y, w, h, interactive),
+            Popup::Color { target, x, y, rgba, hue } => self.draw_color_picker(ui, target, x, y, rgba, hue, w, h, interactive),
             Popup::Confirm { message, action } => self.draw_confirm(ui, message, action, w, h, interactive),
             Popup::Prompt { title, action } => self.draw_prompt(ui, title, action, w, h, interactive),
         }
@@ -2051,39 +2076,107 @@ impl EditorApp {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_color_picker(&mut self, ui: &mut Ui, target: ColorTarget, x: f32, y: f32, w: f32, h: f32, interactive: bool) {
-        let width = 220.0;
-        let height = 150.0;
+    fn draw_color_picker(&mut self, ui: &mut Ui, target: ColorTarget, x: f32, y: f32, mut rgba: [u8; 4], mut hue: f32, w: f32, h: f32, interactive: bool) {
+        let hsv = self.config.layout.hsv_picker;
+        let width = 244.0;
+        let height = if hsv { 196.0 } else { 150.0 };
         let px = x.min(w - width - 4.0).max(2.0);
         let py = y.min(h - height - 4.0).max(2.0);
         let rect = Rect::new(px, py, width, height);
         ui.painter.fill_round_rect(rect, 5.0, self.config.theme.panel);
         ui.painter.stroke_round_rect(rect, 5.0, self.config.theme.border);
 
-        let mut color = self.target_color(&target).unwrap_or([255, 255, 255, 255]);
-        // Preview swatch.
-        ui.painter.fill_round_rect(Rect::new(px + 10.0, py + 10.0, 40.0, 30.0), 4.0, [color[0], color[1], color[2], 255]);
-        ui.painter.stroke_round_rect(Rect::new(px + 10.0, py + 10.0, 40.0, 30.0), 4.0, self.config.theme.border);
+        // Mode toggle (HSV square vs RGBA sliders), persisted.
+        let toggle = Rect::new(px + width - 56.0, py + 8.0, 48.0, 18.0);
+        if interactive && ui.button(toggle, if hsv { "RGB" } else { "HSV" }) {
+            self.config.layout.hsv_picker = !hsv;
+            self.dirty = true;
+        }
+        ui.painter.text(px + 10.0, py + 9.0, "Color", 14.0, self.config.theme.text_dim);
 
-        let labels = ["R", "G", "B", "A"];
         let mut changed = false;
-        for i in 0..4 {
-            let ry = py + 10.0 + i as f32 * 28.0;
-            ui.label(px + 60.0, ry + 4.0, labels[i], self.config.theme.text);
-            if let Some(v) = ui.slider(Rect::new(px + 78.0, ry, 90.0, 20.0), color[i] as f32, 0.0, 255.0) {
-                color[i] = v.round().clamp(0.0, 255.0) as u8;
+        if hsv {
+            // Saturation/Value square for the current hue.
+            let sq = Rect::new(px + 10.0, py + 32.0, 150.0, 120.0);
+            for yy in 0..(sq.h as i32) {
+                for xx in 0..(sq.w as i32) {
+                    let s = xx as f32 / sq.w;
+                    let v = 1.0 - yy as f32 / sq.h;
+                    let c = hsv_to_rgb(hue, s, v);
+                    ui.painter.pixel(sq.x + xx as f32, sq.y + yy as f32, [c[0], c[1], c[2], 255]);
+                }
+            }
+            ui.painter.stroke_rect(sq, self.config.theme.border);
+            // Hue strip.
+            let strip = Rect::new(px + 170.0, py + 32.0, 18.0, 120.0);
+            for yy in 0..(strip.h as i32) {
+                let c = hsv_to_rgb(yy as f32 / strip.h * 360.0, 1.0, 1.0);
+                ui.painter.fill_rect(Rect::new(strip.x, strip.y + yy as f32, strip.w, 1.0), [c[0], c[1], c[2], 255]);
+            }
+            ui.painter.stroke_rect(strip, self.config.theme.border);
+
+            // Interaction.
+            let (_, mut s, mut v) = rgb_to_hsv(rgba);
+            if ui.input.mouse_down && sq.contains(ui.input.mouse_x, ui.input.mouse_y) {
+                s = ((ui.input.mouse_x - sq.x) / sq.w).clamp(0.0, 1.0);
+                v = (1.0 - (ui.input.mouse_y - sq.y) / sq.h).clamp(0.0, 1.0);
+                let c = hsv_to_rgb(hue, s, v);
+                rgba = [c[0], c[1], c[2], rgba[3]];
+                changed = true;
+                ui.wants_redraw = true;
+            }
+            if ui.input.mouse_down && strip.contains(ui.input.mouse_x, ui.input.mouse_y) {
+                hue = ((ui.input.mouse_y - strip.y) / strip.h * 360.0).clamp(0.0, 359.999);
+                let c = hsv_to_rgb(hue, s, v);
+                rgba = [c[0], c[1], c[2], rgba[3]];
+                changed = true;
+                ui.wants_redraw = true;
+            }
+            // SV cursor + hue marker.
+            let cur = Rect::new(sq.x + s * sq.w - 4.0, sq.y + (1.0 - v) * sq.h - 4.0, 8.0, 8.0);
+            ui.painter.stroke_round_rect(cur, 4.0, [255, 255, 255, 255]);
+            ui.painter.fill_rect(Rect::new(strip.x - 2.0, strip.y + hue / 360.0 * strip.h - 1.0, strip.w + 4.0, 2.0), [255, 255, 255, 255]);
+
+            // Preview + alpha slider + hex.
+            ui.painter.fill_round_rect(Rect::new(px + 196.0, py + 32.0, 38.0, 26.0), 4.0, [rgba[0], rgba[1], rgba[2], 255]);
+            ui.painter.stroke_round_rect(Rect::new(px + 196.0, py + 32.0, 38.0, 26.0), 4.0, self.config.theme.border);
+            ui.label(px + 10.0, py + 160.0, "A", self.config.theme.text);
+            if let Some(a) = ui.slider(Rect::new(px + 26.0, py + 158.0, 130.0, 18.0), rgba[3] as f32, 0.0, 255.0) {
+                rgba[3] = a.round() as u8;
                 changed = true;
             }
-            let r = ui.text_field(&format!("cp_{i}"), Rect::new(px + 174.0, ry, 36.0, 20.0), &color[i].to_string());
-            if r.changed {
-                if let Ok(v) = r.text.trim().parse::<i32>() {
-                    color[i] = v.clamp(0, 255) as u8;
+            let hexr = ui.text_field("cp_hex", Rect::new(px + 164.0, py + 158.0, 70.0, 18.0), &format!("{:02X}{:02X}{:02X}", rgba[0], rgba[1], rgba[2]));
+            if hexr.changed {
+                if let Some(c) = parse_hex(&hexr.text) {
+                    rgba = [c[0], c[1], c[2], rgba[3]];
+                    hue = rgb_to_hsv(rgba).0;
                     changed = true;
                 }
             }
+        } else {
+            ui.painter.fill_round_rect(Rect::new(px + 10.0, py + 32.0, 40.0, 30.0), 4.0, [rgba[0], rgba[1], rgba[2], 255]);
+            ui.painter.stroke_round_rect(Rect::new(px + 10.0, py + 32.0, 40.0, 30.0), 4.0, self.config.theme.border);
+            let labels = ["R", "G", "B", "A"];
+            for i in 0..4 {
+                let ry = py + 32.0 + i as f32 * 26.0;
+                ui.label(px + 60.0, ry + 2.0, labels[i], self.config.theme.text);
+                if let Some(v) = ui.slider(Rect::new(px + 78.0, ry, 90.0, 18.0), rgba[i] as f32, 0.0, 255.0) {
+                    rgba[i] = v.round() as u8;
+                    changed = true;
+                }
+                let r = ui.text_field(&format!("cp_{i}"), Rect::new(px + 174.0, ry, 40.0, 18.0), &rgba[i].to_string());
+                if r.changed {
+                    if let Ok(v) = r.text.trim().parse::<i32>() {
+                        rgba[i] = v.clamp(0, 255) as u8;
+                        changed = true;
+                    }
+                }
+            }
+            hue = rgb_to_hsv(rgba).0;
         }
+
         if changed {
-            self.set_target_color(&target, color);
+            self.set_target_color(&target, rgba);
             self.mark_dirty();
         }
 
@@ -2091,7 +2184,7 @@ impl EditorApp {
             && ui.input.mouse_pressed
             && !rect.contains(ui.input.mouse_x, ui.input.mouse_y);
         if !clicked_outside {
-            self.popup = Some(Popup::Color { target, x, y });
+            self.popup = Some(Popup::Color { target, x, y, rgba, hue });
         }
     }
 
@@ -2295,30 +2388,6 @@ impl EditorApp {
 
     // ---- Color target plumbing --------------------------------------------
 
-    fn target_color(&self, target: &ColorTarget) -> Option<[u8; 4]> {
-        match target {
-            ColorTarget::Background => Some(self.scene.background),
-            ColorTarget::Prop { entity, comp, prop } => {
-                let e = self.scene.entity(*entity)?;
-                if let Component::Core { props, .. } = e.components.get(*comp)? {
-                    if let PropValue::Color(c) = props.get(*prop)?.value {
-                        return Some(c);
-                    }
-                }
-                None
-            }
-            ColorTarget::Var { entity, comp, var } => {
-                let e = self.scene.entity(*entity)?;
-                if let Component::Script { variables, .. } = e.components.get(*comp)? {
-                    if let VarValue::Color(c) = variables.get(*var)?.value {
-                        return Some(c);
-                    }
-                }
-                None
-            }
-        }
-    }
-
     fn set_target_color(&mut self, target: &ColorTarget, color: [u8; 4]) {
         match target {
             ColorTarget::Background => self.scene.background = color,
@@ -2475,6 +2544,25 @@ impl EditorApp {
         }
     }
 
+    /// Save an entity (and its descendants) as a `.neoprefab` in the current
+    /// project-bin folder.
+    fn save_prefab(&mut self, id: u64) {
+        let entities = self.scene.subtree(id);
+        let name = self
+            .scene
+            .entity(id)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| "prefab".to_string());
+        let path = self.bin_dir.join(format!("{}.neoprefab", slugify(&name)));
+        match serde_json::to_string_pretty(&entities) {
+            Ok(json) => match std::fs::write(&path, json) {
+                Ok(()) => self.status = format!("Saved prefab {}", path.display()),
+                Err(e) => self.status = format!("Save prefab failed: {e}"),
+            },
+            Err(e) => self.status = format!("Save prefab failed: {e}"),
+        }
+    }
+
     fn run_scene(&mut self) {
         self.export_luau();
         let exe = match std::env::current_exe() {
@@ -2511,6 +2599,64 @@ fn core_icon(name: &str) -> char {
         "Dropdown" => icon::EXPAND_MORE,
         _ => icon::VIEW_QUILT,
     }
+}
+
+/// Convert an RGBA color to (hue 0..360, saturation 0..1, value 0..1).
+fn rgb_to_hsv(c: [u8; 4]) -> (f32, f32, f32) {
+    let r = c[0] as f32 / 255.0;
+    let g = c[1] as f32 / 255.0;
+    let b = c[2] as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let d = max - min;
+    let mut h = if d == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / d) % 6.0)
+    } else if max == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    if h < 0.0 {
+        h += 360.0;
+    }
+    let s = if max == 0.0 { 0.0 } else { d / max };
+    (h, s, max)
+}
+
+/// Convert (hue 0..360, saturation 0..1, value 0..1) to an opaque RGB color.
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [u8; 4] {
+    let c = v * s;
+    let hp = (h % 360.0) / 60.0;
+    let xx = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r, g, b) = match hp as i32 {
+        0 => (c, xx, 0.0),
+        1 => (xx, c, 0.0),
+        2 => (0.0, c, xx),
+        3 => (0.0, xx, c),
+        4 => (xx, 0.0, c),
+        _ => (c, 0.0, xx),
+    };
+    let m = v - c;
+    [
+        ((r + m) * 255.0).round() as u8,
+        ((g + m) * 255.0).round() as u8,
+        ((b + m) * 255.0).round() as u8,
+        255,
+    ]
+}
+
+/// Parse a 6-digit hex color (`RRGGBB`); returns opaque RGBA.
+fn parse_hex(s: &str) -> Option<[u8; 4]> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some([r, g, b, 255])
 }
 
 fn prop_color(props: &[Prop], name: &str) -> Option<[u8; 4]> {
@@ -2557,6 +2703,7 @@ fn file_icon(name: &str) -> char {
         "ttf" | "otf" => icon::FONT_DOWNLOAD,
         "luau" | "lua" => icon::DATA_OBJECT,
         "toml" | "json" | "txt" | "md" | "neoscene" => icon::ARTICLE,
+        "neoprefab" => icon::VIEW_IN_AR,
         _ => icon::INSERT_DRIVE_FILE,
     }
 }
@@ -2739,6 +2886,34 @@ mod tests {
         let e = h.app.scene.entity(id).expect("entity");
         assert!((e.size_x - 140.0).abs() < 2.0, "size_x was {}", e.size_x);
         assert!((e.size_y - 140.0).abs() < 2.0, "size_y was {}", e.size_y);
+    }
+
+    #[test]
+    fn hsv_rgb_round_trips() {
+        for c in [[255, 0, 0, 255], [10, 180, 90, 255], [33, 66, 200, 255], [128, 128, 128, 255]] {
+            let (h, s, v) = rgb_to_hsv(c);
+            let back = hsv_to_rgb(h, s, v);
+            for i in 0..3 {
+                assert!((back[i] as i32 - c[i] as i32).abs() <= 2, "channel {i}: {} vs {}", back[i], c[i]);
+            }
+        }
+        assert_eq!(parse_hex("#1A2B3C"), Some([0x1a, 0x2b, 0x3c, 255]));
+    }
+
+    #[test]
+    fn dragging_entity_to_bin_saves_a_prefab() {
+        let mut h = Harness::new(Scene::default());
+        let id = h.app.scene.entities[0].id;
+        if let Some(e) = h.app.scene.entity_mut(id) {
+            e.name = "Hero".into();
+            e.components.push(Component::core("Rect2D"));
+        }
+        h.app.save_prefab(id);
+        let path = h.app.bin_dir.join("hero.neoprefab");
+        assert!(path.exists(), "prefab file not written");
+        let text = std::fs::read_to_string(&path).expect("read prefab");
+        assert!(text.contains("\"Hero\""));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

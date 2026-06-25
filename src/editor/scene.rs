@@ -568,6 +568,24 @@ impl Scene {
         false
     }
 
+    /// Collect an entity and all of its descendants, with the root's parent
+    /// cleared, for saving as a self-contained prefab.
+    pub fn subtree(&self, id: u64) -> Vec<Entity> {
+        let mut out = Vec::new();
+        let mut stack = vec![id];
+        while let Some(cur) = stack.pop() {
+            if let Some(e) = self.entity(cur) {
+                let mut clone = e.clone();
+                if cur == id {
+                    clone.parent = None;
+                }
+                out.push(clone);
+                stack.extend(self.children_of(Some(cur)));
+            }
+        }
+        out
+    }
+
     /// Direct children of `parent` (or roots when `parent` is `None`).
     pub fn children_of(&self, parent: Option<u64>) -> Vec<u64> {
         self.entities

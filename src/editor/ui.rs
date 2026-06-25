@@ -301,6 +301,11 @@ impl<'a> Painter<'a> {
         self.buffer[idx] = blend(self.buffer[idx], color);
     }
 
+    /// Plot a single pixel (used by gradient widgets like the color picker).
+    pub fn pixel(&mut self, x: f32, y: f32, color: Rgba) {
+        self.put(x.floor() as i64, y.floor() as i64, color);
+    }
+
     /// Fill a rectangle, clipped and alpha-blended.
     pub fn fill_rect(&mut self, rect: Rect, color: Rgba) {
         if color[3] == 0 {
