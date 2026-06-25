@@ -176,6 +176,10 @@ pub struct EditorApp {
     cam_x: f32,
     cam_y: f32,
     cam_zoom: f32,
+    /// Anchor captured when a middle-mouse pan begins: (mouse x, mouse y, cam x,
+    /// cam y). Panning relative to a fixed anchor avoids the camera jumping by
+    /// accumulated hover movement.
+    pan_anchor: Option<(f32, f32, f32, f32)>,
     /// The viewport rect from the last frame (for framing the selection).
     last_viewport: Rect,
     /// Hierarchy name filter (search box).
@@ -230,6 +234,7 @@ impl EditorApp {
             cam_x: 0.0,
             cam_y: 0.0,
             cam_zoom: 1.0,
+            pan_anchor: None,
             last_viewport: Rect::new(0.0, 0.0, 0.0, 0.0),
             hierarchy_filter: String::new(),
             undo_stack: Vec::new(),
@@ -609,6 +614,15 @@ impl EditorApp {
         ui.tooltip(grid_field, "Grid size");
         x += 50.0;
 
+        // Reset camera to the origin.
+        let cam_rect = Rect::new(x, y, 30.0, bh);
+        if ui.icon_toggle(cam_rect, icon::MY_LOCATION, false, self.config.theme.text) {
+            self.reset_view();
+            self.status = "Camera reset to (0, 0)".to_string();
+        }
+        ui.tooltip(cam_rect, "Reset camera to origin (0)");
+        x += 35.0;
+
         // Scene name (read-only display; rename via the dialog button).
         let name_label = format!("Scene: {}", self.scene.name);
         let avail = (w - x - 8.0).max(60.0);
@@ -850,11 +864,20 @@ impl EditorApp {
 
         let inside = area.contains(ui.input.mouse_x, ui.input.mouse_y);
 
-        // Middle-mouse pan.
-        if inside && ui.input.middle_down {
-            self.cam_x += ui.input.delta_x;
-            self.cam_y += ui.input.delta_y;
+        // Middle-mouse pan, anchored so the camera tracks the cursor exactly
+        // instead of jumping by accumulated hover movement.
+        if ui.input.middle_down {
+            let (mx0, my0, cx0, cy0) = *self.pan_anchor.get_or_insert((
+                ui.input.mouse_x,
+                ui.input.mouse_y,
+                self.cam_x,
+                self.cam_y,
+            ));
+            self.cam_x = cx0 + (ui.input.mouse_x - mx0);
+            self.cam_y = cy0 + (ui.input.mouse_y - my0);
             ui.wants_redraw = true;
+        } else {
+            self.pan_anchor = None;
         }
         // Scroll-wheel zoom, anchored at the cursor.
         if inside && ui.input.scroll != 0.0 {
@@ -910,6 +933,8 @@ impl EditorApp {
                         if hot { [255, 255, 255, 255] } else { [40, 40, 40, 255] },
                     );
                 }
+                // Collider2D preview — its shape/size can differ from the entity.
+                self.draw_collider_preview(ui, entity, rect, z);
             }
         }
 
@@ -1005,6 +1030,51 @@ impl EditorApp {
         if !drew {
             ui.painter.stroke_rect(rect, self.config.theme.text_dim);
             ui.painter.text(rect.x + 4.0, rect.y + 4.0, &entity.name, 12.0, self.config.theme.text_dim);
+        }
+    }
+
+    /// Draw a green outline for a selected entity's Collider2D, since the
+    /// collider's shape/size/offset often differ from the entity bounds.
+    fn draw_collider_preview(&self, ui: &mut Ui, entity: &Entity, rect: Rect, z: f32) {
+        for component in &entity.components {
+            if let Component::Core { name, props } = component {
+                if name != "Collider2D" {
+                    continue;
+                }
+                let num = |n: &str| {
+                    props.iter().find(|p| p.name == n).and_then(|p| match p.value {
+                        PropValue::Number(v) => Some(v),
+                        _ => None,
+                    })
+                };
+                let shape = props
+                    .iter()
+                    .find(|p| p.name == "shape")
+                    .and_then(|p| match &p.value {
+                        PropValue::Enum { value, .. } => Some(value.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "box".to_string());
+                let ox = num("offset_x").unwrap_or(0.0) * z;
+                let oy = num("offset_y").unwrap_or(0.0) * z;
+                // Size 0 means "use the entity bounds".
+                let cw = match num("size_x") {
+                    Some(v) if v > 0.0 => v * z,
+                    _ => rect.w,
+                };
+                let ch = match num("size_y") {
+                    Some(v) if v > 0.0 => v * z,
+                    _ => rect.h,
+                };
+                let cr = Rect::new(rect.x + ox, rect.y + oy, cw, ch);
+                let green = [80, 220, 90, 255];
+                if shape == "circle" {
+                    ui.painter.stroke_round_rect(cr, cw.min(ch) / 2.0, green);
+                } else {
+                    ui.painter.stroke_rect(cr, green);
+                }
+                ui.painter.icon_centered(cr.x + 7.0, cr.y + 7.0, icon::BORDER_ALL, 11.0, green);
+            }
         }
     }
 
@@ -2630,6 +2700,21 @@ mod tests {
         let e = h.app.scene.entity(id).expect("entity");
         assert!((e.size_x - 140.0).abs() < 2.0, "size_x was {}", e.size_x);
         assert!((e.size_y - 140.0).abs() < 2.0, "size_y was {}", e.size_y);
+    }
+
+    #[test]
+    fn middle_pan_does_not_jump_by_hover_movement() {
+        let mut h = Harness::new(Scene::default());
+        // Hover far across the viewport with no button held.
+        h.frame(FrameInput { mouse_x: 300.0, mouse_y: 300.0, ..Default::default() });
+        h.frame(FrameInput { mouse_x: 900.0, mouse_y: 300.0, ..Default::default() });
+        assert_eq!(h.app.cam_x, 0.0, "hover moved the camera");
+        // Begin a middle-drag: first frame anchors, no movement applied.
+        h.frame(FrameInput { mouse_x: 900.0, mouse_y: 300.0, middle_down: true, ..Default::default() });
+        assert_eq!(h.app.cam_x, 0.0);
+        // Drag 20px right -> camera moves exactly 20, not by the hover distance.
+        h.frame(FrameInput { mouse_x: 920.0, mouse_y: 300.0, middle_down: true, ..Default::default() });
+        assert!((h.app.cam_x - 20.0).abs() < 0.01, "cam_x was {}", h.app.cam_x);
     }
 
     #[test]

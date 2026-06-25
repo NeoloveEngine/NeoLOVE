@@ -101,11 +101,8 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                     input.shift = state.shift();
                 }
                 WindowEvent::CursorMoved { position, .. } => {
-                    let (nx, ny) = (position.x as f32, position.y as f32);
-                    input.delta_x += nx - input.mouse_x;
-                    input.delta_y += ny - input.mouse_y;
-                    input.mouse_x = nx;
-                    input.mouse_y = ny;
+                    input.mouse_x = position.x as f32;
+                    input.mouse_y = position.y as f32;
                     if input.mouse_down || input.middle_down {
                         window.request_redraw();
                     }
@@ -136,12 +133,14 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                             }
                         }
                         MouseButton::Middle => input.middle_down = pressed,
-                        MouseButton::Other(1) => {
+                        // Side buttons report different codes across mice and
+                        // platforms; accept the common back/forward values.
+                        MouseButton::Other(1 | 8) => {
                             if pressed {
                                 input.back_pressed = true;
                             }
                         }
-                        MouseButton::Other(2) => {
+                        MouseButton::Other(2 | 9) => {
                             if pressed {
                                 input.forward_pressed = true;
                             }
@@ -238,8 +237,6 @@ struct PendingInput {
     back_pressed: bool,
     forward_pressed: bool,
     double_click: bool,
-    delta_x: f32,
-    delta_y: f32,
     scroll: f32,
     typed: String,
     backspace: bool,
@@ -276,8 +273,6 @@ impl Default for PendingInput {
             back_pressed: false,
             forward_pressed: false,
             double_click: false,
-            delta_x: 0.0,
-            delta_y: 0.0,
             scroll: 0.0,
             typed: String::new(),
             backspace: false,
@@ -317,8 +312,6 @@ impl PendingInput {
             middle_down: self.middle_down,
             back_pressed: self.back_pressed,
             forward_pressed: self.forward_pressed,
-            delta_x: self.delta_x,
-            delta_y: self.delta_y,
             scroll: self.scroll,
             typed: std::mem::take(&mut self.typed),
             backspace: self.backspace,
@@ -343,8 +336,6 @@ impl PendingInput {
         self.back_pressed = false;
         self.forward_pressed = false;
         self.double_click = false;
-        self.delta_x = 0.0;
-        self.delta_y = 0.0;
         self.scroll = 0.0;
         self.backspace = false;
         self.enter = false;

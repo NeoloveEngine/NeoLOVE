@@ -63,6 +63,7 @@ pub mod icon {
     pub const VISIBILITY_OFF: char = '\u{e8f5}';
     pub const RESTART_ALT: char = '\u{f053}';
     pub const CENTER_FOCUS: char = '\u{e3b4}';
+    pub const MY_LOCATION: char = '\u{e55c}';
     /// Used for the "swap dock side" affordance on a panel header.
     pub const SWAP: char = '\u{e8f1}';
 }
@@ -473,9 +474,6 @@ pub struct FrameInput {
     pub back_pressed: bool,
     /// Forward (mouse 5) pressed this frame.
     pub forward_pressed: bool,
-    /// Mouse movement since last frame, in pixels.
-    pub delta_x: f32,
-    pub delta_y: f32,
     /// Accumulated vertical scroll for this frame (positive = scroll up).
     pub scroll: f32,
     /// Printable characters typed this frame.
