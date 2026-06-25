@@ -5,8 +5,10 @@
 //! viewport, a bottom Project browser, and a toolbar, plus an overlay layer for
 //! context menus, dropdowns, the color picker and modal dialogs.
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 
@@ -113,6 +115,7 @@ enum ColorTarget {
 #[derive(Clone, Debug)]
 enum Action {
     AddComponent(u64, String),
+    PasteComponent(u64),
     OpenAdvancedComponents(u64, f32, f32),
     AddEntity(Option<u64>),
     /// Add an entity at a specific world position (viewport context menu).
@@ -211,9 +214,16 @@ pub struct EditorApp {
     /// Collapsed section keys (component bodies / advanced groups).
     collapsed: HashSet<String>,
     clipboard: Option<Entity>,
+    /// A copied component, pasteable onto any entity.
+    component_clipboard: Option<Component>,
     /// Hierarchy drag-to-reparent: the entity being dragged.
     reparent_drag: Option<u64>,
+    /// A `.neoprefab` file being dragged from the project bin into the scene.
+    prefab_drag: Option<PathBuf>,
     popup: Option<Popup>,
+    /// Lazily-loaded image assets for accurate viewport previews. `None` marks
+    /// a path that failed to load so we don't retry it every frame.
+    image_cache: RefCell<HashMap<String, Option<Rc<image::RgbaImage>>>>,
     /// Receiver for the outcome of a launched `Run` (None when finished).
     run_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
     status: String,
@@ -263,8 +273,11 @@ impl EditorApp {
             undo_baseline: scene_json,
             collapsed: HashSet::new(),
             clipboard: None,
+            component_clipboard: None,
             reparent_drag: None,
+            prefab_drag: None,
             popup: None,
+            image_cache: RefCell::new(HashMap::new()),
             run_rx: None,
             status: "Ready".to_string(),
             scene_dirty: false,
@@ -961,6 +974,7 @@ impl EditorApp {
         }
 
         self.handle_viewport_input(ui, area);
+        self.handle_prefab_drop(ui, area, z);
 
         // Transform/zoom HUD overlay (Unity-style), bottom-left of the viewport.
         let hud = if let Some(e) = self.selected.and_then(|id| self.scene.entity(id)) {
@@ -1007,6 +1021,21 @@ impl EditorApp {
         }
     }
 
+    /// Load an image asset (relative to the project root), cached. `None` is
+    /// remembered so a missing file isn't retried each frame.
+    fn load_image(&self, path: &str) -> Option<Rc<image::RgbaImage>> {
+        if path.is_empty() {
+            return None;
+        }
+        if let Some(entry) = self.image_cache.borrow().get(path) {
+            return entry.clone();
+        }
+        let full = self.project_root.join(path);
+        let loaded = image::open(&full).ok().map(|i| Rc::new(i.to_rgba8()));
+        self.image_cache.borrow_mut().insert(path.to_string(), loaded.clone());
+        loaded
+    }
+
     fn draw_entity(&self, ui: &mut Ui, entity: &Entity, rect: Rect, zoom: f32) {
         let mut drew = false;
         for component in &entity.components {
@@ -1024,8 +1053,14 @@ impl EditorApp {
                         _ => None,
                     })
                 };
+                let prop_img = |n: &str| {
+                    props.iter().find(|p| p.name == n).and_then(|p| match &p.value {
+                        PropValue::Image(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                };
                 match name.as_str() {
-                    "Rect2D" | "Shape2D" | "NineSliceSprite2D" | "TileTexture2D" | "Frame" | "ScrollList" => {
+                    "Rect2D" | "Shape2D" | "Frame" | "ScrollList" => {
                         let radius = prop_num("corner_radius", 0.0) * zoom;
                         ui.painter.fill_round_rect(rect, radius, color);
                         drew = true;
@@ -1047,15 +1082,34 @@ impl EditorApp {
                         }
                     }
                     "Sprite2D" | "Image2D" => {
-                        ui.painter.fill_rect(rect, color);
-                        ui.painter.stroke_rect(rect, self.config.theme.accent);
-                        ui.painter.icon_centered(
-                            rect.x + rect.w / 2.0,
-                            rect.y + rect.h / 2.0,
-                            icon::IMAGE,
-                            (rect.w.min(rect.h) * 0.4).clamp(10.0, 40.0),
-                            [255, 255, 255, 180],
-                        );
+                        if let Some(img) = prop_img("image").and_then(|p| self.load_image(&p)) {
+                            ui.painter.draw_image(&img, rect, None, color);
+                        } else {
+                            self.draw_missing_image(ui, rect, color);
+                        }
+                        drew = true;
+                    }
+                    "NineSliceSprite2D" => {
+                        if let Some(img) = prop_img("image").and_then(|p| self.load_image(&p)) {
+                            draw_nine_slice(
+                                &mut ui.painter, &img, rect,
+                                prop_num("slice_left", 0.0),
+                                prop_num("slice_right", 0.0),
+                                prop_num("slice_top", 0.0),
+                                prop_num("slice_bottom", 0.0),
+                                color, zoom,
+                            );
+                        } else {
+                            self.draw_missing_image(ui, rect, color);
+                        }
+                        drew = true;
+                    }
+                    "TileTexture2D" => {
+                        if let Some(img) = prop_img("image").and_then(|p| self.load_image(&p)) {
+                            draw_tiled(&mut ui.painter, &img, rect, prop_num("tile_width", 32.0), prop_num("tile_height", 32.0), color, zoom);
+                        } else {
+                            self.draw_missing_image(ui, rect, color);
+                        }
                         drew = true;
                     }
                     _ => {}
@@ -1066,6 +1120,19 @@ impl EditorApp {
             ui.painter.stroke_rect(rect, self.config.theme.text_dim);
             ui.painter.text(rect.x + 4.0, rect.y + 4.0, &entity.name, 12.0, self.config.theme.text_dim);
         }
+    }
+
+    /// Placeholder for an image component whose asset is missing/unset.
+    fn draw_missing_image(&self, ui: &mut Ui, rect: Rect, tint: [u8; 4]) {
+        ui.painter.fill_rect(rect, [tint[0] / 3, tint[1] / 3, tint[2] / 3, 255]);
+        ui.painter.stroke_rect(rect, self.config.theme.accent);
+        ui.painter.icon_centered(
+            rect.x + rect.w / 2.0,
+            rect.y + rect.h / 2.0,
+            icon::IMAGE,
+            (rect.w.min(rect.h) * 0.4).clamp(10.0, 40.0),
+            [255, 255, 255, 150],
+        );
     }
 
     /// Draw a green outline for a selected entity's Collider2D, since the
@@ -1110,6 +1177,69 @@ impl EditorApp {
                 }
                 ui.painter.icon_centered(cr.x + 7.0, cr.y + 7.0, icon::BORDER_ALL, 11.0, green);
             }
+        }
+    }
+
+    /// While a `.neoprefab` is dragged from the bin, show a ghost in the
+    /// viewport and instantiate it at the drop position on release.
+    fn handle_prefab_drop(&mut self, ui: &mut Ui, area: Rect, z: f32) {
+        let Some(path) = self.prefab_drag.clone() else {
+            return;
+        };
+        let (mx, my) = (ui.input.mouse_x, ui.input.mouse_y);
+        if ui.input.mouse_down {
+            if area.contains(mx, my) {
+                let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                ui.painter.fill_round_rect(Rect::new(mx + 8.0, my + 8.0, 120.0, 20.0), 4.0, [0, 0, 0, 200]);
+                ui.painter.icon_centered(mx + 20.0, my + 18.0, icon::VIEW_IN_AR, 13.0, self.config.theme.accent);
+                ui.painter.text_clipped(mx + 30.0, my + 11.0, &name, 13.0, self.config.theme.text, 86.0);
+                ui.painter.stroke_rect(Rect::new(mx - 6.0, my - 6.0, 12.0, 12.0), self.config.theme.accent);
+            }
+            ui.wants_redraw = true;
+        } else {
+            if area.contains(mx, my) {
+                let wx = ((mx - (area.x + self.cam_x)) / z).round();
+                let wy = ((my - (area.y + self.cam_y)) / z).round();
+                self.instantiate_prefab(&path, wx, wy);
+            }
+            self.prefab_drag = None;
+        }
+    }
+
+    fn instantiate_prefab(&mut self, path: &Path, wx: f32, wy: f32) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("Prefab load failed: {e}");
+                return;
+            }
+        };
+        let mut proto: Vec<Entity> = match serde_json::from_str(&text) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("Prefab parse failed: {e}");
+                return;
+            }
+        };
+        if proto.is_empty() {
+            return;
+        }
+        // Offset the whole prefab so its root lands at the drop position.
+        let (rx, ry) = proto
+            .iter()
+            .find(|e| e.parent.is_none())
+            .map(|e| (e.x, e.y))
+            .unwrap_or((proto[0].x, proto[0].y));
+        let (dx, dy) = (wx - rx, wy - ry);
+        for e in &mut proto {
+            e.x += dx;
+            e.y += dy;
+        }
+        if let Some(root) = self.scene.instantiate(proto) {
+            self.selected = Some(root);
+            self.mark_dirty();
+            let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            self.status = format!("Placed prefab {name}");
         }
     }
 
@@ -1416,15 +1546,21 @@ impl EditorApp {
             let glyph = component_icon(&entity.components[index]);
             let key = format!("comp_{id}_{index}");
             let comp_expanded = !self.collapsed.contains(&key);
-            // Header row with collapse + remove.
-            let hdr = Rect::new(x, y, width - 24.0, ROW_H);
+            // Header row with collapse + copy + remove.
+            let hdr = Rect::new(x, y, width - 48.0, ROW_H);
             let tri = if comp_expanded { icon::EXPAND_MORE } else { icon::CHEVRON_RIGHT };
-            ui.painter.fill_round_rect(hdr, 3.0, self.config.theme.panel_alt);
+            ui.painter.fill_round_rect(Rect::new(x, y, width, ROW_H), 3.0, self.config.theme.panel_alt);
             ui.icon(x + 12.0, y + ROW_H / 2.0, tri, 15.0, self.config.theme.text);
             ui.icon(x + 28.0, y + ROW_H / 2.0, glyph, 15.0, self.config.theme.accent);
             ui.label(x + 42.0, y + (ROW_H - 14.0) / 2.0, &comp_label, self.config.theme.text);
             if hdr.contains(ui.input.mouse_x, ui.input.mouse_y) && ui.input.mouse_pressed {
                 self.set_collapsed(&key, comp_expanded);
+            }
+            let copy = Rect::new(x + width - 44.0, y + 2.0, 20.0, ROW_H - 4.0);
+            ui.tooltip(copy, "Copy component");
+            if ui.icon_toggle(copy, icon::CONTENT_COPY, false, self.config.theme.text_dim) {
+                self.component_clipboard = Some(entity.components[index].clone());
+                self.status = format!("Copied {comp_label} component");
             }
             let del = Rect::new(x + width - 22.0, y + 2.0, 20.0, ROW_H - 4.0);
             ui.tooltip(del, "Remove component");
@@ -1563,6 +1699,14 @@ impl EditorApp {
                     ColorTarget::Prop { entity, comp, prop: pi },
                 );
                 *c = col;
+                *y += FIELD_H + 6.0;
+            }
+            PropValue::Image(s) => {
+                let r = ui.text_field(&id, Rect::new(fx, *y, fw, FIELD_H), s);
+                if r.changed {
+                    *s = r.text;
+                    dirty = true;
+                }
                 *y += FIELD_H + 6.0;
             }
         }
@@ -1825,15 +1969,23 @@ impl EditorApp {
             }
             yy += row_h + 1.0;
         }
+        let mut start_prefab_drag: Option<PathBuf> = None;
         for (path, name, glyph) in &files {
-            let (_click, dbl, rc) = draw(ui, yy, *glyph, name, false);
+            let (click, dbl, rc) = draw(ui, yy, *glyph, name, false);
             if dbl {
                 open = Some(path.clone());
+            }
+            // Press-and-drag a prefab into the viewport to instantiate it.
+            if click && path.extension().is_some_and(|e| e == "neoprefab") {
+                start_prefab_drag = Some(path.clone());
             }
             if rc {
                 context = Some((path.clone(), ui.input.mouse_x, ui.input.mouse_y));
             }
             yy += row_h + 1.0;
+        }
+        if let Some(p) = start_prefab_drag {
+            self.prefab_drag = Some(p);
         }
         if dirs.is_empty() && files.is_empty() {
             ui.label(content.x + 10.0, content.y + 8.0, "Empty folder.", self.config.theme.text_dim);
@@ -1927,15 +2079,21 @@ impl EditorApp {
     // ---- Popups ------------------------------------------------------------
 
     fn open_add_component_menu(&mut self, entity: u64, x: f32, y: f32) {
-        let mut items: Vec<MenuItem> = CORE_COMPONENTS
-            .iter()
-            .map(|name| MenuItem {
-                action: Action::AddComponent(entity, name.to_string()),
-                glyph: core_icon(name),
-                label: name.to_string(),
+        let mut items: Vec<MenuItem> = Vec::new();
+        if let Some(c) = &self.component_clipboard {
+            items.push(MenuItem {
+                action: Action::PasteComponent(entity),
+                glyph: icon::CONTENT_PASTE,
+                label: format!("Paste {}", c.label()),
                 danger: false,
-            })
-            .collect();
+            });
+        }
+        items.extend(CORE_COMPONENTS.iter().map(|name| MenuItem {
+            action: Action::AddComponent(entity, name.to_string()),
+            glyph: core_icon(name),
+            label: name.to_string(),
+            danger: false,
+        }));
         items.push(MenuItem {
             action: Action::AddComponent(entity, "Script".to_string()),
             glyph: icon::DATA_OBJECT,
@@ -2319,6 +2477,16 @@ impl EditorApp {
                     self.status = format!("Added {name}");
                 }
             }
+            Action::PasteComponent(id) => {
+                if let Some(c) = self.component_clipboard.clone() {
+                    if let Some(e) = self.scene.entity_mut(id) {
+                        let label = c.label().to_string();
+                        e.components.push(c);
+                        self.mark_dirty();
+                        self.status = format!("Pasted {label} component");
+                    }
+                }
+            }
             Action::OpenAdvancedComponents(id, x, y) => self.open_advanced_component_menu(id, x, y),
             Action::AddEntity(parent) => self.add_entity(parent),
             Action::AddEntityAt(x, y) => self.add_entity_at(None, x, y),
@@ -2695,6 +2863,62 @@ impl EditorApp {
     }
 }
 
+/// Draw a 9-slice image into `dest`: corners keep their (zoom-scaled) size
+/// while edges and the center stretch — matching the engine's renderer.
+fn draw_nine_slice(p: &mut Painter, img: &image::RgbaImage, dest: Rect, l: f32, r: f32, t: f32, b: f32, tint: [u8; 4], z: f32) {
+    let iw = img.width() as f32;
+    let ih = img.height() as f32;
+    // Source slice sizes, clamped so they don't overlap.
+    let sl = l.max(0.0).min(iw);
+    let sr = r.max(0.0).min(iw - sl);
+    let st = t.max(0.0).min(ih);
+    let sb = b.max(0.0).min(ih - st);
+    // Destination corner sizes, clamped to the destination.
+    let dl = (sl * z).min(dest.w);
+    let dr = (sr * z).min(dest.w - dl);
+    let dt = (st * z).min(dest.h);
+    let db = (sb * z).min(dest.h - dt);
+    let sx = [0.0, sl, iw - sr];
+    let sw = [sl, (iw - sl - sr).max(0.0), sr];
+    let sy = [0.0, st, ih - sb];
+    let sh = [st, (ih - st - sb).max(0.0), sb];
+    let dx = [dest.x, dest.x + dl, dest.right() - dr];
+    let dw = [dl, (dest.w - dl - dr).max(0.0), dr];
+    let dy = [dest.y, dest.y + dt, dest.bottom() - db];
+    let dh = [dt, (dest.h - dt - db).max(0.0), db];
+    for row in 0..3 {
+        for col in 0..3 {
+            if sw[col] <= 0.0 || sh[row] <= 0.0 || dw[col] <= 0.0 || dh[row] <= 0.0 {
+                continue;
+            }
+            p.draw_image(
+                img,
+                Rect::new(dx[col], dy[row], dw[col], dh[row]),
+                Some(Rect::new(sx[col], sy[row], sw[col], sh[row])),
+                tint,
+            );
+        }
+    }
+}
+
+/// Tile an image across `dest` at the given (zoom-scaled) tile size.
+fn draw_tiled(p: &mut Painter, img: &image::RgbaImage, dest: Rect, tile_w: f32, tile_h: f32, tint: [u8; 4], z: f32) {
+    let tw = (tile_w * z).max(2.0);
+    let th = (tile_h * z).max(2.0);
+    let mut y = dest.y;
+    while y < dest.bottom() {
+        let mut x = dest.x;
+        while x < dest.right() {
+            let cw = tw.min(dest.right() - x);
+            let ch = th.min(dest.bottom() - y);
+            let src = Rect::new(0.0, 0.0, img.width() as f32 * (cw / tw), img.height() as f32 * (ch / th));
+            p.draw_image(img, Rect::new(x, y, cw, ch), Some(src), tint);
+            x += tw;
+        }
+        y += th;
+    }
+}
+
 /// Word-wrap one line to `max_w` pixels, hard-breaking over-long words.
 fn wrap_line(painter: &Painter, text: &str, size: f32, max_w: f32) -> Vec<String> {
     if text.is_empty() {
@@ -3067,6 +3291,62 @@ mod tests {
         let e = h.app.scene.entity(id).expect("entity");
         assert!((e.size_x - 140.0).abs() < 2.0, "size_x was {}", e.size_x);
         assert!((e.size_y - 140.0).abs() < 2.0, "size_y was {}", e.size_y);
+    }
+
+    #[test]
+    fn image_component_exports_load_call() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        scene.entity_mut(id).expect("e").components.push(Component::core("Sprite2D"));
+        // Default image path present -> assets.loadImage(...)
+        let luau = scene.to_luau();
+        assert!(luau.contains("assets.loadImage(\"assets/sprite.png\")"), "got: {luau}");
+        assert!(!luau.contains(".image = \"assets/sprite.png\""), "exported raw string path");
+    }
+
+    #[test]
+    fn empty_image_is_omitted_from_export() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        scene.entity_mut(id).expect("e").components.push(Component::core("Sprite2D"));
+        if let Some(Component::Core { props, .. }) = scene.entity_mut(id).expect("e").components.last_mut() {
+            if let Some(p) = props.iter_mut().find(|p| p.name == "image") {
+                p.value = PropValue::Image(String::new());
+            }
+        }
+        assert!(!scene.to_luau().contains(".image ="));
+    }
+
+    #[test]
+    fn copy_paste_component_between_entities() {
+        let mut scene = Scene::default();
+        let a = scene.entities[0].id;
+        scene.entity_mut(a).expect("a").components.push(Component::core("Rect2D"));
+        let b = scene.add_entity("B", 10.0, 10.0).id;
+        let mut h = Harness::new(scene);
+        h.app.component_clipboard = h.app.scene.entity(a).expect("a").components.first().cloned();
+        h.app.perform(Action::PasteComponent(b));
+        assert_eq!(h.app.scene.entity(b).expect("b").components.len(), 1);
+    }
+
+    #[test]
+    fn instantiate_prefab_remaps_ids_and_parents() {
+        // Build a two-entity prefab (parent + child) and instantiate it twice.
+        let mut src = Scene::default();
+        let p = src.entities[0].id;
+        let c = src.add_entity("Child", 5.0, 5.0).id;
+        src.entity_mut(c).expect("c").parent = Some(p);
+        let proto = src.subtree(p);
+
+        let mut scene = Scene::default();
+        let before = scene.entities.len();
+        let root1 = scene.instantiate(proto.clone()).expect("root1");
+        let root2 = scene.instantiate(proto).expect("root2");
+        assert_ne!(root1, root2);
+        assert_eq!(scene.entities.len(), before + 4);
+        // Each instance's child points at its own (new) root.
+        let kids: Vec<u64> = scene.entities.iter().filter(|e| e.parent == Some(root1)).map(|e| e.id).collect();
+        assert_eq!(kids.len(), 1);
     }
 
     #[test]

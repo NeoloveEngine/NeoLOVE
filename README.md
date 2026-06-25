@@ -117,6 +117,11 @@ The editor opens a window with a dockable **Hierarchy**, a 2D **Viewport**, an
   bin) with draggable splitters; the layout adapts to any window size.
 - Browse, create, and open project files from the bottom Project panel; reveal
   folders in your OS file manager. Toggle the grid overlay and grid snapping.
+- Image components (`Sprite2D`, `Image2D`, `NineSliceSprite2D`, `TileTexture2D`)
+  load and preview their real assets in the viewport (with true 9-slice and
+  tiling). Copy/paste components between entities. Save a prefab by dragging an
+  entity onto the Project panel, and drag a `.neoprefab` back into the viewport
+  to instantiate it.
 - Right-click almost anything for a context menu; hover any control for a
   tooltip; unsaved changes prompt before New/Load/Quit.
 - Unity-style quality-of-life: undo/redo (Ctrl+Z / Ctrl+Y), duplicate (Ctrl+D),

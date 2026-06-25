@@ -26,6 +26,9 @@ pub enum PropValue {
     Color(Color),
     /// A one-of-many string value with its allowed options for the dropdown.
     Enum { value: String, options: Vec<String> },
+    /// An image asset path. Exported as `assets.loadImage("...")` so the
+    /// runtime receives an ImageHandle rather than a bare string.
+    Image(String),
 }
 
 impl PropValue {
@@ -44,6 +47,7 @@ impl PropValue {
                 }
             }
             PropValue::Enum { value, .. } => format!("\"{}\"", escape_luau(value)),
+            PropValue::Image(s) => format!("assets.loadImage(\"{}\")", escape_luau(s)),
         }
     }
 }
@@ -97,6 +101,9 @@ impl Prop {
     }
     fn int(name: &str, label: &str, v: i32) -> Self {
         Self::new(name, label, PropValue::Int(v), false)
+    }
+    fn image(name: &str, label: &str, v: &str) -> Self {
+        Self::new(name, label, PropValue::Image(v.to_string()), false)
     }
     /// An optional text prop (omitted from export when empty), e.g. a font path.
     fn opt_text(name: &str, label: &str) -> Self {
@@ -282,7 +289,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
         }
         "Sprite2D" | "Image2D" => {
             let mut p = vec![
-                Prop::text("image", "Image", "assets/sprite.png"),
+                Prop::image("image", "Image", "assets/sprite.png"),
                 Prop::color("color", "Tint", [255, 255, 255, 255]),
                 Prop::boolean("visible", "Visible", true),
             ];
@@ -294,7 +301,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
         }
         "NineSliceSprite2D" => {
             let mut p = vec![
-                Prop::text("image", "Image", "assets/sprite.png"),
+                Prop::image("image", "Image", "assets/sprite.png"),
                 Prop::color("color", "Tint", [255, 255, 255, 255]),
                 Prop::boolean("visible", "Visible", true),
                 Prop::num("slice_left", "Slice L", 8.0),
@@ -307,7 +314,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             p
         }
         "TileTexture2D" => vec![
-            Prop::text("image", "Image", "assets/tile.png"),
+            Prop::image("image", "Image", "assets/tile.png"),
             Prop::color("color", "Tint", [255, 255, 255, 255]),
             Prop::boolean("visible", "Visible", true),
             Prop::num("tile_width", "Tile W", 32.0),
@@ -563,6 +570,27 @@ impl Scene {
         false
     }
 
+    /// Instantiate a prefab (a list of entities, root first with no parent)
+    /// into the scene with fresh, unique ids and remapped parents. Returns the
+    /// new id of the prefab root.
+    pub fn instantiate(&mut self, proto: Vec<Entity>) -> Option<u64> {
+        let mut map = std::collections::HashMap::new();
+        for e in &proto {
+            map.insert(e.id, self.allocate_id());
+        }
+        let mut root = None;
+        for mut e in proto {
+            let nid = *map.get(&e.id)?;
+            e.parent = e.parent.and_then(|p| map.get(&p).copied());
+            if e.parent.is_none() && root.is_none() {
+                root = Some(nid);
+            }
+            e.id = nid;
+            self.entities.push(e);
+        }
+        root
+    }
+
     /// Collect an entity and all of its descendants, with the root's parent
     /// cleared, for saving as a self-contained prefab.
     pub fn subtree(&self, id: u64) -> Vec<Entity> {
@@ -670,13 +698,18 @@ impl Scene {
                             "local {cvar} = {var}:AddComponent(core.{name})\n"
                         ));
                         for prop in props {
-                            // Skip optional props left at their empty default so
-                            // the runtime keeps its own (e.g. an unset font).
+                            // Skip optional text props left empty, and empty
+                            // image paths, so the runtime keeps its default.
                             if prop.optional {
                                 if let PropValue::Text(t) = &prop.value {
                                     if t.is_empty() {
                                         continue;
                                     }
+                                }
+                            }
+                            if let PropValue::Image(p) = &prop.value {
+                                if p.is_empty() {
+                                    continue;
                                 }
                             }
                             out.push_str(&format!(

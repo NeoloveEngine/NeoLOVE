@@ -306,6 +306,50 @@ impl<'a> Painter<'a> {
         self.put(x.floor() as i64, y.floor() as i64, color);
     }
 
+    /// Draw an image into `dest`, sampling the optional `src` sub-rectangle
+    /// (in image pixels) with nearest-neighbour, multiplied by `tint`. Clipped
+    /// and alpha-blended. Used for accurate sprite/9-slice/tile previews.
+    pub fn draw_image(
+        &mut self,
+        img: &image::RgbaImage,
+        dest: Rect,
+        src: Option<Rect>,
+        tint: Rgba,
+    ) {
+        let (iw, ih) = (img.width() as f32, img.height() as f32);
+        if iw <= 0.0 || ih <= 0.0 || dest.w <= 0.0 || dest.h <= 0.0 {
+            return;
+        }
+        let src = src.unwrap_or(Rect::new(0.0, 0.0, iw, ih));
+        if src.w <= 0.0 || src.h <= 0.0 {
+            return;
+        }
+        let x0 = (dest.x.floor() as i64).max(self.clip[0]);
+        let y0 = (dest.y.floor() as i64).max(self.clip[1]);
+        let x1 = (dest.right().ceil() as i64).min(self.clip[2]);
+        let y1 = (dest.bottom().ceil() as i64).min(self.clip[3]);
+        for py in y0..y1 {
+            let v = (py as f32 + 0.5 - dest.y) / dest.h;
+            let sy = (src.y + v * src.h).clamp(0.0, ih - 1.0) as u32;
+            for px in x0..x1 {
+                let u = (px as f32 + 0.5 - dest.x) / dest.w;
+                let sx = (src.x + u * src.w).clamp(0.0, iw - 1.0) as u32;
+                let p = img.get_pixel(sx, sy).0;
+                let a = (p[3] as u32 * tint[3] as u32 / 255) as u8;
+                if a == 0 {
+                    continue;
+                }
+                let c = [
+                    (p[0] as u32 * tint[0] as u32 / 255) as u8,
+                    (p[1] as u32 * tint[1] as u32 / 255) as u8,
+                    (p[2] as u32 * tint[2] as u32 / 255) as u8,
+                    a,
+                ];
+                self.put(px, py, c);
+            }
+        }
+    }
+
     /// Fill a rectangle, clipped and alpha-blended.
     pub fn fill_rect(&mut self, rect: Rect, color: Rgba) {
         if color[3] == 0 {
