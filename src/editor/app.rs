@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::scene::{Component, Entity, Prop, PropValue, Scene, ScriptVar, VarValue, CORE_COMPONENTS};
+use super::scene::{
+    Component, Entity, Prop, PropValue, Scene, ScriptVar, VarValue, ADVANCED_COMPONENTS,
+    CORE_COMPONENTS,
+};
 use super::ui::{icon, Rect, Theme, Ui};
 
 const TOOLBAR_H: f32 = 40.0;
@@ -107,6 +110,7 @@ enum ColorTarget {
 #[derive(Clone, Debug)]
 enum Action {
     AddComponent(u64, String),
+    OpenAdvancedComponents(u64, f32, f32),
     AddEntity(Option<u64>),
     Rename(u64),
     Duplicate(u64),
@@ -990,28 +994,41 @@ impl EditorApp {
         for component in &entity.components {
             if let Component::Core { name, props } = component {
                 let color = prop_color(props, "color").unwrap_or([200, 200, 200, 255]);
+                let prop_num = |n: &str, d: f32| {
+                    props.iter().find(|p| p.name == n).and_then(|p| match p.value {
+                        PropValue::Number(v) => Some(v),
+                        _ => None,
+                    }).unwrap_or(d)
+                };
+                let prop_str = |n: &str| {
+                    props.iter().find(|p| p.name == n).and_then(|p| match &p.value {
+                        PropValue::Text(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                };
                 match name.as_str() {
-                    "Rect2D" | "Shape2D" | "NineSliceSprite2D" | "TileTexture2D" => {
-                        ui.painter.fill_rect(rect, color);
+                    "Rect2D" | "Shape2D" | "NineSliceSprite2D" | "TileTexture2D" | "Frame" | "ScrollList" => {
+                        let radius = prop_num("corner_radius", 0.0) * zoom;
+                        ui.painter.fill_round_rect(rect, radius, color);
                         drew = true;
                     }
-                    "TextBox" => {
-                        if let Some(Prop { value: PropValue::Text(t), .. }) =
-                            props.iter().find(|p| p.name == "text")
-                        {
-                            let size = props
-                                .iter()
-                                .find(|p| p.name == "scale")
-                                .and_then(|p| match p.value {
-                                    PropValue::Number(n) => Some(n),
-                                    _ => None,
-                                })
-                                .unwrap_or(20.0);
-                            ui.painter.text(rect.x, rect.y, t, (size * zoom).clamp(6.0, 200.0), color);
+                    "Button" | "Dropdown" | "TextInput" => {
+                        let radius = prop_num("corner_radius", 6.0) * zoom;
+                        ui.painter.fill_round_rect(rect, radius, color);
+                        if let Some(t) = prop_str("text") {
+                            let size = (prop_num("scale", 18.0) * zoom).clamp(6.0, 200.0);
+                            ui.painter.text(rect.x + 6.0, rect.y + (rect.h - size) / 2.0, &t, size, [20, 20, 20, 255]);
+                        }
+                        drew = true;
+                    }
+                    "TextBox" | "TextLabel" | "RudimentaryTextLabel" => {
+                        if let Some(t) = prop_str("text") {
+                            let size = (prop_num("scale", 20.0) * zoom).clamp(6.0, 200.0);
+                            ui.painter.text(rect.x, rect.y, &t, size, color);
                             drew = true;
                         }
                     }
-                    "Sprite2D" => {
+                    "Sprite2D" | "Image2D" => {
                         ui.painter.fill_rect(rect, color);
                         ui.painter.stroke_rect(rect, self.config.theme.accent);
                         ui.painter.icon_centered(
@@ -1889,6 +1906,25 @@ impl EditorApp {
             label: "Script".to_string(),
             danger: false,
         });
+        items.push(MenuItem {
+            action: Action::OpenAdvancedComponents(entity, x, y),
+            glyph: icon::EXPAND_MORE,
+            label: "Advanced…".to_string(),
+            danger: false,
+        });
+        self.popup = Some(Popup::Menu { x, y, items });
+    }
+
+    fn open_advanced_component_menu(&mut self, entity: u64, x: f32, y: f32) {
+        let items: Vec<MenuItem> = ADVANCED_COMPONENTS
+            .iter()
+            .map(|name| MenuItem {
+                action: Action::AddComponent(entity, name.to_string()),
+                glyph: core_icon(name),
+                label: name.to_string(),
+                danger: false,
+            })
+            .collect();
         self.popup = Some(Popup::Menu { x, y, items });
     }
 
@@ -2129,6 +2165,7 @@ impl EditorApp {
                     self.status = format!("Added {name}");
                 }
             }
+            Action::OpenAdvancedComponents(id, x, y) => self.open_advanced_component_menu(id, x, y),
             Action::AddEntity(parent) => self.add_entity(parent),
             Action::Rename(id) => {
                 let cur = self.scene.entity(id).map(|e| e.name.clone()).unwrap_or_default();
@@ -2463,13 +2500,15 @@ fn component_icon(component: &Component) -> char {
 
 fn core_icon(name: &str) -> char {
     match name {
-        "Rect2D" => icon::CROP_SQUARE,
-        "Shape2D" => icon::CROP_SQUARE,
-        "TextBox" => icon::TITLE,
-        "Sprite2D" | "NineSliceSprite2D" | "TileTexture2D" => icon::IMAGE,
+        "Rect2D" | "Shape2D" => icon::CROP_SQUARE,
+        "TextBox" | "TextLabel" | "RudimentaryTextLabel" | "TextInput" => icon::TITLE,
+        "Sprite2D" | "Image2D" | "NineSliceSprite2D" | "TileTexture2D" | "Spritebox2D" => icon::IMAGE,
         "Collider2D" => icon::BORDER_ALL,
         "Rigidbody2D" => icon::VIEW_IN_AR,
-        "Bolt2D" | "Rope2D" => icon::TUNE,
+        "Bolt2D" | "Rope2D" | "LegacyBolt2D" | "String2D" => icon::TUNE,
+        "Frame" | "ScrollList" => icon::VIEW_QUILT,
+        "Button" => icon::ADD_CIRCLE,
+        "Dropdown" => icon::EXPAND_MORE,
         _ => icon::VIEW_QUILT,
     }
 }

@@ -59,6 +59,10 @@ pub struct Prop {
     /// Advanced props are tucked under a collapsible section in the inspector.
     #[serde(default)]
     pub advanced: bool,
+    /// Optional props are omitted from the Luau export when left at their empty
+    /// default (e.g. an unset font), so the runtime keeps its own default.
+    #[serde(default)]
+    pub optional: bool,
 }
 
 impl Prop {
@@ -91,12 +95,26 @@ impl Prop {
             advanced,
         )
     }
+    fn int(name: &str, label: &str, v: i32) -> Self {
+        Self::new(name, label, PropValue::Int(v), false)
+    }
+    /// An optional text prop (omitted from export when empty), e.g. a font path.
+    fn opt_text(name: &str, label: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            label: label.to_string(),
+            value: PropValue::Text(String::new()),
+            advanced: false,
+            optional: true,
+        }
+    }
     fn new(name: &str, label: &str, value: PropValue, advanced: bool) -> Self {
         Self {
             name: name.to_string(),
             label: label.to_string(),
             value,
             advanced,
+            optional: false,
         }
     }
 }
@@ -169,19 +187,34 @@ impl Component {
     }
 }
 
-/// The list of core components offered in the "Add Component" menu, in display
-/// order, matching the engine's `core` module.
+/// Common core components offered directly in the "Add Component" menu, in
+/// display order, matching the engine's `core` module.
 pub const CORE_COMPONENTS: &[&str] = &[
     "Rect2D",
     "Shape2D",
     "TextBox",
+    "TextLabel",
     "Sprite2D",
+    "Image2D",
     "NineSliceSprite2D",
     "TileTexture2D",
+    "Frame",
+    "Button",
+    "TextInput",
+    "Dropdown",
+    "ScrollList",
     "Collider2D",
     "Rigidbody2D",
+];
+
+/// Advanced / legacy core components, shown under an "Advanced" submenu.
+pub const ADVANCED_COMPONENTS: &[&str] = &[
+    "Spritebox2D",
     "Bolt2D",
     "Rope2D",
+    "LegacyBolt2D",
+    "String2D",
+    "RudimentaryTextLabel",
 ];
 
 /// Default editable properties for each core component, grounded in the engine
@@ -218,12 +251,13 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             p.push(Prop::num_adv("size_y", "Size Y", 0.0));
             p
         }
-        "TextBox" => {
+        "TextBox" | "TextLabel" | "RudimentaryTextLabel" => {
             let mut p = vec![
                 Prop::text("text", "Text", "Text"),
                 Prop::color("color", "Color", [255, 255, 255, 255]),
                 Prop::boolean("visible", "Visible", true),
                 Prop::num("scale", "Scale", 24.0),
+                Prop::opt_text("font", "Font"),
                 Prop::enumv("align_x", "Align X", "left", &["left", "center", "right"], false),
                 Prop::enumv("align_y", "Align Y", "top", &["top", "center", "bottom"], false),
                 Prop::enumv("wrap", "Wrap", "none", &["none", "word", "char"], false),
@@ -251,7 +285,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             p.push(Prop::num_adv("tab_size", "Tab Size", 4.0));
             p
         }
-        "Sprite2D" => {
+        "Sprite2D" | "Image2D" => {
             let mut p = vec![
                 Prop::text("image", "Image", "assets/sprite.png"),
                 Prop::color("color", "Tint", [255, 255, 255, 255]),
@@ -318,7 +352,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::num("offset_y", "Offset Y", 0.0),
             Prop::boolean_adv("contacts_enabled", "Contacts", true),
         ],
-        "Rope2D" => vec![
+        "Rope2D" | "String2D" => vec![
             Prop::boolean("enabled", "Enabled", true),
             Prop::num("min_length", "Min Length", 0.0),
             Prop::num("max_length", "Max Length", 100.0),
@@ -326,6 +360,62 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::num("damping", "Damping", 0.0),
             Prop::num_adv("break_force", "Break Force", 0.0),
         ],
+        "LegacyBolt2D" => core_component_props("Bolt2D"),
+        // ---- UI components ----
+        "Frame" => vec![
+            Prop::color("color", "Color", [255, 255, 255, 255]),
+            Prop::boolean("visible", "Visible", true),
+            Prop::num("corner_radius", "Corner", 10.0),
+            Prop::num("padding", "Padding", 8.0),
+        ],
+        "Button" => vec![
+            Prop::text("text", "Text", "Button"),
+            Prop::color("color", "Color", [255, 255, 255, 255]),
+            Prop::boolean("visible", "Visible", true),
+            Prop::num("scale", "Scale", 18.0),
+            Prop::enumv("align_x", "Align X", "center", &["left", "center", "right"], false),
+            Prop::num("corner_radius", "Corner", 8.0),
+            Prop::num_adv("padding_x", "Padding X", 12.0),
+            Prop::num_adv("padding_y", "Padding Y", 8.0),
+            Prop::num_adv("icon_gap", "Icon Gap", 8.0),
+        ],
+        "TextInput" => vec![
+            Prop::text("text", "Text", ""),
+            Prop::color("color", "Color", [255, 255, 255, 255]),
+            Prop::boolean("visible", "Visible", true),
+            Prop::num("scale", "Scale", 18.0),
+            Prop::enumv("align_x", "Align X", "left", &["left", "center", "right"], false),
+            Prop::num("corner_radius", "Corner", 8.0),
+            Prop::int("max_length", "Max Length", 0),
+            Prop::boolean("password", "Password", false),
+            Prop::boolean_adv("submit_on_enter", "Submit Enter", true),
+            Prop::boolean_adv("clear_on_submit", "Clear Submit", false),
+            Prop::num_adv("border_width", "Border", 1.0),
+            Prop::num_adv("padding_x", "Padding X", 10.0),
+            Prop::num_adv("padding_y", "Padding Y", 8.0),
+        ],
+        "Dropdown" => vec![
+            Prop::color("color", "Color", [255, 255, 255, 255]),
+            Prop::boolean("visible", "Visible", true),
+            Prop::num("scale", "Scale", 18.0),
+            Prop::num("item_height", "Item H", 32.0),
+            Prop::int("max_visible_items", "Max Items", 8),
+            Prop::num("corner_radius", "Corner", 8.0),
+            Prop::boolean_adv("open_upwards", "Open Up", false),
+            Prop::num_adv("padding_x", "Padding X", 10.0),
+            Prop::num_adv("padding_y", "Padding Y", 8.0),
+        ],
+        "ScrollList" => vec![
+            Prop::color("color", "Color", [255, 255, 255, 255]),
+            Prop::boolean("visible", "Visible", true),
+            Prop::num("item_height", "Item H", 32.0),
+            Prop::num("item_spacing", "Item Gap", 4.0),
+            Prop::boolean("show_scrollbar", "Scrollbar", true),
+            Prop::num("scrollbar_width", "Bar Width", 8.0),
+            Prop::num_adv("padding_x", "Padding X", 10.0),
+            Prop::num_adv("padding_y", "Padding Y", 8.0),
+        ],
+        "Spritebox2D" => vec![Prop::num("alpha_threshold", "Alpha Thresh", 0.5)],
         _ => Vec::new(),
     }
 }
@@ -567,6 +657,15 @@ impl Scene {
                             "local {cvar} = {var}:AddComponent(core.{name})\n"
                         ));
                         for prop in props {
+                            // Skip optional props left at their empty default so
+                            // the runtime keeps its own (e.g. an unset font).
+                            if prop.optional {
+                                if let PropValue::Text(t) = &prop.value {
+                                    if t.is_empty() {
+                                        continue;
+                                    }
+                                }
+                            }
                             out.push_str(&format!(
                                 "{cvar}.{} = {}\n",
                                 sanitize_field(&prop.name),
@@ -779,6 +878,42 @@ mod tests {
         let luau = scene.to_luau();
         assert!(luau.contains("AddComponent(require(\"scripts/Player\"))"));
         assert!(luau.contains(".speed = 200"));
+    }
+
+    #[test]
+    fn textbox_font_is_optional_in_export() {
+        let mut scene = Scene {
+            name: "F".into(),
+            background: [0, 0, 0, 255],
+            entities: Vec::new(),
+            next_id: 1,
+        };
+        let mut e = scene.add_entity("T", 0.0, 0.0);
+        e.components.push(Component::core("TextBox"));
+        let id = e.id;
+        scene.replace_entity(id, e);
+        // Empty font: no `.font =` line.
+        assert!(!scene.to_luau().contains(".font ="));
+        // Set the font and it appears.
+        if let Some(Component::Core { props, .. }) =
+            scene.entity_mut(id).expect("e").components.get_mut(0)
+        {
+            if let Some(p) = props.iter_mut().find(|p| p.name == "font") {
+                p.value = PropValue::Text("assets/font.ttf".into());
+            }
+        }
+        assert!(scene.to_luau().contains(".font = \"assets/font.ttf\""));
+    }
+
+    #[test]
+    fn ui_and_legacy_components_export() {
+        for name in ["Frame", "Button", "TextInput", "Dropdown", "ScrollList", "LegacyBolt2D", "String2D"] {
+            let mut scene = Scene::default();
+            let id = scene.entities[0].id;
+            scene.entity_mut(id).expect("e").components.push(Component::core(name));
+            let luau = scene.to_luau();
+            assert!(luau.contains(&format!("AddComponent(core.{name})")), "missing {name}");
+        }
     }
 
     #[test]
