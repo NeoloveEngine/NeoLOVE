@@ -2499,6 +2499,62 @@ pub fn add_core_components(
         )?;
     }
 
+    // EntityScaler
+    // percentage-plus-pixel transform helper for responsive parent-relative layout
+    {
+        let entity_scaler = lua.create_table()?;
+        entity_scaler.set(
+            "awake",
+            lua.create_function(move |_ctx, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "EntityScaler")?;
+                component.set("enabled", true)?;
+                component.set("x_percent", 0.0)?;
+                component.set("y_percent", 0.0)?;
+                component.set("offset_x", 0.0)?;
+                component.set("offset_y", 0.0)?;
+                component.set("pivot_x", 0.0)?;
+                component.set("pivot_y", 0.0)?;
+                Ok(())
+            })?,
+        )?;
+        entity_scaler.set(
+            "update",
+            lua.create_function(move |_ctx, (entity, component, _dt): (Table, Table, f32)| {
+                if !component.get::<bool>("enabled").unwrap_or(true) {
+                    return Ok(());
+                }
+
+                let x_percent = get_number_field(&component, "x_percent", "xPercent")
+                    .or_else(|| get_number_field(&component, "percent_x", "percentX"))
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                let y_percent = get_number_field(&component, "y_percent", "yPercent")
+                    .or_else(|| get_number_field(&component, "percent_y", "percentY"))
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                let offset_x = get_number_field(&component, "offset_x", "offsetX").unwrap_or(0.0);
+                let offset_y = get_number_field(&component, "offset_y", "offsetY").unwrap_or(0.0);
+                let pivot_x = get_number_field(&component, "pivot_x", "pivotX")
+                    .or_else(|| get_number_field(&component, "anchor_x", "anchorX"))
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                let pivot_y = get_number_field(&component, "pivot_y", "pivotY")
+                    .or_else(|| get_number_field(&component, "anchor_y", "anchorY"))
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+
+                entity.set("anchor_x", x_percent)?;
+                entity.set("anchor_y", y_percent)?;
+                entity.set("x", offset_x)?;
+                entity.set("y", offset_y)?;
+                entity.set("pivot_x", pivot_x)?;
+                entity.set("pivot_y", pivot_y)?;
+                Ok(())
+            })?,
+        )?;
+        core_components.set("EntityScaler", entity_scaler)?;
+    }
+
     // Rect2d
     // basic renderer
     {

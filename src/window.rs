@@ -4727,6 +4727,46 @@ mod tests {
     }
 
     #[test]
+    fn entity_scaler_positions_entity_by_parent_percent_and_offset() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("entity_scaler")?;
+
+        let ecs: Table = runtime.lua.globals().get("ecs")?;
+        let core: Table = runtime.lua.globals().get("core")?;
+        let new_entity: Function = ecs.get("newEntity")?;
+        let parent: Table =
+            new_entity.call(("parent".to_string(), None::<Table>, Some(10.0), Some(20.0)))?;
+        parent.set("size_x", 200.0)?;
+        parent.set("size_y", 100.0)?;
+        let child: Table =
+            new_entity.call(("child".to_string(), Some(parent), Some(0.0), Some(0.0)))?;
+        child.set("size_x", 20.0)?;
+        child.set("size_y", 10.0)?;
+        let add_component: Function = child.get("AddComponent")?;
+        let scaler: Table = add_component.call((child.clone(), core.get::<Table>("EntityScaler")?))?;
+        scaler.set("x_percent", 0.5)?;
+        scaler.set("y_percent", 0.5)?;
+        scaler.set("offset_x", 5.0)?;
+        scaler.set("offset_y", -10.0)?;
+        scaler.set("pivot_x", 0.5)?;
+        scaler.set("pivot_y", 0.5)?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+
+        assert_eq!(child.get::<f32>("anchor_x")?, 0.5);
+        assert_eq!(child.get::<f32>("anchor_y")?, 0.5);
+        assert_eq!(child.get::<f32>("x")?, 5.0);
+        assert_eq!(child.get::<f32>("y")?, -10.0);
+        assert_eq!(child.get::<f32>("pivot_x")?, 0.5);
+        assert_eq!(child.get::<f32>("pivot_y")?, 0.5);
+        let (world_x, world_y) = get_global_position(&child)?;
+        assert_eq!(world_x, 105.0);
+        assert_eq!(world_y, 55.0);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
     fn get_entities_in_front_filters_point_and_z_and_sorts_frontmost_first() -> mlua::Result<()> {
         let (runtime, root) = start_test_runtime("entities_in_front")?;
 

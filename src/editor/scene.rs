@@ -205,6 +205,7 @@ pub const CORE_COMPONENTS: &[&str] = &[
     "Image2D",
     "NineSliceSprite2D",
     "TileTexture2D",
+    "EntityScaler",
     "Collider2D",
     "Rigidbody2D",
 ];
@@ -267,10 +268,10 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             p.push(Prop::num_adv("min_scale", "Min Scale", 1.0));
             p.push(Prop::enumv(
                 "text_scale",
-                "Text Scale",
-                "none",
+                "Text Fit",
+                "fit",
                 &["none", "fit", "fit_width", "fit_height"],
-                true,
+                false,
             ));
             p.push(Prop::enumv(
                 "size_mode",
@@ -282,7 +283,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             p.push(Prop::num_adv("padding", "Padding", 0.0));
             p.push(Prop::num_adv("padding_x", "Padding X", 0.0));
             p.push(Prop::num_adv("padding_y", "Padding Y", 0.0));
-            p.push(Prop::num_adv("line_spacing", "Line Space", 0.0));
+            p.push(Prop::num_adv("line_spacing", "Line Space", 1.0));
             p.push(Prop::num_adv("letter_spacing", "Letter Space", 0.0));
             p.push(Prop::num_adv("tab_size", "Tab Size", 4.0));
             p
@@ -321,6 +322,15 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::num("tile_height", "Tile H", 32.0),
             Prop::num_adv("offset_x", "Offset X", 0.0),
             Prop::num_adv("offset_y", "Offset Y", 0.0),
+        ],
+        "EntityScaler" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::num("x_percent", "X %", 0.0),
+            Prop::num("y_percent", "Y %", 0.0),
+            Prop::num("offset_x", "Offset X", 0.0),
+            Prop::num("offset_y", "Offset Y", 0.0),
+            Prop::num("pivot_x", "Pivot X", 0.0),
+            Prop::num("pivot_y", "Pivot Y", 0.0),
         ],
         "Collider2D" => vec![
             Prop::boolean("enabled", "Enabled", true),
@@ -949,6 +959,42 @@ mod tests {
             }
         }
         assert!(scene.to_luau().contains(".font = \"assets/font.ttf\""));
+    }
+
+    #[test]
+    fn textbox_defaults_fit_entity_bounds() {
+        let component = Component::core("TextBox");
+        let Component::Core { props, .. } = component else {
+            panic!("expected core component");
+        };
+        let text_scale = props
+            .iter()
+            .find(|prop| prop.name == "text_scale")
+            .expect("text_scale prop");
+        assert!(matches!(
+            &text_scale.value,
+            PropValue::Enum { value, .. } if value == "fit"
+        ));
+        let line_spacing = props
+            .iter()
+            .find(|prop| prop.name == "line_spacing")
+            .expect("line spacing prop");
+        assert_eq!(line_spacing.value, PropValue::Number(1.0));
+    }
+
+    #[test]
+    fn entity_scaler_exports_core_component() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        scene
+            .entity_mut(id)
+            .expect("entity")
+            .components
+            .push(Component::core("EntityScaler"));
+        let luau = scene.to_luau();
+        assert!(luau.contains("AddComponent(core.EntityScaler)"));
+        assert!(luau.contains(".x_percent = 0"));
+        assert!(luau.contains(".pivot_x = 0"));
     }
 
     #[test]

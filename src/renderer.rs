@@ -665,13 +665,17 @@ fn layout_lines_for(
     lines
 }
 
-fn style_for_index(request: &TextRenderRequest, index: usize) -> ResolvedTextStyle {
+fn style_for_index(
+    request: &TextRenderRequest,
+    index: usize,
+    base_scale: f32,
+) -> ResolvedTextStyle {
     let mut style = ResolvedTextStyle {
         bold: false,
         italic: false,
         underline: false,
         color: request.color,
-        scale: request.scale.max(1.0),
+        scale: base_scale.max(1.0),
         font: request.font.clone(),
     };
     for range in &request.rich_text {
@@ -683,7 +687,7 @@ fn style_for_index(request: &TextRenderRequest, index: usize) -> ResolvedTextSty
                 style.color = Color::rgba(r, g, b, a);
             }
             if let Some(bits) = range.size {
-                style.scale = (request.scale * f32::from_bits(bits)).max(1.0);
+                style.scale = (base_scale * f32::from_bits(bits)).max(1.0);
             }
             if let Some(font) = &range.font {
                 style.font = font.clone();
@@ -831,7 +835,7 @@ fn prepare_text_layout_uncached(request: &TextRenderRequest) -> Option<PreparedT
 
         for (char_index, ch) in line.text.chars().enumerate() {
             let global_index = glyphs.len();
-            let style = style_for_index(request, global_index);
+            let style = style_for_index(request, global_index, used_scale);
             let glyph_font = load_font(&style.font).unwrap_or_else(|| font.clone());
             let glyph_px = style.scale.max(1.0);
             if char_index > 0 {
@@ -1927,6 +1931,54 @@ mod tests {
         assert!(sprite.dest.h > 0.0);
         assert!(sprite.image.width() > 0);
         assert!(sprite.image.height() > 0);
+    }
+
+    #[test]
+    fn fitted_text_rasterizes_at_used_scale() {
+        let request = TextRenderRequest {
+            text: "Text".to_string(),
+            bounds: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 120.0,
+                h: 60.0,
+            },
+            rotation: 0.0,
+            pivot: Vec2::default(),
+            color: Color::WHITE,
+            font: FontHandle::Default,
+            scale: 3500.0,
+            min_scale: 1.0,
+            text_scale: TextScaleMode::Fit,
+            align_x: TextAlignX::Center,
+            align_y: TextAlignY::Center,
+            wrap: TextWrapMode::None,
+            padding_x: 0.0,
+            padding_y: 0.0,
+            line_spacing: 1.0,
+            letter_spacing: 0.0,
+            tab_size: 4.0,
+            stretch_width: 0.0,
+            stretch_height: 0.0,
+            rich_text: Vec::new(),
+        };
+
+        let metrics = measure_text(&request).expect("metrics");
+        assert!(metrics.used_scale < 3500.0);
+        assert!(metrics.used_scale > 1.0);
+        let sprite = rasterize_text_sprite(&request).expect("sprite");
+        assert!(
+            sprite.dest.w <= request.bounds.w + 2.0,
+            "sprite width {} exceeded bounds {}",
+            sprite.dest.w,
+            request.bounds.w
+        );
+        assert!(
+            sprite.dest.h <= request.bounds.h + 2.0,
+            "sprite height {} exceeded bounds {}",
+            sprite.dest.h,
+            request.bounds.h
+        );
     }
 
     #[test]

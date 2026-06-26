@@ -10,6 +10,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +36,8 @@ const LABEL_W: f32 = 84.0;
 const MIN_PANEL_W: f32 = 150.0;
 const MIN_VIEWPORT_W: f32 = 160.0;
 const SPLIT_HALF: f32 = 4.0;
+const PREVIEW_ROOT_WIDTH: f32 = 1280.0;
+const PREVIEW_ROOT_HEIGHT: f32 = 720.0;
 
 /// Which side of the window a dockable panel lives on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,7 +142,9 @@ enum Action {
     NewFolder,
     NewScript,
     RevealInExplorer,
+    OpenProjectInVscode,
     OpenPath(PathBuf),
+    OpenScene(PathBuf),
     EnterFolder(PathBuf),
 }
 
@@ -156,6 +161,7 @@ struct MenuItem {
 enum Pending {
     NewScene,
     LoadScene,
+    LoadScenePath(PathBuf),
     Quit,
     RenameScene,
     CreateFolder,
@@ -230,7 +236,7 @@ pub struct EditorApp {
     popup: Option<Popup>,
     /// Lazily-loaded image assets for accurate viewport previews. `None` marks
     /// a path that failed to load so we don't retry it every frame.
-    image_cache: RefCell<HashMap<String, Option<Rc<image::RgbaImage>>>>,
+    image_cache: RefCell<HashMap<String, EditorImageCacheEntry>>,
     /// Receiver for the outcome of a launched `Run` (None when finished).
     run_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
     status: String,
@@ -1043,17 +1049,28 @@ impl EditorApp {
         if path.is_empty() {
             return None;
         }
-        if let Some(entry) = self.image_cache.borrow().get(path) {
-            return entry.clone();
-        }
         let full = self.project_root.join(path);
+        let modified = std::fs::metadata(&full)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        if let Some(entry) = self.image_cache.borrow().get(path) {
+            if entry.modified == modified {
+                return entry.image.clone();
+            }
+        }
         let loaded = image::open(&full).ok().map(|i| Rc::new(i.to_rgba8()));
-        self.image_cache.borrow_mut().insert(path.to_string(), loaded.clone());
+        self.image_cache.borrow_mut().insert(
+            path.to_string(),
+            EditorImageCacheEntry {
+                modified,
+                image: loaded.clone(),
+            },
+        );
         loaded
     }
 
     fn entity_world_transform(&self, id: u64) -> Option<EditorWorldTransform> {
-        scene_world_transform(&self.scene, id)
+        scene_world_transform(&self.scene, id, self.preview_root_size())
     }
 
     fn entity_screen_rect(&self, entity: &Entity, area: Rect) -> Option<Rect> {
@@ -1073,7 +1090,17 @@ impl EditorApp {
         world_x: f32,
         world_y: f32,
     ) -> Option<(f32, f32)> {
-        scene_world_origin_to_local_position(&self.scene, entity_id, world_x, world_y)
+        scene_world_origin_to_local_position(
+            &self.scene,
+            entity_id,
+            world_x,
+            world_y,
+            self.preview_root_size(),
+        )
+    }
+
+    fn preview_root_size(&self) -> (f32, f32) {
+        (PREVIEW_ROOT_WIDTH, PREVIEW_ROOT_HEIGHT)
     }
 
     fn draw_entity(&self, ui: &mut Ui, entity: &Entity, rect: Rect, zoom: f32) {
@@ -1144,9 +1171,9 @@ impl EditorApp {
                             default_scale: 32.0,
                             default_align_x: TextAlignX::Left,
                             default_align_y: TextAlignY::Top,
-                            default_text_scale: TextScaleMode::None,
+                            default_text_scale: TextScaleMode::Fit,
                             default_wrap: TextWrapMode::None,
-                            default_size_mode_uses_entity: false,
+                            default_size_mode_uses_entity: true,
                             color_names: &["color"],
                             fallback_color: color,
                         };
@@ -1207,12 +1234,14 @@ impl EditorApp {
         let Some(sprite) = renderer::rasterize_text_sprite(&request) else {
             return false;
         };
+        let clip = ui.painter.push_clip(rect);
         ui.painter.draw_image(
             sprite.image.as_ref(),
             Rect::new(sprite.dest.x, sprite.dest.y, sprite.dest.w, sprite.dest.h),
             None,
             [255, 255, 255, 255],
         );
+        ui.painter.set_clip_raw(clip);
         true
     }
 
@@ -1325,7 +1354,7 @@ impl EditorApp {
         if proto.is_empty() {
             return;
         }
-        // Offset the whole prefab so its root lands at the drop position.
+        // Offset only prefab roots so child positions remain parent-local.
         let (rx, ry) = proto
             .iter()
             .find(|e| e.parent.is_none())
@@ -1333,8 +1362,10 @@ impl EditorApp {
             .unwrap_or((proto[0].x, proto[0].y));
         let (dx, dy) = (wx - rx, wy - ry);
         for e in &mut proto {
-            e.x += dx;
-            e.y += dy;
+            if e.parent.is_none() {
+                e.x += dx;
+                e.y += dy;
+            }
         }
         if let Some(root) = self.scene.instantiate(proto) {
             self.selected = Some(root);
@@ -1990,7 +2021,7 @@ impl EditorApp {
         let rel = self.bin_rel();
         ui.painter.text_clipped(area.x + 92.0, area.y + (HEADER_H - 13.0) / 2.0, &format!("/{rel}"), 13.0, self.config.theme.text_dim, area.w - 320.0);
 
-        // Header buttons: new folder, new script, reveal, up.
+        // Header buttons: new folder, new script, VS Code, reveal, up.
         let mut bx = area.right() - 30.0;
         let btn = |ui: &mut Ui, x: f32, glyph: char, tip: &str| -> bool {
             let r = Rect::new(x, area.y + 3.0, 24.0, HEADER_H - 6.0);
@@ -2007,6 +2038,10 @@ impl EditorApp {
         bx -= 28.0;
         if btn(ui, bx, icon::OPEN_IN_NEW, "Reveal in file manager") {
             self.reveal_in_explorer();
+        }
+        bx -= 28.0;
+        if btn(ui, bx, icon::CODE, "Open project in VS Code") {
+            self.open_project_in_vscode();
         }
         bx -= 28.0;
         if btn(ui, bx, icon::CREATE_NEW_FOLDER, "New folder") {
@@ -2090,7 +2125,11 @@ impl EditorApp {
         for (path, name, glyph) in &files {
             let (click, dbl, rc) = draw(ui, yy, *glyph, name, false);
             if dbl {
-                open = Some(path.clone());
+                if path.extension().is_some_and(|e| e == "neoscene") {
+                    self.open_scene_path(path.clone());
+                } else {
+                    open = Some(path.clone());
+                }
             }
             // Press-and-drag a prefab into the viewport to instantiate it.
             if click && path.extension().is_some_and(|e| e == "neoprefab") {
@@ -2281,6 +2320,7 @@ impl EditorApp {
         let items = vec![
             MenuItem { action: Action::NewFolder, glyph: icon::CREATE_NEW_FOLDER, label: "New Folder".into(), danger: false },
             MenuItem { action: Action::NewScript, glyph: icon::NOTE_ADD, label: "New Script".into(), danger: false },
+            MenuItem { action: Action::OpenProjectInVscode, glyph: icon::CODE, label: "Open in VS Code".into(), danger: false },
             MenuItem { action: Action::RevealInExplorer, glyph: icon::OPEN_IN_NEW, label: "Reveal in File Manager".into(), danger: false },
         ];
         self.popup = Some(Popup::Menu { x, y, items });
@@ -2291,6 +2331,8 @@ impl EditorApp {
         let mut items = Vec::new();
         if is_dir {
             items.push(MenuItem { action: Action::EnterFolder(path.clone()), glyph: icon::FOLDER_OPEN, label: "Open Folder".into(), danger: false });
+        } else if path.extension().is_some_and(|e| e == "neoscene") {
+            items.push(MenuItem { action: Action::OpenScene(path.clone()), glyph: icon::ARTICLE, label: "Open Scene".into(), danger: false });
         } else {
             items.push(MenuItem { action: Action::OpenPath(path.clone()), glyph: icon::OPEN_IN_NEW, label: "Open".into(), danger: false });
         }
@@ -2653,7 +2695,9 @@ impl EditorApp {
             Action::NewFolder => self.open_prompt("New folder name", Pending::CreateFolder, "NewFolder"),
             Action::NewScript => self.open_prompt("New script name", Pending::CreateScript, "script.luau"),
             Action::RevealInExplorer => self.reveal_in_explorer(),
+            Action::OpenProjectInVscode => self.open_project_in_vscode(),
             Action::OpenPath(p) => self.open_path(&p),
+            Action::OpenScene(p) => self.open_scene_path(p),
             Action::EnterFolder(p) => self.navigate_bin(p),
         }
     }
@@ -2667,6 +2711,7 @@ impl EditorApp {
                 self.status = "New scene".to_string();
             }
             Pending::LoadScene => self.load(),
+            Pending::LoadScenePath(path) => self.load_scene_file(path),
             Pending::Quit => self.should_quit = true,
             _ => {}
         }
@@ -2804,9 +2849,33 @@ impl EditorApp {
     }
 
     fn load(&mut self) {
-        match Scene::load(&self.scene_path) {
+        self.load_scene_file(self.scene_path.clone());
+    }
+
+    fn open_scene_path(&mut self, path: PathBuf) {
+        if !path.starts_with(&self.project_root) {
+            self.status = "Scene is outside the project".to_string();
+            return;
+        }
+        if path.extension().is_none_or(|ext| ext != "neoscene") {
+            self.open_path(&path);
+            return;
+        }
+        if self.scene_dirty {
+            self.open_confirm(
+                "Discard unsaved changes and open this scene?",
+                Pending::LoadScenePath(path),
+            );
+        } else {
+            self.load_scene_file(path);
+        }
+    }
+
+    fn load_scene_file(&mut self, path: PathBuf) {
+        match Scene::load(&path) {
             Ok(scene) => {
                 self.scene = scene;
+                self.scene_path = path;
                 self.selected = None;
                 self.scene_dirty = false;
                 self.status = format!("Loaded {}", self.scene_path.display());
@@ -2871,6 +2940,27 @@ impl EditorApp {
     fn reveal_in_explorer(&mut self) {
         let dir = self.bin_dir.clone();
         self.open_path(&dir);
+    }
+
+    fn open_project_in_vscode(&mut self) {
+        for command in ["code", "code-insiders", "codium"] {
+            match std::process::Command::new(command)
+                .arg("--reuse-window")
+                .arg(&self.project_root)
+                .spawn()
+            {
+                Ok(_) => {
+                    self.status = format!("Opened project in {command}");
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    self.status = format!("Failed to open VS Code: {error}");
+                    return;
+                }
+            }
+        }
+        self.status = "VS Code command not found on PATH".to_string();
     }
 
     /// Open a file or folder with the OS default handler.
@@ -2987,6 +3077,23 @@ struct EditorWorldTransform {
     scale: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct EditorLocalTransform {
+    x: f32,
+    y: f32,
+    scale: f32,
+    anchor_x: f32,
+    anchor_y: f32,
+    pivot_x: f32,
+    pivot_y: f32,
+}
+
+#[derive(Clone)]
+struct EditorImageCacheEntry {
+    modified: Option<SystemTime>,
+    image: Option<Rc<image::RgbaImage>>,
+}
+
 fn editor_entity_scale(entity: &Entity) -> f32 {
     if entity.scale.is_finite() {
         entity.scale.max(0.0)
@@ -2995,27 +3102,78 @@ fn editor_entity_scale(entity: &Entity) -> f32 {
     }
 }
 
-fn editor_parent_anchor_offset(scene: &Scene, entity: &Entity) -> (f32, f32) {
-    let Some(parent_id) = entity.parent else {
-        return (0.0, 0.0);
-    };
-    let Some(parent) = scene.entity(parent_id) else {
-        return (0.0, 0.0);
-    };
-    (
-        parent.size_x * entity.anchor_x,
-        parent.size_y * entity.anchor_y,
-    )
+fn editor_parent_size(scene: &Scene, entity: &Entity, root_size: (f32, f32)) -> (f32, f32) {
+    match entity.parent {
+        Some(parent_id) => scene
+            .entity(parent_id)
+            .map(|parent| (parent.size_x, parent.size_y))
+            .unwrap_or((0.0, 0.0)),
+        None => root_size,
+    }
 }
 
-fn scene_world_transform(scene: &Scene, id: u64) -> Option<EditorWorldTransform> {
+fn editor_anchor_offset(
+    scene: &Scene,
+    entity: &Entity,
+    local: EditorLocalTransform,
+    root_size: (f32, f32),
+) -> (f32, f32) {
+    let (parent_w, parent_h) = editor_parent_size(scene, entity, root_size);
+    (parent_w * local.anchor_x, parent_h * local.anchor_y)
+}
+
+fn editor_entity_local_transform(entity: &Entity) -> EditorLocalTransform {
+    let mut transform = EditorLocalTransform {
+        x: entity.x,
+        y: entity.y,
+        scale: editor_entity_scale(entity),
+        anchor_x: entity.anchor_x,
+        anchor_y: entity.anchor_y,
+        pivot_x: 0.0,
+        pivot_y: 0.0,
+    };
+
+    for component in &entity.components {
+        let Component::Core { name, props } = component else {
+            continue;
+        };
+        if name != "EntityScaler" || prop_bool(props, &["enabled"]).is_some_and(|enabled| !enabled) {
+            continue;
+        }
+
+        transform.anchor_x = prop_number(props, &["x_percent", "xPercent", "percent_x", "percentX"])
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        transform.anchor_y = prop_number(props, &["y_percent", "yPercent", "percent_y", "percentY"])
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        transform.x = prop_number(props, &["offset_x", "offsetX"]).unwrap_or(0.0);
+        transform.y = prop_number(props, &["offset_y", "offsetY"]).unwrap_or(0.0);
+        transform.pivot_x = prop_number(props, &["pivot_x", "pivotX", "anchor_x", "anchorX"])
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        transform.pivot_y = prop_number(props, &["pivot_y", "pivotY", "anchor_y", "anchorY"])
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        break;
+    }
+
+    transform
+}
+
+fn scene_world_transform(
+    scene: &Scene,
+    id: u64,
+    root_size: (f32, f32),
+) -> Option<EditorWorldTransform> {
     let mut visiting = HashSet::new();
-    scene_world_transform_inner(scene, id, &mut visiting)
+    scene_world_transform_inner(scene, id, root_size, &mut visiting)
 }
 
 fn scene_world_transform_inner(
     scene: &Scene,
     id: u64,
+    root_size: (f32, f32),
     visiting: &mut HashSet<u64>,
 ) -> Option<EditorWorldTransform> {
     if !visiting.insert(id) {
@@ -3023,19 +3181,22 @@ fn scene_world_transform_inner(
     }
 
     let entity = scene.entity(id)?;
+    let local = editor_entity_local_transform(entity);
     let parent_transform = entity
         .parent
-        .and_then(|parent| scene_world_transform_inner(scene, parent, visiting))
+        .and_then(|parent| scene_world_transform_inner(scene, parent, root_size, visiting))
         .unwrap_or(EditorWorldTransform {
             x: 0.0,
             y: 0.0,
             scale: 1.0,
         });
-    let (anchor_x, anchor_y) = editor_parent_anchor_offset(scene, entity);
+    let (anchor_x, anchor_y) = editor_anchor_offset(scene, entity, local, root_size);
+    let pivot_x = entity.size_x * local.scale * local.pivot_x;
+    let pivot_y = entity.size_y * local.scale * local.pivot_y;
     let transform = EditorWorldTransform {
-        x: parent_transform.x + (anchor_x + entity.x) * parent_transform.scale,
-        y: parent_transform.y + (anchor_y + entity.y) * parent_transform.scale,
-        scale: parent_transform.scale * editor_entity_scale(entity),
+        x: parent_transform.x + (anchor_x + local.x - pivot_x) * parent_transform.scale,
+        y: parent_transform.y + (anchor_y + local.y - pivot_y) * parent_transform.scale,
+        scale: parent_transform.scale * local.scale,
     };
     visiting.remove(&id);
     Some(transform)
@@ -3046,11 +3207,13 @@ fn scene_world_origin_to_local_position(
     entity_id: u64,
     world_x: f32,
     world_y: f32,
+    root_size: (f32, f32),
 ) -> Option<(f32, f32)> {
     let entity = scene.entity(entity_id)?;
+    let local = editor_entity_local_transform(entity);
     let parent_transform = entity
         .parent
-        .and_then(|parent| scene_world_transform(scene, parent))
+        .and_then(|parent| scene_world_transform(scene, parent, root_size))
         .unwrap_or(EditorWorldTransform {
             x: 0.0,
             y: 0.0,
@@ -3061,10 +3224,12 @@ fn scene_world_origin_to_local_position(
     } else {
         parent_transform.scale
     };
-    let (anchor_x, anchor_y) = editor_parent_anchor_offset(scene, entity);
+    let (anchor_x, anchor_y) = editor_anchor_offset(scene, entity, local, root_size);
+    let pivot_x = entity.size_x * local.scale * local.pivot_x;
+    let pivot_y = entity.size_y * local.scale * local.pivot_y;
     Some((
-        (world_x - parent_transform.x) / parent_scale - anchor_x,
-        (world_y - parent_transform.y) / parent_scale - anchor_y,
+        (world_x - parent_transform.x) / parent_scale - anchor_x + pivot_x,
+        (world_y - parent_transform.y) / parent_scale - anchor_y + pivot_y,
     ))
 }
 
@@ -3461,7 +3626,7 @@ fn core_icon(name: &str) -> char {
         "Sprite2D" | "Image2D" | "NineSliceSprite2D" | "TileTexture2D" | "Spritebox2D" => icon::IMAGE,
         "Collider2D" => icon::BORDER_ALL,
         "Rigidbody2D" => icon::VIEW_IN_AR,
-        "Bolt2D" | "Rope2D" | "LegacyBolt2D" | "String2D" => icon::TUNE,
+        "EntityScaler" | "Bolt2D" | "Rope2D" | "LegacyBolt2D" | "String2D" => icon::TUNE,
         "Frame" | "ScrollList" => icon::VIEW_QUILT,
         "Button" => icon::ADD_CIRCLE,
         "Dropdown" => icon::EXPAND_MORE,
@@ -3813,6 +3978,65 @@ mod tests {
     }
 
     #[test]
+    fn prefab_import_offsets_only_roots() {
+        let mut h = Harness::new(Scene::default());
+        let path = h.app.bin_dir.join("nested.neoprefab");
+        let mut root = Entity::new(10, "Root", 25.0, 30.0);
+        root.size_x = 40.0;
+        root.size_y = 40.0;
+        let mut child = Entity::new(11, "Child", 8.0, 9.0);
+        child.parent = Some(root.id);
+        let json = serde_json::to_string_pretty(&vec![root, child]).expect("serialize prefab");
+        std::fs::write(&path, json).expect("write prefab");
+
+        h.app.instantiate_prefab(&path, 100.0, 120.0);
+        let root_id = h.app.selected.expect("root selected");
+        let root = h.app.scene.entity(root_id).expect("root");
+        assert_eq!((root.x, root.y), (100.0, 120.0));
+        let child = h
+            .app
+            .scene
+            .entities
+            .iter()
+            .find(|entity| entity.parent == Some(root_id))
+            .expect("child");
+        assert_eq!((child.x, child.y), (8.0, 9.0));
+    }
+
+    #[test]
+    fn opening_scene_path_loads_scene_document() {
+        let mut h = Harness::new(Scene::default());
+        let path = h.app.bin_dir.join("other.neoscene");
+        let mut scene = Scene::default();
+        scene.name = "Other".into();
+        scene.save(&path).expect("save scene");
+
+        h.app.open_scene_path(path.clone());
+        assert_eq!(h.app.scene.name, "Other");
+        assert_eq!(h.app.scene_path, path);
+    }
+
+    #[test]
+    fn image_cache_reloads_when_file_changes() {
+        let h = Harness::new(Scene::default());
+        let assets = h.app.project_root.join("assets");
+        std::fs::create_dir_all(&assets).expect("assets dir");
+        let path = assets.join("sprite.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]))
+            .save(&path)
+            .expect("save red");
+        let first = h.app.load_image("assets/sprite.png").expect("load first");
+        assert_eq!(first.get_pixel(0, 0).0, [255, 0, 0, 255]);
+
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 255, 0, 255]))
+            .save(&path)
+            .expect("save green");
+        let second = h.app.load_image("assets/sprite.png").expect("load second");
+        assert_eq!(second.get_pixel(0, 0).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
     fn add_entity_at_uses_world_position() {
         let mut h = Harness::new(Scene::default());
         let before = h.app.scene.entities.len();
@@ -3957,6 +4181,118 @@ mod tests {
     }
 
     #[test]
+    fn root_entity_scaler_uses_preview_root_bounds() {
+        let mut scene = Scene::default();
+        let entity_id = scene.entities[0].id;
+        {
+            let entity = scene.entity_mut(entity_id).expect("entity");
+            entity.size_x = 200.0;
+            entity.size_y = 100.0;
+            entity.components.push(Component::Core {
+                name: "EntityScaler".into(),
+                props: vec![
+                    Prop {
+                        name: "enabled".into(),
+                        label: "Enabled".into(),
+                        value: PropValue::Bool(true),
+                        advanced: false,
+                        optional: false,
+                    },
+                    Prop {
+                        name: "x_percent".into(),
+                        label: "X Pos %".into(),
+                        value: PropValue::Number(0.5),
+                        advanced: false,
+                        optional: false,
+                    },
+                    Prop {
+                        name: "y_percent".into(),
+                        label: "Y Pos %".into(),
+                        value: PropValue::Number(0.5),
+                        advanced: false,
+                        optional: false,
+                    },
+                    Prop {
+                        name: "offset_x".into(),
+                        label: "X Offset".into(),
+                        value: PropValue::Number(0.0),
+                        advanced: false,
+                        optional: false,
+                    },
+                    Prop {
+                        name: "offset_y".into(),
+                        label: "Y Offset".into(),
+                        value: PropValue::Number(0.0),
+                        advanced: false,
+                        optional: false,
+                    },
+                    Prop {
+                        name: "pivot_x".into(),
+                        label: "Pivot X".into(),
+                        value: PropValue::Number(0.5),
+                        advanced: false,
+                        optional: false,
+                    },
+                    Prop {
+                        name: "pivot_y".into(),
+                        label: "Pivot Y".into(),
+                        value: PropValue::Number(0.5),
+                        advanced: false,
+                        optional: false,
+                    },
+                ],
+            });
+        }
+
+        let h = Harness::new(scene);
+        let rect = h
+            .app
+            .entity_screen_rect(
+                h.app.scene.entity(entity_id).expect("entity"),
+                Rect::new(0.0, 0.0, 400.0, 300.0),
+            )
+            .expect("screen rect");
+
+        assert_eq!(rect.x, 540.0);
+        assert_eq!(rect.y, 310.0);
+        assert_eq!(rect.w, 200.0);
+        assert_eq!(rect.h, 100.0);
+    }
+
+    #[test]
+    fn root_anchor_uses_preview_root_bounds() {
+        let mut scene = Scene::default();
+        let entity_id = scene.entities[0].id;
+        {
+            let entity = scene.entity_mut(entity_id).expect("entity");
+            entity.x = 10.0;
+            entity.y = -20.0;
+            entity.anchor_x = 0.5;
+            entity.anchor_y = 0.5;
+            entity.size_x = 80.0;
+            entity.size_y = 40.0;
+        }
+
+        let h = Harness::new(scene);
+        let rect = h
+            .app
+            .entity_screen_rect(
+                h.app.scene.entity(entity_id).expect("entity"),
+                Rect::new(0.0, 0.0, 400.0, 300.0),
+            )
+            .expect("screen rect");
+        assert_eq!(rect.x, 650.0);
+        assert_eq!(rect.y, 340.0);
+
+        let (local_x, local_y) = h
+            .app
+            .world_origin_to_local_position(entity_id, 650.0, 340.0)
+            .expect("local position");
+        assert_eq!(local_x, 10.0);
+        assert_eq!(local_y, -20.0);
+    }
+
+    #[test]
     fn viewport_hit_uses_parent_relative_transform() {
         let mut scene = Scene::default();
         let parent = scene.entities[0].id;
@@ -4000,7 +4336,7 @@ mod tests {
         scene.entity_mut(child).expect("child").parent = Some(parent);
 
         let (local_x, local_y) =
-            scene_world_origin_to_local_position(&scene, child, 150.0, 70.0)
+            scene_world_origin_to_local_position(&scene, child, 150.0, 70.0, (1280.0, 720.0))
                 .expect("local position");
         assert_eq!(local_x, 25.0);
         assert_eq!(local_y, 10.0);

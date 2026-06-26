@@ -510,6 +510,27 @@ export type BaseDrawableComponent = ComponentInstance & {
 
 export type Rect2D = BaseDrawableComponent
 
+export type EntityScaler = ComponentInstance & {
+	__neolove_component: "EntityScaler",
+	enabled: boolean,
+	x_percent: number,
+	y_percent: number,
+	xPercent: number?,
+	yPercent: number?,
+	percent_x: number?,
+	percent_y: number?,
+	percentX: number?,
+	percentY: number?,
+	offset_x: number,
+	offset_y: number,
+	offsetX: number?,
+	offsetY: number?,
+	pivot_x: number,
+	pivot_y: number,
+	pivotX: number?,
+	pivotY: number?,
+}
+
 export type Shape2DShape = "box" | "circle" | "triangle" | "right_triangle" | "righttriangle" | "rightangledtriangle"
 export type TriangleCorner = "bl" | "br" | "tl" | "tr" | "bottomright" | "rightbottom" | "topleft" | "lefttop" | "topright" | "righttop"
 
@@ -774,6 +795,7 @@ export type Rope2D = ComponentInstance & {
 
 export type CoreModule = {
 	Rect2D: Rect2D,
+	EntityScaler: EntityScaler,
 	Shape2D: Shape2D,
 	TextBox: TextBox,
 	TextLabel: TextLabel,
