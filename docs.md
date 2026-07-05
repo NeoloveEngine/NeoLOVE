@@ -1,7 +1,7 @@
 <!-- page: overview | Overview -->
 # Overview
 
-NeoLOVE is a Rust game engine for Luau projects. A project is a directory with a `main.luau` file and, optionally, a `neolove.toml`, assets, components, modules, and generated web output. Runtime APIs are exposed as Luau globals such as `ecs`, `core`, `assets`, `input`, `audio`, `fs`, `servers`, `shaders`, `tweening`, and `async`.
+NeoLOVE is a Rust game engine for Luau projects. A project is a directory with a `main.luau` file and, optionally, a `neolove.toml`, assets, components, modules, and generated web output. Runtime APIs are exposed as Luau globals such as `ecs`, `core`, `assets`, `input`, `audio`, `fs`, `servers`, `shaders`, `tweening`, `animation`, and `async`.
 
 The generated type surface is also available in `neolove_engine_api.d.luau`. New projects receive a copy from `src/project_template/neolove_engine_api.d.luau`.
 
@@ -29,7 +29,7 @@ cargo build --release
 cargo build --release --features vulkan
 ```
 
-The default desktop binary uses the software renderer and omits Vulkan to reduce executable size. Use `--features vulkan` for GPU acceleration and custom shader rendering. The default asset codecs include PNG, BMP, TGA, PNM, and WebP images plus WAV audio on native builds; web builds can also play browser-decodable audio formats.
+The default desktop binary uses the software renderer and omits Vulkan to reduce executable size. Use `--features vulkan` for GPU acceleration and custom shader rendering. Image codecs include PNG, JPEG, GIF, BMP, TGA, TIFF, PNM, WebP, HDR, and DDS. Native audio supports WAV, MP3, OGG/Vorbis, and FLAC; web builds can also play browser-decodable AAC/M4A and AIFF.
 
 <!-- page: project-model | Project Model -->
 # Project Model
@@ -69,7 +69,7 @@ neolove editor
 neolove editor path/to/my-game
 ```
 
-The editor opens a native window with a toolbar, a dockable Hierarchy, a 2D
+The editor opens a native window with a toolbar, document tabs, a dockable Hierarchy, a 2D
 Viewport, an Inspector, and a bottom Project browser. It does not require a
 `main.luau` file to open; it loads `scene.neoscene` when present and creates a
 starter scene otherwise.
@@ -83,7 +83,7 @@ Editor files:
 
 Toolbar actions:
 
-- **New** creates a new scene document.
+- **New** creates a new scene in its own tab.
 - **Save** writes the current scene to its `.neoscene` file.
 - **Load** reloads the current `.neoscene` file.
 - **Export** writes a runnable `main.luau`.
@@ -97,23 +97,81 @@ active toggle to exclude an entity and its descendants from export, and use
 right-click menus for common actions such as add child, duplicate, copy, paste,
 unparent, reset transform, frame selected, rename, and delete.
 
+The toolbar's three-dot menu contains Unity-style selection, hierarchy,
+alignment, and Scene-view tools. Hierarchy eye and lock controls affect only
+the editor view: they never disable or remove an entity from the exported game.
+Branches can be folded individually or collapsed and expanded in bulk.
+
 The Inspector edits entity transform data (`x`, `y`, `z`, size, rotation,
 scale, and anchors), scene background color, attached components, and script
 public variables. The editor's built-in component menu is backed by the real
 engine component names:
 
-- Common: `Rect2D`, `Shape2D`, `TextBox`, `TextLabel`, `Sprite2D`, `Image2D`,
-  `NineSliceSprite2D`, `TileTexture2D`, `Collider2D`, and `Rigidbody2D`.
+- Common: `Rect2D`, `Shape2D`, `ParticleSystem2D`, `TextBox`, `TextLabel`, `Sprite2D`, `Image2D`,
+  `NineSliceSprite2D`, `Tilemap2D`, `TileTexture2D`, `Collider2D`, and `Rigidbody2D`.
 - Advanced: `Spritebox2D`, `Bolt2D`, `Rope2D`, `LegacyBolt2D`, `String2D`,
   and `RudimentaryTextLabel`.
-- Script components store a module path plus public variables of type number,
-  boolean, text, or color. Export assigns those values after
-  `AddComponent(require("..."))`.
+- Drag a `.luau` or `.lua` component script from the Project browser onto an
+  entity in the Hierarchy or Viewport to attach it.
+- Script variables wrapped in `Inspector(...)` are derived from their defaults
+  and exported after `AddComponent(require("..."))`:
 
-Image properties use project-relative asset paths and export as
-`assets.loadImage("...")`, so generated Luau receives image handles rather than
-plain strings. The viewport previews image components with the real asset,
-including nine-slice and tiled rendering.
+```luau
+local Component = {
+    speed = Inspector(100),                    -- number field
+    lives = Inspector(1, 10),                  -- whole-number slider
+    opacity = Inspector(0, 1, true),           -- fractional slider
+    tint = Inspector(Color4(255, 120, 80)),    -- colour picker
+    inventory = Inspector({ "sword", "key" }), -- editable list
+    stats = Inspector({ health = 100, mana = 40 }), -- dictionary
+    target = Inspector(IEntity),               -- scene entity reference
+    renderer = Inspector(IComponent),          -- scene component reference
+}
+```
+
+For numeric sliders, the first number is both the initial value and one range
+endpoint. Passing `true` as the third argument enables fractional values;
+fractional bounds enable them automatically. Tables with consecutive numeric
+keys starting at `1` are lists. Tables with gaps or non-numeric keys are
+dictionaries. Lists and dictionaries can contain nested inspector-supported
+values. When the script changes on disk, the editor refreshes its declaration
+schema and preserves compatible edited values by name.
+
+Entity and component defaults may also be concrete runtime values instead of
+`IEntity`/`IComponent`; the editor infers the same reference field. To assign an
+entity, drag its Hierarchy row onto the field. To assign a component, drag its
+Inspector header, hover the destination entity in the Hierarchy to inspect it,
+then drop the component onto the destination field without releasing the mouse.
+
+Image properties use project-relative paths or base64 PNG data. The editor
+generates an `images.luau` cache and requires script component modules at the
+top of `main.luau`, so images and code are loaded once in the appropriate
+place. The viewport previews image components with the real asset, including
+nine-slice and tiled rendering.
+
+### Particle System 2D
+
+`ParticleSystem2D` is a bounded circle-particle emitter with point, box, and
+circle emission shapes. The visual editor exposes emission rate, maximum
+particles, duration/looping, lifetime, speed, direction/spread, start/end size,
+start/end color, radius, and gravity. Its deterministic editor preview shows a
+representative spread without changing the saved scene.
+
+```luau
+local emitter = ecs.newEntity("Sparks", ecs.root, 320, 240)
+local particles = emitter:AddComponent(core.ParticleSystem2D)
+particles.emission_rate = 40
+particles.lifetime = 0.8
+particles.speed = 140
+particles.spread = 55
+particles.start_color = Color4(255, 210, 90)
+particles.end_color = Color4(255, 60, 20, 0)
+
+particles:pause()
+particles:emit(12) -- one-shot burst
+particles:play()
+particles:stop()   -- stops and clears live particles
+```
 
 ## Viewport And Project Browser
 
@@ -128,7 +186,10 @@ handles editor prefabs:
 - Drag an entity from the Hierarchy to the Project browser to save a
   `.neoprefab` containing that entity and its descendants.
 - Drag a `.neoprefab` from the Project browser into the Viewport to instantiate
-  it at the drop position with fresh entity ids.
+  it at the drop position with fresh entity ids and a source link.
+- Double-click a `.neoscene` or `.neoprefab` to open it in a tab. A prefab tab
+  contains only that prefab. Saving it refreshes linked instances in open and
+  on-disk scenes while preserving each instance root's placement.
 
 Useful shortcuts:
 
@@ -137,11 +198,20 @@ Useful shortcuts:
 - `Ctrl+Y` or `Ctrl+Shift+Z`: redo.
 - `Ctrl+C` / `Ctrl+V`: copy and paste the selected entity.
 - `Ctrl+D`: duplicate the selected entity.
+- `Ctrl+A`: select all entities; `Ctrl+Shift+A` inverts the selection.
+- `Ctrl+G`: group the selection; `Ctrl+Shift+G` unparents it.
+- `H` / `Shift+H`: hide the selection in the Scene view / show all.
+- `L` / `Shift+L`: lock selection from Scene picking / unlock all.
+- `G`: toggle the grid; `Shift+S`: toggle snapping.
 - `F`: frame the selected entity.
+- `Home`: frame all visible entities.
+- `Shift+Space`: maximize or restore the Scene view.
 - `0`: reset the viewport camera.
 - `F2`: rename the selected entity.
 - Arrow keys: nudge the selected entity by one unit; hold `Shift` to nudge by
   the grid step.
+- Hold `Ctrl` while dragging a resize handle to preserve the entity's aspect
+  ratio.
 
 ## Runtime Loading
 
@@ -272,8 +342,11 @@ Fields and functions:
 
 - `app.bg`: clear color.
 - `app.nearestNeighborScaling`: texture filtering default. `true` means nearest-neighbor.
+- `app.antiAliasing`: `off`, `standard`, or `high` (the default).
 - `app.setNearestNeighborScaling(enabled?)`
 - `app.getNearestNeighborScaling()`
+- `app.setAntiAliasing(mode?)`
+- `app.getAntiAliasing()`
 - `app.setMaxFps(fps?)`
 - `app.getMaxFps()`
 - `app.setShowFps(enabled?)`
@@ -334,6 +407,9 @@ Images:
 
 ```luau
 local image = assets.loadImage("assets/player.png")
+local embedded = assets.loadImage("data:image/png;base64,iVBORw0KGgo...")
+local embeddedRaw = assets.loadImageBase64("iVBORw0KGgo...")
+local photo = assets.snapPhoto(100, 80, 420, 300)
 local blank = assets.newImage(64, 64, Color4(0, 0, 0, 0))
 local w = image:width()
 local h = image:height()
@@ -370,7 +446,12 @@ local imageCount, soundCount = assets.gc()
 
 Edges:
 
-- Images can be loaded from PNG, BMP, TGA, PNM, and WebP files in the default build.
+- Images can be loaded from PNG, JPEG, GIF, BMP, TGA, TIFF, PNM, WebP, HDR, and DDS files.
+- `loadImage` also accepts raw base64-encoded PNG data, `base64:` values, and
+  `data:image/png;base64,...` URIs. `loadImageBase64` is the explicit raw-data API.
+- `snapPhoto(x, y, x2, y2)` returns an `ImageHandle` containing that rectangle
+  from the most recently rendered frame. Coordinates are top-left and
+  bottom-right, and are clipped to the window. Call it after at least one frame.
 - `getPixel` and `setPixel` use zero-based coordinates.
 - Unloaded handles reject further reads, writes, uploads, and rendering.
 - Relative `save` and `export` paths use the writable game data directory.
@@ -402,10 +483,19 @@ audio.stop(sound)
 
 Edges:
 
-- Native builds load WAV audio. Web builds can also pass browser-decodable MP3, OGG, FLAC, AAC/M4A, and AIFF files to `audio.play`; editable sample data is available for WAV sounds.
+- Native builds load WAV, MP3, OGG/Vorbis, and FLAC. Web builds also pass browser-decodable AAC/M4A and AIFF through WebAudio.
 - Volume is clamped to `0..1`.
 - Browser audio may not start until the user interacts with the page.
 - `playOnce` is `play(sound, false, volume)`.
+
+2D spatial playback uses world coordinates. Move the listener once per frame
+when it follows a camera or player:
+
+```luau
+audio.setListenerPosition(camera.x, camera.y)
+audio.playSpatial(sound, enemy.x, enemy.y, true, 0.8)
+audio.setPosition(sound, enemy.x, enemy.y)
+```
 
 <!-- page: file-system | File System -->
 # File System
@@ -618,6 +708,33 @@ Edges:
 - `cancelAll()` returns the number of cancelled tweens.
 - The engine exposes `tweening.update(dt)` for explicit control.
 
+<!-- page: animation | Animation -->
+# Animation
+
+Globals: `animation`, `animations`
+
+Animation clips contain numeric property tracks and advance automatically
+before game systems update. Tracks support linear and step/hold interpolation.
+
+```luau
+local clip = {
+    duration = 1,
+    looping = true,
+    tracks = {
+        { property = "x", keys = {
+            { time = 0, value = 100 },
+            { time = 1, value = 300 },
+        }},
+    },
+}
+
+local player = animation.play(entity, clip)
+player:pause()
+player:seek(0.25)
+player:setSpeed(2)
+player:play()
+```
+
 <!-- page: ecs | ECS -->
 # ECS
 
@@ -660,7 +777,12 @@ entity:Delete()
 entity:FindFirstChild("name")
 local wx, wy = entity:GetWorldPosition()
 local rot = entity:GetWorldRotation()
+local containsPoint = entity:IsInside(worldX, worldY)
 ```
+
+`IsInside` returns whether a world-space point is within the entity's transformed
+bounds, including parent transforms, scale, rotation, and pivots. Bounds edges
+count as inside. `isInside` is a lower-camel alias.
 
 ECS functions:
 
@@ -816,12 +938,16 @@ Globals: `prefabs`, `prefab`
 local template = prefabs.capture(entity)
 prefabs.register("enemy", template)
 local enemy = prefabs.instantiate("enemy", ecs.root)
+
+local fileTemplate = prefabs.load("prefabs/enemy.neoprefab")
+local fileEnemy = prefabs.instantiate(fileTemplate, ecs.root)
 ```
 
 Functions:
 
 - `prefabs.capture(entity)`
 - `prefabs.component(source, overrides?)`
+- `prefabs.load(path)`
 - `prefabs.register(name, source)`
 - `prefabs.get(name)`
 - `prefabs.remove(name)`
@@ -835,9 +961,16 @@ Edges:
 - Prefabs store entity fields, children, and components.
 - `prefabs.component` is useful for making component prototypes with overrides.
 - `instantiate` accepts a registered name, an entity, or a prefab template.
-- The visual editor also saves `.neoprefab` files from entity subtrees. These
-  are editor JSON files that can be dragged back into the editor viewport; the
-  runtime `prefabs` API uses Luau tables instead.
+- The visual editor saves `.neoprefab` files from entity subtrees. Drag them
+  into the editor viewport, or load them at runtime with `prefabs.load(path)`.
+- Prefab paths use the same project/data resource resolution as `fs.readFile`.
+- Script component paths stored in editor prefabs resolve from the project root,
+  even when `prefabs.load` is called by a nested module. Entity and component
+  Inspector references within the prefab are preserved and remapped per instance.
+- Instantiation runs component `awake` callbacks once, in parent-to-descendant
+  and component-list order, after the complete prefab tree and its references
+  have been created. Prefab-authored component values are preserved across
+  default initialization. Loading a prefab template does not run script `awake`.
 
 <!-- page: rendering-components | Core Rendering Components -->
 # Core Rendering Components
@@ -891,6 +1024,7 @@ Fields:
 - `letter_spacing`
 - `tab_size`: number of spaces a tab character advances by, default `4`; `tab_width` is accepted as an alias
 - `font`
+- `antialiasing`: `inherit`, `off`, `standard`, or `high`. `inherit` uses `app.antiAliasing`.
 - `scale_x`, `scale_y`, `dx`, `dy`, `line_count`
 
 Rich text methods use zero-based, end-exclusive character ranges. Formatting is stored separately from `text`, so surviving ranges continue to apply after text reassignment when their indices still overlap the new string. Overlapping formatting is supported. `clearFormatting()` with no arguments clears the whole string; `clearAllFormatting()` is an explicit alias.
@@ -901,6 +1035,8 @@ Rich text methods use zero-based, end-exclusive character ranges. Formatting is 
 - `setColor(startIndex, endIndex, Color4)`
 - `setSize(startIndex, endIndex, scale)` relative to the component `scale`
 - `setFont(startIndex, endIndex, fontPath)`
+- `setOffset(startIndex, endIndex, x, y)` applies a pixel offset without changing character advance; `setPixelOffset` is an alias.
+- `setCharacterOffset(charIndex, x, y)` offsets one character.
 - `clearFormatting(startIndex?, endIndex?)`
 - `clearAllFormatting()`
 - `getLetterCount()`
@@ -980,6 +1116,13 @@ Edges:
 - `tile_width` and `tile_height` default to the image size when `0`.
 - Non-rotated tile layers are culled to the viewport before queueing tiles.
 - Rotated tile layers preserve full-entity iteration for correctness.
+
+## `core.Tilemap2D`
+
+Draws a finite grid from an atlas. Set `map_width`, `map_height`, `tile_width`,
+and `tile_height`. `tiles` is a flat numeric array or a comma/whitespace-separated
+string. Tile `0` is the first atlas cell and `-1` is empty. `spacing` and
+`margin` support packed atlases.
 
 <!-- page: spritebox2d | Spritebox2D -->
 # Spritebox2D
@@ -1205,6 +1348,17 @@ Texture filtering comes from `app.nearestNeighborScaling`:
 
 - `true`: nearest neighbor.
 - `false`: linear filtering.
+
+Anti-aliasing comes from `app.antiAliasing`:
+
+- `off`: hard one-sample edges and pixel-hard text masks.
+- `standard`: 2× software edge coverage and normal grayscale glyph rasterization.
+- `high`: 4× software geometry edge coverage and 2× supersampled text with
+  premultiplied downsampling. Individual text components can override this with
+  their `antialiasing` field.
+
+Vulkan builds use the best supported device MSAA level for geometry; the text
+quality modes still apply because glyphs are rasterized before GPU upload.
 
 Rendering is skipped for components with `visible = false`, nil images, unloaded images, zero or negative sizes, or fully transparent colors.
 

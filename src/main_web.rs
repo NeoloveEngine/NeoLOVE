@@ -1,4 +1,5 @@
 mod assets;
+mod animation;
 mod audio_system;
 mod commands;
 mod core;

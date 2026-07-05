@@ -16,7 +16,7 @@ optional `neolove.toml` configuration file.
 ## Features
 
 - Luau scripting with generated type definitions
-- Entities, hierarchy, components, systems, prefabs, and tweening
+- Entities, hierarchy, components, systems, linked prefabs, tweening, and keyframe animation
 - Shapes, text, sprites, nine-slice sprites, tile textures, and custom shaders
 - Rigidbody, collider, rope, raycasting, and pixel-shaped sprite queries
 - Keyboard, mouse, audio, image, file system, HTTP, and server APIs
@@ -104,7 +104,7 @@ The editor opens a window with a dockable **Hierarchy**, a 2D **Viewport**, an
 **Inspector**, and a bottom **Project** file browser:
 
 - Build scenes from entities and the real engine components — `Rect2D`,
-  `Shape2D`, `TextBox`, `Sprite2D`, `NineSliceSprite2D`, `TileTexture2D`,
+  `Shape2D`, `ParticleSystem2D`, `TextBox`, `Sprite2D`, `NineSliceSprite2D`, `Tilemap2D`, `TileTexture2D`,
   `Collider2D`, `Rigidbody2D`, `Bolt2D`, `Rope2D` — added from a dropdown, each
   with its inspector-editable properties (advanced fields collapse away).
 - Nest entities into a hierarchy by dragging rows; set per-entity `z` order and
@@ -168,7 +168,7 @@ NeoLOVE exposes its APIs as Luau globals:
 | Assets and audio | `assets`, `audio` |
 | Files and processes | `fs`, `commands`, `command` |
 | Networking | `http`, `servers` |
-| Gameplay helpers | `prefabs`, `prefab`, `tweening`, `tween` |
+| Gameplay helpers | `prefabs`, `prefab`, `tweening`, `tween`, `animation`, `animations` |
 | Rendering | `shaders` |
 
 The complete typed API is defined in
@@ -218,7 +218,8 @@ and a local toolchain under `~/.neolove/toolchains/emsdk`.
 
 ## Asset Support
 
-- Images: PNG, BMP, TGA, PNM, and WebP
+- Images: PNG, JPEG, GIF, BMP, TGA, TIFF, PNM, WebP, HDR, and DDS
+- Audio: WAV, MP3, OGG/Vorbis, and FLAC natively, plus browser codecs on web
 - Native audio: WAV
 - Browser audio: WAV and browser-decodable MP3, OGG, FLAC, AAC/M4A, and AIFF
 
@@ -238,23 +239,6 @@ They are not restricted to the project, data, or executable directory; normal
 operating-system permissions still apply. See [`docs.md`](docs.md) for path and
 async task examples.
 
-## Examples
-
-The [`samples`](samples) directory includes projects covering:
-
-- [`dodge`](samples/dodge) and [`blackjack`](samples/blackjack)
-- [`rigidbody2d`](samples/rigidbody2d), [`bolt2d`](samples/bolt2d), and
-  [`raycasting`](samples/raycasting)
-- [`spriteboxes`](samples/spriteboxes) and [`shaders`](samples/shaders)
-- [`tweening`](samples/tweening) and [`webasm_smoke`](samples/webasm_smoke)
-- [`feature_lab`](samples/feature_lab), a comprehensive interactive API smoke test
-
-Run any sample by passing its directory to the CLI:
-
-```bash
-neolove run samples/dodge
-```
-
 ## Development
 
 ```bash
@@ -265,7 +249,8 @@ cargo check --target wasm32-unknown-unknown
 ```
 
 Release builds use size optimization, fat LTO, a single codegen unit, stripped
-binaries, and abort-on-panic behavior.
+symbols, and a deflated embedded project payload so image and audio assets are
+compressed in standalone builds. Web upload ZIPs use deflate compression as well.
 
 ## License
 

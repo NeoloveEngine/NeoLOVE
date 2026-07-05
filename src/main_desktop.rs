@@ -1,8 +1,10 @@
 mod assets;
+mod animation;
 mod audio_system;
 mod commands;
 mod core;
 mod editor;
+mod editor_ipc;
 mod fs_module;
 #[cfg(feature = "vulkan")]
 mod gpu_renderer;
@@ -26,6 +28,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use image::imageops::FilterType;
@@ -50,6 +53,7 @@ use crate::renderer::SoftwareRenderer;
 
 const EMBED_TRAILER_MAGIC: &[u8; 16] = b"NEOLOVE_EMBED_V1";
 const PAYLOAD_MAGIC: &[u8; 8] = b"NLPKGv1\0";
+const COMPRESSED_PAYLOAD_MAGIC: &[u8; 8] = b"NLPKGv2\0";
 const TEMPLATE_LUAURC: &str = include_str!("project_template/.luaurc");
 const TEMPLATE_VSCODE_SETTINGS: &str = include_str!("project_template/vscode_settings.json");
 const TEMPLATE_NEOLOVE_ENGINE_API: &str =
@@ -581,7 +585,28 @@ fn build_payload(project_root: &Path) -> Result<Vec<u8>, String> {
     step += 1;
     progress_bar(step, total_steps, "Finalizing payload");
 
-    Ok(payload)
+    compress_build_payload(&payload)
+}
+
+fn compress_build_payload(payload: &[u8]) -> Result<Vec<u8>, String> {
+    let cursor = std::io::Cursor::new(Vec::new());
+    let mut archive = zip::ZipWriter::new(cursor);
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .compression_level(Some(9));
+    archive
+        .start_file("project.payload", options)
+        .map_err(|error| format!("failed to start compressed build payload: {error}"))?;
+    archive
+        .write_all(payload)
+        .map_err(|error| format!("failed to compress build assets: {error}"))?;
+    let cursor = archive
+        .finish()
+        .map_err(|error| format!("failed to finalize compressed build payload: {error}"))?;
+    let mut compressed = Vec::with_capacity(COMPRESSED_PAYLOAD_MAGIC.len() + cursor.get_ref().len());
+    compressed.extend_from_slice(COMPRESSED_PAYLOAD_MAGIC);
+    compressed.extend_from_slice(cursor.get_ref());
+    Ok(compressed)
 }
 
 fn read_embedded_payload(exe_path: &Path) -> Result<Option<Vec<u8>>, String> {
@@ -630,6 +655,19 @@ fn read_embedded_payload(exe_path: &Path) -> Result<Option<Vec<u8>>, String> {
 }
 
 fn unpack_payload(payload: &[u8], output_dir: &Path) -> Result<(), String> {
+    if payload.starts_with(COMPRESSED_PAYLOAD_MAGIC) {
+        let cursor = std::io::Cursor::new(&payload[COMPRESSED_PAYLOAD_MAGIC.len()..]);
+        let mut archive = zip::ZipArchive::new(cursor)
+            .map_err(|error| format!("compressed payload is invalid: {error}"))?;
+        let mut entry = archive
+            .by_name("project.payload")
+            .map_err(|error| format!("compressed payload has no project data: {error}"))?;
+        let mut decoded = Vec::new();
+        entry
+            .read_to_end(&mut decoded)
+            .map_err(|error| format!("failed to decompress build assets: {error}"))?;
+        return unpack_payload(&decoded, output_dir);
+    }
     let mut index = 0usize;
     let magic = read_exact(payload, &mut index, PAYLOAD_MAGIC.len())?;
     if magic != PAYLOAD_MAGIC {
@@ -1819,9 +1857,13 @@ fn report_runtime_failure(title: &str, message: &str) {
     }
 }
 
-fn exit_runtime_failure(control_flow: &mut ControlFlow, title: &str, message: &str) {
+fn exit_runtime_failure(_control_flow: &mut ControlFlow, title: &str, message: &str) -> ! {
     report_runtime_failure(title, message);
-    *control_flow = ControlFlow::Exit;
+    // EventLoop::run terminates with status 0 when ControlFlow::Exit is used,
+    // which makes the editor treat a fatal runtime error as a normal close and
+    // discard stderr. A fatal frame/render error must be observable by the
+    // parent process.
+    std::process::exit(1);
 }
 
 fn desktop_panic_hint(message: &str) -> Option<&'static str> {
@@ -1847,6 +1889,41 @@ fn describe_desktop_panic(context: &str, payload: &(dyn std::any::Any + Send)) -
     rendered
 }
 
+fn install_desktop_panic_hook() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            let thread = std::thread::current();
+            let thread_name = thread.name().unwrap_or("unnamed");
+            let location = info
+                .location()
+                .map(|location| {
+                    format!(
+                        "{}:{}:{}",
+                        location.file(),
+                        location.line(),
+                        location.column()
+                    )
+                })
+                .unwrap_or_else(|| "unknown location".to_string());
+            let payload = if let Some(message) = info.payload().downcast_ref::<&str>() {
+                (*message).to_string()
+            } else if let Some(message) = info.payload().downcast_ref::<String>() {
+                message.clone()
+            } else {
+                "non-string panic payload".to_string()
+            };
+            let message = format!(
+                "NeoLOVE internal panic on thread '{thread_name}' at {location}:\n{payload}\nBacktrace:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+            // A panic hook must not cause a second panic if stderr has already
+            // been closed by a launcher or pipe consumer.
+            let _ = writeln!(std::io::stderr().lock(), "{message}");
+        }));
+    });
+}
+
 fn catch_desktop_panic<T>(context: &str, f: impl FnOnce() -> T) -> Result<T, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
         .map_err(|payload| describe_desktop_panic(context, payload.as_ref()))
@@ -1865,6 +1942,17 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
         None => window::Runtime::new(project_root),
     };
     runtime.set_platform_window_state(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
+
+    // When launched by the editor, stream logs and live scene snapshots back to
+    // its logger window over loopback IPC. Absent the env var this is a no-op.
+    let ipc_client = env::var("NEOLOVE_EDITOR_IPC")
+        .ok()
+        .and_then(|addr| editor_ipc::IpcClient::connect(&addr));
+    let (log_tx, log_rx) = std::sync::mpsc::channel();
+    if ipc_client.is_some() {
+        runtime.set_log_sink(log_tx);
+    }
+
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.start())) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -1904,6 +1992,7 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
     let mut presenter = DesktopPresenter::new(&event_loop, &window)?;
 
     let mut last_update = Instant::now();
+    let mut last_snapshot = Instant::now();
     let mut cursor_grab_warning_logged = false;
     event_loop.run(move |event, _target, control_flow| {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2012,7 +2101,6 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
                             exit_runtime_failure(control_flow, "Fatal Runtime Error:", &error);
-                            return;
                         }
                         Err(payload) => {
                             exit_runtime_failure(
@@ -2023,7 +2111,20 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
                                     lua_error::describe_panic(payload.as_ref())
                                 ),
                             );
-                            return;
+                        }
+                    }
+
+                    // Stream output and a throttled live snapshot to the editor.
+                    if let Some(ipc) = ipc_client.as_ref() {
+                        while let Ok(line) = log_rx.try_recv() {
+                            ipc.send(&editor_ipc::IpcMessage::Log(line));
+                        }
+                        let now = Instant::now();
+                        if now.duration_since(last_snapshot) >= Duration::from_millis(100) {
+                            last_snapshot = now;
+                            ipc.send(&editor_ipc::IpcMessage::Scene {
+                                entities: runtime.snapshot_entities(),
+                            });
                         }
                     }
 
@@ -2056,7 +2157,6 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
                         },
                     ) {
                         exit_runtime_failure(control_flow, "Fatal Runtime Error:", &error);
-                        return;
                     }
 
                     if let Some(max_fps) = runtime.max_fps() {
@@ -2384,6 +2484,7 @@ fn run_cli() -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    install_desktop_panic_hook();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_cli)) {
         Ok(Ok(())) => ExitCode::SUCCESS,
         Ok(Err(error)) => {
@@ -2402,5 +2503,35 @@ fn main() -> ExitCode {
             }
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod build_compression_tests {
+    use super::*;
+
+    #[test]
+    fn compressed_payload_round_trips_asset_bytes() {
+        let data = vec![42u8; 32 * 1024];
+        let path = "assets/ambience.wav";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(PAYLOAD_MAGIC);
+        write_u32(&mut raw, 1);
+        write_u16(&mut raw, path.len() as u16);
+        raw.extend_from_slice(path.as_bytes());
+        write_u64(&mut raw, data.len() as u64);
+        raw.extend_from_slice(&data);
+
+        let compressed = compress_build_payload(&raw).expect("compress payload");
+        assert!(compressed.len() < raw.len());
+        let output = std::env::temp_dir().join(format!(
+            "neolove_compression_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&output);
+        std::fs::create_dir_all(&output).unwrap();
+        unpack_payload(&compressed, &output).expect("unpack payload");
+        assert_eq!(std::fs::read(output.join(path)).unwrap(), data);
+        let _ = std::fs::remove_dir_all(output);
     }
 }

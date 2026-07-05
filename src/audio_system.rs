@@ -2,16 +2,41 @@
 mod native {
     use crate::assets::SoundHandle;
     use mlua::{AnyUserData, Lua};
-    use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
+    use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source, SpatialSink};
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
 
+    enum PlayingSink {
+        Flat(Arc<Sink>),
+        Spatial {
+            sink: Arc<SpatialSink>,
+            emitter: [f32; 3],
+        },
+    }
+
+    impl PlayingSink {
+        fn stop(&self) {
+            match self {
+                Self::Flat(sink) => sink.stop(),
+                Self::Spatial { sink, .. } => sink.stop(),
+            }
+        }
+
+        fn set_volume(&self, volume: f32) {
+            match self {
+                Self::Flat(sink) => sink.set_volume(volume),
+                Self::Spatial { sink, .. } => sink.set_volume(volume),
+            }
+        }
+    }
+
     struct AudioBackend {
         _stream: OutputStream,
         handle: OutputStreamHandle,
-        sinks: Mutex<HashMap<usize, Arc<Sink>>>,
+        sinks: Mutex<HashMap<usize, PlayingSink>>,
+        listener: Mutex<[f32; 2]>,
     }
 
     impl AudioBackend {
@@ -23,6 +48,7 @@ mod native {
                 _stream: stream,
                 handle,
                 sinks: Mutex::new(HashMap::new()),
+                listener: Mutex::new([0.0, 0.0]),
             })
         }
 
@@ -44,10 +70,88 @@ mod native {
                 .sinks
                 .lock()
                 .map_err(|_| mlua::Error::external("audio sink lock poisoned"))?;
-            if let Some(existing) = sinks.insert(sound.id(), sink.clone()) {
+            if let Some(existing) = sinks.insert(sound.id(), PlayingSink::Flat(sink.clone())) {
                 existing.stop();
             }
             sink.play();
+            Ok(())
+        }
+
+        fn play_spatial(
+            &self,
+            sound: &SoundHandle,
+            x: f32,
+            y: f32,
+            looped: bool,
+            volume: f32,
+        ) -> mlua::Result<()> {
+            let bytes = sound.bytes()?;
+            let decoder = Decoder::new(Cursor::new(bytes)).map_err(|error| {
+                mlua::Error::external(format!("failed to decode audio data: {error}"))
+            })?;
+            let listener = *self
+                .listener
+                .lock()
+                .map_err(|_| mlua::Error::external("audio listener lock poisoned"))?;
+            let left_ear = [listener[0] - 0.1, listener[1], 0.0];
+            let right_ear = [listener[0] + 0.1, listener[1], 0.0];
+            let emitter = [x, y, 0.0];
+            let sink = Arc::new(
+                SpatialSink::try_new(&self.handle, emitter, left_ear, right_ear).map_err(
+                    |error| mlua::Error::external(format!("failed to create spatial audio sink: {error}")),
+                )?,
+            );
+            sink.set_volume(volume.clamp(0.0, 1.0));
+            if looped {
+                sink.append(decoder.repeat_infinite());
+            } else {
+                sink.append(decoder);
+            }
+            let mut sinks = self
+                .sinks
+                .lock()
+                .map_err(|_| mlua::Error::external("audio sink lock poisoned"))?;
+            if let Some(existing) = sinks.insert(
+                sound.id(),
+                PlayingSink::Spatial {
+                    sink: sink.clone(),
+                    emitter,
+                },
+            ) {
+                existing.stop();
+            }
+            sink.play();
+            Ok(())
+        }
+
+        fn set_position(&self, sound: &SoundHandle, x: f32, y: f32) -> mlua::Result<bool> {
+            let mut sinks = self
+                .sinks
+                .lock()
+                .map_err(|_| mlua::Error::external("audio sink lock poisoned"))?;
+            let Some(PlayingSink::Spatial { sink, emitter }) = sinks.get_mut(&sound.id()) else {
+                return Ok(false);
+            };
+            *emitter = [x, y, 0.0];
+            sink.set_emitter_position(*emitter);
+            Ok(true)
+        }
+
+        fn set_listener_position(&self, x: f32, y: f32) -> mlua::Result<()> {
+            *self
+                .listener
+                .lock()
+                .map_err(|_| mlua::Error::external("audio listener lock poisoned"))? = [x, y];
+            let sinks = self
+                .sinks
+                .lock()
+                .map_err(|_| mlua::Error::external("audio sink lock poisoned"))?;
+            for sink in sinks.values() {
+                if let PlayingSink::Spatial { sink, .. } = sink {
+                    sink.set_left_ear_position([x - 0.1, y, 0.0]);
+                    sink.set_right_ear_position([x + 0.1, y, 0.0]);
+                }
+            }
             Ok(())
         }
 
@@ -134,6 +238,45 @@ mod native {
             })?,
         )?;
 
+        audio.set(
+            "playSpatial",
+            lua.create_function(
+                move |_lua,
+                      (sound_ud, x, y, looped, volume): (
+                    AnyUserData,
+                    f32,
+                    f32,
+                    Option<bool>,
+                    Option<f32>,
+                )| {
+                    let sound = sound_ud.borrow::<SoundHandle>()?;
+                    sound.ensure_uploaded()?;
+                    with_audio_backend(|audio| {
+                        audio.play_spatial(
+                            &sound,
+                            x,
+                            y,
+                            looped.unwrap_or(false),
+                            volume.unwrap_or(1.0),
+                        )
+                    })
+                },
+            )?,
+        )?;
+        audio.set(
+            "setPosition",
+            lua.create_function(move |_lua, (sound_ud, x, y): (AnyUserData, f32, f32)| {
+                let sound = sound_ud.borrow::<SoundHandle>()?;
+                with_audio_backend(|audio| audio.set_position(&sound, x, y))
+            })?,
+        )?;
+        audio.set(
+            "setListenerPosition",
+            lua.create_function(move |_lua, (x, y): (f32, f32)| {
+                with_audio_backend(|audio| audio.set_listener_position(x, y))
+            })?,
+        )?;
+
         lua.globals().set("audio", audio)?;
         Ok(())
     }
@@ -155,6 +298,17 @@ mod native {
         ) -> i32;
         fn neolove_web_audio_stop(sound_id: i32) -> i32;
         fn neolove_web_audio_set_volume(sound_id: i32, volume: f32) -> i32;
+        fn neolove_web_audio_play_spatial(
+            sound_id: i32,
+            bytes: *const u8,
+            bytes_len: i32,
+            looped: i32,
+            volume: f32,
+            x: f32,
+            y: f32,
+        ) -> i32;
+        fn neolove_web_audio_set_position(sound_id: i32, x: f32, y: f32) -> i32;
+        fn neolove_web_audio_set_listener_position(x: f32, y: f32) -> i32;
         fn neolove_web_take_audio_error(buffer: *mut c_char, capacity: i32) -> i32;
     }
 
@@ -203,6 +357,33 @@ mod native {
         check_bridge_result(result, "failed to play audio")
     }
 
+    fn play_spatial_sound(
+        sound: &SoundHandle,
+        x: f32,
+        y: f32,
+        looped: bool,
+        volume: f32,
+    ) -> mlua::Result<()> {
+        let bytes = sound.bytes()?;
+        if bytes.is_empty() || bytes.len() > i32::MAX as usize {
+            return Err(mlua::Error::external("sound has invalid encoded audio bytes"));
+        }
+        check_bridge_result(
+            unsafe {
+                neolove_web_audio_play_spatial(
+                    sound.id() as i32,
+                    bytes.as_ptr(),
+                    bytes.len() as i32,
+                    i32::from(looped),
+                    volume.clamp(0.0, 1.0),
+                    x,
+                    y,
+                )
+            },
+            "failed to play spatial audio",
+        )
+    }
+
     pub(crate) fn add_audio_module(lua: &Lua) -> mlua::Result<()> {
         let audio = lua.create_table()?;
 
@@ -245,6 +426,45 @@ mod native {
                         neolove_web_audio_set_volume(sound.id() as i32, volume.clamp(0.0, 1.0))
                     },
                     "failed to set audio volume",
+                )
+            })?,
+        )?;
+        audio.set(
+            "playSpatial",
+            lua.create_function(
+                move |_lua,
+                      (sound_ud, x, y, looped, volume): (
+                    AnyUserData,
+                    f32,
+                    f32,
+                    Option<bool>,
+                    Option<f32>,
+                )| {
+                    let sound = sound_ud.borrow::<SoundHandle>()?;
+                    sound.ensure_uploaded()?;
+                    play_spatial_sound(
+                        &sound,
+                        x,
+                        y,
+                        looped.unwrap_or(false),
+                        volume.unwrap_or(1.0),
+                    )
+                },
+            )?,
+        )?;
+        audio.set(
+            "setPosition",
+            lua.create_function(move |_lua, (sound_ud, x, y): (AnyUserData, f32, f32)| {
+                let sound = sound_ud.borrow::<SoundHandle>()?;
+                Ok(unsafe { neolove_web_audio_set_position(sound.id() as i32, x, y) } != 0)
+            })?,
+        )?;
+        audio.set(
+            "setListenerPosition",
+            lua.create_function(move |_lua, (x, y): (f32, f32)| {
+                check_bridge_result(
+                    unsafe { neolove_web_audio_set_listener_position(x, y) },
+                    "failed to set audio listener position",
                 )
             })?,
         )?;

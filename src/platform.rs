@@ -18,6 +18,24 @@ impl Color {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Antialiasing {
+    Off,
+    Standard,
+    #[default]
+    High,
+}
+
+impl Antialiasing {
+    pub(crate) fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "disabled" | "pixel" => Self::Off,
+            "standard" | "fast" | "normal" | "on" => Self::Standard,
+            _ => Self::High,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct MouseState {
     pub x: f32,
@@ -52,12 +70,14 @@ pub(crate) struct InputState {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FrameState {
     pub clear_color: Color,
+    pub antialiasing: Antialiasing,
 }
 
 impl Default for FrameState {
     fn default() -> Self {
         Self {
             clear_color: Color::WHITE,
+            antialiasing: Antialiasing::High,
         }
     }
 }
@@ -109,6 +129,14 @@ impl PlatformState {
 
     pub(crate) fn set_clear_color(&mut self, color: Color) {
         self.frame.clear_color = color;
+    }
+
+    pub(crate) fn antialiasing(&self) -> Antialiasing {
+        self.frame.antialiasing
+    }
+
+    pub(crate) fn set_antialiasing(&mut self, antialiasing: Antialiasing) {
+        self.frame.antialiasing = antialiasing;
     }
 
     pub(crate) fn begin_frame(&mut self) {

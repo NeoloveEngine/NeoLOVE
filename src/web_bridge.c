@@ -99,6 +99,12 @@ EM_JS(void, neolove_js_bootstrap, (), {
       }
     } catch (_error) {
     }
+    try {
+      if (existing.panner) {
+        existing.panner.disconnect();
+      }
+    } catch (_error) {
+    }
   };
 
   if (!state.audio.resumeHooksInstalled) {
@@ -1261,7 +1267,10 @@ EM_JS(int, neolove_js_audio_play, (
   const uint8_t* bytes,
   int bytes_len,
   int looped,
-  float volume
+  float volume,
+  int spatial,
+  float x,
+  float y
 ), {
   const state = Module.neoloveState;
   if (!state) {
@@ -1282,6 +1291,10 @@ EM_JS(int, neolove_js_audio_play, (
     const entry = {
       source: null,
       gain: null,
+      panner: null,
+      x: x,
+      y: y,
+      volume: Math.min(1, Math.max(0, volume)),
       stopped: false,
       started: false
     };
@@ -1300,6 +1313,12 @@ EM_JS(int, neolove_js_audio_play, (
       try {
         if (entry.gain) {
           entry.gain.disconnect();
+        }
+      } catch (_error) {
+      }
+      try {
+        if (entry.panner) {
+          entry.panner.disconnect();
         }
       } catch (_error) {
       }
@@ -1323,8 +1342,23 @@ EM_JS(int, neolove_js_audio_play, (
         }
 
         const gain = context.createGain();
-        gain.gain.value = Math.min(1, Math.max(0, volume));
-        gain.connect(context.destination);
+        gain.gain.value = entry.volume;
+        let output = gain;
+        if (spatial) {
+          const panner = context.createPanner();
+          panner.panningModel = "HRTF";
+          panner.distanceModel = "inverse";
+          panner.refDistance = 1;
+          panner.maxDistance = 10000;
+          panner.rolloffFactor = 1;
+          panner.positionX.value = entry.x;
+          panner.positionY.value = entry.y;
+          panner.positionZ.value = 0;
+          gain.connect(panner);
+          output = panner;
+          entry.panner = panner;
+        }
+        output.connect(context.destination);
 
         const source = context.createBufferSource();
         source.buffer = audioBuffer;
@@ -1344,6 +1378,43 @@ EM_JS(int, neolove_js_audio_play, (
         Module.neoloveSetAudioError(error);
       });
 
+    return 1;
+  } catch (error) {
+    Module.neoloveSetAudioError(error);
+    return 0;
+  }
+});
+
+EM_JS(int, neolove_js_audio_set_position, (int sound_id, float x, float y), {
+  const state = Module.neoloveState;
+  if (!state) return 0;
+  try {
+    const existing = state.audio.active.get(sound_id);
+    if (!existing) return 0;
+    existing.x = x;
+    existing.y = y;
+    if (existing.panner) {
+      existing.panner.positionX.value = x;
+      existing.panner.positionY.value = y;
+    }
+    return 1;
+  } catch (error) {
+    Module.neoloveSetAudioError(error);
+    return 0;
+  }
+});
+
+EM_JS(int, neolove_js_audio_set_listener_position, (float x, float y), {
+  try {
+    const context = Module.neoloveEnsureAudioContext();
+    const listener = context.listener;
+    if (listener.positionX) {
+      listener.positionX.value = x;
+      listener.positionY.value = y;
+      listener.positionZ.value = 0;
+    } else if (listener.setPosition) {
+      listener.setPosition(x, y, 0);
+    }
     return 1;
   } catch (error) {
     Module.neoloveSetAudioError(error);
@@ -1375,7 +1446,10 @@ EM_JS(int, neolove_js_audio_set_volume, (int sound_id, float volume), {
     Module.neoloveClearAudioError();
     const existing = state.audio.active.get(sound_id);
     if (existing) {
-      existing.gain.gain.value = Math.min(1, Math.max(0, volume));
+      existing.volume = Math.min(1, Math.max(0, volume));
+      if (existing.gain) {
+        existing.gain.gain.value = existing.volume;
+      }
     }
     return 1;
   } catch (error) {
@@ -1598,7 +1672,22 @@ int neolove_web_audio_play(
       bytes,
       bytes_len,
       looped,
-      volume);
+      volume,
+      0,
+      0.0f,
+      0.0f);
+}
+
+int neolove_web_audio_play_spatial(
+    int sound_id,
+    const uint8_t* bytes,
+    int bytes_len,
+    int looped,
+    float volume,
+    float x,
+    float y) {
+  return neolove_js_audio_play(
+      sound_id, bytes, bytes_len, looped, volume, 1, x, y);
 }
 
 int neolove_web_audio_stop(int sound_id) {
@@ -1607,6 +1696,14 @@ int neolove_web_audio_stop(int sound_id) {
 
 int neolove_web_audio_set_volume(int sound_id, float volume) {
   return neolove_js_audio_set_volume(sound_id, volume);
+}
+
+int neolove_web_audio_set_position(int sound_id, float x, float y) {
+  return neolove_js_audio_set_position(sound_id, x, y);
+}
+
+int neolove_web_audio_set_listener_position(float x, float y) {
+  return neolove_js_audio_set_listener_position(x, y);
 }
 
 int neolove_web_take_audio_error(char* buffer, int capacity) {

@@ -66,6 +66,16 @@ pub mod icon {
     pub const MY_LOCATION: char = '\u{e55c}';
     /// Used for the "swap dock side" affordance on a panel header.
     pub const SWAP: char = '\u{e8f1}';
+    pub const CHECK: char = '\u{e5ca}';
+    pub const MORE_VERT: char = '\u{e5d4}';
+    pub const LOCK: char = '\u{e897}';
+    pub const LOCK_OPEN: char = '\u{e898}';
+    pub const UNFOLD_MORE: char = '\u{e5d7}';
+    pub const UNFOLD_LESS: char = '\u{e5d6}';
+    pub const FULLSCREEN: char = '\u{e5d0}';
+    pub const FULLSCREEN_EXIT: char = '\u{e5d1}';
+    pub const SELECT_ALL: char = '\u{e162}';
+    pub const ZOOM_OUT_MAP: char = '\u{e56b}';
 }
 
 /// An RGBA color in `[r, g, b, a]` byte order.
@@ -207,6 +217,12 @@ fn blend(dst: u32, src: Rgba) -> u32 {
     b | (g << 8) | (r << 16)
 }
 
+/// Twice the signed area of triangle `(a, b, c)`. Used as an edge function for
+/// point-in-triangle tests.
+fn edge(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
+    (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+}
+
 /// Signed distance from a point to a rounded rectangle's edge (negative
 /// inside). Used to render antialiased rounded corners.
 fn round_rect_sdf(rect: Rect, radius: f32, cx: f32, cy: f32) -> f32 {
@@ -229,6 +245,16 @@ pub struct Fonts {
     pub icons: Arc<Font>,
 }
 
+/// An active rotation applied to subsequent drawing: rotate by `angle`
+/// (encoded as `sin`/`cos`) about the screen-space pivot `(px, py)`.
+#[derive(Clone, Copy)]
+pub struct RotXform {
+    px: f32,
+    py: f32,
+    sin: f32,
+    cos: f32,
+}
+
 /// Draws shapes and text into a borrowed framebuffer with an optional clip.
 pub struct Painter<'a> {
     buffer: &'a mut [u32],
@@ -238,6 +264,9 @@ pub struct Painter<'a> {
     icon_font: Arc<Font>,
     /// Clip bounds in pixels: `[x0, y0, x1, y1)`.
     clip: [i64; 4],
+    /// When set, fills and images are rasterized rotated about a pivot so the
+    /// editor preview can mirror the runtime's per-entity rotation.
+    rot: Option<RotXform>,
 }
 
 impl<'a> Painter<'a> {
@@ -249,7 +278,189 @@ impl<'a> Painter<'a> {
             font: fonts.text,
             icon_font: fonts.icons,
             clip: [0, 0, width as i64, height as i64],
+            rot: None,
         }
+    }
+
+    /// Rotate subsequent drawing by `angle` radians about the screen point
+    /// `(px, py)`. Returns the previous transform to restore afterwards with
+    /// [`Painter::set_rotation_raw`]. A near-zero angle clears rotation so the
+    /// fast axis-aligned paths stay in use.
+    pub fn push_rotation(&mut self, px: f32, py: f32, angle: f32) -> Option<RotXform> {
+        let prev = self.rot;
+        self.rot = if angle.abs() < 1e-4 {
+            None
+        } else {
+            Some(RotXform {
+                px,
+                py,
+                sin: angle.sin(),
+                cos: angle.cos(),
+            })
+        };
+        prev
+    }
+
+    pub fn set_rotation_raw(&mut self, rot: Option<RotXform>) {
+        self.rot = rot;
+    }
+
+    /// Axis-aligned screen bounds of `rect` after the active rotation, or
+    /// `rect` unchanged when there is no rotation. Used to widen clips so they
+    /// don't crop rotated content.
+    pub fn rotated_bounds(&self, rect: Rect) -> Rect {
+        let Some(rot) = self.rot else {
+            return rect;
+        };
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for (x, y) in [
+            (rect.x, rect.y),
+            (rect.right(), rect.y),
+            (rect.right(), rect.bottom()),
+            (rect.x, rect.bottom()),
+        ] {
+            let dx = x - rot.px;
+            let dy = y - rot.py;
+            let sx = rot.px + dx * rot.cos - dy * rot.sin;
+            let sy = rot.py + dx * rot.sin + dy * rot.cos;
+            min_x = min_x.min(sx);
+            min_y = min_y.min(sy);
+            max_x = max_x.max(sx);
+            max_y = max_y.max(sy);
+        }
+        Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
+    }
+
+    /// Rasterize a rotated quad: walk the screen pixels covering `bounds`
+    /// (the rotated extent of `rect`), inverse-rotate each back into `rect`'s
+    /// unrotated space, and blend whatever color `sample` returns there. Only
+    /// meaningful while `self.rot` is `Some`.
+    fn rasterize_rotated(
+        &mut self,
+        bounds: Rect,
+        mut sample: impl FnMut(f32, f32) -> Option<Rgba>,
+    ) {
+        let Some(rot) = self.rot else {
+            return;
+        };
+        let x0 = (bounds.x.floor() as i64).max(self.clip[0]);
+        let y0 = (bounds.y.floor() as i64).max(self.clip[1]);
+        let x1 = (bounds.right().ceil() as i64).min(self.clip[2]);
+        let y1 = (bounds.bottom().ceil() as i64).min(self.clip[3]);
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let dx = px as f32 + 0.5 - rot.px;
+                let dy = py as f32 + 0.5 - rot.py;
+                // Inverse rotation (by -angle) back into unrotated space.
+                let lx = rot.px + dx * rot.cos + dy * rot.sin;
+                let ly = rot.py - dx * rot.sin + dy * rot.cos;
+                if let Some(color) = sample(lx, ly) {
+                    self.put(px, py, color);
+                }
+            }
+        }
+    }
+
+    /// Rasterize a shape whose unrotated extent is `bounds`, evaluating
+    /// `sample` at each pixel centre (in unrotated space). Honors the active
+    /// rotation transparently, so callers describe shapes once and get rotation
+    /// for free.
+    fn rasterize_shape(&mut self, bounds: Rect, mut sample: impl FnMut(f32, f32) -> Option<Rgba>) {
+        if self.rot.is_some() {
+            self.rasterize_rotated(bounds, sample);
+            return;
+        }
+        let x0 = (bounds.x.floor() as i64).max(self.clip[0]);
+        let y0 = (bounds.y.floor() as i64).max(self.clip[1]);
+        let x1 = (bounds.right().ceil() as i64).min(self.clip[2]);
+        let y1 = (bounds.bottom().ceil() as i64).min(self.clip[3]);
+        for py in y0..y1 {
+            for px in x0..x1 {
+                if let Some(color) = sample(px as f32 + 0.5, py as f32 + 0.5) {
+                    self.put(px, py, color);
+                }
+            }
+        }
+    }
+
+    /// Fill an antialiased circle centred on `(cx, cy)`.
+    pub fn fill_circle(&mut self, cx: f32, cy: f32, radius: f32, color: Rgba) {
+        if color[3] == 0 || radius <= 0.0 {
+            return;
+        }
+        let pad = radius + 1.0;
+        let bounds = Rect::new(cx - pad, cy - pad, pad * 2.0, pad * 2.0);
+        self.rasterize_shape(bounds, |x, y| {
+            let dist = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+            let coverage = (radius + 0.5 - dist).clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                None
+            } else {
+                Some([color[0], color[1], color[2], (color[3] as f32 * coverage) as u8])
+            }
+        });
+    }
+
+    /// Fill a triangle given its three (screen-space) vertices.
+    pub fn fill_triangle(&mut self, p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), color: Rgba) {
+        if color[3] == 0 {
+            return;
+        }
+        let area = edge(p0, p1, p2);
+        if area.abs() < 1e-6 {
+            return;
+        }
+        let sign = area.signum();
+        let min_x = p0.0.min(p1.0).min(p2.0) - 1.0;
+        let max_x = p0.0.max(p1.0).max(p2.0) + 1.0;
+        let min_y = p0.1.min(p1.1).min(p2.1) - 1.0;
+        let max_y = p0.1.max(p1.1).max(p2.1) + 1.0;
+        let bounds = Rect::new(min_x, min_y, max_x - min_x, max_y - min_y);
+        self.rasterize_shape(bounds, |x, y| {
+            let pt = (x, y);
+            let w0 = edge(p1, p2, pt) * sign;
+            let w1 = edge(p2, p0, pt) * sign;
+            let w2 = edge(p0, p1, pt) * sign;
+            if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
+                Some(color)
+            } else {
+                None
+            }
+        });
+    }
+
+    /// Stroke an antialiased one-pixel line segment.
+    pub fn stroke_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, color: Rgba) {
+        if color[3] == 0 {
+            return;
+        }
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let len_sq = dx * dx + dy * dy;
+        if len_sq <= 1e-6 {
+            self.fill_circle(x0, y0, 0.75, color);
+            return;
+        }
+        let min_x = x0.min(x1) - 1.5;
+        let max_x = x0.max(x1) + 1.5;
+        let min_y = y0.min(y1) - 1.5;
+        let max_y = y0.max(y1) + 1.5;
+        let bounds = Rect::new(min_x, min_y, max_x - min_x, max_y - min_y);
+        self.rasterize_shape(bounds, |x, y| {
+            let t = (((x - x0) * dx + (y - y0) * dy) / len_sq).clamp(0.0, 1.0);
+            let px = x0 + dx * t;
+            let py = y0 + dy * t;
+            let dist = ((x - px).powi(2) + (y - py).powi(2)).sqrt();
+            let coverage = (1.0 - dist).clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                None
+            } else {
+                Some([color[0], color[1], color[2], (color[3] as f32 * coverage) as u8])
+            }
+        });
     }
 
     pub fn width(&self) -> f32 {
@@ -324,6 +535,30 @@ impl<'a> Painter<'a> {
         if src.w <= 0.0 || src.h <= 0.0 {
             return;
         }
+        if self.rot.is_some() {
+            let bounds = self.rotated_bounds(dest);
+            self.rasterize_rotated(bounds, |x, y| {
+                if x < dest.x || x >= dest.right() || y < dest.y || y >= dest.bottom() {
+                    return None;
+                }
+                let u = (x - dest.x) / dest.w;
+                let v = (y - dest.y) / dest.h;
+                let sx = (src.x + u * src.w).clamp(0.0, iw - 1.0) as u32;
+                let sy = (src.y + v * src.h).clamp(0.0, ih - 1.0) as u32;
+                let p = img.get_pixel(sx, sy).0;
+                let a = (p[3] as u32 * tint[3] as u32 / 255) as u8;
+                if a == 0 {
+                    return None;
+                }
+                Some([
+                    (p[0] as u32 * tint[0] as u32 / 255) as u8,
+                    (p[1] as u32 * tint[1] as u32 / 255) as u8,
+                    (p[2] as u32 * tint[2] as u32 / 255) as u8,
+                    a,
+                ])
+            });
+            return;
+        }
         let x0 = (dest.x.floor() as i64).max(self.clip[0]);
         let y0 = (dest.y.floor() as i64).max(self.clip[1]);
         let x1 = (dest.right().ceil() as i64).min(self.clip[2]);
@@ -355,6 +590,17 @@ impl<'a> Painter<'a> {
         if color[3] == 0 {
             return;
         }
+        if self.rot.is_some() {
+            let bounds = self.rotated_bounds(rect);
+            self.rasterize_rotated(bounds, |x, y| {
+                if x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom() {
+                    Some(color)
+                } else {
+                    None
+                }
+            });
+            return;
+        }
         let x0 = (rect.x.floor() as i64).max(self.clip[0]);
         let y0 = (rect.y.floor() as i64).max(self.clip[1]);
         let x1 = (rect.right().ceil() as i64).min(self.clip[2]);
@@ -375,6 +621,18 @@ impl<'a> Painter<'a> {
             return;
         }
         if color[3] == 0 {
+            return;
+        }
+        if self.rot.is_some() {
+            let bounds = self.rotated_bounds(rect);
+            self.rasterize_rotated(bounds, |x, y| {
+                let coverage = (0.5 - round_rect_sdf(rect, radius, x, y)).clamp(0.0, 1.0);
+                if coverage <= 0.0 {
+                    None
+                } else {
+                    Some([color[0], color[1], color[2], (color[3] as f32 * coverage) as u8])
+                }
+            });
             return;
         }
         let x0 = (rect.x.floor() as i64).max(self.clip[0]);
@@ -406,6 +664,21 @@ impl<'a> Painter<'a> {
     pub fn stroke_round_rect(&mut self, rect: Rect, radius: f32, color: Rgba) {
         if radius <= 0.5 {
             self.stroke_rect(rect, color);
+            return;
+        }
+        if self.rot.is_some() {
+            // Grow the sampled extent by a pixel so the antialiased outer band
+            // of the outline isn't clipped at the rotated rect edge.
+            let outer = Rect::new(rect.x - 1.0, rect.y - 1.0, rect.w + 2.0, rect.h + 2.0);
+            let bounds = self.rotated_bounds(outer);
+            self.rasterize_rotated(bounds, |x, y| {
+                let coverage = (1.0 - round_rect_sdf(rect, radius, x, y).abs()).clamp(0.0, 1.0);
+                if coverage <= 0.0 {
+                    None
+                } else {
+                    Some([color[0], color[1], color[2], (color[3] as f32 * coverage) as u8])
+                }
+            });
             return;
         }
         let x0 = ((rect.x - 1.0).floor() as i64).max(self.clip[0]);
@@ -487,6 +760,33 @@ impl<'a> Painter<'a> {
     }
 
     fn blit_coverage(&mut self, x: f32, y: f32, w: usize, h: usize, bitmap: &[u8], color: Rgba) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        if self.rot.is_some() {
+            // Sample the glyph's coverage mask in its own (unrotated) space so
+            // text rotates along with the entity it belongs to.
+            let glyph = Rect::new(x, y, w as f32, h as f32);
+            let bounds = self.rotated_bounds(glyph);
+            self.rasterize_rotated(bounds, |lx, ly| {
+                let gx = (lx - x).floor() as i64;
+                let gy = (ly - y).floor() as i64;
+                if gx < 0 || gy < 0 || gx >= w as i64 || gy >= h as i64 {
+                    return None;
+                }
+                let coverage = bitmap[gy as usize * w + gx as usize];
+                if coverage == 0 {
+                    return None;
+                }
+                Some([
+                    color[0],
+                    color[1],
+                    color[2],
+                    (coverage as u32 * color[3] as u32 / 255) as u8,
+                ])
+            });
+            return;
+        }
         let ox = x.round() as i64;
         let oy = y.round() as i64;
         for gy in 0..h {
@@ -539,6 +839,21 @@ pub struct FrameInput {
     pub duplicate: bool,
     pub undo: bool,
     pub redo: bool,
+    pub select_all: bool,
+    pub invert_selection: bool,
+    pub group_selection: bool,
+    pub unparent_selection: bool,
+    pub hide_selection: bool,
+    pub show_all: bool,
+    pub lock_selection: bool,
+    pub unlock_all: bool,
+    pub frame_all: bool,
+    pub maximize_view: bool,
+    pub toggle_grid: bool,
+    pub toggle_snap: bool,
+    /// Modifier keys held during this frame.
+    pub ctrl: bool,
+    pub shift: bool,
     /// `F` frames the selection; `F2` renames it; `0` resets the view.
     pub focus_selection: bool,
     pub rename: bool,
@@ -852,20 +1167,19 @@ impl<'a> Ui<'a> {
     pub fn checkbox(&mut self, rect: Rect, value: bool) -> Option<bool> {
         let hovered = self.hovered(rect);
         let radius = (self.theme.corner_radius - 1.0).max(0.0);
-        let bg = if value { self.theme.accent } else { self.theme.field };
+        let base = if value { self.theme.accent } else { self.theme.field };
+        let bg = if hovered { lighten(base, 0.1) } else { base };
         self.painter.fill_round_rect(rect, radius, bg);
         self.painter
             .stroke_round_rect(rect, radius, self.theme.border);
         if value {
-            // Simple check mark.
-            let cx = rect.x + rect.w * 0.5;
-            let cy = rect.y + rect.h * 0.5;
-            self.painter.fill_rect(
-                Rect::new(cx - 3.0, cy - 1.0, 3.0, 2.0),
+            self.painter.icon_centered(
+                rect.x + rect.w * 0.5,
+                rect.y + rect.h * 0.5,
+                icon::CHECK,
+                rect.w.min(rect.h) * 0.72,
                 [255, 255, 255, 255],
             );
-            self.painter
-                .fill_rect(Rect::new(cx - 1.0, cy, 5.0, 2.0), [255, 255, 255, 255]);
         }
         if hovered && self.input.mouse_pressed {
             Some(!value)
@@ -1015,6 +1329,40 @@ mod tests {
             serde_json::from_str("{\"accent\":[1,2,3,255]}").expect("parse partial theme");
         assert_eq!(restored.accent, [1, 2, 3, 255]);
         assert_eq!(restored.text, Theme::default().text);
+    }
+
+    #[test]
+    fn fill_circle_covers_centre_not_corners() {
+        let mut buf = vec![0u32; 11 * 11];
+        let fonts = load_fonts().expect("load fonts");
+        let mut painter = Painter::new(&mut buf, 11, 11, fonts);
+        painter.fill_circle(5.5, 5.5, 4.0, [255, 255, 255, 255]);
+        assert_ne!(buf[5 * 11 + 5], 0, "centre should be filled");
+        assert_eq!(buf[0], 0, "top-left corner is outside the circle");
+        assert_eq!(buf[10 * 11 + 10], 0, "bottom-right corner is outside");
+    }
+
+    #[test]
+    fn fill_triangle_uses_point_in_triangle_test() {
+        let mut buf = vec![0u32; 12 * 12];
+        let fonts = load_fonts().expect("load fonts");
+        let mut painter = Painter::new(&mut buf, 12, 12, fonts);
+        // Right triangle with the right angle at the bottom-left.
+        painter.fill_triangle((0.0, 0.0), (0.0, 10.0), (10.0, 10.0), [255, 255, 255, 255]);
+        assert_ne!(buf[8 * 12 + 2], 0, "(2,8) is inside the triangle");
+        assert_eq!(buf[2 * 12 + 8], 0, "(8,2) is outside the triangle");
+    }
+
+    #[test]
+    fn rotation_moves_painted_pixels() {
+        let mut buf = vec![0u32; 5 * 5];
+        let fonts = load_fonts().expect("load fonts");
+        let mut painter = Painter::new(&mut buf, 5, 5, fonts);
+        // A 90° rotation about (2,2) turns the top row into a column at x=3.
+        painter.push_rotation(2.0, 2.0, std::f32::consts::FRAC_PI_2);
+        painter.fill_rect(Rect::new(0.0, 0.0, 5.0, 1.0), [255, 255, 255, 255]);
+        assert_ne!(buf[2 * 5 + 3], 0, "rotated strip lands on the x=3 column");
+        assert_eq!(buf[0], 0, "the unrotated top-left is no longer painted");
     }
 
     #[test]

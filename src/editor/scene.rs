@@ -134,24 +134,208 @@ pub enum VarValue {
     Bool(bool),
     Text(String),
     Color(Color),
+    /// A reference to an entity in this scene. `None` is an unassigned
+    /// `Inspector(IEntity)` field.
+    Entity(Option<u64>),
+    /// A reference to a component attached to an entity in this scene.
+    Component(Option<ComponentReference>),
+    List(Vec<VarValue>),
+    Dictionary(Vec<DictionaryEntry>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ComponentReference {
+    pub entity: u64,
+    pub component: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "value")]
+pub enum VarKey {
+    Number(f32),
+    Bool(bool),
+    Text(String),
+}
+
+impl VarKey {
+    pub fn to_luau(&self) -> String {
+        match self {
+            Self::Number(value) => fmt_num(*value),
+            Self::Bool(value) => value.to_string(),
+            Self::Text(value) => format!("\"{}\"", escape_luau(value)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DictionaryEntry {
+    pub key: VarKey,
+    pub value: VarValue,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind")]
+pub enum VarControl {
+    #[default]
+    Field,
+    Slider {
+        min: f32,
+        max: f32,
+        fractional: bool,
+    },
 }
 
 impl VarValue {
-    pub fn type_label(&self) -> &'static str {
-        match self {
-            VarValue::Number(_) => "Number",
-            VarValue::Bool(_) => "Bool",
-            VarValue::Text(_) => "Text",
-            VarValue::Color(_) => "Color",
-        }
-    }
-
     pub fn to_luau(&self) -> String {
         match self {
             VarValue::Number(n) => fmt_num(*n),
             VarValue::Bool(b) => b.to_string(),
             VarValue::Text(s) => format!("\"{}\"", escape_luau(s)),
-            VarValue::Color([r, g, b, _]) => format!("Color4({r}, {g}, {b})"),
+            VarValue::Color([r, g, b, a]) => {
+                if *a == 255 {
+                    format!("Color4({r}, {g}, {b})")
+                } else {
+                    format!("Color4({r}, {g}, {b}, {a})")
+                }
+            }
+            // Scene export resolves references against its generated local
+            // variables. Outside that context, an unassigned value is safest.
+            VarValue::Entity(_) | VarValue::Component(_) => "nil".to_string(),
+            VarValue::List(values) => format!(
+                "{{{}}}",
+                values.iter().map(Self::to_luau).collect::<Vec<_>>().join(", ")
+            ),
+            VarValue::Dictionary(entries) => format!(
+                "{{{}}}",
+                entries
+                    .iter()
+                    .map(|entry| format!("[{}] = {}", entry.key.to_luau(), entry.value.to_luau()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    fn contains_reference(&self) -> bool {
+        match self {
+            Self::Entity(_) | Self::Component(_) => true,
+            Self::List(values) => values.iter().any(Self::contains_reference),
+            Self::Dictionary(entries) => entries
+                .iter()
+                .any(|entry| entry.value.contains_reference()),
+            _ => false,
+        }
+    }
+
+    fn to_luau_with_references(
+        &self,
+        entities: &std::collections::HashMap<u64, String>,
+        components: &std::collections::HashMap<(u64, usize), String>,
+    ) -> String {
+        match self {
+            Self::Entity(Some(id)) => entities.get(id).cloned().unwrap_or_else(|| "nil".into()),
+            Self::Entity(None) => "nil".into(),
+            Self::Component(Some(reference)) => components
+                .get(&(reference.entity, reference.component))
+                .cloned()
+                .unwrap_or_else(|| "nil".into()),
+            Self::Component(None) => "nil".into(),
+            Self::List(values) => format!(
+                "{{{}}}",
+                values
+                    .iter()
+                    .map(|value| value.to_luau_with_references(entities, components))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::Dictionary(entries) => format!(
+                "{{{}}}",
+                entries
+                    .iter()
+                    .map(|entry| format!(
+                        "[{}] = {}",
+                        entry.key.to_luau(),
+                        entry.value.to_luau_with_references(entities, components)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            _ => self.to_luau(),
+        }
+    }
+
+    fn remap_entity_references(&mut self, map: &std::collections::HashMap<u64, u64>) {
+        match self {
+            Self::Entity(Some(id)) => {
+                if let Some(next) = map.get(id) {
+                    *id = *next;
+                }
+            }
+            Self::Component(Some(reference)) => {
+                if let Some(next) = map.get(&reference.entity) {
+                    reference.entity = *next;
+                }
+            }
+            Self::List(values) => {
+                for value in values {
+                    value.remap_entity_references(map);
+                }
+            }
+            Self::Dictionary(entries) => {
+                for entry in entries {
+                    entry.value.remap_entity_references(map);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn remove_entity_reference(&mut self, id: u64) {
+        match self {
+            Self::Entity(reference) if *reference == Some(id) => *reference = None,
+            Self::Component(reference)
+                if reference.as_ref().is_some_and(|reference| reference.entity == id) =>
+            {
+                *reference = None;
+            }
+            Self::List(values) => {
+                for value in values {
+                    value.remove_entity_reference(id);
+                }
+            }
+            Self::Dictionary(entries) => {
+                for entry in entries {
+                    entry.value.remove_entity_reference(id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn remove_component_reference(&mut self, entity: u64, removed: usize) {
+        match self {
+            Self::Component(reference) => {
+                if let Some(target) = reference {
+                    if target.entity == entity {
+                        if target.component == removed {
+                            *reference = None;
+                        } else if target.component > removed {
+                            target.component -= 1;
+                        }
+                    }
+                }
+            }
+            Self::List(values) => {
+                for value in values {
+                    value.remove_component_reference(entity, removed);
+                }
+            }
+            Self::Dictionary(entries) => {
+                for entry in entries {
+                    entry.value.remove_component_reference(entity, removed);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -161,6 +345,8 @@ impl VarValue {
 pub struct ScriptVar {
     pub name: String,
     pub value: VarValue,
+    #[serde(default)]
+    pub control: VarControl,
 }
 
 /// A component attached to an entity.
@@ -194,16 +380,41 @@ impl Component {
     }
 }
 
+fn normalize_core_component(component: &mut Component) {
+    let Component::Core { name, props } = component else {
+        return;
+    };
+    if name != "EntityScaler" {
+        return;
+    }
+
+    let mut existing = std::mem::take(props);
+    let mut normalized = Vec::new();
+    for default in core_component_props(name) {
+        if let Some(index) = existing.iter().position(|prop| prop.name == default.name) {
+            normalized.push(existing.remove(index));
+        } else {
+            normalized.push(default);
+        }
+    }
+    // Preserve forward-compatible or user-authored fields that this editor
+    // version does not know about.
+    normalized.extend(existing);
+    *props = normalized;
+}
+
 /// Common core components offered directly in the "Add Component" menu, in
 /// display order, matching the engine's `core` module.
 pub const CORE_COMPONENTS: &[&str] = &[
     "Rect2D",
     "Shape2D",
+    "ParticleSystem2D",
     "TextBox",
     "TextLabel",
     "Sprite2D",
     "Image2D",
     "NineSliceSprite2D",
+    "Tilemap2D",
     "TileTexture2D",
     "EntityScaler",
     "Collider2D",
@@ -254,12 +465,39 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             p.push(Prop::num_adv("size_y", "Size Y", 0.0));
             p
         }
+        "ParticleSystem2D" => vec![
+            Prop::boolean("playing", "Playing", true),
+            Prop::boolean("looping", "Looping", true),
+            Prop::boolean("visible", "Visible", true),
+            Prop::num("duration", "Duration", 5.0),
+            Prop::num("emission_rate", "Rate", 12.0),
+            Prop::int("max_particles", "Max Particles", 256),
+            Prop::num("lifetime", "Lifetime", 1.5),
+            Prop::num("speed", "Speed", 80.0),
+            Prop::num("direction", "Direction °", -90.0),
+            Prop::num("spread", "Spread °", 30.0),
+            Prop::num("start_size", "Start Size", 8.0),
+            Prop::num("end_size", "End Size", 2.0),
+            Prop::color("start_color", "Start Color", [255, 184, 76, 255]),
+            Prop::color("end_color", "End Color", [255, 92, 40, 0]),
+            Prop::enumv("shape", "Emitter", "point", &["point", "box", "circle"], false),
+            Prop::num("radius", "Radius", 32.0),
+            Prop::num_adv("gravity_x", "Gravity X", 0.0),
+            Prop::num_adv("gravity_y", "Gravity Y", 60.0),
+        ],
         "TextBox" | "TextLabel" | "RudimentaryTextLabel" => {
             let mut p = vec![
                 Prop::text("text", "Text", "Text"),
                 Prop::color("color", "Color", [255, 255, 255, 255]),
                 Prop::boolean("visible", "Visible", true),
                 Prop::num("scale", "Scale", 24.0),
+                Prop::enumv(
+                    "antialiasing",
+                    "Anti-aliasing",
+                    "inherit",
+                    &["inherit", "off", "standard", "high"],
+                    false,
+                ),
                 Prop::opt_text("font", "Font"),
                 Prop::enumv("align_x", "Align X", "left", &["left", "center", "right"], false),
                 Prop::enumv("align_y", "Align Y", "top", &["top", "center", "bottom"], false),
@@ -323,10 +561,25 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::num_adv("offset_x", "Offset X", 0.0),
             Prop::num_adv("offset_y", "Offset Y", 0.0),
         ],
+        "Tilemap2D" => vec![
+            Prop::image("image", "Tileset", "assets/tiles.png"),
+            Prop::color("color", "Tint", [255, 255, 255, 255]),
+            Prop::boolean("visible", "Visible", true),
+            Prop::int("map_width", "Columns", 10),
+            Prop::int("map_height", "Rows", 10),
+            Prop::num("tile_width", "Tile W", 32.0),
+            Prop::num("tile_height", "Tile H", 32.0),
+            Prop::text("tiles", "Tile IDs", "0"),
+            Prop::num_adv("spacing", "Spacing", 0.0),
+            Prop::num_adv("margin", "Margin", 0.0),
+        ],
         "EntityScaler" => vec![
             Prop::boolean("enabled", "Enabled", true),
+            Prop::boolean("edit_with_percent", "Edit With %", true),
             Prop::num("x_percent", "X %", 0.0),
             Prop::num("y_percent", "Y %", 0.0),
+            Prop::num("size_x_percent", "Size X %", 0.0),
+            Prop::num("size_y_percent", "Size Y %", 0.0),
             Prop::num("offset_x", "Offset X", 0.0),
             Prop::num("offset_y", "Offset Y", 0.0),
             Prop::num("pivot_x", "Pivot X", 0.0),
@@ -437,6 +690,10 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
 pub struct Entity {
     pub id: u64,
     pub name: String,
+    /// Project-relative prefab source for linked instances. Only the root of
+    /// an instantiated prefab carries this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefab_source: Option<String>,
     pub x: f32,
     pub y: f32,
     /// Draw order; higher draws in front.
@@ -474,6 +731,7 @@ impl Entity {
         Self {
             id,
             name: name.into(),
+            prefab_source: None,
             x,
             y,
             z: 0.0,
@@ -495,9 +753,25 @@ impl Entity {
 pub struct Scene {
     pub name: String,
     pub background: Color,
+    /// When true (the default) textures are upscaled with nearest-neighbour
+    /// sampling for crisp pixel-art; when false they use bilinear filtering for
+    /// a smoother look. Exported as `app.nearestNeighborScaling`.
+    #[serde(default = "default_nearest_neighbor")]
+    pub nearest_neighbor_scaling: bool,
+    /// Geometry and default text anti-aliasing quality: off, standard, or high.
+    #[serde(default = "default_antialiasing")]
+    pub antialiasing: String,
     pub entities: Vec<Entity>,
     #[serde(skip)]
     next_id: u64,
+}
+
+fn default_nearest_neighbor() -> bool {
+    true
+}
+
+fn default_antialiasing() -> String {
+    "high".to_string()
 }
 
 impl Default for Scene {
@@ -505,6 +779,8 @@ impl Default for Scene {
         let mut scene = Self {
             name: "Untitled".to_string(),
             background: [24, 26, 32, 255],
+            nearest_neighbor_scaling: true,
+            antialiasing: default_antialiasing(),
             entities: Vec::new(),
             next_id: 1,
         };
@@ -516,6 +792,24 @@ impl Default for Scene {
 }
 
 impl Scene {
+    pub fn from_prefab(name: impl Into<String>, mut entities: Vec<Entity>) -> Self {
+        for entity in &mut entities {
+            entity.prefab_source = None;
+            for component in &mut entity.components {
+                normalize_core_component(component);
+            }
+        }
+        let next_id = entities.iter().map(|entity| entity.id).max().unwrap_or(0) + 1;
+        Self {
+            name: name.into(),
+            background: [24, 26, 32, 255],
+            nearest_neighbor_scaling: true,
+            antialiasing: default_antialiasing(),
+            entities,
+            next_id,
+        }
+    }
+
     pub fn add_entity(&mut self, name: impl Into<String>, x: f32, y: f32) -> Entity {
         let id = self.allocate_id();
         let entity = Entity::new(id, name, x, y);
@@ -527,6 +821,9 @@ impl Scene {
     pub fn insert_entity(&mut self, mut entity: Entity) -> u64 {
         let id = self.allocate_id();
         entity.id = id;
+        for component in &mut entity.components {
+            normalize_core_component(component);
+        }
         self.entities.push(entity);
         id
     }
@@ -563,6 +860,29 @@ impl Scene {
             }
         }
         self.entities.retain(|e| e.id != id);
+        for entity in &mut self.entities {
+            for component in &mut entity.components {
+                if let Component::Script { variables, .. } = component {
+                    for variable in variables {
+                        variable.value.remove_entity_reference(id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Clear references to a removed component and shift references to later
+    /// components on the same entity so they continue to point at their target.
+    pub fn adjust_component_references(&mut self, entity: u64, removed: usize) {
+        for owner in &mut self.entities {
+            for component in &mut owner.components {
+                if let Component::Script { variables, .. } = component {
+                    for variable in variables {
+                        variable.value.remove_component_reference(entity, removed);
+                    }
+                }
+            }
+        }
     }
 
     /// Would making `child` a descendant of `new_parent` create a cycle?
@@ -596,9 +916,80 @@ impl Scene {
                 root = Some(nid);
             }
             e.id = nid;
+            for component in &mut e.components {
+                normalize_core_component(component);
+                if let Component::Script { variables, .. } = component {
+                    for variable in variables {
+                        variable.value.remap_entity_references(&map);
+                    }
+                }
+            }
             self.entities.push(e);
         }
         root
+    }
+
+    /// Instantiate and link the new root to its project-relative prefab file.
+    pub fn instantiate_linked(&mut self, proto: Vec<Entity>, source: impl Into<String>) -> Option<u64> {
+        let root = self.instantiate(proto)?;
+        self.entity_mut(root)?.prefab_source = Some(source.into());
+        Some(root)
+    }
+
+    /// Replace every linked instance of `source` with the latest prefab data.
+    /// Root identity and placement are preserved so external references and
+    /// per-scene positioning continue to work.
+    pub fn refresh_prefab_instances(&mut self, source: &str, proto: &[Entity]) -> usize {
+        let Some(proto_root) = proto.iter().find(|entity| entity.parent.is_none()).cloned() else {
+            return 0;
+        };
+        let roots: Vec<u64> = self
+            .entities
+            .iter()
+            .filter(|entity| entity.prefab_source.as_deref() == Some(source))
+            .map(|entity| entity.id)
+            .collect();
+        let mut refreshed = 0;
+        for root_id in roots {
+            let Some(instance_root) = self.entity(root_id).cloned() else { continue; };
+            let removed: std::collections::HashSet<u64> =
+                self.subtree(root_id).into_iter().map(|entity| entity.id).collect();
+            self.entities.retain(|entity| !removed.contains(&entity.id));
+
+            let mut id_map = std::collections::HashMap::new();
+            id_map.insert(proto_root.id, root_id);
+            for entity in proto.iter().filter(|entity| entity.id != proto_root.id) {
+                id_map.insert(entity.id, self.allocate_id());
+            }
+            for mut entity in proto.iter().cloned() {
+                let old_id = entity.id;
+                entity.id = id_map[&old_id];
+                entity.parent = entity.parent.and_then(|parent| id_map.get(&parent).copied());
+                entity.prefab_source = None;
+                for component in &mut entity.components {
+                    normalize_core_component(component);
+                    if let Component::Script { variables, .. } = component {
+                        for variable in variables {
+                            variable.value.remap_entity_references(&id_map);
+                        }
+                    }
+                }
+                if old_id == proto_root.id {
+                    entity.parent = instance_root.parent;
+                    entity.x = instance_root.x;
+                    entity.y = instance_root.y;
+                    entity.z = instance_root.z;
+                    entity.rotation = instance_root.rotation;
+                    entity.scale = instance_root.scale;
+                    entity.anchor_x = instance_root.anchor_x;
+                    entity.anchor_y = instance_root.anchor_y;
+                    entity.prefab_source = Some(source.to_string());
+                }
+                self.entities.push(entity);
+            }
+            refreshed += 1;
+        }
+        refreshed
     }
 
     /// Collect an entity and all of its descendants, with the root's parent
@@ -635,6 +1026,11 @@ impl Scene {
     pub fn from_json(text: &str) -> Result<Self, String> {
         let mut scene: Scene =
             serde_json::from_str(text).map_err(|e| format!("failed to parse scene: {e}"))?;
+        for entity in &mut scene.entities {
+            for component in &mut entity.components {
+                normalize_core_component(component);
+            }
+        }
         scene.next_id = scene.entities.iter().map(|e| e.id).max().unwrap_or(0) + 1;
         Ok(scene)
     }
@@ -655,12 +1051,63 @@ impl Scene {
         let mut out = String::new();
         out.push_str("-- Generated by the NeoLOVE visual editor. Edits may be overwritten.\n");
         out.push_str(&format!("-- Scene: {}\n\n", self.name));
+
+        // Require code modules at the top of main.luau. Images remain in their
+        // own generated cache module because loading/retaining image handles is
+        // asset work, while component code belongs in the entry module.
+        let (image_paths, script_paths) = self.collect_assets();
+        if !image_paths.is_empty() {
+            out.push_str("local Images = require(\"./images\")\n");
+        }
+        let script_vars: std::collections::HashMap<String, String> = script_paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let variable = format!("ScriptModule_{index}");
+                out.push_str(&format!(
+                    "local {variable} = require(\"{}\")\n",
+                    escape_luau(path)
+                ));
+                (path.clone(), variable)
+            })
+            .collect();
+        if !image_paths.is_empty() || !script_paths.is_empty() {
+            out.push('\n');
+        }
+
         let [br, bg, bb, _] = self.background;
-        out.push_str(&format!("app.bg = Color4({br}, {bg}, {bb})\n\n"));
+        out.push_str(&format!("app.bg = Color4({br}, {bg}, {bb})\n"));
+        out.push_str(&format!(
+            "app.nearestNeighborScaling = {}\n",
+            self.nearest_neighbor_scaling
+        ));
+        out.push_str(&format!(
+            "app.antiAliasing = \"{}\"\n\n",
+            escape_luau(&self.antialiasing)
+        ));
 
         // Emit parents before children so `ecs.newEntity(..., parentVar)` works.
         let ordered = self.topological_order();
-        let mut var_of = std::collections::HashMap::new();
+        let var_of: std::collections::HashMap<u64, String> = ordered
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| self.is_active_in_tree(**id))
+            .map(|(index, id)| (*id, format!("ent_{index}")))
+            .collect();
+        let component_vars: std::collections::HashMap<(u64, usize), String> = self
+            .entities
+            .iter()
+            .filter_map(|entity| {
+                var_of
+                    .get(&entity.id)
+                    .map(|variable| (entity, variable.clone()))
+            })
+            .flat_map(|(entity, variable)| {
+                (0..entity.components.len())
+                    .map(move |index| ((entity.id, index), format!("{variable}_c{index}")))
+            })
+            .collect();
+        let mut deferred_reference_assignments = Vec::new();
         for (index, id) in ordered.iter().enumerate() {
             let Some(entity) = self.entity(*id) else {
                 continue;
@@ -670,7 +1117,6 @@ impl Scene {
                 continue;
             }
             let var = format!("ent_{index}");
-            var_of.insert(*id, var.clone());
             let parent_expr = entity
                 .parent
                 .and_then(|pid| var_of.get(&pid))
@@ -721,6 +1167,13 @@ impl Scene {
                                 if p.is_empty() {
                                     continue;
                                 }
+                                // Reference the shared, pre-loaded handle.
+                                out.push_str(&format!(
+                                    "{cvar}.{} = Images[\"{}\"]\n",
+                                    sanitize_field(&prop.name),
+                                    escape_luau(p)
+                                ));
+                                continue;
                             }
                             out.push_str(&format!(
                                 "{cvar}.{} = {}\n",
@@ -733,25 +1186,106 @@ impl Scene {
                         let module = if path.is_empty() {
                             "-- TODO: set script path".to_string()
                         } else {
-                            format!("require(\"{}\")", escape_luau(path))
+                            script_vars
+                                .get(&normalize_require_path(path))
+                                .cloned()
+                                .unwrap_or_else(|| "nil -- missing script module".to_string())
                         };
                         out.push_str(&format!("local {cvar} = {var}:AddComponent({module})\n"));
                         for variable in variables {
                             if variable.name.is_empty() {
                                 continue;
                             }
-                            out.push_str(&format!(
+                            let assignment = format!(
                                 "{cvar}.{} = {}\n",
                                 sanitize_field(&variable.name),
-                                variable.value.to_luau()
-                            ));
+                                if variable.value.contains_reference() {
+                                    variable
+                                        .value
+                                        .to_luau_with_references(&var_of, &component_vars)
+                                } else {
+                                    variable.value.to_luau()
+                                }
+                            );
+                            if variable.value.contains_reference() {
+                                deferred_reference_assignments.push(assignment);
+                            } else {
+                                out.push_str(&assignment);
+                            }
                         }
                     }
                 }
             }
             out.push('\n');
         }
+        if !deferred_reference_assignments.is_empty() {
+            out.push_str("-- Inspector scene references\n");
+            for assignment in deferred_reference_assignments {
+                out.push_str(&assignment);
+            }
+        }
         out
+    }
+
+    /// Unique image paths and script module paths referenced by active
+    /// entities, each in first-use order.
+    fn collect_assets(&self) -> (Vec<String>, Vec<String>) {
+        let mut images: Vec<String> = Vec::new();
+        let mut scripts: Vec<String> = Vec::new();
+        for id in self.topological_order() {
+            if !self.is_active_in_tree(id) {
+                continue;
+            }
+            let Some(entity) = self.entity(id) else {
+                continue;
+            };
+            for component in &entity.components {
+                match component {
+                    Component::Core { props, .. } => {
+                        for prop in props {
+                            if let PropValue::Image(path) = &prop.value {
+                                if !path.is_empty() && !images.contains(path) {
+                                    images.push(path.clone());
+                                }
+                            }
+                        }
+                    }
+                    Component::Script { path, .. } => {
+                        if !path.is_empty() {
+                            let module = normalize_require_path(path);
+                            if !scripts.contains(&module) {
+                                scripts.push(module);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (images, scripts)
+    }
+
+    /// Generate `images.luau`, loading each unique image exactly once. Script
+    /// modules are required at the top of `main.luau` instead.
+    pub fn to_images_luau(&self) -> Option<String> {
+        let (images, _) = self.collect_assets();
+        if images.is_empty() {
+            return None;
+        }
+
+        let mut out = String::new();
+        out.push_str("-- Generated by the NeoLOVE visual editor. Edits may be overwritten.\n");
+        out.push_str("-- Shared image cache: every image is loaded once and reused.\n\n");
+        out.push_str("local Images = {}\n\n");
+
+        for path in &images {
+            let escaped = escape_luau(path);
+            out.push_str(&format!(
+                "Images[\"{escaped}\"] = assets.loadImage(\"{escaped}\")\n"
+            ));
+        }
+
+        out.push_str("\nreturn Images\n");
+        Some(out)
     }
 
     /// True if this entity and all of its ancestors are enabled.
@@ -835,6 +1369,20 @@ fn escape_luau(value: &str) -> String {
     out
 }
 
+fn normalize_require_path(path: &str) -> String {
+    let mut path = path.replace('\\', "/");
+    if path.ends_with(".luau") {
+        path.truncate(path.len() - ".luau".len());
+    } else if path.ends_with(".lua") {
+        path.truncate(path.len() - ".lua".len());
+    }
+    if path.starts_with("./") || path.starts_with("../") || path.starts_with('@') {
+        path
+    } else {
+        format!("./{path}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -849,6 +1397,37 @@ mod tests {
     }
 
     #[test]
+    fn linked_prefab_refresh_preserves_root_placement() {
+        let mut prototype_scene = Scene::default();
+        let prototype_root = prototype_scene.entities[0].id;
+        prototype_scene.entity_mut(prototype_root).unwrap().name = "Enemy".into();
+        let child = prototype_scene.add_entity("Weapon", 4.0, 5.0).id;
+        prototype_scene.entity_mut(child).unwrap().parent = Some(prototype_root);
+        let prototype = prototype_scene.subtree(prototype_root);
+
+        let mut scene = Scene::default();
+        scene.entities.clear();
+        let root = scene
+            .instantiate_linked(prototype.clone(), "prefabs/enemy.neoprefab")
+            .unwrap();
+        scene.entity_mut(root).unwrap().x = 320.0;
+        scene.entity_mut(root).unwrap().y = 180.0;
+
+        let mut edited = prototype;
+        edited[0].name = "Strong Enemy".into();
+        edited.push(Entity::new(99, "Health Bar", 0.0, -12.0));
+        edited.last_mut().unwrap().parent = Some(edited[0].id);
+        assert_eq!(
+            scene.refresh_prefab_instances("prefabs/enemy.neoprefab", &edited),
+            1
+        );
+        let refreshed = scene.entity(root).unwrap();
+        assert_eq!(refreshed.name, "Strong Enemy");
+        assert_eq!((refreshed.x, refreshed.y), (320.0, 180.0));
+        assert_eq!(scene.children_of(Some(root)).len(), 2);
+    }
+
+    #[test]
     fn default_entity_has_no_components() {
         let scene = Scene::default();
         assert_eq!(scene.entities.len(), 1);
@@ -860,6 +1439,8 @@ mod tests {
         let mut scene = Scene {
             name: "Test".into(),
             background: [10, 20, 30, 255],
+            nearest_neighbor_scaling: true,
+            antialiasing: default_antialiasing(),
             entities: Vec::new(),
             next_id: 1,
         };
@@ -875,6 +1456,44 @@ mod tests {
         assert!(luau.contains("AddComponent(core.TextBox)"));
         assert!(luau.contains(".text = \"Text\""));
         assert!(luau.contains(".align_x = \"left\""));
+        assert!(luau.contains("app.antiAliasing = \"high\""));
+        assert!(luau.contains(".antialiasing = \"inherit\""));
+    }
+
+    #[test]
+    fn particle_system_has_editor_schema_and_exports_runtime_component() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        let particle_system = Component::core("ParticleSystem2D");
+        let Component::Core { props, .. } = &particle_system else {
+            unreachable!()
+        };
+        assert!(props.iter().any(|prop| prop.name == "emission_rate"));
+        assert!(props.iter().any(|prop| prop.name == "start_color"));
+        assert!(props.iter().any(|prop| prop.name == "gravity_y" && prop.advanced));
+        scene
+            .entity_mut(id)
+            .expect("entity")
+            .components
+            .push(particle_system);
+
+        let luau = scene.to_luau();
+        assert!(luau.contains("AddComponent(core.ParticleSystem2D)"));
+        assert!(luau.contains(".emission_rate = 12"));
+        assert!(luau.contains(".end_color = Color4(255, 92, 40, 0)"));
+    }
+
+    #[test]
+    fn tilemap_has_editor_schema_and_exports_runtime_component() {
+        let component = Component::core("Tilemap2D");
+        let Component::Core { props, .. } = &component else { unreachable!() };
+        assert!(props.iter().any(|prop| prop.name == "tiles"));
+        assert!(props.iter().any(|prop| prop.name == "map_width"));
+        let mut scene = Scene::default();
+        scene.entities[0].components.push(component);
+        let luau = scene.to_luau();
+        assert!(luau.contains("AddComponent(core.Tilemap2D)"));
+        assert!(luau.contains(".tiles = \"0\""));
     }
 
     #[test]
@@ -882,6 +1501,8 @@ mod tests {
         let mut scene = Scene {
             name: "T".into(),
             background: [0, 0, 0, 255],
+            nearest_neighbor_scaling: true,
+            antialiasing: default_antialiasing(),
             entities: Vec::new(),
             next_id: 1,
         };
@@ -917,6 +1538,8 @@ mod tests {
         let mut scene = Scene {
             name: "S".into(),
             background: [0, 0, 0, 255],
+            nearest_neighbor_scaling: true,
+            antialiasing: default_antialiasing(),
             entities: Vec::new(),
             next_id: 1,
         };
@@ -926,14 +1549,204 @@ mod tests {
             variables: vec![ScriptVar {
                 name: "speed".into(),
                 value: VarValue::Number(200.0),
+                control: VarControl::Field,
             }],
         });
         let id = e.id;
         scene.replace_entity(id, e);
 
         let luau = scene.to_luau();
-        assert!(luau.contains("AddComponent(require(\"scripts/Player\"))"));
+        assert!(luau.contains("local ScriptModule_0 = require(\"./scripts/Player\")"));
+        assert!(luau.contains("AddComponent(ScriptModule_0)"));
         assert!(luau.contains(".speed = 200"));
+        assert!(scene.to_images_luau().is_none());
+        assert!(luau.find("require(\"./scripts/Player\")").unwrap() < luau.find("app.bg").unwrap());
+    }
+
+    #[test]
+    fn script_component_exports_forward_entity_and_component_references() {
+        let mut scene = Scene::default();
+        scene.entities.clear();
+        let mut owner = scene.add_entity("Owner", 0.0, 0.0);
+        let owner_id = owner.id;
+        owner.components.push(Component::Script {
+            path: "scripts/Owner.luau".into(),
+            variables: Vec::new(),
+        });
+        scene.replace_entity(owner_id, owner);
+
+        let mut target = scene.add_entity("Target", 0.0, 0.0);
+        let target_id = target.id;
+        target.components.push(Component::core("Rect2D"));
+        scene.replace_entity(target_id, target);
+
+        let Component::Script { variables, .. } =
+            &mut scene.entity_mut(owner_id).unwrap().components[0]
+        else {
+            unreachable!()
+        };
+        variables.push(ScriptVar {
+            name: "target".into(),
+            value: VarValue::Entity(Some(target_id)),
+            control: VarControl::Field,
+        });
+        variables.push(ScriptVar {
+            name: "renderer".into(),
+            value: VarValue::Component(Some(ComponentReference {
+                entity: target_id,
+                component: 0,
+            })),
+            control: VarControl::Field,
+        });
+
+        let luau = scene.to_luau();
+        let target_component = luau
+            .find("local ent_1_c0 = ent_1:AddComponent(core.Rect2D)")
+            .expect("target component declaration");
+        let entity_assignment = luau
+            .find("ent_0_c0.target = ent_1")
+            .expect("entity reference assignment");
+        let component_assignment = luau
+            .find("ent_0_c0.renderer = ent_1_c0")
+            .expect("component reference assignment");
+        assert!(entity_assignment > target_component);
+        assert!(component_assignment > target_component);
+    }
+
+    #[test]
+    fn removing_component_clears_or_shifts_component_references() {
+        let mut scene = Scene::default();
+        let target_id = scene.entities[0].id;
+        scene.entity_mut(target_id).unwrap().components = vec![
+            Component::core("Rect2D"),
+            Component::core("Shape2D"),
+            Component::Script {
+                path: "scripts/Refs.luau".into(),
+                variables: vec![
+                    ScriptVar {
+                        name: "removed".into(),
+                        value: VarValue::Component(Some(ComponentReference {
+                            entity: target_id,
+                            component: 0,
+                        })),
+                        control: VarControl::Field,
+                    },
+                    ScriptVar {
+                        name: "shifted".into(),
+                        value: VarValue::Component(Some(ComponentReference {
+                            entity: target_id,
+                            component: 1,
+                        })),
+                        control: VarControl::Field,
+                    },
+                ],
+            },
+        ];
+        scene.entity_mut(target_id).unwrap().components.remove(0);
+        scene.adjust_component_references(target_id, 0);
+
+        let Component::Script { variables, .. } = &scene.entity(target_id).unwrap().components[1]
+        else {
+            unreachable!()
+        };
+        assert!(matches!(variables[0].value, VarValue::Component(None)));
+        assert!(matches!(
+            variables[1].value,
+            VarValue::Component(Some(ComponentReference { component: 0, .. }))
+        ));
+    }
+
+    #[test]
+    fn script_component_preserves_valid_require_prefixes() {
+        for (path, required) in [
+            ("./scripts/A.luau", "./scripts/A"),
+            ("../shared/B.lua", "../shared/B"),
+            ("@game/C", "@game/C"),
+        ] {
+            let mut scene = Scene::default();
+            let id = scene.entities[0].id;
+            scene.entity_mut(id).expect("entity").components.push(Component::Script {
+                path: path.into(),
+                variables: Vec::new(),
+            });
+            let luau = scene.to_luau();
+            assert!(luau.contains(&format!("local ScriptModule_0 = require(\"{required}\")")));
+            assert!(luau.contains("AddComponent(ScriptModule_0)"));
+            assert!(luau.find(&format!("require(\"{required}\")")).unwrap() < luau.find("app.bg").unwrap());
+        }
+    }
+
+    #[test]
+    fn shared_image_is_loaded_once_and_referenced_everywhere() {
+        let mut scene = Scene::default();
+        // Two sprites pointing at the same image must share one loadImage call.
+        for name in ["A", "B"] {
+            let mut e = scene.add_entity(name, 0.0, 0.0);
+            let mut sprite = Component::core("Sprite2D");
+            if let Component::Core { props, .. } = &mut sprite {
+                for prop in props.iter_mut() {
+                    if let PropValue::Image(path) = &mut prop.value {
+                        *path = "assets/shared.png".into();
+                    }
+                }
+            }
+            e.components.push(sprite);
+            let id = e.id;
+            scene.replace_entity(id, e);
+        }
+
+        let images = scene.to_images_luau().expect("images emitted");
+        assert_eq!(images.matches("assets.loadImage(").count(), 1);
+        assert!(images.contains("Images[\"assets/shared.png\"] = assets.loadImage(\"assets/shared.png\")"));
+
+        let luau = scene.to_luau();
+        // Both entities reference the cached handle, none call loadImage inline.
+        assert!(!luau.contains("loadImage"));
+        assert!(luau.contains("local Images = require(\"./images\")"));
+        assert_eq!(luau.matches("Images[\"assets/shared.png\"]").count(), 2);
+    }
+
+    #[test]
+    fn scene_without_images_emits_no_images_module() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        scene.entity_mut(id).expect("entity").components.push(Component::core("TextBox"));
+        assert!(scene.to_images_luau().is_none());
+        assert!(!scene.to_luau().contains("require(\"./images\")"));
+    }
+
+    #[test]
+    fn script_component_exports_color_list_and_dictionary_variables() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        scene.entity_mut(id).expect("entity").components.push(Component::Script {
+            path: "scripts/Inventory.luau".into(),
+            variables: vec![
+                ScriptVar {
+                    name: "tint".into(),
+                    value: VarValue::Color([1, 2, 3, 4]),
+                    control: VarControl::Field,
+                },
+                ScriptVar {
+                    name: "items".into(),
+                    value: VarValue::List(vec![VarValue::Text("key".into()), VarValue::Number(2.0)]),
+                    control: VarControl::Field,
+                },
+                ScriptVar {
+                    name: "stats".into(),
+                    value: VarValue::Dictionary(vec![DictionaryEntry {
+                        key: VarKey::Text("health".into()),
+                        value: VarValue::Number(100.0),
+                    }]),
+                    control: VarControl::Field,
+                },
+            ],
+        });
+
+        let luau = scene.to_luau();
+        assert!(luau.contains(".tint = Color4(1, 2, 3, 4)"));
+        assert!(luau.contains(".items = {\"key\", 2}"));
+        assert!(luau.contains(".stats = {[\"health\"] = 100}"));
     }
 
     #[test]
@@ -941,6 +1754,8 @@ mod tests {
         let mut scene = Scene {
             name: "F".into(),
             background: [0, 0, 0, 255],
+            nearest_neighbor_scaling: true,
+            antialiasing: default_antialiasing(),
             entities: Vec::new(),
             next_id: 1,
         };
@@ -993,8 +1808,43 @@ mod tests {
             .push(Component::core("EntityScaler"));
         let luau = scene.to_luau();
         assert!(luau.contains("AddComponent(core.EntityScaler)"));
+        assert!(luau.contains(".edit_with_percent = true"));
         assert!(luau.contains(".x_percent = 0"));
+        assert!(luau.contains(".size_x_percent = 0"));
+        assert!(luau.contains(".size_y_percent = 0"));
         assert!(luau.contains(".pivot_x = 0"));
+    }
+
+    #[test]
+    fn old_entity_scalers_gain_percent_editing_fields_on_load() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        let mut scaler = Component::core("EntityScaler");
+        let Component::Core { props, .. } = &mut scaler else {
+            unreachable!();
+        };
+        props.retain(|prop| {
+            !matches!(
+                prop.name.as_str(),
+                "edit_with_percent" | "size_x_percent" | "size_y_percent"
+            )
+        });
+        scene.entity_mut(id).expect("entity").components.push(scaler);
+
+        let restored = Scene::from_json(&scene.to_json().expect("serialize")).expect("load");
+        let Component::Core { props, .. } = &restored.entities[0].components[0] else {
+            panic!("expected core component");
+        };
+        assert!(matches!(
+            props.iter().find(|prop| prop.name == "edit_with_percent").map(|prop| &prop.value),
+            Some(PropValue::Bool(true))
+        ));
+        for name in ["size_x_percent", "size_y_percent"] {
+            assert!(matches!(
+                props.iter().find(|prop| prop.name == name).map(|prop| &prop.value),
+                Some(PropValue::Number(value)) if *value == 0.0
+            ));
+        }
     }
 
     #[test]
