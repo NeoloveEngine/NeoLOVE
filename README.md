@@ -39,6 +39,30 @@ sudo apt-get install pkg-config libasound2-dev
 
 ## Install
 
+Automated setup scripts install Git, native build dependencies, the stable Rust
+toolchain, and NeoLOVE in a user-local application-data directory. They then
+compile and launch the editor using the optimized release profile. Vulkan is
+enabled automatically when a working runtime is detected.
+
+On Linux or macOS:
+
+```bash
+./install.sh
+```
+
+Set `NEOLOVE_VULKAN=1` or `NEOLOVE_VULKAN=0` to override Vulkan detection.
+
+On Windows PowerShell:
+
+```powershell
+.\install.ps1
+```
+
+Pass `-Vulkan On` or `-Vulkan Off` to override Vulkan detection. The Windows
+installer also installs the Visual Studio 2022 Desktop C++ build workload.
+
+### Manual install
+
 Build and install the CLI from source:
 
 ```bash
