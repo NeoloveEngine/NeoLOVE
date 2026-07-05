@@ -588,6 +588,8 @@ export type Shape2D = BaseDrawableComponent & {
 }
 
 export type ParticleEmitterShape = "point" | "box" | "circle"
+export type ParticleColorKeypoint = { time: number, color: Color4Value }
+export type ParticleNumberKeypoint = { time: number, value: number }
 
 export type ParticleSystem2D = BaseDrawableComponent & {
 	__neolove_component: "ParticleSystem2D",
@@ -604,6 +606,8 @@ export type ParticleSystem2D = BaseDrawableComponent & {
 	end_size: number,
 	start_color: Color4Value,
 	end_color: Color4Value,
+	color_sequence: { ParticleColorKeypoint },
+	transparency_sequence: { ParticleNumberKeypoint },
 	shape: ParticleEmitterShape,
 	radius: number,
 	gravity_x: number,
@@ -617,6 +621,18 @@ export type ParticleSystem2D = BaseDrawableComponent & {
 	Stop: (self: ParticleSystem2D) -> (),
 	emit: (self: ParticleSystem2D, count: number?) -> (),
 	Emit: (self: ParticleSystem2D, count: number?) -> (),
+}
+
+export type SpatialSound2D = ComponentInstance & {
+	__neolove_component: "SpatialSound2D",
+	sound: SoundHandle?,
+	volume: number,
+	looping: boolean,
+	autoplay: boolean,
+	play: (self: SpatialSound2D) -> boolean,
+	Play: (self: SpatialSound2D) -> boolean,
+	stop: (self: SpatialSound2D) -> (),
+	Stop: (self: SpatialSound2D) -> (),
 }
 
 export type TextScaleMode = "none" | "fit" | "fit_width" | "fit_height"
@@ -889,6 +905,7 @@ export type CoreModule = {
 	EntityScaler: EntityScaler,
 	Shape2D: Shape2D,
 	ParticleSystem2D: ParticleSystem2D,
+	SpatialSound2D: SpatialSound2D,
 	TextBox: TextBox,
 	TextLabel: TextLabel,
 	RudimentaryTextLabel: RudimentaryTextLabel,

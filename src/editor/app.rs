@@ -20,8 +20,8 @@ use crate::renderer::{
     TextRenderRequest, TextScaleMode, TextWrapMode, Vec2 as RenderVec2,
 };
 use crate::scene::{
-    Component, ComponentReference, DictionaryEntry, Entity, Prop, PropValue, Scene, ScriptVar,
-    VarControl, VarKey, VarValue, ADVANCED_COMPONENTS, CORE_COMPONENTS,
+    ColorKeypoint, Component, ComponentReference, DictionaryEntry, Entity, NumberKeypoint, Prop,
+    PropValue, Scene, ScriptVar, VarControl, VarKey, VarValue, ADVANCED_COMPONENTS, CORE_COMPONENTS,
 };
 use crate::update::AvailableUpdate;
 
@@ -305,6 +305,69 @@ enum Pending {
     UpdateEngine,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum AssetKind {
+    Image,
+    Font,
+    Sound,
+    Shader,
+}
+
+impl AssetKind {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Image => "Choose Image",
+            Self::Font => "Choose Font",
+            Self::Sound => "Choose Sound",
+            Self::Shader => "Choose Fragment Shader",
+        }
+    }
+
+    fn glyph(self) -> char {
+        match self {
+            Self::Image => icon::IMAGE,
+            Self::Font => icon::FONT_DOWNLOAD,
+            Self::Sound => icon::AUDIOTRACK,
+            Self::Shader => icon::DATA_OBJECT,
+        }
+    }
+
+    fn accepts(self, path: &Path) -> bool {
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        match self {
+            Self::Image => matches_ignore_ascii_case(
+                extension,
+                &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tga", "tif", "tiff", "pnm", "ppm", "pgm", "hdr", "dds"],
+            ),
+            Self::Font => matches_ignore_ascii_case(extension, &["ttf", "otf"]),
+            Self::Sound => matches_ignore_ascii_case(extension, &["wav", "mp3", "ogg", "oga", "flac"]),
+            Self::Shader => matches_ignore_ascii_case(extension, &["glsl", "frag", "fs", "shader"]),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SequenceKind {
+    Color,
+    Transparency,
+}
+
+#[derive(Clone, Debug)]
+enum SequenceValue {
+    Colors(Vec<ColorKeypoint>),
+    Numbers(Vec<NumberKeypoint>),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AssetTarget {
+    entity: u64,
+    component: usize,
+    prop: usize,
+}
+
 /// An overlay drawn above everything, with input precedence.
 enum Popup {
     Menu { x: f32, y: f32, items: Vec<MenuItem> },
@@ -319,6 +382,19 @@ enum Popup {
     },
     Confirm { message: String, action: Pending },
     Prompt { title: String, action: Pending },
+    Asset {
+        target: AssetTarget,
+        kind: AssetKind,
+        files: Vec<String>,
+        query: String,
+        scroll: f32,
+    },
+    Sequence {
+        target: AssetTarget,
+        kind: SequenceKind,
+        value: SequenceValue,
+        selected: usize,
+    },
     /// A runtime error captured from a failed `Run`, with a copy button.
     Error { message: String, copied: bool },
 }
@@ -2145,6 +2221,38 @@ impl EditorApp {
                         let end_size = prop_num("end_size", 2.0).max(0.0);
                         let start_color = prop_color(props, "start_color").unwrap_or([255, 184, 76, 255]);
                         let end_color = prop_color(props, "end_color").unwrap_or([255, 92, 40, 0]);
+                        let color_sequence = props
+                            .iter()
+                            .find(|prop| prop.name == "color_sequence")
+                            .and_then(|prop| match &prop.value {
+                                PropValue::ColorSequence(keypoints) => Some(keypoints.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| {
+                                vec![
+                                    ColorKeypoint { time: 0.0, color: start_color },
+                                    ColorKeypoint { time: 1.0, color: end_color },
+                                ]
+                            });
+                        let transparency_sequence = props
+                            .iter()
+                            .find(|prop| prop.name == "transparency_sequence")
+                            .and_then(|prop| match &prop.value {
+                                PropValue::NumberSequence(keypoints) => Some(keypoints.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| {
+                                vec![
+                                    NumberKeypoint {
+                                        time: 0.0,
+                                        value: 1.0 - start_color[3] as f32 / 255.0,
+                                    },
+                                    NumberKeypoint {
+                                        time: 1.0,
+                                        value: 1.0 - end_color[3] as f32 / 255.0,
+                                    },
+                                ]
+                            });
                         let emitter = prop_enum("shape").unwrap_or_else(|| "point".into());
                         let emitter_radius = prop_num("radius", 32.0).max(0.0) * world_scale * zoom;
                         let gravity_x = prop_num("gravity_x", 0.0);
@@ -2185,15 +2293,12 @@ impl EditorApp {
                             let size = (start_size + (end_size - start_size) * phase)
                                 * world_scale
                                 * zoom;
-                            let mix = |from: u8, to: u8| {
-                                (from as f32 + (to as f32 - from as f32) * phase).round() as u8
-                            };
-                            let particle_color = [
-                                mix(start_color[0], end_color[0]),
-                                mix(start_color[1], end_color[1]),
-                                mix(start_color[2], end_color[2]),
-                                mix(start_color[3], end_color[3]),
-                            ];
+                            let mut particle_color = sample_color_sequence(&color_sequence, phase);
+                            particle_color[3] = ((1.0
+                                - sample_number_sequence(&transparency_sequence, phase)
+                                    .clamp(0.0, 1.0))
+                                * 255.0)
+                                .round() as u8;
                             ui.painter.fill_circle(px, py, size * 0.5, particle_color);
                         }
                         drew = true;
@@ -3187,14 +3292,14 @@ impl EditorApp {
             }
             // Upscaling filter: checked = bilinear (smooth), unchecked =
             // nearest-neighbour (crisp pixel-art, the default).
-            ui.label(x, y + 4.0, "Bilinear upscaling", self.config.theme.text);
+            self.inspector_label(ui, x, y + 4.0, "Bilinear upscaling", LABEL_W - 6.0);
             let bilinear = !self.scene.nearest_neighbor_scaling;
             if let Some(nv) = ui.checkbox(Rect::new(x + LABEL_W, y, FIELD_H, FIELD_H), bilinear) {
                 self.scene.nearest_neighbor_scaling = !nv;
                 self.mark_dirty();
             }
             y += FIELD_H + 6.0;
-            ui.label(x, y + 4.0, "Anti-aliasing", self.config.theme.text);
+            self.inspector_label(ui, x, y + 4.0, "Anti-aliasing", LABEL_W - 6.0);
             let aa_button = Rect::new(x + LABEL_W, y, (width - LABEL_W).max(40.0), FIELD_H);
             if ui.button(aa_button, &self.scene.antialiasing) {
                 self.scene.antialiasing = match self.scene.antialiasing.as_str() {
@@ -3260,7 +3365,14 @@ impl EditorApp {
             ui.painter.fill_round_rect(Rect::new(x, y, width, ROW_H), 3.0, self.config.theme.panel_alt);
             ui.icon(x + 12.0, y + ROW_H / 2.0, tri, 15.0, self.config.theme.text);
             ui.icon(x + 28.0, y + ROW_H / 2.0, glyph, 15.0, self.config.theme.accent);
-            ui.label(x + 42.0, y + (ROW_H - 14.0) / 2.0, &comp_label, self.config.theme.text);
+            ui.painter.text_clipped(
+                x + 42.0,
+                y + (ROW_H - 14.0) / 2.0,
+                &comp_label,
+                14.0,
+                self.config.theme.text,
+                (width - 90.0).max(1.0),
+            );
             let collapse_hit = Rect::new(x, y, 22.0, ROW_H);
             if collapse_hit.contains(ui.input.mouse_x, ui.input.mouse_y)
                 && ui.input.mouse_pressed
@@ -3367,7 +3479,7 @@ impl EditorApp {
         let mut dirty = false;
         let fx = x + LABEL_W;
         let fw = (width - LABEL_W).max(30.0);
-        ui.label(x, *y + 4.0, &prop.label, self.config.theme.text);
+        self.inspector_label(ui, x, *y + 4.0, &prop.label, LABEL_W - 6.0);
         match &mut prop.value {
             PropValue::Number(n) => {
                 let r = ui.text_field(&id, Rect::new(fx, *y, fw, FIELD_H), &format_num(*n));
@@ -3427,15 +3539,144 @@ impl EditorApp {
                 *y += FIELD_H + 6.0;
             }
             PropValue::Image(s) => {
-                let r = ui.text_field(&id, Rect::new(fx, *y, fw, FIELD_H), s);
-                if r.changed {
-                    *s = r.text;
-                    dirty = true;
-                }
+                dirty |= self.asset_path_row(
+                    ui,
+                    &id,
+                    s,
+                    AssetKind::Image,
+                    AssetTarget { entity, component: comp, prop: pi },
+                    fx,
+                    fw,
+                    *y,
+                );
+                *y += FIELD_H + 6.0;
+            }
+            PropValue::Font(s) => {
+                dirty |= self.asset_path_row(
+                    ui,
+                    &id,
+                    s,
+                    AssetKind::Font,
+                    AssetTarget { entity, component: comp, prop: pi },
+                    fx,
+                    fw,
+                    *y,
+                );
+                *y += FIELD_H + 6.0;
+            }
+            PropValue::Sound(s) => {
+                dirty |= self.asset_path_row(
+                    ui,
+                    &id,
+                    s,
+                    AssetKind::Sound,
+                    AssetTarget { entity, component: comp, prop: pi },
+                    fx,
+                    fw,
+                    *y,
+                );
+                *y += FIELD_H + 6.0;
+            }
+            PropValue::Shader(s) => {
+                dirty |= self.asset_path_row(
+                    ui,
+                    &id,
+                    s,
+                    AssetKind::Shader,
+                    AssetTarget { entity, component: comp, prop: pi },
+                    fx,
+                    fw,
+                    *y,
+                );
+                *y += FIELD_H + 6.0;
+            }
+            PropValue::ColorSequence(keypoints) => {
+                self.sequence_row(
+                    ui,
+                    AssetTarget { entity, component: comp, prop: pi },
+                    SequenceKind::Color,
+                    SequenceValue::Colors(keypoints.clone()),
+                    fx,
+                    fw,
+                    *y,
+                );
+                *y += FIELD_H + 6.0;
+            }
+            PropValue::NumberSequence(keypoints) => {
+                self.sequence_row(
+                    ui,
+                    AssetTarget { entity, component: comp, prop: pi },
+                    SequenceKind::Transparency,
+                    SequenceValue::Numbers(keypoints.clone()),
+                    fx,
+                    fw,
+                    *y,
+                );
                 *y += FIELD_H + 6.0;
             }
         }
         dirty
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sequence_row(
+        &mut self,
+        ui: &mut Ui,
+        target: AssetTarget,
+        kind: SequenceKind,
+        value: SequenceValue,
+        x: f32,
+        width: f32,
+        y: f32,
+    ) {
+        let rect = Rect::new(x, y, width, FIELD_H);
+        draw_sequence_strip(&mut ui.painter, rect, &value, self.config.theme.field);
+        let hovered = rect.contains(ui.input.mouse_x, ui.input.mouse_y);
+        ui.painter.stroke_round_rect(
+            rect,
+            3.0,
+            if hovered { self.config.theme.accent } else { self.config.theme.border },
+        );
+        if hovered && ui.input.mouse_pressed {
+            self.popup = Some(Popup::Sequence {
+                target,
+                kind,
+                value,
+                selected: 0,
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn asset_path_row(
+        &mut self,
+        ui: &mut Ui,
+        id: &str,
+        value: &mut String,
+        kind: AssetKind,
+        target: AssetTarget,
+        x: f32,
+        width: f32,
+        y: f32,
+    ) -> bool {
+        let picker_width = 24.0;
+        let field_width = (width - picker_width - 4.0).max(24.0);
+        let result = ui.text_field(id, Rect::new(x, y, field_width, FIELD_H), value);
+        let button = Rect::new(x + field_width + 4.0, y, picker_width, FIELD_H);
+        if ui.icon_toggle(button, kind.glyph(), false, self.config.theme.text_dim) {
+            let files = self.asset_paths(kind);
+            self.popup = Some(Popup::Asset {
+                target,
+                kind,
+                files,
+                query: String::new(),
+                scroll: 0.0,
+            });
+        }
+        if result.changed {
+            *value = result.text;
+        }
+        result.changed
     }
 
     fn script_variables(
@@ -3534,7 +3775,7 @@ impl EditorApp {
                     fractional,
                 } = control
                 {
-                    ui.label(x, *y + 4.0, label, self.config.theme.text);
+                    self.inspector_label(ui, x, *y + 4.0, label, LABEL_W - 6.0);
                     let fx = x + LABEL_W;
                     let value_w = 54.0_f32.min((width - LABEL_W) * 0.35).max(36.0);
                     let slider_w = (width - LABEL_W - value_w - 6.0).max(24.0);
@@ -3568,7 +3809,7 @@ impl EditorApp {
                 }
             }
             VarValue::Bool(boolean) => {
-                ui.label(x, *y + 4.0, label, self.config.theme.text);
+                self.inspector_label(ui, x, *y + 4.0, label, LABEL_W - 6.0);
                 if let Some(next) =
                     ui.checkbox(Rect::new(x + LABEL_W, *y, FIELD_H, FIELD_H), *boolean)
                 {
@@ -3583,7 +3824,7 @@ impl EditorApp {
                 }
             }
             VarValue::Color(color) => {
-                ui.label(x, *y + 4.0, label, self.config.theme.text);
+                self.inspector_label(ui, x, *y + 4.0, label, LABEL_W - 6.0);
                 let fx = x + LABEL_W;
                 let mut next = *color;
                 if self.color_row_inline(
@@ -3606,7 +3847,7 @@ impl EditorApp {
                 *y += FIELD_H + 6.0;
             }
             VarValue::Entity(reference) => {
-                ui.label(x, *y + 4.0, label, self.config.theme.text);
+                self.inspector_label(ui, x, *y + 4.0, label, LABEL_W - 6.0);
                 let field = Rect::new(
                     x + LABEL_W,
                     *y,
@@ -3668,7 +3909,7 @@ impl EditorApp {
                 *y += FIELD_H + 6.0;
             }
             VarValue::Component(reference) => {
-                ui.label(x, *y + 4.0, label, self.config.theme.text);
+                self.inspector_label(ui, x, *y + 4.0, label, LABEL_W - 6.0);
                 let field = Rect::new(
                     x + LABEL_W,
                     *y,
@@ -3896,8 +4137,19 @@ impl EditorApp {
         y + 22.0
     }
 
+    fn inspector_label(&self, ui: &mut Ui, x: f32, y: f32, label: &str, width: f32) {
+        ui.painter.text_clipped(
+            x,
+            y,
+            label,
+            14.0,
+            self.config.theme.text,
+            width.max(1.0),
+        );
+    }
+
     fn num_row(&mut self, ui: &mut Ui, id: &str, label: &str, value: &mut f32, x: f32, width: f32, y: &mut f32) -> bool {
-        ui.label(x, *y + 4.0, label, self.config.theme.text);
+        self.inspector_label(ui, x, *y + 4.0, label, LABEL_W - 6.0);
         let fx = x + LABEL_W;
         let fw = (width - LABEL_W).max(30.0);
         let r = ui.text_field(id, Rect::new(fx, *y, fw, FIELD_H), &format_num(*value));
@@ -3916,7 +4168,7 @@ impl EditorApp {
     }
 
     fn text_row(&mut self, ui: &mut Ui, id: &str, label: &str, value: &mut String, x: f32, width: f32, y: &mut f32) -> bool {
-        ui.label(x, *y + 4.0, label, self.config.theme.text);
+        self.inspector_label(ui, x, *y + 4.0, label, LABEL_W - 6.0);
         let fx = x + LABEL_W;
         let fw = (width - LABEL_W).max(30.0);
         let r = ui.text_field(id, Rect::new(fx, *y, fw, FIELD_H), value);
@@ -3932,7 +4184,7 @@ impl EditorApp {
     /// A color row with a swatch (opens the picker) plus inline RGB fields.
     #[allow(clippy::too_many_arguments)]
     fn color_row(&mut self, ui: &mut Ui, id: &str, label: &str, color: &mut [u8; 4], target: ColorTarget, x: f32, width: f32, y: f32) -> f32 {
-        ui.label(x, y + 4.0, label, self.config.theme.text);
+        self.inspector_label(ui, x, y + 4.0, label, LABEL_W - 6.0);
         let fx = x + LABEL_W;
         self.color_row_inline(ui, id, fx, (x + width) - fx, y, color, target);
         y + FIELD_H + 6.0
@@ -4399,8 +4651,8 @@ impl EditorApp {
         };
         // Escape closes any popup (but not on the frame it just opened).
         if interactive && ui.input.escape {
-            if matches!(popup, Popup::Prompt { .. }) {
-                self.focus = None;
+            if matches!(popup, Popup::Prompt { .. } | Popup::Asset { .. } | Popup::Sequence { .. }) {
+                ui.clear_focus();
             }
             return;
         }
@@ -4409,8 +4661,484 @@ impl EditorApp {
             Popup::Color { target, x, y, rgba, hue } => self.draw_color_picker(ui, target, x, y, rgba, hue, w, h, interactive),
             Popup::Confirm { message, action } => self.draw_confirm(ui, message, action, w, h, interactive),
             Popup::Prompt { title, action } => self.draw_prompt(ui, title, action, w, h, interactive),
+            Popup::Asset {
+                target,
+                kind,
+                files,
+                query,
+                scroll,
+            } => {
+                self.draw_asset_picker(ui, target, kind, files, query, scroll, w, h, interactive)
+            }
+            Popup::Sequence { target, kind, value, selected } => {
+                self.draw_sequence_editor(ui, target, kind, value, selected, w, h, interactive)
+            }
             Popup::Error { message, copied } => self.draw_error(ui, message, copied, w, h, interactive),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_sequence_editor(
+        &mut self,
+        ui: &mut Ui,
+        target: AssetTarget,
+        kind: SequenceKind,
+        mut value: SequenceValue,
+        mut selected: usize,
+        w: f32,
+        h: f32,
+        interactive: bool,
+    ) {
+        let width = (w - 32.0).min(620.0).max(340.0);
+        let height = 230.0_f32.min(h - 24.0).max(200.0);
+        let x = (w - width) * 0.5;
+        let y = (h - height) * 0.5;
+        let panel = Rect::new(x, y, width, height);
+        ui.painter.fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 120]);
+        ui.painter.fill_round_rect(panel, 6.0, self.config.theme.panel);
+        ui.painter.stroke_round_rect(panel, 6.0, self.config.theme.accent);
+        let title = match kind {
+            SequenceKind::Color => "Particle Color Over Lifetime",
+            SequenceKind::Transparency => "Particle Transparency Over Lifetime",
+        };
+        ui.painter.text(x + 14.0, y + 12.0, title, 16.0, self.config.theme.text);
+
+        let strip = Rect::new(x + 18.0, y + 44.0, width - 36.0, 62.0);
+        draw_sequence_strip(&mut ui.painter, strip, &value, self.config.theme.field);
+        ui.painter.stroke_rect(strip, self.config.theme.border);
+
+        let times: Vec<f32> = match &value {
+            SequenceValue::Colors(keypoints) => keypoints.iter().map(|keypoint| keypoint.time).collect(),
+            SequenceValue::Numbers(keypoints) => keypoints.iter().map(|keypoint| keypoint.time).collect(),
+        };
+        selected = selected.min(times.len().saturating_sub(1));
+        let mut marker_hit = None;
+        for (index, time) in times.iter().enumerate() {
+            let marker_x = strip.x + strip.w * time.clamp(0.0, 1.0);
+            let color = if index == selected {
+                self.config.theme.accent
+            } else {
+                self.config.theme.text
+            };
+            ui.painter.fill_triangle(
+                (marker_x - 6.0, strip.y - 9.0),
+                (marker_x + 6.0, strip.y - 9.0),
+                (marker_x, strip.y - 1.0),
+                color,
+            );
+            ui.painter.fill_triangle(
+                (marker_x - 6.0, strip.bottom() + 9.0),
+                (marker_x + 6.0, strip.bottom() + 9.0),
+                (marker_x, strip.bottom() + 1.0),
+                color,
+            );
+            if interactive
+                && ui.input.mouse_pressed
+                && (ui.input.mouse_x - marker_x).abs() <= 9.0
+                && ui.input.mouse_y >= strip.y - 12.0
+                && ui.input.mouse_y <= strip.bottom() + 12.0
+            {
+                marker_hit = Some(index);
+            }
+        }
+        if let Some(index) = marker_hit {
+            selected = index;
+        }
+
+        let mut changed = false;
+        if interactive
+            && marker_hit.is_none()
+            && strip.contains(ui.input.mouse_x, ui.input.mouse_y)
+            && ui.input.mouse_pressed
+        {
+            let time = ((ui.input.mouse_x - strip.x) / strip.w).clamp(0.001, 0.999);
+            match &mut value {
+                SequenceValue::Colors(keypoints) => {
+                    let color = sample_color_sequence(keypoints, time);
+                    keypoints.push(ColorKeypoint { time, color });
+                    keypoints.sort_by(|a, b| a.time.total_cmp(&b.time));
+                    selected = nearest_color_keypoint(keypoints, time);
+                }
+                SequenceValue::Numbers(keypoints) => {
+                    let number = sample_number_sequence(keypoints, time);
+                    keypoints.push(NumberKeypoint { time, value: number });
+                    keypoints.sort_by(|a, b| a.time.total_cmp(&b.time));
+                    selected = nearest_number_keypoint(keypoints, time);
+                }
+            }
+            changed = true;
+        }
+
+        let controls_y = y + 130.0;
+        ui.painter.text(x + 18.0, controls_y + 5.0, "Time", 14.0, self.config.theme.text_dim);
+        let selected_time = match &value {
+            SequenceValue::Colors(keypoints) => keypoints.get(selected).map(|keypoint| keypoint.time).unwrap_or(0.0),
+            SequenceValue::Numbers(keypoints) => keypoints.get(selected).map(|keypoint| keypoint.time).unwrap_or(0.0),
+        };
+        let time_field = ui.text_field(
+            "sequence_time",
+            Rect::new(x + 56.0, controls_y, 70.0, FIELD_H),
+            &format_num(selected_time),
+        );
+        if time_field.changed {
+            if let Ok(mut time) = time_field.text.trim().parse::<f32>() {
+                let len = times.len();
+                time = if selected == 0 {
+                    0.0
+                } else if selected + 1 == len {
+                    1.0
+                } else {
+                    time.clamp(0.001, 0.999)
+                };
+                match &mut value {
+                    SequenceValue::Colors(keypoints) => {
+                        if let Some(keypoint) = keypoints.get_mut(selected) {
+                            keypoint.time = time;
+                        }
+                        keypoints.sort_by(|a, b| a.time.total_cmp(&b.time));
+                        selected = nearest_color_keypoint(keypoints, time);
+                    }
+                    SequenceValue::Numbers(keypoints) => {
+                        if let Some(keypoint) = keypoints.get_mut(selected) {
+                            keypoint.time = time;
+                        }
+                        keypoints.sort_by(|a, b| a.time.total_cmp(&b.time));
+                        selected = nearest_number_keypoint(keypoints, time);
+                    }
+                }
+                changed = true;
+            }
+        }
+        ui.painter.text(
+            x + 132.0,
+            controls_y + 5.0,
+            &format!("{}%", (selected_time * 100.0).round() as i32),
+            13.0,
+            self.config.theme.text_dim,
+        );
+
+        match &mut value {
+            SequenceValue::Colors(keypoints) => {
+                ui.painter.text(x + 178.0, controls_y + 5.0, "Color", 14.0, self.config.theme.text_dim);
+                if let Some(keypoint) = keypoints.get_mut(selected) {
+                    let swatch = Rect::new(x + 222.0, controls_y, 24.0, FIELD_H);
+                    ui.painter.fill_rect(swatch, keypoint.color);
+                    ui.painter.stroke_rect(swatch, self.config.theme.border);
+                    let labels = ["R", "G", "B"];
+                    for index in 0..3 {
+                        let field_x = x + 252.0 + index as f32 * 76.0;
+                        ui.painter.text(field_x, controls_y + 5.0, labels[index], 12.0, self.config.theme.text_dim);
+                        let response = ui.text_field(
+                            &format!("sequence_color_{index}"),
+                            Rect::new(field_x + 14.0, controls_y, 54.0, FIELD_H),
+                            &keypoint.color[index].to_string(),
+                        );
+                        if response.changed {
+                            if let Ok(channel) = response.text.trim().parse::<u8>() {
+                                keypoint.color[index] = channel;
+                                keypoint.color[3] = 255;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            SequenceValue::Numbers(keypoints) => {
+                ui.painter.text(x + 178.0, controls_y + 5.0, "Transparency", 14.0, self.config.theme.text_dim);
+                if let Some(keypoint) = keypoints.get_mut(selected) {
+                    let response = ui.text_field(
+                        "sequence_number",
+                        Rect::new(x + 278.0, controls_y, 80.0, FIELD_H),
+                        &format_num(keypoint.value),
+                    );
+                    if response.changed {
+                        if let Ok(number) = response.text.trim().parse::<f32>() {
+                            keypoint.value = number.clamp(0.0, 1.0);
+                            changed = true;
+                        }
+                    }
+                    ui.painter.text(
+                        x + 364.0,
+                        controls_y + 5.0,
+                        &format!("{}%", (keypoint.value * 100.0).round() as i32),
+                        13.0,
+                        self.config.theme.text_dim,
+                    );
+                }
+            }
+        }
+
+        let buttons_y = panel.bottom() - 38.0;
+        let add = Rect::new(x + 18.0, buttons_y, 80.0, 26.0);
+        let delete = Rect::new(x + 104.0, buttons_y, 80.0, 26.0);
+        let reset = Rect::new(panel.right() - 184.0, buttons_y, 78.0, 26.0);
+        let close = Rect::new(panel.right() - 98.0, buttons_y, 80.0, 26.0);
+        if interactive && ui.button(add, "Add Key") {
+            match &mut value {
+                SequenceValue::Colors(keypoints) => {
+                    let time = largest_color_gap_midpoint(keypoints);
+                    let color = sample_color_sequence(keypoints, time);
+                    keypoints.push(ColorKeypoint { time, color });
+                    keypoints.sort_by(|a, b| a.time.total_cmp(&b.time));
+                    selected = nearest_color_keypoint(keypoints, time);
+                }
+                SequenceValue::Numbers(keypoints) => {
+                    let time = largest_number_gap_midpoint(keypoints);
+                    let number = sample_number_sequence(keypoints, time);
+                    keypoints.push(NumberKeypoint { time, value: number });
+                    keypoints.sort_by(|a, b| a.time.total_cmp(&b.time));
+                    selected = nearest_number_keypoint(keypoints, time);
+                }
+            }
+            changed = true;
+        }
+        let sequence_len = match &value {
+            SequenceValue::Colors(keypoints) => keypoints.len(),
+            SequenceValue::Numbers(keypoints) => keypoints.len(),
+        };
+        if interactive && ui.button(delete, "Delete") && selected > 0 && selected + 1 < sequence_len {
+            match &mut value {
+                SequenceValue::Colors(keypoints) => {
+                    keypoints.remove(selected);
+                }
+                SequenceValue::Numbers(keypoints) => {
+                    keypoints.remove(selected);
+                }
+            }
+            selected = selected.saturating_sub(1);
+            changed = true;
+        }
+        if interactive && ui.button(reset, "Reset") {
+            value = match kind {
+                SequenceKind::Color => SequenceValue::Colors(vec![
+                    ColorKeypoint { time: 0.0, color: [255, 184, 76, 255] },
+                    ColorKeypoint { time: 1.0, color: [255, 92, 40, 255] },
+                ]),
+                SequenceKind::Transparency => SequenceValue::Numbers(vec![
+                    NumberKeypoint { time: 0.0, value: 0.0 },
+                    NumberKeypoint { time: 1.0, value: 1.0 },
+                ]),
+            };
+            selected = 0;
+            changed = true;
+        }
+        let close_clicked = interactive && ui.button(close, "Close");
+        if changed {
+            self.assign_sequence(target, &value);
+        }
+        if close_clicked {
+            ui.clear_focus();
+        } else {
+            self.popup = Some(Popup::Sequence { target, kind, value, selected });
+        }
+    }
+
+    fn assign_sequence(&mut self, target: AssetTarget, value: &SequenceValue) {
+        let Some(entity) = self.scene.entity_mut(target.entity) else {
+            return;
+        };
+        let Some(Component::Core { props, .. }) = entity.components.get_mut(target.component) else {
+            return;
+        };
+        let Some(prop) = props.get_mut(target.prop) else {
+            return;
+        };
+        match (&mut prop.value, value) {
+            (PropValue::ColorSequence(current), SequenceValue::Colors(next)) => *current = next.clone(),
+            (PropValue::NumberSequence(current), SequenceValue::Numbers(next)) => *current = next.clone(),
+            _ => return,
+        }
+        let label = prop.label.clone();
+        self.mark_dirty();
+        self.status = format!("Updated {label} sequence");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_asset_picker(
+        &mut self,
+        ui: &mut Ui,
+        target: AssetTarget,
+        kind: AssetKind,
+        files: Vec<String>,
+        mut query: String,
+        mut scroll: f32,
+        w: f32,
+        h: f32,
+        interactive: bool,
+    ) {
+        let width = (w - 32.0).min(520.0).max(280.0);
+        let height = (h - 48.0).min(440.0).max(220.0);
+        let x = (w - width) * 0.5;
+        let y = (h - height) * 0.5;
+        let panel = Rect::new(x, y, width, height);
+        ui.painter.fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 120]);
+        ui.painter.fill_round_rect(panel, 6.0, self.config.theme.panel);
+        ui.painter.stroke_round_rect(panel, 6.0, self.config.theme.accent);
+        ui.icon(x + 20.0, y + 20.0, kind.glyph(), 17.0, self.config.theme.accent);
+        ui.painter.text(x + 34.0, y + 12.0, kind.title(), 16.0, self.config.theme.text);
+
+        let close = Rect::new(panel.right() - 32.0, y + 7.0, 24.0, 24.0);
+        let close_clicked = interactive
+            && ui.icon_toggle(close, icon::DELETE, false, self.config.theme.text_dim);
+
+        let search = ui.text_field(
+            "asset_picker_search",
+            Rect::new(x + 12.0, y + 40.0, width - 24.0, FIELD_H + 2.0),
+            &query,
+        );
+        if search.changed {
+            query = search.text;
+            scroll = 0.0;
+        }
+
+        let query_lower = query.trim().to_lowercase();
+        let paths: Vec<&String> = files
+            .iter()
+            .filter(|path| query_lower.is_empty() || path.to_lowercase().contains(&query_lower))
+            .collect();
+
+        let list = Rect::new(x + 12.0, y + 72.0, width - 24.0, height - 116.0);
+        let row_h = 26.0;
+        let content_h = (paths.len() + 1) as f32 * row_h;
+        let max_scroll = (content_h - list.h).max(0.0);
+        if interactive && list.contains(ui.input.mouse_x, ui.input.mouse_y) && ui.input.scroll != 0.0 {
+            scroll = (scroll - ui.input.scroll * row_h * 2.0).clamp(0.0, max_scroll);
+            ui.wants_redraw = true;
+        } else {
+            scroll = scroll.clamp(0.0, max_scroll);
+        }
+
+        let previous_clip = ui.painter.push_clip(list);
+        ui.set_input_clip(list);
+        let mut chosen: Option<String> = None;
+        let mut row_y = list.y - scroll;
+        let draw_asset = |ui: &mut Ui, row_y: f32, glyph: char, label: &str| -> bool {
+            let row = Rect::new(list.x, row_y, list.w, row_h - 1.0);
+            let hovered = row.contains(ui.input.mouse_x, ui.input.mouse_y);
+            if hovered {
+                ui.painter.fill_round_rect(row, 3.0, ui.theme.panel_alt);
+            }
+            ui.icon(row.x + 13.0, row.y + row.h * 0.5, glyph, 15.0, ui.theme.text_dim);
+            ui.painter.text_clipped(
+                row.x + 28.0,
+                row.y + 5.0,
+                label,
+                14.0,
+                ui.theme.text,
+                row.w - 34.0,
+            );
+            hovered && ui.input.mouse_pressed
+        };
+        if draw_asset(ui, row_y, icon::DELETE, "None") && interactive {
+            chosen = Some(String::new());
+        }
+        row_y += row_h;
+        for path in &paths {
+            if draw_asset(ui, row_y, kind.glyph(), path) && interactive {
+                chosen = Some((*path).clone());
+            }
+            row_y += row_h;
+        }
+        ui.reset_input_clip();
+        ui.painter.set_clip_raw(previous_clip);
+
+        if paths.is_empty() {
+            ui.painter.text(
+                list.x + 32.0,
+                list.y + row_h + 8.0,
+                "No matching assets in this project.",
+                13.0,
+                self.config.theme.text_dim,
+            );
+        }
+        if max_scroll > 0.0 {
+            let thumb_h = (list.h * list.h / content_h).max(20.0);
+            let thumb_y = list.y + (scroll / max_scroll) * (list.h - thumb_h);
+            ui.painter.fill_round_rect(
+                Rect::new(list.right() - 4.0, thumb_y, 3.0, thumb_h),
+                1.5,
+                self.config.theme.text_dim,
+            );
+        }
+
+        ui.painter.text(
+            x + 12.0,
+            panel.bottom() - 30.0,
+            &format!("{} asset{}", paths.len(), if paths.len() == 1 { "" } else { "s" }),
+            12.0,
+            self.config.theme.text_dim,
+        );
+
+        if let Some(path) = chosen {
+            self.assign_asset(target, kind, path);
+            ui.clear_focus();
+        } else if close_clicked {
+            ui.clear_focus();
+        } else {
+            self.popup = Some(Popup::Asset {
+                target,
+                kind,
+                files,
+                query,
+                scroll,
+            });
+        }
+    }
+
+    fn asset_paths(&self, kind: AssetKind) -> Vec<String> {
+        let mut files = Vec::new();
+        collect_asset_files(&self.project_root, kind, &mut files);
+        let mut paths: Vec<String> = files
+            .into_iter()
+            .filter_map(|path| {
+                Some(
+                    path.strip_prefix(&self.project_root)
+                        .ok()?
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                )
+            })
+            .collect();
+        paths.sort_by_key(|path| path.to_lowercase());
+        paths
+    }
+
+    fn assign_asset(&mut self, target: AssetTarget, kind: AssetKind, path: String) {
+        let Some(entity) = self.scene.entity_mut(target.entity) else {
+            return;
+        };
+        let Some(Component::Core { props, .. }) = entity.components.get_mut(target.component) else {
+            return;
+        };
+        let Some(prop) = props.get_mut(target.prop) else {
+            return;
+        };
+        let matches_kind = matches!(
+            (&prop.value, kind),
+            (PropValue::Image(_), AssetKind::Image)
+                | (PropValue::Font(_), AssetKind::Font)
+                | (PropValue::Sound(_), AssetKind::Sound)
+                | (PropValue::Shader(_), AssetKind::Shader)
+        );
+        if !matches_kind {
+            return;
+        }
+        match &mut prop.value {
+            PropValue::Image(value)
+            | PropValue::Font(value)
+            | PropValue::Sound(value)
+            | PropValue::Shader(value) => {
+                *value = path.clone();
+            }
+            _ => return,
+        }
+        let label = prop.label.clone();
+        self.mark_dirty();
+        self.status = if path.is_empty() {
+            format!("Cleared {label}")
+        } else {
+            format!("Selected {path}")
+        };
     }
 
     fn draw_error(&mut self, ui: &mut Ui, message: String, mut copied: bool, w: f32, h: f32, interactive: bool) {
@@ -5848,12 +6576,16 @@ fn set_entity_scaler_numbers(entity: &mut Entity, values: &[(&str, &str, f32)]) 
 
 fn prop_string_like(props: &[Prop], names: &[&str]) -> Option<String> {
     prop_by_name(props, names).and_then(|prop| match &prop.value {
-        PropValue::Text(value) | PropValue::Image(value) => Some(value.clone()),
+        PropValue::Text(value)
+        | PropValue::Image(value)
+        | PropValue::Font(value)
+        | PropValue::Sound(value)
+        | PropValue::Shader(value) => Some(value.clone()),
         PropValue::Enum { value, .. } => Some(value.clone()),
         PropValue::Number(value) => Some(format_num(*value)),
         PropValue::Int(value) => Some(value.to_string()),
         PropValue::Bool(value) => Some(value.to_string()),
-        PropValue::Color(_) => None,
+        PropValue::Color(_) | PropValue::ColorSequence(_) | PropValue::NumberSequence(_) => None,
     })
 }
 
@@ -6080,6 +6812,121 @@ fn draw_tilemap(
     }
 }
 
+fn sample_color_sequence(keypoints: &[ColorKeypoint], time: f32) -> [u8; 4] {
+    let Some(first) = keypoints.first() else {
+        return [255, 255, 255, 255];
+    };
+    let time = time.clamp(0.0, 1.0);
+    if time <= first.time {
+        return first.color;
+    }
+    for pair in keypoints.windows(2) {
+        if time <= pair[1].time {
+            let span = (pair[1].time - pair[0].time).max(f32::EPSILON);
+            let amount = ((time - pair[0].time) / span).clamp(0.0, 1.0);
+            let mut color = [0; 4];
+            for channel in 0..4 {
+                color[channel] = (pair[0].color[channel] as f32
+                    + (pair[1].color[channel] as f32 - pair[0].color[channel] as f32) * amount)
+                    .round() as u8;
+            }
+            return color;
+        }
+    }
+    keypoints.last().map(|keypoint| keypoint.color).unwrap_or(first.color)
+}
+
+fn sample_number_sequence(keypoints: &[NumberKeypoint], time: f32) -> f32 {
+    let Some(first) = keypoints.first() else {
+        return 0.0;
+    };
+    let time = time.clamp(0.0, 1.0);
+    if time <= first.time {
+        return first.value;
+    }
+    for pair in keypoints.windows(2) {
+        if time <= pair[1].time {
+            let span = (pair[1].time - pair[0].time).max(f32::EPSILON);
+            let amount = ((time - pair[0].time) / span).clamp(0.0, 1.0);
+            return pair[0].value + (pair[1].value - pair[0].value) * amount;
+        }
+    }
+    keypoints.last().map(|keypoint| keypoint.value).unwrap_or(first.value)
+}
+
+fn draw_sequence_strip(painter: &mut Painter, rect: Rect, value: &SequenceValue, fallback: [u8; 4]) {
+    let tile = 8.0;
+    let columns = (rect.w / tile).ceil() as usize;
+    let rows = (rect.h / tile).ceil() as usize;
+    for row in 0..rows {
+        for column in 0..columns {
+            let shade = if (row + column) % 2 == 0 { 78 } else { 46 };
+            painter.fill_rect(
+                Rect::new(
+                    rect.x + column as f32 * tile,
+                    rect.y + row as f32 * tile,
+                    tile.min(rect.right() - (rect.x + column as f32 * tile)),
+                    tile.min(rect.bottom() - (rect.y + row as f32 * tile)),
+                ),
+                [shade, shade, shade, 255],
+            );
+        }
+    }
+    let steps = rect.w.max(1.0).ceil() as usize;
+    for step in 0..steps {
+        let time = (step as f32 + 0.5) / steps as f32;
+        let color = match value {
+            SequenceValue::Colors(keypoints) => sample_color_sequence(keypoints, time),
+            SequenceValue::Numbers(keypoints) => {
+                let alpha = ((1.0 - sample_number_sequence(keypoints, time).clamp(0.0, 1.0)) * 255.0)
+                    .round() as u8;
+                [255, 255, 255, alpha]
+            }
+        };
+        painter.fill_rect(
+            Rect::new(rect.x + step as f32, rect.y, 1.0, rect.h),
+            color,
+        );
+    }
+    if steps == 0 {
+        painter.fill_rect(rect, fallback);
+    }
+}
+
+fn nearest_color_keypoint(keypoints: &[ColorKeypoint], time: f32) -> usize {
+    keypoints
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| (a.time - time).abs().total_cmp(&(b.time - time).abs()))
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+fn nearest_number_keypoint(keypoints: &[NumberKeypoint], time: f32) -> usize {
+    keypoints
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| (a.time - time).abs().total_cmp(&(b.time - time).abs()))
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+fn largest_color_gap_midpoint(keypoints: &[ColorKeypoint]) -> f32 {
+    keypoints
+        .windows(2)
+        .max_by(|a, b| (a[1].time - a[0].time).total_cmp(&(b[1].time - b[0].time)))
+        .map(|pair| (pair[0].time + pair[1].time) * 0.5)
+        .unwrap_or(0.5)
+}
+
+fn largest_number_gap_midpoint(keypoints: &[NumberKeypoint]) -> f32 {
+    keypoints
+        .windows(2)
+        .max_by(|a, b| (a[1].time - a[0].time).total_cmp(&(b[1].time - b[0].time)))
+        .map(|pair| (pair[0].time + pair[1].time) * 0.5)
+        .unwrap_or(0.5)
+}
+
 /// Word-wrap one line to `max_w` pixels, hard-breaking over-long words.
 fn wrap_line(painter: &Painter, text: &str, size: f32, max_w: f32) -> Vec<String> {
     if text.is_empty() {
@@ -6156,6 +7003,7 @@ fn core_icon(name: &str) -> char {
     match name {
         "Rect2D" | "Shape2D" => icon::CROP_SQUARE,
         "ParticleSystem2D" => icon::PALETTE,
+        "SpatialSound2D" => icon::AUDIOTRACK,
         "TextBox" | "TextLabel" | "RudimentaryTextLabel" | "TextInput" => icon::TITLE,
         "Sprite2D" | "Image2D" | "NineSliceSprite2D" | "TileTexture2D" | "Tilemap2D" | "Spritebox2D" => icon::IMAGE,
         "Collider2D" => icon::BORDER_ALL,
@@ -6269,6 +7117,31 @@ fn collect_files_with_extension(root: &Path, extension: &str, out: &mut Vec<Path
     }
 }
 
+fn matches_ignore_ascii_case(value: &str, choices: &[&str]) -> bool {
+    choices.iter().any(|choice| value.eq_ignore_ascii_case(choice))
+}
+
+fn collect_asset_files(root: &Path, kind: AssetKind, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with('.'))
+        {
+            continue;
+        }
+        if path.is_dir() {
+            collect_asset_files(&path, kind, out);
+        } else if kind.accepts(&path) {
+            out.push(path);
+        }
+    }
+}
+
 fn slugify(name: &str) -> String {
     let mut out = String::new();
     for ch in name.chars() {
@@ -6290,6 +7163,7 @@ fn file_icon(name: &str) -> char {
         "png" | "bmp" | "tga" | "webp" | "jpg" | "jpeg" | "pnm" | "ppm" | "pgm" | "gif" | "tif" | "tiff" | "hdr" | "dds" => icon::IMAGE,
         "wav" | "mp3" | "ogg" | "flac" | "aac" | "m4a" | "aiff" => icon::AUDIOTRACK,
         "ttf" | "otf" => icon::FONT_DOWNLOAD,
+        "glsl" | "frag" | "vert" | "fs" | "vs" | "shader" => icon::DATA_OBJECT,
         "luau" | "lua" => icon::DATA_OBJECT,
         "toml" | "json" | "txt" | "md" | "neoscene" => icon::ARTICLE,
         "neoprefab" => icon::VIEW_IN_AR,
@@ -6415,6 +7289,55 @@ mod tests {
         assert_eq!(humanize_identifier("per_second"), "Per Second");
         assert_eq!(humanize_identifier("isEnabled"), "Is Enabled");
         assert_eq!(humanize_identifier("max_FPS"), "Max FPS");
+    }
+
+    #[test]
+    fn asset_picker_filters_supported_types_and_assigns_typed_paths() {
+        assert!(AssetKind::Image.accepts(Path::new("sprite.PNG")));
+        assert!(AssetKind::Font.accepts(Path::new("ui.otf")));
+        assert!(AssetKind::Sound.accepts(Path::new("music.flac")));
+        assert!(AssetKind::Shader.accepts(Path::new("glow.GLSL")));
+        assert!(!AssetKind::Sound.accepts(Path::new("notes.txt")));
+
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        scene
+            .entity_mut(id)
+            .expect("entity")
+            .components
+            .push(Component::core("SpatialSound2D"));
+        let mut harness = Harness::new(scene);
+        harness.app.assign_asset(
+            AssetTarget {
+                entity: id,
+                component: 0,
+                prop: 0,
+            },
+            AssetKind::Sound,
+            "assets/effect.wav".into(),
+        );
+        let Component::Core { props, .. } = &harness.app.scene.entities[0].components[0] else {
+            unreachable!()
+        };
+        assert_eq!(props[0].value, PropValue::Sound("assets/effect.wav".into()));
+        assert!(harness.app.scene_dirty);
+    }
+
+    #[test]
+    fn particle_sequences_interpolate_at_authored_times() {
+        let colors = vec![
+            ColorKeypoint { time: 0.0, color: [0, 20, 40, 255] },
+            ColorKeypoint { time: 0.5, color: [100, 120, 140, 255] },
+            ColorKeypoint { time: 1.0, color: [200, 220, 240, 255] },
+        ];
+        let transparency = vec![
+            NumberKeypoint { time: 0.0, value: 0.0 },
+            NumberKeypoint { time: 0.5, value: 0.25 },
+            NumberKeypoint { time: 1.0, value: 1.0 },
+        ];
+        assert_eq!(sample_color_sequence(&colors, 0.25), [50, 70, 90, 255]);
+        assert!((sample_number_sequence(&transparency, 0.75) - 0.625).abs() < 0.0001);
+        assert_eq!(largest_color_gap_midpoint(&colors), 0.75);
     }
 
     #[test]
@@ -7056,6 +7979,25 @@ mod tests {
         });
         h.frame(FrameInput { mouse_x: 10.0, mouse_y: 10.0, ..Default::default() });
         assert!(h.app.popup.is_some());
+    }
+
+    #[test]
+    fn particle_sequence_popup_renders_without_panicking() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        scene.entity_mut(id).expect("entity").components.push(Component::core("ParticleSystem2D"));
+        let mut h = Harness::new(scene);
+        h.app.popup = Some(Popup::Sequence {
+            target: AssetTarget { entity: id, component: 0, prop: 12 },
+            kind: SequenceKind::Color,
+            value: SequenceValue::Colors(vec![
+                ColorKeypoint { time: 0.0, color: [255, 0, 0, 255] },
+                ColorKeypoint { time: 1.0, color: [0, 0, 255, 255] },
+            ]),
+            selected: 0,
+        });
+        h.frame(FrameInput::default());
+        assert!(matches!(h.app.popup, Some(Popup::Sequence { .. })));
     }
 
     #[test]

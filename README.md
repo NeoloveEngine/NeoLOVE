@@ -128,7 +128,7 @@ The editor opens a window with a dockable **Hierarchy**, a 2D **Viewport**, an
 **Inspector**, and a bottom **Project** file browser:
 
 - Build scenes from entities and the real engine components — `Rect2D`,
-  `Shape2D`, `ParticleSystem2D`, `TextBox`, `Sprite2D`, `NineSliceSprite2D`, `Tilemap2D`, `TileTexture2D`,
+  `Shape2D`, `ParticleSystem2D`, `SpatialSound2D`, `TextBox`, `Sprite2D`, `NineSliceSprite2D`, `Tilemap2D`, `TileTexture2D`,
   `Collider2D`, `Rigidbody2D`, `Bolt2D`, `Rope2D` — added from a dropdown, each
   with its inspector-editable properties (advanced fields collapse away).
 - Nest entities into a hierarchy by dragging rows; set per-entity `z` order and

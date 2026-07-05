@@ -919,6 +919,13 @@ impl<'a> Ui<'a> {
         self.focus.is_some()
     }
 
+    /// Release the active text field, used when a modal containing that field
+    /// closes.
+    pub fn clear_focus(&mut self) {
+        self.focus = None;
+        self.edit_buffer.clear();
+    }
+
     /// The current edit buffer (the text of whatever field is/was focused this
     /// frame). Used by modal prompts to read their value reliably.
     pub fn last_edit(&self) -> &str {

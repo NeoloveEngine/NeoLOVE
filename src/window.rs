@@ -5202,6 +5202,14 @@ mod tests {
                 testParticles = entity:AddComponent(core.ParticleSystem2D)
                 testParticles.playing = false
                 testParticles.gravity_y = 0
+                testParticles.color_sequence = {
+                    { time = 0, color = Color4(10, 20, 30) },
+                    { time = 1, color = Color4(40, 50, 60) },
+                }
+                testParticles.transparency_sequence = {
+                    { time = 0, value = 0.5 },
+                    { time = 1, value = 0.5 },
+                }
                 testParticles:emit(4)
                 "#,
             )
@@ -5220,6 +5228,12 @@ mod tests {
                 .count(),
             4
         );
+        assert!(commands.iter().all(|command| match command {
+            crate::renderer::DrawCommand::Circle { color, .. } => {
+                *color == crate::platform::Color::rgba(10, 20, 30, 128)
+            }
+            _ => true,
+        }));
 
         let stop: Function = component.get("stop")?;
         stop.call::<()>(component.clone())?;
@@ -5231,6 +5245,35 @@ mod tests {
         play.call::<()>(component.clone())?;
         runtime.update(0.25).map_err(mlua::Error::external)?;
         assert_eq!(component.get::<usize>("particle_count")?, 5);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn spatial_sound_component_exposes_safe_playback_controls() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("spatial_sound")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                local entity = ecs.newEntity("speaker", ecs.root, 100, 120)
+                testSpatialSound = entity:AddComponent(core.SpatialSound2D)
+                testSpatialPlayResult = testSpatialSound:play()
+                "#,
+            )
+            .set_name("@spatial_sound_test.luau")
+            .exec()?;
+
+        let component: Table = runtime.lua.globals().get("testSpatialSound")?;
+        assert_eq!(
+            component.get::<String>("__neolove_component")?,
+            "SpatialSound2D"
+        );
+        assert!(!runtime.lua.globals().get::<bool>("testSpatialPlayResult")?);
+        assert!(component.get::<Function>("play").is_ok());
+        assert!(component.get::<Function>("stop").is_ok());
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
 
         std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())

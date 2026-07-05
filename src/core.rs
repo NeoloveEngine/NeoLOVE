@@ -121,6 +121,86 @@ fn lerp_particle_color(start: Color, end: Color, t: f32) -> Color {
     )
 }
 
+fn read_particle_color_sequence(
+    component: &Table,
+    start: Color,
+    end: Color,
+) -> mlua::Result<Vec<(f32, Color)>> {
+    let mut keypoints = Vec::new();
+    if let Ok(sequence) = component.get::<Table>("color_sequence") {
+        for entry in sequence.sequence_values::<Table>() {
+            let entry = entry?;
+            if let Ok(color) = entry.get::<Table>("color") {
+                keypoints.push((
+                    entry.get::<f32>("time").unwrap_or(0.0).clamp(0.0, 1.0),
+                    color4_to_color(color)?,
+                ));
+            }
+        }
+    }
+    if keypoints.len() < 2 {
+        keypoints = vec![(0.0, start), (1.0, end)];
+    }
+    keypoints.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(keypoints)
+}
+
+fn read_particle_number_sequence(
+    component: &Table,
+    start: f32,
+    end: f32,
+) -> mlua::Result<Vec<(f32, f32)>> {
+    let mut keypoints = Vec::new();
+    if let Ok(sequence) = component.get::<Table>("transparency_sequence") {
+        for entry in sequence.sequence_values::<Table>() {
+            let entry = entry?;
+            keypoints.push((
+                entry.get::<f32>("time").unwrap_or(0.0).clamp(0.0, 1.0),
+                entry.get::<f32>("value").unwrap_or(0.0).clamp(0.0, 1.0),
+            ));
+        }
+    }
+    if keypoints.len() < 2 {
+        keypoints = vec![(0.0, start), (1.0, end)];
+    }
+    keypoints.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(keypoints)
+}
+
+fn sample_particle_color(keypoints: &[(f32, Color)], time: f32) -> Color {
+    let Some(first) = keypoints.first() else {
+        return Color::WHITE;
+    };
+    let time = time.clamp(0.0, 1.0);
+    if time <= first.0 {
+        return first.1;
+    }
+    for pair in keypoints.windows(2) {
+        if time <= pair[1].0 {
+            let amount = (time - pair[0].0) / (pair[1].0 - pair[0].0).max(f32::EPSILON);
+            return lerp_particle_color(pair[0].1, pair[1].1, amount);
+        }
+    }
+    keypoints.last().map(|keypoint| keypoint.1).unwrap_or(first.1)
+}
+
+fn sample_particle_number(keypoints: &[(f32, f32)], time: f32) -> f32 {
+    let Some(first) = keypoints.first() else {
+        return 0.0;
+    };
+    let time = time.clamp(0.0, 1.0);
+    if time <= first.0 {
+        return first.1;
+    }
+    for pair in keypoints.windows(2) {
+        if time <= pair[1].0 {
+            let amount = (time - pair[0].0) / (pair[1].0 - pair[0].0).max(f32::EPSILON);
+            return pair[0].1 + (pair[1].1 - pair[0].1) * amount;
+        }
+    }
+    keypoints.last().map(|keypoint| keypoint.1).unwrap_or(first.1)
+}
+
 fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -2628,6 +2708,96 @@ pub fn add_core_components(
         core_components.set("EntityScaler", entity_scaler)?;
     }
 
+    // SpatialSound2D
+    // Plays a sound at the owning entity's world position and keeps the
+    // emitter position synchronized while it is active.
+    {
+        let spatial_sound = lua.create_table()?;
+        spatial_sound.set("__neolove_component", "SpatialSound2D")?;
+        spatial_sound.set(
+            "awake",
+            lua.create_function(|_lua, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "SpatialSound2D")?;
+                component.set("sound", Value::Nil)?;
+                component.set("volume", 1.0)?;
+                component.set("looping", false)?;
+                component.set("autoplay", false)?;
+                component.set("__autoplay_started", false)?;
+                component.set("__playing", false)?;
+                Ok(())
+            })?,
+        )?;
+
+        let play = lua.create_function(|lua, component: Table| {
+            let sound = component.get::<Value>("sound").unwrap_or(Value::Nil);
+            if !matches!(&sound, Value::UserData(_)) {
+                return Ok(false);
+            }
+            let entity: Table = component.get("entity")?;
+            let (x, y, _) = crate::window::get_global_transform(&entity)?;
+            let looping = component.get::<bool>("looping").unwrap_or(false);
+            let volume = component.get::<f32>("volume").unwrap_or(1.0).clamp(0.0, 1.0);
+            let audio: Table = lua.globals().get("audio")?;
+            audio
+                .get::<Function>("playSpatial")?
+                .call::<()>((sound, x, y, looping, volume))?;
+            component.set("__autoplay_started", true)?;
+            component.set("__playing", true)?;
+            Ok(true)
+        })?;
+        spatial_sound.set("play", play.clone())?;
+        spatial_sound.set("Play", play.clone())?;
+
+        let stop = lua.create_function(|lua, component: Table| {
+            let sound = component.get::<Value>("sound").unwrap_or(Value::Nil);
+            if matches!(&sound, Value::UserData(_)) {
+                let audio: Table = lua.globals().get("audio")?;
+                audio.get::<Function>("stop")?.call::<()>(sound)?;
+            }
+            component.set("__playing", false)
+        })?;
+        spatial_sound.set("stop", stop.clone())?;
+        spatial_sound.set("Stop", stop.clone())?;
+
+        let play_for_update = play.clone();
+        spatial_sound.set(
+            "update",
+            lua.create_function(move |lua, (entity, component, _dt): (Table, Table, f32)| {
+                let autoplay = component.get::<bool>("autoplay").unwrap_or(false);
+                let started = component
+                    .get::<bool>("__autoplay_started")
+                    .unwrap_or(false);
+                if autoplay && !started {
+                    let _ = play_for_update.call::<bool>(component.clone())?;
+                }
+                if component.get::<bool>("__playing").unwrap_or(false) {
+                    let sound = component.get::<Value>("sound").unwrap_or(Value::Nil);
+                    if matches!(&sound, Value::UserData(_)) {
+                        let (x, y, _) = crate::window::get_global_transform(&entity)?;
+                        let audio: Table = lua.globals().get("audio")?;
+                        let _ = audio
+                            .get::<Function>("setPosition")?
+                            .call::<bool>((sound, x, y))?;
+                    }
+                }
+                Ok(())
+            })?,
+        )?;
+
+        spatial_sound.set(
+            "destroy",
+            lua.create_function(move |lua, (_entity, component): (Table, Table)| {
+                let sound = component.get::<Value>("sound").unwrap_or(Value::Nil);
+                if matches!(&sound, Value::UserData(_)) {
+                    let audio: Table = lua.globals().get("audio")?;
+                    audio.get::<Function>("stop")?.call::<()>(sound)?;
+                }
+                Ok(())
+            })?,
+        )?;
+        core_components.set("SpatialSound2D", spatial_sound)?;
+    }
+
     // Rect2d
     // basic renderer
     {
@@ -2827,6 +2997,26 @@ pub fn add_core_components(
                 component.set("end_size", 2.0)?;
                 component.set("start_color", color4(ctx, 255, 184, 76, 255)?)?;
                 component.set("end_color", color4(ctx, 255, 92, 40, 0)?)?;
+                let color_sequence = ctx.create_table()?;
+                let color_start = ctx.create_table()?;
+                color_start.set("time", 0.0)?;
+                color_start.set("color", color4(ctx, 255, 184, 76, 255)?)?;
+                color_sequence.set(1, color_start)?;
+                let color_end = ctx.create_table()?;
+                color_end.set("time", 1.0)?;
+                color_end.set("color", color4(ctx, 255, 92, 40, 255)?)?;
+                color_sequence.set(2, color_end)?;
+                component.set("color_sequence", color_sequence)?;
+                let transparency_sequence = ctx.create_table()?;
+                let transparency_start = ctx.create_table()?;
+                transparency_start.set("time", 0.0)?;
+                transparency_start.set("value", 0.0)?;
+                transparency_sequence.set(1, transparency_start)?;
+                let transparency_end = ctx.create_table()?;
+                transparency_end.set("time", 1.0)?;
+                transparency_end.set("value", 1.0)?;
+                transparency_sequence.set(2, transparency_end)?;
+                component.set("transparency_sequence", transparency_sequence)?;
                 component.set("shape", "point")?;
                 component.set("radius", 32.0)?;
                 component.set("gravity_x", 0.0)?;
@@ -2908,6 +3098,13 @@ pub fn add_core_components(
                     * entity_scale;
                 let start_color = color4_to_color(component.get("start_color")?)?;
                 let end_color = color4_to_color(component.get("end_color")?)?;
+                let color_sequence =
+                    read_particle_color_sequence(&component, start_color, end_color)?;
+                let transparency_sequence = read_particle_number_sequence(
+                    &component,
+                    1.0 - start_color.a as f32 / 255.0,
+                    1.0 - end_color.a as f32 / 255.0,
+                )?;
                 let shader = shader_from_component(&component)?;
 
                 let current = component
@@ -2944,7 +3141,12 @@ pub fn add_core_components(
                     if visible {
                         let t = age / particle_lifetime;
                         let size = start_size + (end_size - start_size) * t;
-                        draw.push((x, y, size * 0.5, lerp_particle_color(start_color, end_color, t)));
+                        let mut color = sample_particle_color(&color_sequence, t);
+                        color.a = ((1.0
+                            - sample_particle_number(&transparency_sequence, t).clamp(0.0, 1.0))
+                            * 255.0)
+                            .round() as u8;
+                        draw.push((x, y, size * 0.5, color));
                     }
                 }
 
@@ -2999,11 +3201,16 @@ pub fn add_core_components(
                     count += 1;
                     next.raw_set(count, particle)?;
                     if visible {
+                        let mut color = sample_particle_color(&color_sequence, 0.0);
+                        color.a = ((1.0
+                            - sample_particle_number(&transparency_sequence, 0.0).clamp(0.0, 1.0))
+                            * 255.0)
+                            .round() as u8;
                         draw.push((
                             origin_x + offset_x,
                             origin_y + offset_y,
                             start_size * 0.5,
-                            start_color,
+                            color,
                         ));
                     }
                 }

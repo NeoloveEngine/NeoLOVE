@@ -14,6 +14,18 @@ use serde::{Deserialize, Serialize};
 /// An RGBA color stored as four bytes in `[r, g, b, a]` order.
 pub type Color = [u8; 4];
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ColorKeypoint {
+    pub time: f32,
+    pub color: Color,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NumberKeypoint {
+    pub time: f32,
+    pub value: f32,
+}
+
 /// A typed property value. This is the single source of truth for how a value
 /// is edited in the inspector and written to Luau.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -29,6 +41,18 @@ pub enum PropValue {
     /// An image asset path. Exported as `assets.loadImage("...")` so the
     /// runtime receives an ImageHandle rather than a bare string.
     Image(String),
+    /// A font asset path. Fonts are consumed as project-relative paths by the
+    /// text renderer.
+    Font(String),
+    /// A sound asset path. Exported as `assets.loadSound("...")` so audio
+    /// components receive a SoundHandle.
+    Sound(String),
+    /// A fragment shader asset path, exported as a runtime ShaderHandle.
+    Shader(String),
+    /// Colour keypoints sampled over a particle's normalized lifetime.
+    ColorSequence(Vec<ColorKeypoint>),
+    /// Numeric keypoints sampled over a particle's normalized lifetime.
+    NumberSequence(Vec<NumberKeypoint>),
 }
 
 impl PropValue {
@@ -48,6 +72,36 @@ impl PropValue {
             }
             PropValue::Enum { value, .. } => format!("\"{}\"", escape_luau(value)),
             PropValue::Image(s) => format!("assets.loadImage(\"{}\")", escape_luau(s)),
+            PropValue::Font(s) => format!("\"{}\"", escape_luau(s)),
+            PropValue::Sound(s) => format!("assets.loadSound(\"{}\")", escape_luau(s)),
+            PropValue::Shader(s) => format!("shaders.loadFragment(\"{}\")", escape_luau(s)),
+            PropValue::ColorSequence(keypoints) => format!(
+                "{{{}}}",
+                keypoints
+                    .iter()
+                    .map(|keypoint| format!(
+                        "{{ time = {}, color = Color4({}, {}, {}, {}) }}",
+                        fmt_num(keypoint.time),
+                        keypoint.color[0],
+                        keypoint.color[1],
+                        keypoint.color[2],
+                        keypoint.color[3]
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            PropValue::NumberSequence(keypoints) => format!(
+                "{{{}}}",
+                keypoints
+                    .iter()
+                    .map(|keypoint| format!(
+                        "{{ time = {}, value = {} }}",
+                        fmt_num(keypoint.time),
+                        fmt_num(keypoint.value)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
 }
@@ -105,15 +159,32 @@ impl Prop {
     fn image(name: &str, label: &str, v: &str) -> Self {
         Self::new(name, label, PropValue::Image(v.to_string()), false)
     }
-    /// An optional text prop (omitted from export when empty), e.g. a font path.
-    fn opt_text(name: &str, label: &str) -> Self {
+    fn font(name: &str, label: &str, v: &str) -> Self {
         Self {
             name: name.to_string(),
             label: label.to_string(),
-            value: PropValue::Text(String::new()),
+            value: PropValue::Font(v.to_string()),
             advanced: false,
             optional: true,
         }
+    }
+    fn sound(name: &str, label: &str, v: &str) -> Self {
+        Self::new(name, label, PropValue::Sound(v.to_string()), false)
+    }
+    fn shader(name: &str, label: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            label: label.to_string(),
+            value: PropValue::Shader(String::new()),
+            advanced: true,
+            optional: true,
+        }
+    }
+    fn color_sequence(name: &str, label: &str, keypoints: Vec<ColorKeypoint>) -> Self {
+        Self::new(name, label, PropValue::ColorSequence(keypoints), false)
+    }
+    fn number_sequence(name: &str, label: &str, keypoints: Vec<NumberKeypoint>) -> Self {
+        Self::new(name, label, PropValue::NumberSequence(keypoints), false)
     }
     fn new(name: &str, label: &str, value: PropValue, advanced: bool) -> Self {
         Self {
@@ -384,23 +455,82 @@ fn normalize_core_component(component: &mut Component) {
     let Component::Core { name, props } = component else {
         return;
     };
-    if name != "EntityScaler" {
-        return;
-    }
-
-    let mut existing = std::mem::take(props);
-    let mut normalized = Vec::new();
-    for default in core_component_props(name) {
-        if let Some(index) = existing.iter().position(|prop| prop.name == default.name) {
-            normalized.push(existing.remove(index));
-        } else {
-            normalized.push(default);
+    // Scenes saved before asset pickers had fonts represented as generic text.
+    // Upgrade them in place so existing projects get the picker too.
+    if matches!(name.as_str(), "TextBox" | "TextLabel" | "RudimentaryTextLabel") {
+        for prop in props.iter_mut() {
+            if prop.name == "font" {
+                if let PropValue::Text(path) = &prop.value {
+                    prop.value = PropValue::Font(path.clone());
+                }
+            }
         }
     }
-    // Preserve forward-compatible or user-authored fields that this editor
-    // version does not know about.
-    normalized.extend(existing);
-    *props = normalized;
+
+    if name == "ParticleSystem2D" {
+        let start = props
+            .iter()
+            .find(|prop| prop.name == "start_color")
+            .and_then(|prop| match prop.value {
+                PropValue::Color(color) => Some(color),
+                _ => None,
+            })
+            .unwrap_or([255, 184, 76, 255]);
+        let end = props
+            .iter()
+            .find(|prop| prop.name == "end_color")
+            .and_then(|prop| match prop.value {
+                PropValue::Color(color) => Some(color),
+                _ => None,
+            })
+            .unwrap_or([255, 92, 40, 0]);
+        if !props.iter().any(|prop| prop.name == "color_sequence") {
+            props.push(Prop::color_sequence(
+                "color_sequence",
+                "Color",
+                vec![
+                    ColorKeypoint { time: 0.0, color: [start[0], start[1], start[2], 255] },
+                    ColorKeypoint { time: 1.0, color: [end[0], end[1], end[2], 255] },
+                ],
+            ));
+        }
+        if !props.iter().any(|prop| prop.name == "transparency_sequence") {
+            props.push(Prop::number_sequence(
+                "transparency_sequence",
+                "Transparency",
+                vec![
+                    NumberKeypoint { time: 0.0, value: 1.0 - start[3] as f32 / 255.0 },
+                    NumberKeypoint { time: 1.0, value: 1.0 - end[3] as f32 / 255.0 },
+                ],
+            ));
+        }
+        props.retain(|prop| prop.name != "start_color" && prop.name != "end_color");
+    }
+
+    if !props.iter().any(|prop| prop.name == "shader") {
+        if let Some(shader) = core_component_props(name)
+            .into_iter()
+            .find(|prop| prop.name == "shader")
+        {
+            props.push(shader);
+        }
+    }
+
+    if name == "EntityScaler" {
+        let mut existing = std::mem::take(props);
+        let mut normalized = Vec::new();
+        for default in core_component_props(name) {
+            if let Some(index) = existing.iter().position(|prop| prop.name == default.name) {
+                normalized.push(existing.remove(index));
+            } else {
+                normalized.push(default);
+            }
+        }
+        // Preserve forward-compatible or user-authored fields that this editor
+        // version does not know about.
+        normalized.extend(existing);
+        *props = normalized;
+    }
 }
 
 /// Common core components offered directly in the "Add Component" menu, in
@@ -409,6 +539,7 @@ pub const CORE_COMPONENTS: &[&str] = &[
     "Rect2D",
     "Shape2D",
     "ParticleSystem2D",
+    "SpatialSound2D",
     "TextBox",
     "TextLabel",
     "Sprite2D",
@@ -439,6 +570,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
         vec![
             Prop::color("color", "Color", [255, 255, 255, 255]),
             Prop::boolean("visible", "Visible", true),
+            Prop::shader("shader", "Shader"),
         ]
     };
     match name {
@@ -478,18 +610,34 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::num("spread", "Spread °", 30.0),
             Prop::num("start_size", "Start Size", 8.0),
             Prop::num("end_size", "End Size", 2.0),
-            Prop::color("start_color", "Start Color", [255, 184, 76, 255]),
-            Prop::color("end_color", "End Color", [255, 92, 40, 0]),
+            Prop::color_sequence(
+                "color_sequence",
+                "Color",
+                vec![
+                    ColorKeypoint { time: 0.0, color: [255, 184, 76, 255] },
+                    ColorKeypoint { time: 1.0, color: [255, 92, 40, 255] },
+                ],
+            ),
+            Prop::number_sequence(
+                "transparency_sequence",
+                "Transparency",
+                vec![
+                    NumberKeypoint { time: 0.0, value: 0.0 },
+                    NumberKeypoint { time: 1.0, value: 1.0 },
+                ],
+            ),
             Prop::enumv("shape", "Emitter", "point", &["point", "box", "circle"], false),
             Prop::num("radius", "Radius", 32.0),
             Prop::num_adv("gravity_x", "Gravity X", 0.0),
             Prop::num_adv("gravity_y", "Gravity Y", 60.0),
+            Prop::shader("shader", "Shader"),
         ],
         "TextBox" | "TextLabel" | "RudimentaryTextLabel" => {
             let mut p = vec![
                 Prop::text("text", "Text", "Text"),
                 Prop::color("color", "Color", [255, 255, 255, 255]),
                 Prop::boolean("visible", "Visible", true),
+                Prop::shader("shader", "Shader"),
                 Prop::num("scale", "Scale", 24.0),
                 Prop::enumv(
                     "antialiasing",
@@ -498,7 +646,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
                     &["inherit", "off", "standard", "high"],
                     false,
                 ),
-                Prop::opt_text("font", "Font"),
+                Prop::font("font", "Font", ""),
                 Prop::enumv("align_x", "Align X", "left", &["left", "center", "right"], false),
                 Prop::enumv("align_y", "Align Y", "top", &["top", "center", "bottom"], false),
                 Prop::enumv("wrap", "Wrap", "none", &["none", "word", "char"], false),
@@ -531,6 +679,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
                 Prop::image("image", "Image", "assets/sprite.png"),
                 Prop::color("color", "Tint", [255, 255, 255, 255]),
                 Prop::boolean("visible", "Visible", true),
+                Prop::shader("shader", "Shader"),
             ];
             p.push(Prop::num_adv("source_x", "Source X", 0.0));
             p.push(Prop::num_adv("source_y", "Source Y", 0.0));
@@ -543,6 +692,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
                 Prop::image("image", "Image", "assets/sprite.png"),
                 Prop::color("color", "Tint", [255, 255, 255, 255]),
                 Prop::boolean("visible", "Visible", true),
+                Prop::shader("shader", "Shader"),
                 Prop::num("slice_left", "Slice L", 8.0),
                 Prop::num("slice_right", "Slice R", 8.0),
                 Prop::num("slice_top", "Slice T", 8.0),
@@ -556,6 +706,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::image("image", "Image", "assets/tile.png"),
             Prop::color("color", "Tint", [255, 255, 255, 255]),
             Prop::boolean("visible", "Visible", true),
+            Prop::shader("shader", "Shader"),
             Prop::num("tile_width", "Tile W", 32.0),
             Prop::num("tile_height", "Tile H", 32.0),
             Prop::num_adv("offset_x", "Offset X", 0.0),
@@ -565,6 +716,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::image("image", "Tileset", "assets/tiles.png"),
             Prop::color("color", "Tint", [255, 255, 255, 255]),
             Prop::boolean("visible", "Visible", true),
+            Prop::shader("shader", "Shader"),
             Prop::int("map_width", "Columns", 10),
             Prop::int("map_height", "Rows", 10),
             Prop::num("tile_width", "Tile W", 32.0),
@@ -609,6 +761,12 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::num_adv("restitution", "Restitution", 0.0),
             Prop::num_adv("friction", "Friction", 0.5),
             Prop::num_adv("max_speed", "Max Speed", 0.0),
+        ],
+        "SpatialSound2D" => vec![
+            Prop::sound("sound", "Sound", ""),
+            Prop::num("volume", "Volume", 1.0),
+            Prop::boolean("looping", "Looping", false),
+            Prop::boolean("autoplay", "Autoplay", false),
         ],
         "Bolt2D" => vec![
             Prop::boolean("enabled", "Enabled", true),
@@ -1154,14 +1312,20 @@ impl Scene {
                             "local {cvar} = {var}:AddComponent(core.{name})\n"
                         ));
                         for prop in props {
-                            // Skip optional text props left empty, and empty
-                            // image paths, so the runtime keeps its default.
-                            if prop.optional {
-                                if let PropValue::Text(t) = &prop.value {
-                                    if t.is_empty() {
-                                        continue;
-                                    }
-                                }
+                            // Skip optional asset/text props left empty, and
+                            // empty handle paths, so the runtime keeps defaults.
+                            if prop.optional
+                                && matches!(
+                                    &prop.value,
+                                    PropValue::Text(path)
+                                        | PropValue::Font(path)
+                                        | PropValue::Image(path)
+                                        | PropValue::Sound(path)
+                                        | PropValue::Shader(path)
+                                        if path.is_empty()
+                                )
+                            {
+                                continue;
                             }
                             if let PropValue::Image(p) = &prop.value {
                                 if p.is_empty() {
@@ -1174,6 +1338,11 @@ impl Scene {
                                     escape_luau(p)
                                 ));
                                 continue;
+                            }
+                            if let PropValue::Sound(path) = &prop.value {
+                                if path.is_empty() {
+                                    continue;
+                                }
                             }
                             out.push_str(&format!(
                                 "{cvar}.{} = {}\n",
@@ -1469,7 +1638,8 @@ mod tests {
             unreachable!()
         };
         assert!(props.iter().any(|prop| prop.name == "emission_rate"));
-        assert!(props.iter().any(|prop| prop.name == "start_color"));
+        assert!(props.iter().any(|prop| prop.name == "color_sequence"));
+        assert!(props.iter().any(|prop| prop.name == "transparency_sequence"));
         assert!(props.iter().any(|prop| prop.name == "gravity_y" && prop.advanced));
         scene
             .entity_mut(id)
@@ -1480,7 +1650,112 @@ mod tests {
         let luau = scene.to_luau();
         assert!(luau.contains("AddComponent(core.ParticleSystem2D)"));
         assert!(luau.contains(".emission_rate = 12"));
-        assert!(luau.contains(".end_color = Color4(255, 92, 40, 0)"));
+        assert!(luau.contains(".color_sequence = {{ time = 0, color = Color4(255, 184, 76, 255) }"));
+        assert!(luau.contains(".transparency_sequence = {{ time = 0, value = 0 }"));
+    }
+
+    #[test]
+    fn drawable_shader_paths_export_as_shader_handles() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        let mut rect = Component::core("Rect2D");
+        let Component::Core { props, .. } = &mut rect else {
+            unreachable!()
+        };
+        props
+            .iter_mut()
+            .find(|prop| prop.name == "shader")
+            .expect("shader property")
+            .value = PropValue::Shader("shaders/glow.glsl".into());
+        scene.entity_mut(id).expect("entity").components.push(rect);
+
+        assert!(scene
+            .to_luau()
+            .contains(".shader = shaders.loadFragment(\"shaders/glow.glsl\")"));
+    }
+
+    #[test]
+    fn spatial_sound_has_asset_schema_and_exports_sound_handle() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        let mut sound = Component::core("SpatialSound2D");
+        let Component::Core { props, .. } = &mut sound else {
+            unreachable!()
+        };
+        let sound_prop = props
+            .iter_mut()
+            .find(|prop| prop.name == "sound")
+            .expect("sound property");
+        assert!(matches!(sound_prop.value, PropValue::Sound(_)));
+        sound_prop.value = PropValue::Sound("assets/ambience.ogg".into());
+        scene.entity_mut(id).expect("entity").components.push(sound);
+
+        let luau = scene.to_luau();
+        assert!(luau.contains("AddComponent(core.SpatialSound2D)"));
+        assert!(luau.contains(".sound = assets.loadSound(\"assets/ambience.ogg\")"));
+        assert!(luau.contains(".volume = 1"));
+    }
+
+    #[test]
+    fn old_text_font_properties_upgrade_to_font_assets() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        let mut text = Component::core("TextBox");
+        let Component::Core { props, .. } = &mut text else {
+            unreachable!()
+        };
+        props
+            .iter_mut()
+            .find(|prop| prop.name == "font")
+            .expect("font property")
+            .value = PropValue::Text("assets/legacy.ttf".into());
+        scene.entity_mut(id).expect("entity").components.push(text);
+
+        let restored = Scene::from_json(&scene.to_json().expect("serialize")).expect("restore");
+        let Component::Core { props, .. } = &restored.entities[0].components[0] else {
+            unreachable!()
+        };
+        assert!(matches!(
+            &props.iter().find(|prop| prop.name == "font").expect("font").value,
+            PropValue::Font(path) if path == "assets/legacy.ttf"
+        ));
+    }
+
+    #[test]
+    fn old_particle_colors_upgrade_to_lifetime_sequences() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        let mut particle = Component::core("ParticleSystem2D");
+        let Component::Core { props, .. } = &mut particle else {
+            unreachable!()
+        };
+        props.retain(|prop| {
+            prop.name != "color_sequence"
+                && prop.name != "transparency_sequence"
+                && prop.name != "shader"
+        });
+        props.push(Prop::color("start_color", "Start Color", [10, 20, 30, 204]));
+        props.push(Prop::color("end_color", "End Color", [40, 50, 60, 51]));
+        scene.entity_mut(id).expect("entity").components.push(particle);
+
+        let restored = Scene::from_json(&scene.to_json().expect("serialize")).expect("restore");
+        let Component::Core { props, .. } = &restored.entities[0].components[0] else {
+            unreachable!()
+        };
+        assert!(props.iter().any(|prop| matches!(
+            &prop.value,
+            PropValue::ColorSequence(keypoints)
+                if keypoints[0].color == [10, 20, 30, 255]
+                    && keypoints[1].color == [40, 50, 60, 255]
+        )));
+        assert!(props.iter().any(|prop| matches!(
+            &prop.value,
+            PropValue::NumberSequence(keypoints)
+                if (keypoints[0].value - 0.2).abs() < 0.001
+                    && (keypoints[1].value - 0.8).abs() < 0.001
+        )));
+        assert!(props.iter().any(|prop| matches!(prop.value, PropValue::Shader(_))));
+        assert!(!props.iter().any(|prop| prop.name == "start_color" || prop.name == "end_color"));
     }
 
     #[test]

@@ -121,7 +121,7 @@ scale, and anchors), scene background color, attached components, and script
 public variables. The editor's built-in component menu is backed by the real
 engine component names:
 
-- Common: `Rect2D`, `Shape2D`, `ParticleSystem2D`, `TextBox`, `TextLabel`,
+- Common: `Rect2D`, `Shape2D`, `ParticleSystem2D`, `SpatialSound2D`, `TextBox`, `TextLabel`,
   `Sprite2D`, `Image2D`, `NineSliceSprite2D`, `Tilemap2D`, `TileTexture2D`,
   `EntityScaler`, `Collider2D`, and `Rigidbody2D`.
 - Advanced: `Spritebox2D`, `Bolt2D`, `Rope2D`, `LegacyBolt2D`, `String2D`,
@@ -177,7 +177,8 @@ nine-slice and tiled rendering.
 `ParticleSystem2D` is a bounded circle-particle emitter with point, box, and
 circle emission shapes. The visual editor exposes emission rate, maximum
 particles, duration/looping, lifetime, speed, direction/spread, start/end size,
-start/end color, radius, and gravity. Its deterministic editor preview shows a
+colour and transparency keypoints over normalized lifetime, radius, and gravity.
+Clicking either sequence strip opens a Roblox-style keypoint editor. Its deterministic editor preview shows a
 representative spread without changing the saved scene.
 
 ```luau
@@ -187,8 +188,15 @@ particles.emission_rate = 40
 particles.lifetime = 0.8
 particles.speed = 140
 particles.spread = 55
-particles.start_color = Color4(255, 210, 90)
-particles.end_color = Color4(255, 60, 20, 0)
+particles.color_sequence = {
+    { time = 0, color = Color4(255, 210, 90) },
+    { time = 0.6, color = Color4(255, 120, 30) },
+    { time = 1, color = Color4(255, 60, 20) },
+}
+particles.transparency_sequence = {
+    { time = 0, value = 0 }, -- opaque
+    { time = 1, value = 1 }, -- transparent
+}
 
 particles:pause()
 particles:emit(12) -- one-shot burst
@@ -520,6 +528,17 @@ audio.playSpatial(sound, enemy.x, enemy.y, true, 0.8)
 audio.setPosition(sound, enemy.x, enemy.y)
 ```
 
+For entity-bound audio, `SpatialSound2D` owns the emitter position and follows
+the entity automatically. Its sound can be selected from the editor Inspector:
+
+```luau
+local emitter = enemy:AddComponent(core.SpatialSound2D)
+emitter.sound = assets.loadSound("assets/enemy.ogg")
+emitter.volume = 0.8
+emitter.looping = true
+emitter:play()
+```
+
 <!-- page: file-system | File System -->
 # File System
 
@@ -702,6 +721,7 @@ Uniform setters:
 Edges:
 
 - Custom shaders require the Vulkan renderer on desktop; build the engine with `--features vulkan`.
+- Drawable components in the visual editor expose a Shader asset field under Advanced. Selecting a fragment shader exports a real `shaders.loadFragment(...)` handle.
 - Web builds support fragment shaders on rectangles, triangles, circles, and images through the browser WebGL path, including float/vector uniforms. Shape commands use the built-in white `Texture` sampler, while image commands bind their source image to `Texture`.
 - `shaders.DEFAULT_VERTEX_SHADER` contains the built-in vertex shader source.
 
