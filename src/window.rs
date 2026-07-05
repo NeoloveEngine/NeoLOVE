@@ -3616,7 +3616,7 @@ impl Runtime {
         let mut integration_parameters = IntegrationParameters::default();
         integration_parameters.dt = step_dt;
         integration_parameters.length_unit = 100.0;
-        integration_parameters.num_solver_iterations = NonZeroUsize::new(8).unwrap();
+        integration_parameters.num_solver_iterations = NonZeroUsize::new(8).expect("8 is non-zero");
         integration_parameters.num_internal_pgs_iterations = 2;
         integration_parameters.num_internal_stabilization_iterations = 4;
         integration_parameters.num_additional_friction_iterations = 2;

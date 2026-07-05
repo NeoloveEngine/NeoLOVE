@@ -2529,9 +2529,9 @@ mod build_compression_tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&output);
-        std::fs::create_dir_all(&output).unwrap();
+        std::fs::create_dir_all(&output).expect("create temp dir");
         unpack_payload(&compressed, &output).expect("unpack payload");
-        assert_eq!(std::fs::read(output.join(path)).unwrap(), data);
+        assert_eq!(std::fs::read(output.join(path)).expect("read unpacked file"), data);
         let _ = std::fs::remove_dir_all(output);
     }
 }

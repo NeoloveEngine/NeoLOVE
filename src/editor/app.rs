@@ -6888,7 +6888,7 @@ mod tests {
         let mut h = Harness::new(Scene::default());
         let path = h.app.project_root.join("button.neoprefab");
         let entities = vec![Entity::new(40, "Button", 0.0, 0.0)];
-        std::fs::write(&path, serde_json::to_string(&entities).unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string(&entities).expect("serialize entities")).expect("write prefab file");
         h.app.open_prefab_path(path.clone());
         assert_eq!(h.app.document_kind, DocumentKind::Prefab);
         assert_eq!(h.app.scene.entities.len(), 1);

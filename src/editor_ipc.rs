@@ -182,7 +182,7 @@ mod tests {
         let state = session.state.clone();
         assert!(
             wait_until(|| {
-                let guard = state.lock().unwrap();
+                let guard = state.lock().expect("state mutex not poisoned");
                 guard.logs.iter().any(|line| line.message == "hello from game")
                     && guard.entities.iter().any(|entity| entity.name == "Player")
             }),

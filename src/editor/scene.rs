@@ -1400,28 +1400,28 @@ mod tests {
     fn linked_prefab_refresh_preserves_root_placement() {
         let mut prototype_scene = Scene::default();
         let prototype_root = prototype_scene.entities[0].id;
-        prototype_scene.entity_mut(prototype_root).unwrap().name = "Enemy".into();
+        prototype_scene.entity_mut(prototype_root).expect("prototype root exists").name = "Enemy".into();
         let child = prototype_scene.add_entity("Weapon", 4.0, 5.0).id;
-        prototype_scene.entity_mut(child).unwrap().parent = Some(prototype_root);
+        prototype_scene.entity_mut(child).expect("child exists").parent = Some(prototype_root);
         let prototype = prototype_scene.subtree(prototype_root);
 
         let mut scene = Scene::default();
         scene.entities.clear();
         let root = scene
             .instantiate_linked(prototype.clone(), "prefabs/enemy.neoprefab")
-            .unwrap();
-        scene.entity_mut(root).unwrap().x = 320.0;
-        scene.entity_mut(root).unwrap().y = 180.0;
+            .expect("instantiate linked prefab");
+        scene.entity_mut(root).expect("root exists").x = 320.0;
+        scene.entity_mut(root).expect("root exists").y = 180.0;
 
         let mut edited = prototype;
         edited[0].name = "Strong Enemy".into();
         edited.push(Entity::new(99, "Health Bar", 0.0, -12.0));
-        edited.last_mut().unwrap().parent = Some(edited[0].id);
+        edited.last_mut().expect("edited is non-empty").parent = Some(edited[0].id);
         assert_eq!(
             scene.refresh_prefab_instances("prefabs/enemy.neoprefab", &edited),
             1
         );
-        let refreshed = scene.entity(root).unwrap();
+        let refreshed = scene.entity(root).expect("root still exists after refresh");
         assert_eq!(refreshed.name, "Strong Enemy");
         assert_eq!((refreshed.x, refreshed.y), (320.0, 180.0));
         assert_eq!(scene.children_of(Some(root)).len(), 2);
@@ -1560,7 +1560,7 @@ mod tests {
         assert!(luau.contains("AddComponent(ScriptModule_0)"));
         assert!(luau.contains(".speed = 200"));
         assert!(scene.to_images_luau().is_none());
-        assert!(luau.find("require(\"./scripts/Player\")").unwrap() < luau.find("app.bg").unwrap());
+        assert!(luau.find("require(\"./scripts/Player\")").expect("require in output") < luau.find("app.bg").expect("app.bg in output"));
     }
 
     #[test]
@@ -1581,7 +1581,7 @@ mod tests {
         scene.replace_entity(target_id, target);
 
         let Component::Script { variables, .. } =
-            &mut scene.entity_mut(owner_id).unwrap().components[0]
+            &mut scene.entity_mut(owner_id).expect("owner exists").components[0]
         else {
             unreachable!()
         };
@@ -1617,7 +1617,7 @@ mod tests {
     fn removing_component_clears_or_shifts_component_references() {
         let mut scene = Scene::default();
         let target_id = scene.entities[0].id;
-        scene.entity_mut(target_id).unwrap().components = vec![
+        scene.entity_mut(target_id).expect("target exists").components = vec![
             Component::core("Rect2D"),
             Component::core("Shape2D"),
             Component::Script {
@@ -1642,10 +1642,10 @@ mod tests {
                 ],
             },
         ];
-        scene.entity_mut(target_id).unwrap().components.remove(0);
+        scene.entity_mut(target_id).expect("target exists").components.remove(0);
         scene.adjust_component_references(target_id, 0);
 
-        let Component::Script { variables, .. } = &scene.entity(target_id).unwrap().components[1]
+        let Component::Script { variables, .. } = &scene.entity(target_id).expect("target exists").components[1]
         else {
             unreachable!()
         };
@@ -1672,7 +1672,7 @@ mod tests {
             let luau = scene.to_luau();
             assert!(luau.contains(&format!("local ScriptModule_0 = require(\"{required}\")")));
             assert!(luau.contains("AddComponent(ScriptModule_0)"));
-            assert!(luau.find(&format!("require(\"{required}\")")).unwrap() < luau.find("app.bg").unwrap());
+            assert!(luau.find(&format!("require(\"{required}\")")).expect("require in output") < luau.find("app.bg").expect("app.bg in output"));
         }
     }
 
