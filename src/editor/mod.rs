@@ -14,7 +14,6 @@
 mod app;
 mod inspector;
 mod logger;
-pub(crate) mod scene;
 mod ui;
 
 use std::num::NonZeroU32;
@@ -30,7 +29,7 @@ use winit::window::{Window, WindowBuilder};
 
 use app::EditorApp;
 use logger::LoggerWindow;
-use scene::Scene;
+use crate::scene::Scene;
 use ui::{FrameInput, Fonts, Painter, Theme, Ui};
 
 const DEFAULT_SCENE_FILE: &str = "scene.neoscene";
@@ -71,6 +70,9 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
     let smoke_png: Option<PathBuf> = smoke_var
         .map(PathBuf::from)
         .filter(|p| p.extension().is_some_and(|e| e == "png"));
+    if !smoke_test {
+        editor.start_update_check();
+    }
 
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
@@ -132,6 +134,9 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                 next_idle_redraw = now + IDLE_FRAME_INTERVAL;
             }
             if editor.poll_run() {
+                window.request_redraw();
+            }
+            if editor.poll_update_check() {
                 window.request_redraw();
             }
         }

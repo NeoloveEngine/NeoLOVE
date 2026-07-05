@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use mlua::{Lua, Table, Value, Variadic, VmState};
 
-use super::scene::{DictionaryEntry, ScriptVar, VarControl, VarKey, VarValue};
+use crate::scene::{DictionaryEntry, ScriptVar, VarControl, VarKey, VarValue};
 
 const MAX_INSPECTOR_INSTRUCTIONS: usize = 200_000;
 

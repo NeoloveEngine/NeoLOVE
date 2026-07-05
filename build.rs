@@ -13,6 +13,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HOME");
     println!("cargo:rerun-if-env-changed=USERPROFILE");
 
+    emit_git_revision();
+
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
@@ -35,6 +37,53 @@ fn main() {
             .archiver(archiver)
             .file("src/web_bridge.c")
             .compile("neolove_web_bridge");
+    }
+}
+
+fn emit_git_revision() {
+    let manifest_dir =
+        std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
+    let git_dir = resolve_git_dir(&manifest_dir);
+    let head_path = git_dir.join("HEAD");
+    println!("cargo:rerun-if-changed={}", head_path.display());
+    if let Ok(head) = std::fs::read_to_string(&head_path)
+        && let Some(reference) = head.trim().strip_prefix("ref: ")
+    {
+        println!(
+            "cargo:rerun-if-changed={}",
+            git_dir.join(reference).display()
+        );
+    }
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&manifest_dir)
+        .output();
+    let revision = output
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=NEOLOVE_GIT_REVISION={revision}");
+}
+
+fn resolve_git_dir(manifest_dir: &std::path::Path) -> std::path::PathBuf {
+    let dot_git = manifest_dir.join(".git");
+    if dot_git.is_dir() {
+        return dot_git;
+    }
+    let Ok(contents) = std::fs::read_to_string(&dot_git) else {
+        return dot_git;
+    };
+    let Some(path) = contents.trim().strip_prefix("gitdir: ") else {
+        return dot_git;
+    };
+    let path = std::path::PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        manifest_dir.join(path)
     }
 }
 

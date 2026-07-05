@@ -14,9 +14,12 @@ mod lua_error;
 mod platform;
 mod prefabs;
 mod renderer;
+#[path = "editor/scene.rs"]
+mod scene;
 mod servers;
 mod shader;
 mod tweening;
+mod update;
 mod user_input;
 pub mod window;
 
@@ -2284,6 +2287,7 @@ fn print_usage() {
     println!("  neolove editor [project-dir]");
     println!("  neolove build [project-dir] [--webasm]");
     println!("  neolove api [project-dir]");
+    println!("  neolove update");
     println!("  neolove setup-path");
     println!("  neolove --help");
     println!("  neolove --version");
@@ -2387,6 +2391,17 @@ fn run_cli() -> Result<(), String> {
             Ok(false) => println!("PATH already contains Neolove."),
             Err(error) => return Err(format!("failed to set PATH: {error}")),
         },
+        "update" => {
+            if args.len() != 2 {
+                return Err(format!(
+                    "update failed: expected no arguments, got {}",
+                    args.len().saturating_sub(2)
+                ));
+            }
+            let outcome = update::update_engine()
+                .map_err(|error| format!("update failed: {error}"))?;
+            println!("{outcome}");
+        }
         "new" => {
             if args.len() != 3 {
                 return Err(format!(

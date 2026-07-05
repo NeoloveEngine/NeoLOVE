@@ -2749,7 +2749,7 @@ impl Runtime {
                 let json = std::fs::read_to_string(&path).map_err(|e| {
                     mlua::Error::RuntimeError(format!("loadScene: failed to read '{path}': {e}"))
                 })?;
-                let scene = crate::editor::scene::Scene::from_json(&json)
+                let scene = crate::scene::Scene::from_json(&json)
                     .map_err(|e| mlua::Error::RuntimeError(format!("loadScene: {e}")))?;
                 lua.load(scene.to_luau())
                     .set_name(format!("@{path}"))
@@ -5378,7 +5378,7 @@ mod tests {
 
     #[test]
     fn exported_script_component_require_path_starts_runtime() -> mlua::Result<()> {
-        use crate::editor::scene::{Component, Scene};
+        use crate::scene::{Component, Scene};
 
         let root = temp_project_root("script_component_require");
         std::fs::create_dir_all(root.join("scripts")).map_err(mlua::Error::external)?;
@@ -5407,7 +5407,7 @@ mod tests {
 
     #[test]
     fn runtime_loads_and_instantiates_editor_neoprefab_files() -> mlua::Result<()> {
-        use crate::editor::scene::{Component, Scene};
+        use crate::scene::{Component, Scene};
 
         let (runtime, root) = start_test_runtime("load_neoprefab")?;
         let mut prefab_scene = Scene::default();
@@ -5449,7 +5449,7 @@ mod tests {
 
     #[test]
     fn nested_script_loads_prefab_components_from_project_root() -> mlua::Result<()> {
-        use crate::editor::scene::{
+        use crate::scene::{
             Component, PropValue, Scene, ScriptVar, VarControl, VarValue,
         };
 

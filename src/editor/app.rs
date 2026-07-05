@@ -19,12 +19,13 @@ use crate::renderer::{
     self, FontHandle, Rect as RenderRect, TextAlignX, TextAlignY, TextAntialiasing,
     TextRenderRequest, TextScaleMode, TextWrapMode, Vec2 as RenderVec2,
 };
-
-use super::inspector::parse_inspector_variables;
-use super::scene::{
+use crate::scene::{
     Component, ComponentReference, DictionaryEntry, Entity, Prop, PropValue, Scene, ScriptVar,
     VarControl, VarKey, VarValue, ADVANCED_COMPONENTS, CORE_COMPONENTS,
 };
+use crate::update::AvailableUpdate;
+
+use super::inspector::parse_inspector_variables;
 use super::ui::{icon, Painter, Rect, Theme, Ui};
 
 const TOOLBAR_H: f32 = 40.0;
@@ -48,6 +49,10 @@ fn rotate_point_about(px: f32, py: f32, cx: f32, cy: f32, angle: f32) -> (f32, f
     let dx = px - cx;
     let dy = py - cy;
     (cx + dx * cos - dy * sin, cy + dx * sin + dy * cos)
+}
+
+fn short_revision(revision: &str) -> &str {
+    revision.get(..revision.len().min(8)).unwrap_or(revision)
 }
 
 fn rect_from_points(x0: f32, y0: f32, x1: f32, y1: f32) -> Rect {
@@ -297,6 +302,7 @@ enum Pending {
     CreateFolder,
     CreateScript,
     RenameEntity(u64),
+    UpdateEngine,
 }
 
 /// An overlay drawn above everything, with input precedence.
@@ -396,6 +402,10 @@ pub struct EditorApp {
     /// A freshly created logger IPC session waiting to be picked up by the
     /// windowing layer to open/show the logger window.
     pending_logger_session: Option<crate::editor_ipc::LoggerSession>,
+    /// Background Git upstream check; network work never blocks editor frames.
+    update_rx: Option<std::sync::mpsc::Receiver<Result<Option<AvailableUpdate>, String>>>,
+    /// An update result waiting for another modal popup to close.
+    pending_update: Option<AvailableUpdate>,
     status: String,
     scene_dirty: bool,
     should_quit: bool,
@@ -469,6 +479,8 @@ impl EditorApp {
             script_schema_cache: HashMap::new(),
             run_rx: None,
             pending_logger_session: None,
+            update_rx: None,
+            pending_update: None,
             status: "Ready".to_string(),
             scene_dirty: false,
             should_quit: false,
@@ -511,6 +523,105 @@ impl EditorApp {
 
     pub fn should_quit(&self) -> bool {
         self.should_quit
+    }
+
+    pub fn start_update_check(&mut self) {
+        if self.update_rx.is_some() {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(crate::update::check_for_update());
+        });
+        self.update_rx = Some(receiver);
+    }
+
+    /// Poll the non-blocking update check. Returns true when visible state changed.
+    pub fn poll_update_check(&mut self) -> bool {
+        let result = self
+            .update_rx
+            .as_ref()
+            .and_then(|receiver| match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("update check stopped unexpectedly".to_string()))
+                }
+            });
+
+        if let Some(result) = result {
+            self.update_rx = None;
+            match result {
+                Ok(Some(update)) => self.offer_update(update),
+                Ok(None) => {
+                    self.status = "NeoLOVE is up to date".to_string();
+                }
+                Err(error) => {
+                    eprintln!("warning: NeoLOVE update check failed: {error}");
+                }
+            }
+            return true;
+        }
+
+        if self.popup.is_none()
+            && let Some(update) = self.pending_update.take()
+        {
+            self.offer_update(update);
+            return true;
+        }
+        false
+    }
+
+    fn offer_update(&mut self, update: AvailableUpdate) {
+        self.status = format!(
+            "Update available on {}: {} -> {}",
+            update.branch,
+            short_revision(&update.current_revision),
+            short_revision(&update.latest_revision)
+        );
+        if self.popup.is_some() {
+            self.pending_update = Some(update);
+        } else {
+            self.open_confirm(
+                "A NeoLOVE update is available. Update and restart?",
+                Pending::UpdateEngine,
+            );
+        }
+    }
+
+    fn launch_update(&mut self) {
+        self.sync_active_document();
+        if self.documents.iter().any(|document| document.dirty) {
+            self.popup = Some(Popup::Error {
+                message: "Save or discard all unsaved scene changes before updating NeoLOVE."
+                    .to_string(),
+                copied: false,
+            });
+            return;
+        }
+
+        let executable = match std::env::current_exe() {
+            Ok(executable) => executable,
+            Err(error) => {
+                self.popup = Some(Popup::Error {
+                    message: format!("Could not start the NeoLOVE update: {error}"),
+                    copied: false,
+                });
+                return;
+            }
+        };
+        match std::process::Command::new(executable).arg("update").spawn() {
+            Ok(_) => {
+                self.status = "Updating NeoLOVE; the editor will restart when reopened".to_string();
+                self.should_quit = true;
+            }
+            Err(error) => {
+                self.popup = Some(Popup::Error {
+                    message: format!("Could not start the NeoLOVE update: {error}"),
+                    copied: false,
+                });
+            }
+        }
     }
 
     /// Called from the event loop when the window is asked to close. Returns
@@ -4698,6 +4809,7 @@ impl EditorApp {
         match action {
             Pending::LoadScene => self.load(),
             Pending::Quit => self.should_quit = true,
+            Pending::UpdateEngine => self.launch_update(),
             _ => {}
         }
     }
@@ -7536,5 +7648,33 @@ mod tests {
             harness.app.selected = Some(id);
             harness.frame(FrameInput::default());
         }
+    }
+
+    #[test]
+    fn available_update_opens_confirmation_popup() {
+        let mut harness = Harness::new(Scene::default());
+        harness.app.offer_update(AvailableUpdate {
+            current_revision: "1111111111111111".to_string(),
+            latest_revision: "2222222222222222".to_string(),
+            branch: "main".to_string(),
+        });
+        assert!(matches!(
+            harness.app.popup,
+            Some(Popup::Confirm {
+                action: Pending::UpdateEngine,
+                ..
+            })
+        ));
+        assert!(harness.app.status.contains("22222222"));
+    }
+
+    #[test]
+    fn update_refuses_to_close_with_unsaved_documents() {
+        let mut harness = Harness::new(Scene::default());
+        harness.app.scene_dirty = true;
+        harness.app.documents[0].dirty = true;
+        harness.app.launch_update();
+        assert!(!harness.app.should_quit);
+        assert!(matches!(harness.app.popup, Some(Popup::Error { .. })));
     }
 }

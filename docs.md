@@ -13,12 +13,19 @@ neolove new <project-name>
 neolove run [project-dir]
 neolove editor [project-dir]
 neolove build [project-dir] [--webasm]
+neolove api [project-dir]
+neolove update
 neolove setup-path
 neolove --help
 neolove --version
 ```
 
 `run` and `build` require the target project to contain `main.luau`.
+
+`neolove update` fast-forwards the engine's tracked Git branch, rebuilds the
+same renderer feature set in release mode, and replaces the current executable.
+The engine source checkout must be clean. The editor checks for updates without
+blocking startup and asks before launching the updater.
 
 `neolove build --webasm` creates an HTML5 bundle in `dist/webasm/` and a zip at `dist/<project-name>-webasm.zip`. Serve web builds over `http://` or `https://`; browsers will not reliably load the bundle from `file://`.
 

@@ -693,8 +693,14 @@ fn editor_value_to_lua(lua: &Lua, value: &JsonValue, path: &str) -> mlua::Result
             .ok_or_else(|| prefab_json_error(path, "invalid number component property")),
         "Int" => payload
             .as_i64()
-            .map(|value| Some(Value::Integer(value)))
-            .ok_or_else(|| prefab_json_error(path, "invalid integer component property")),
+            .ok_or_else(|| prefab_json_error(path, "invalid integer component property"))
+            .and_then(|value| {
+                mlua::Integer::try_from(value)
+                    .map(|value| Some(Value::Integer(value)))
+                    .map_err(|_| {
+                        prefab_json_error(path, "integer component property is out of range")
+                    })
+            }),
         "Bool" => payload
             .as_bool()
             .map(|value| Some(Value::Boolean(value)))

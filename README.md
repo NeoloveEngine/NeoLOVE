@@ -177,9 +177,15 @@ to recolor the editor.
 | `neolove build [project-dir]` | Build a standalone desktop executable |
 | `neolove build [project-dir] --webasm` | Build an HTML5 bundle and upload zip |
 | `neolove api [project-dir]` | Refresh the Luau API type definitions |
+| `neolove update` | Pull, rebuild, and install the latest engine revision |
 | `neolove setup-path` | Add NeoLOVE to the user PATH |
 | `neolove --help` | Show CLI usage |
 | `neolove --version` | Print the installed version |
+
+The visual editor checks its tracked Git branch for updates in the background
+when it opens. If a newer revision is available, it offers to run
+`neolove update` and restart. Updates require a clean engine source checkout;
+local engine changes must be committed or stashed first.
 
 ## Runtime API
 

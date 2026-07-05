@@ -10,6 +10,9 @@ mod lua_error;
 mod platform;
 mod prefabs;
 mod renderer;
+#[allow(dead_code)]
+#[path = "editor/scene.rs"]
+mod scene;
 mod servers;
 mod shader;
 mod tweening;
