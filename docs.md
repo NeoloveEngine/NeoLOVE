@@ -87,15 +87,22 @@ Toolbar actions:
 - **Save** writes the current scene to its `.neoscene` file.
 - **Load** reloads the current `.neoscene` file.
 - **Export** writes a runnable `main.luau`.
-- **Run** exports `main.luau` and launches a live preview.
+- **Run** exports `main.luau` and launches a live preview. If the preview exits
+  with an error, the editor shows a dismissible **Runtime Error** dialog with the
+  captured output and a copy button.
 - **Entity** adds an entity to the scene.
+
+The toolbar also has a reset-camera button (returns the viewport to the origin),
+snap and grid-visibility toggles, a grid-size field, and a scene-rename field;
+renaming a scene also renames its `.neoscene` file.
 
 ## Editing Scenes
 
-The Hierarchy contains editor entities. Drag rows to reparent entities, use the
-active toggle to exclude an entity and its descendants from export, and use
-right-click menus for common actions such as add child, duplicate, copy, paste,
-unparent, reset transform, frame selected, rename, and delete.
+The Hierarchy contains editor entities, shown as a tree with a search box that
+filters by name. Drag rows to reparent entities, use the per-row eye toggle to
+exclude an entity and its descendants from export, and use right-click menus for
+common actions such as add child, duplicate, copy, paste, unparent, reset
+transform, frame selected, rename, activate/deactivate, and delete.
 
 The toolbar's three-dot menu contains Unity-style selection, hierarchy,
 alignment, and Scene-view tools. Hierarchy eye and lock controls affect only
@@ -107,8 +114,9 @@ scale, and anchors), scene background color, attached components, and script
 public variables. The editor's built-in component menu is backed by the real
 engine component names:
 
-- Common: `Rect2D`, `Shape2D`, `ParticleSystem2D`, `TextBox`, `TextLabel`, `Sprite2D`, `Image2D`,
-  `NineSliceSprite2D`, `Tilemap2D`, `TileTexture2D`, `Collider2D`, and `Rigidbody2D`.
+- Common: `Rect2D`, `Shape2D`, `ParticleSystem2D`, `TextBox`, `TextLabel`,
+  `Sprite2D`, `Image2D`, `NineSliceSprite2D`, `Tilemap2D`, `TileTexture2D`,
+  `EntityScaler`, `Collider2D`, and `Rigidbody2D`.
 - Advanced: `Spritebox2D`, `Bolt2D`, `Rope2D`, `LegacyBolt2D`, `String2D`,
   and `RudimentaryTextLabel`.
 - Drag a `.luau` or `.lua` component script from the Project browser onto an
@@ -142,6 +150,14 @@ Entity and component defaults may also be concrete runtime values instead of
 entity, drag its Hierarchy row onto the field. To assign a component, drag its
 Inspector header, hover the destination entity in the Hierarchy to inspect it,
 then drop the component onto the destination field without releasing the mouse.
+
+Components can be reordered by removing and re-adding them. Each component
+header has a copy button, and the **Add Component** menu offers **Paste** to
+apply a copied component to another entity. Color properties (and the scene
+background) open a picker that toggles between an HSV square with a hue strip
+and plain RGBA sliders; the choice is remembered in `editor.json`. Selecting an
+entity with a `Collider2D` previews the collider's shape and size as a green
+outline, since it can differ from the entity bounds.
 
 Image properties use project-relative paths or base64 PNG data. The editor
 generates an `images.luau` cache and requires script component modules at the

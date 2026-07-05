@@ -7401,7 +7401,13 @@ mod tests {
         assert_eq!(request.wrap, TextWrapMode::Char);
         assert_eq!(request.scale, 24.0);
         assert_eq!(request.padding_x, 6.0);
-        assert!(matches!(request.font, FontHandle::Path(ref path) if path.ends_with("/tmp/neolove-test-project/assets/game.ttf")));
+        match request.font {
+            FontHandle::Path(ref path) => assert!(
+                std::path::Path::new(path).ends_with("neolove-test-project/assets/game.ttf"),
+                "unexpected font path: {path}"
+            ),
+            _ => panic!("expected a Path font handle"),
+        }
     }
 
     #[test]
