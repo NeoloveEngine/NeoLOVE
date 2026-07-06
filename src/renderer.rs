@@ -38,8 +38,7 @@ pub(crate) enum TextAntialiasing {
 }
 
 const DEFAULT_FONT_CACHE_KEY: &str = "__neolove_default_font__";
-const DEFAULT_FONT_BYTES: &[u8] =
-    include_bytes!("../samples/new_features_test/assets/fonts/ProggyClean.ttf");
+const DEFAULT_FONT_BYTES: &[u8] = include_bytes!("editor/assets/OpenSans-Regular.ttf");
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub(crate) enum FontHandle {

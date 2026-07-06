@@ -1,7 +1,8 @@
-# Bundled editor fonts
+# Bundled fonts
 
-The visual editor embeds two third-party fonts. They are used only for editor
-chrome and are not part of the game runtime.
+NeoLOVE embeds two third-party fonts. Open Sans is used for editor chrome and
+as the game runtime's built-in default font. Material Icons is used only for
+editor chrome.
 
 ## Open Sans (`OpenSans-Regular.ttf`)
 
