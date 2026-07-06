@@ -1,0 +1,343 @@
+//! Timeline/keyframe animation for Luau tables and entities.
+//!
+//! Clips are data tables, so the same representation can be authored by the
+//! editor, loaded from modules, or assembled at runtime.
+
+use mlua::{Lua, RegistryKey, Table, Value};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+#[derive(Clone, Copy)]
+enum Interpolation {
+    Linear,
+    Step,
+}
+
+struct Keyframe {
+    time: f64,
+    value: f64,
+}
+
+struct Track {
+    property: String,
+    interpolation: Interpolation,
+    keys: Vec<Keyframe>,
+}
+
+struct Player {
+    id: u64,
+    target: RegistryKey,
+    tracks: Vec<Track>,
+    duration: f64,
+    time: f64,
+    speed: f64,
+    looping: bool,
+    playing: bool,
+    finished: bool,
+}
+
+struct AnimationState {
+    next_id: u64,
+    players: Vec<Player>,
+}
+
+fn number(value: Value, field: &str) -> mlua::Result<f64> {
+    match value {
+        Value::Integer(value) => Ok(value as f64),
+        Value::Number(value) if value.is_finite() => Ok(value),
+        _ => Err(mlua::Error::external(format!("{field} must be a finite number"))),
+    }
+}
+
+fn parse_clip(clip: &Table) -> mlua::Result<(Vec<Track>, f64, bool)> {
+    let tracks_table: Table = clip.get("tracks")?;
+    let mut tracks = Vec::new();
+    let mut inferred_duration = 0.0f64;
+    for track in tracks_table.sequence_values::<Table>() {
+        let track = track?;
+        let property: String = track.get("property")?;
+        if property.trim().is_empty() {
+            return Err(mlua::Error::external("animation track property cannot be empty"));
+        }
+        let interpolation = match track
+            .get::<Option<String>>("interpolation")?
+            .unwrap_or_else(|| "linear".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "linear" => Interpolation::Linear,
+            "step" | "hold" => Interpolation::Step,
+            other => {
+                return Err(mlua::Error::external(format!(
+                    "unknown animation interpolation '{other}'"
+                )))
+            }
+        };
+        let key_table: Table = track.get("keys")?;
+        let mut keys = Vec::new();
+        for key in key_table.sequence_values::<Table>() {
+            let key = key?;
+            let time = number(key.get("time")?, "keyframe time")?;
+            if time < 0.0 {
+                return Err(mlua::Error::external("keyframe time must be >= 0"));
+            }
+            let value = number(key.get("value")?, "keyframe value")?;
+            inferred_duration = inferred_duration.max(time);
+            keys.push(Keyframe { time, value });
+        }
+        keys.sort_by(|a, b| a.time.total_cmp(&b.time));
+        if !keys.is_empty() {
+            tracks.push(Track {
+                property,
+                interpolation,
+                keys,
+            });
+        }
+    }
+    if tracks.is_empty() {
+        return Err(mlua::Error::external("animation clip has no keyframes"));
+    }
+    let duration = clip
+        .get::<Option<f64>>("duration")?
+        .unwrap_or(inferred_duration)
+        .max(inferred_duration);
+    let looping = clip
+        .get::<Option<bool>>("looping")?
+        .or(clip.get::<Option<bool>>("looped")?)
+        .unwrap_or(false);
+    Ok((tracks, duration, looping))
+}
+
+fn sample(track: &Track, time: f64) -> f64 {
+    let first = &track.keys[0];
+    if time <= first.time {
+        return first.value;
+    }
+    let last = track.keys.last().expect("track is non-empty");
+    if time >= last.time {
+        return last.value;
+    }
+    for pair in track.keys.windows(2) {
+        let from = &pair[0];
+        let to = &pair[1];
+        if time <= to.time {
+            return match track.interpolation {
+                Interpolation::Step => from.value,
+                Interpolation::Linear => {
+                    let span = (to.time - from.time).max(f64::EPSILON);
+                    let alpha = ((time - from.time) / span).clamp(0.0, 1.0);
+                    from.value + (to.value - from.value) * alpha
+                }
+            };
+        }
+    }
+    last.value
+}
+
+fn with_player<R>(
+    state: &Rc<RefCell<AnimationState>>,
+    id: u64,
+    f: impl FnOnce(&mut Player) -> R,
+) -> mlua::Result<R> {
+    let mut state = state.borrow_mut();
+    let player = state
+        .players
+        .iter_mut()
+        .find(|player| player.id == id)
+        .ok_or_else(|| mlua::Error::external("animation player no longer exists"))?;
+    Ok(f(player))
+}
+
+fn create_handle(lua: &Lua, state: Rc<RefCell<AnimationState>>, id: u64) -> mlua::Result<Table> {
+    let handle = lua.create_table()?;
+    handle.set("id", id)?;
+
+    for (name, command) in [("play", 0u8), ("pause", 1), ("stop", 2)] {
+        let state = state.clone();
+        handle.set(
+            name,
+            lua.create_function(move |_lua, this: Table| {
+                let id = this.get("id")?;
+                with_player(&state, id, |player| match command {
+                    0 => {
+                        player.playing = true;
+                        player.finished = false;
+                    }
+                    1 => player.playing = false,
+                    _ => {
+                        player.playing = false;
+                        player.finished = false;
+                        player.time = 0.0;
+                    }
+                })?;
+                Ok(())
+            })?,
+        )?;
+    }
+
+    let seek_state = state.clone();
+    handle.set(
+        "seek",
+        lua.create_function(move |_lua, (this, time): (Table, f64)| {
+            let id = this.get("id")?;
+            with_player(&seek_state, id, |player| {
+                player.time = time.clamp(0.0, player.duration);
+                player.finished = false;
+            })?;
+            Ok(())
+        })?,
+    )?;
+    let speed_state = state.clone();
+    handle.set(
+        "setSpeed",
+        lua.create_function(move |_lua, (this, speed): (Table, f64)| {
+            if !speed.is_finite() || speed < 0.0 {
+                return Err(mlua::Error::external("animation speed must be >= 0"));
+            }
+            let id = this.get("id")?;
+            with_player(&speed_state, id, |player| player.speed = speed)?;
+            Ok(())
+        })?,
+    )?;
+    let status_state = state;
+    handle.set(
+        "isPlaying",
+        lua.create_function(move |_lua, this: Table| {
+            let id = this.get("id")?;
+            with_player(&status_state, id, |player| player.playing)
+        })?,
+    )?;
+    Ok(handle)
+}
+
+pub(crate) fn add_animation_module(lua: &Lua) -> mlua::Result<()> {
+    let module = lua.create_table()?;
+    let state = Rc::new(RefCell::new(AnimationState {
+        next_id: 1,
+        players: Vec::new(),
+    }));
+
+    let create_state = state.clone();
+    let create = lua.create_function(move |lua, (target, clip): (Table, Table)| {
+        let (tracks, duration, looping) = parse_clip(&clip)?;
+        let mut state = create_state.borrow_mut();
+        let id = state.next_id;
+        state.next_id += 1;
+        state.players.push(Player {
+            id,
+            target: lua.create_registry_value(target)?,
+            tracks,
+            duration,
+            time: 0.0,
+            speed: 1.0,
+            looping,
+            playing: false,
+            finished: false,
+        });
+        drop(state);
+        create_handle(lua, create_state.clone(), id)
+    })?;
+    module.set("new", create.clone())?;
+    module.set("create", create)?;
+
+    let play_state = state.clone();
+    module.set(
+        "play",
+        lua.create_function(move |lua, (target, clip): (Table, Table)| {
+            let (tracks, duration, looping) = parse_clip(&clip)?;
+            let mut state = play_state.borrow_mut();
+            let id = state.next_id;
+            state.next_id += 1;
+            state.players.push(Player {
+                id,
+                target: lua.create_registry_value(target)?,
+                tracks,
+                duration,
+                time: 0.0,
+                speed: 1.0,
+                looping,
+                playing: true,
+                finished: false,
+            });
+            drop(state);
+            create_handle(lua, play_state.clone(), id)
+        })?,
+    )?;
+
+    let update_state = state;
+    let update = lua.create_function(move |lua, dt: f64| {
+        if !dt.is_finite() || dt < 0.0 {
+            return Ok(());
+        }
+        let mut state = update_state.borrow_mut();
+        for player in &mut state.players {
+            if player.playing {
+                player.time += dt * player.speed;
+                if player.duration <= 0.0 || player.time >= player.duration {
+                    if player.looping && player.duration > 0.0 {
+                        player.time %= player.duration;
+                    } else {
+                        player.time = player.duration;
+                        player.playing = false;
+                        player.finished = true;
+                    }
+                }
+            }
+            let target: Table = lua.registry_value(&player.target)?;
+            for track in &player.tracks {
+                target.raw_set(track.property.as_str(), sample(track, player.time))?;
+            }
+        }
+        Ok(())
+    })?;
+    module.set("update", update.clone())?;
+    module.set("_update", update)?;
+
+    lua.globals().set("animation", module.clone())?;
+    lua.globals().set("animations", module)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn samples_linear_tracks() {
+        let track = Track {
+            property: "x".into(),
+            interpolation: Interpolation::Linear,
+            keys: vec![
+                Keyframe { time: 0.0, value: 2.0 },
+                Keyframe { time: 2.0, value: 10.0 },
+            ],
+        };
+        assert_eq!(sample(&track, 1.0), 6.0);
+    }
+
+    #[test]
+    fn module_plays_and_controls_clip() -> mlua::Result<()> {
+        let lua = Lua::new();
+        add_animation_module(&lua)?;
+        lua.load(
+            r#"
+            target = { x = 0 }
+            player = animation.play(target, {
+                duration = 2,
+                tracks = {{ property = "x", keys = {
+                    { time = 0, value = 10 }, { time = 2, value = 30 }
+                }}}
+            })
+            animation.update(1)
+            assert(target.x == 20)
+            player:pause()
+            animation.update(1)
+            assert(target.x == 20)
+            player:seek(2)
+            animation.update(0)
+            assert(target.x == 30)
+            "#,
+        )
+        .exec()
+    }
+}

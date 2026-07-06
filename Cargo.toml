@@ -13,8 +13,9 @@ hound = "3.5.1"
 rapier2d = "0.23"
 bytemuck = { version = "1.16.1", features = ["derive"] }
 fontdue = "0.9.3"
-image = { version = "0.24.9", default-features = false, features = ["png", "bmp", "tga", "pnm", "webp"] }
-rodio = { version = "0.20.1", default-features = false, features = ["wav"] }
+image = { version = "0.24.9", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tga", "tiff", "pnm", "webp", "hdr", "dds"] }
+base64 = "0.21.7"
+rodio = { version = "0.20.1", default-features = false, features = ["wav", "mp3", "flac", "vorbis"] }
 vulkano = { version = "0.34.1", optional = true }
 winit = "0.28.7"
 softbuffer = "0.3.4"
@@ -36,7 +37,9 @@ hound = "3.5.1"
 rapier2d = "0.23"
 bytemuck = { version = "1.16.1", features = ["derive"] }
 fontdue = "0.9.3"
-image = { version = "0.24.9", default-features = false, features = ["png", "bmp", "tga", "pnm", "webp"] }
+image = { version = "0.24.9", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tga", "tiff", "pnm", "webp", "hdr", "dds"] }
+base64 = "0.21.7"
+serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 
 [build-dependencies]
@@ -46,8 +49,13 @@ cc = "1.2.43"
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
-strip = true
-panic = "abort"
+# Keep the symbol table so release crash backtraces still name NeoLOVE frames;
+# debug sections are removed to keep packaged binaries small.
+strip = "debuginfo"
+# Runtime and renderer entry points deliberately catch panics and turn them into
+# actionable error dialogs. Keep unwinding enabled in release builds so those
+# guards work instead of terminating with an unexplained native abort.
+panic = "unwind"
 
 [profile.release.build-override]
 debug = false

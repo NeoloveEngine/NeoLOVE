@@ -5,7 +5,8 @@ use crate::lua_error::protect_lua_call;
 use crate::platform::{Color, InputState, SharedPlatformState, WindowState, lock_platform_state};
 use crate::renderer::{
     DrawCommand, FontHandle, Rect, RenderState, SharedRenderState, TextAlignX, TextAlignY,
-    TextRenderRequest, TextScaleMode, TextStyleRange, TextWrapMode, TextureFilter, Vec2,
+    TextAntialiasing, TextRenderRequest, TextScaleMode, TextStyleRange, TextWrapMode, TextureFilter,
+    Vec2,
 };
 use mlua::{AnyUserData, Function, Lua, Table, UserData, Value};
 use std::path::{Component, Path, PathBuf};
@@ -73,6 +74,16 @@ fn rich_text_ranges_from_component(
             color,
             size: range.get::<f32>("size").ok().map(f32::to_bits),
             font,
+            offset_x: range
+                .get::<f32>("offset_x")
+                .ok()
+                .filter(|value| value.is_finite())
+                .map(f32::to_bits),
+            offset_y: range
+                .get::<f32>("offset_y")
+                .ok()
+                .filter(|value| value.is_finite())
+                .map(f32::to_bits),
         });
     }
     Ok(out)
@@ -91,6 +102,103 @@ fn rotate_local(x: f32, y: f32, rotation: f32) -> (f32, f32) {
     let cos_r = rotation.cos();
     let sin_r = rotation.sin();
     (x * cos_r - y * sin_r, x * sin_r + y * cos_r)
+}
+
+fn particle_random(seed: &mut u32) -> f32 {
+    *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    (*seed as f32) / (u32::MAX as f32)
+}
+
+fn lerp_particle_color(start: Color, end: Color, t: f32) -> Color {
+    let mix = |a: u8, b: u8| {
+        (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)).round() as u8
+    };
+    Color::rgba(
+        mix(start.r, end.r),
+        mix(start.g, end.g),
+        mix(start.b, end.b),
+        mix(start.a, end.a),
+    )
+}
+
+fn read_particle_color_sequence(
+    component: &Table,
+    start: Color,
+    end: Color,
+) -> mlua::Result<Vec<(f32, Color)>> {
+    let mut keypoints = Vec::new();
+    if let Ok(sequence) = component.get::<Table>("color_sequence") {
+        for entry in sequence.sequence_values::<Table>() {
+            let entry = entry?;
+            if let Ok(color) = entry.get::<Table>("color") {
+                keypoints.push((
+                    entry.get::<f32>("time").unwrap_or(0.0).clamp(0.0, 1.0),
+                    color4_to_color(color)?,
+                ));
+            }
+        }
+    }
+    if keypoints.len() < 2 {
+        keypoints = vec![(0.0, start), (1.0, end)];
+    }
+    keypoints.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(keypoints)
+}
+
+fn read_particle_number_sequence(
+    component: &Table,
+    start: f32,
+    end: f32,
+) -> mlua::Result<Vec<(f32, f32)>> {
+    let mut keypoints = Vec::new();
+    if let Ok(sequence) = component.get::<Table>("transparency_sequence") {
+        for entry in sequence.sequence_values::<Table>() {
+            let entry = entry?;
+            keypoints.push((
+                entry.get::<f32>("time").unwrap_or(0.0).clamp(0.0, 1.0),
+                entry.get::<f32>("value").unwrap_or(0.0).clamp(0.0, 1.0),
+            ));
+        }
+    }
+    if keypoints.len() < 2 {
+        keypoints = vec![(0.0, start), (1.0, end)];
+    }
+    keypoints.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(keypoints)
+}
+
+fn sample_particle_color(keypoints: &[(f32, Color)], time: f32) -> Color {
+    let Some(first) = keypoints.first() else {
+        return Color::WHITE;
+    };
+    let time = time.clamp(0.0, 1.0);
+    if time <= first.0 {
+        return first.1;
+    }
+    for pair in keypoints.windows(2) {
+        if time <= pair[1].0 {
+            let amount = (time - pair[0].0) / (pair[1].0 - pair[0].0).max(f32::EPSILON);
+            return lerp_particle_color(pair[0].1, pair[1].1, amount);
+        }
+    }
+    keypoints.last().map(|keypoint| keypoint.1).unwrap_or(first.1)
+}
+
+fn sample_particle_number(keypoints: &[(f32, f32)], time: f32) -> f32 {
+    let Some(first) = keypoints.first() else {
+        return 0.0;
+    };
+    let time = time.clamp(0.0, 1.0);
+    if time <= first.0 {
+        return first.1;
+    }
+    for pair in keypoints.windows(2) {
+        if time <= pair[1].0 {
+            let amount = (time - pair[0].0) / (pair[1].0 - pair[0].0).max(f32::EPSILON);
+            return pair[0].1 + (pair[1].1 - pair[0].1) * amount;
+        }
+    }
+    keypoints.last().map(|keypoint| keypoint.1).unwrap_or(first.1)
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -166,6 +274,30 @@ fn parse_text_scale_mode(raw: &str) -> TextScaleMode {
         "fit_height" | "fitheight" | "height" => TextScaleMode::FitHeight,
         _ => TextScaleMode::None,
     }
+}
+
+fn parse_text_antialiasing(raw: &str) -> TextAntialiasing {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" | "pixel" => TextAntialiasing::Off,
+        "standard" | "fast" | "normal" | "on" => TextAntialiasing::Standard,
+        _ => TextAntialiasing::High,
+    }
+}
+
+fn component_text_antialiasing(lua: &Lua, component: &Table) -> TextAntialiasing {
+    let component_mode = component
+        .get::<String>("antialiasing")
+        .unwrap_or_else(|_| "inherit".to_string());
+    if !component_mode.eq_ignore_ascii_case("inherit") {
+        return parse_text_antialiasing(&component_mode);
+    }
+    let app_mode = lua
+        .globals()
+        .get::<Table>("app")
+        .ok()
+        .and_then(|app| app.get::<String>("antiAliasing").ok())
+        .unwrap_or_else(|| "high".to_string());
+    parse_text_antialiasing(&app_mode)
 }
 
 fn parse_align_x(raw: &str) -> TextAlignX {
@@ -1712,6 +1844,11 @@ fn build_text_request(
         stretch_width: 0.0,
         stretch_height: 0.0,
         rich_text: Vec::new(),
+        antialiasing: component
+            .get::<String>("antialiasing")
+            .ok()
+            .map(|mode| parse_text_antialiasing(&mode))
+            .unwrap_or_default(),
     }
 }
 
@@ -1767,6 +1904,7 @@ fn build_textbox_render_request(
     root: &Path,
     entity: &Table,
     component: &Table,
+    antialiasing: TextAntialiasing,
 ) -> mlua::Result<TextRenderRequest> {
     let (x, y, rotation) = crate::window::get_global_transform(entity)?;
     let text = component
@@ -1872,6 +2010,7 @@ fn build_textbox_render_request(
             0.0
         },
         rich_text: rich_text_ranges_from_component(root, component)?,
+        antialiasing,
     })
 }
 
@@ -1940,7 +2079,12 @@ fn refresh_textbox_layout_cache(
     entity: &Table,
     component: &Table,
 ) -> mlua::Result<TextRenderRequest> {
-    let request = build_textbox_render_request(root, entity, component)?;
+    let request = build_textbox_render_request(
+        root,
+        entity,
+        component,
+        component_text_antialiasing(lua, component),
+    )?;
     let cache_id = crate::renderer::text_render_request_cache_id(&request).to_string();
     let has_cached_bounds = component.get::<Table>("__letter_bounds").is_ok()
         && component.get::<Table>("__letter_caret_start").is_ok()
@@ -2085,13 +2229,8 @@ fn get_letter_bounds_values(
     let Some(key) = letter_bounds_table_key(index) else {
         return Ok(missing_letter_bounds());
     };
+    refresh_letter_bounds_if_available(lua, root, &component)?;
     let entry = cached_letter_bounds_entry(&component, key);
-    let entry = if entry.is_none() {
-        refresh_letter_bounds_if_available(lua, root, &component)?;
-        cached_letter_bounds_entry(&component, key)
-    } else {
-        entry
-    };
     let entry = entry.or_else(|| caret_letter_bounds_entry(&component, key));
     let Some(entry) = entry else {
         return Ok(missing_letter_bounds());
@@ -2113,13 +2252,8 @@ fn get_letter_position_values(
     let Some(key) = letter_bounds_table_key(index) else {
         return Ok(missing_letter_position());
     };
+    refresh_letter_bounds_if_available(lua, root, &component)?;
     let entry = cached_letter_bounds_entry(&component, key);
-    let entry = if entry.is_none() {
-        refresh_letter_bounds_if_available(lua, root, &component)?;
-        cached_letter_bounds_entry(&component, key)
-    } else {
-        entry
-    };
     let entry = entry.or_else(|| caret_letter_bounds_entry(&component, key));
     let Some(entry) = entry else {
         return Ok(missing_letter_position());
@@ -2499,10 +2633,176 @@ pub fn add_core_components(
         )?;
     }
 
+    // EntityScaler
+    // percentage-plus-pixel transform helper for responsive parent-relative layout
+    {
+        let entity_scaler = lua.create_table()?;
+        entity_scaler.set(
+            "awake",
+            lua.create_function(move |_ctx, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "EntityScaler")?;
+                component.set("enabled", true)?;
+                component.set("edit_with_percent", true)?;
+                component.set("x_percent", 0.0)?;
+                component.set("y_percent", 0.0)?;
+                component.set("size_x_percent", 0.0)?;
+                component.set("size_y_percent", 0.0)?;
+                component.set("offset_x", 0.0)?;
+                component.set("offset_y", 0.0)?;
+                component.set("pivot_x", 0.0)?;
+                component.set("pivot_y", 0.0)?;
+                Ok(())
+            })?,
+        )?;
+        entity_scaler.set(
+            "update",
+            lua.create_function(move |_ctx, (entity, component, _dt): (Table, Table, f32)| {
+                if !component.get::<bool>("enabled").unwrap_or(true) {
+                    return Ok(());
+                }
+
+                let x_percent = get_number_field(&component, "x_percent", "xPercent")
+                    .or_else(|| get_number_field(&component, "percent_x", "percentX"))
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                let y_percent = get_number_field(&component, "y_percent", "yPercent")
+                    .or_else(|| get_number_field(&component, "percent_y", "percentY"))
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                let size_x_percent =
+                    get_number_field(&component, "size_x_percent", "sizeXPercent")
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 1.0);
+                let size_y_percent =
+                    get_number_field(&component, "size_y_percent", "sizeYPercent")
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 1.0);
+                let offset_x = get_number_field(&component, "offset_x", "offsetX").unwrap_or(0.0);
+                let offset_y = get_number_field(&component, "offset_y", "offsetY").unwrap_or(0.0);
+                let pivot_x = get_number_field(&component, "pivot_x", "pivotX")
+                    .or_else(|| get_number_field(&component, "anchor_x", "anchorX"))
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                let pivot_y = get_number_field(&component, "pivot_y", "pivotY")
+                    .or_else(|| get_number_field(&component, "anchor_y", "anchorY"))
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+
+                entity.set("anchor_x", x_percent)?;
+                entity.set("anchor_y", y_percent)?;
+                entity.set("x", offset_x)?;
+                entity.set("y", offset_y)?;
+                entity.set("pivot_x", pivot_x)?;
+                entity.set("pivot_y", pivot_y)?;
+                if let Some(parent) = entity.get::<Option<Table>>("parent")? {
+                    if size_x_percent > 0.0 {
+                        entity.set("size_x", parent.get::<f32>("size_x")? * size_x_percent)?;
+                    }
+                    if size_y_percent > 0.0 {
+                        entity.set("size_y", parent.get::<f32>("size_y")? * size_y_percent)?;
+                    }
+                }
+                Ok(())
+            })?,
+        )?;
+        core_components.set("EntityScaler", entity_scaler)?;
+    }
+
+    // SpatialSound2D
+    // Plays a sound at the owning entity's world position and keeps the
+    // emitter position synchronized while it is active.
+    {
+        let spatial_sound = lua.create_table()?;
+        spatial_sound.set("__neolove_component", "SpatialSound2D")?;
+        spatial_sound.set(
+            "awake",
+            lua.create_function(|_lua, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "SpatialSound2D")?;
+                component.set("sound", Value::Nil)?;
+                component.set("volume", 1.0)?;
+                component.set("looping", false)?;
+                component.set("autoplay", false)?;
+                component.set("__autoplay_started", false)?;
+                component.set("__playing", false)?;
+                Ok(())
+            })?,
+        )?;
+
+        let play = lua.create_function(|lua, component: Table| {
+            let sound = component.get::<Value>("sound").unwrap_or(Value::Nil);
+            if !matches!(&sound, Value::UserData(_)) {
+                return Ok(false);
+            }
+            let entity: Table = component.get("entity")?;
+            let (x, y, _) = crate::window::get_global_transform(&entity)?;
+            let looping = component.get::<bool>("looping").unwrap_or(false);
+            let volume = component.get::<f32>("volume").unwrap_or(1.0).clamp(0.0, 1.0);
+            let audio: Table = lua.globals().get("audio")?;
+            audio
+                .get::<Function>("playSpatial")?
+                .call::<()>((sound, x, y, looping, volume))?;
+            component.set("__autoplay_started", true)?;
+            component.set("__playing", true)?;
+            Ok(true)
+        })?;
+        spatial_sound.set("play", play.clone())?;
+        spatial_sound.set("Play", play.clone())?;
+
+        let stop = lua.create_function(|lua, component: Table| {
+            let sound = component.get::<Value>("sound").unwrap_or(Value::Nil);
+            if matches!(&sound, Value::UserData(_)) {
+                let audio: Table = lua.globals().get("audio")?;
+                audio.get::<Function>("stop")?.call::<()>(sound)?;
+            }
+            component.set("__playing", false)
+        })?;
+        spatial_sound.set("stop", stop.clone())?;
+        spatial_sound.set("Stop", stop.clone())?;
+
+        let play_for_update = play.clone();
+        spatial_sound.set(
+            "update",
+            lua.create_function(move |lua, (entity, component, _dt): (Table, Table, f32)| {
+                let autoplay = component.get::<bool>("autoplay").unwrap_or(false);
+                let started = component
+                    .get::<bool>("__autoplay_started")
+                    .unwrap_or(false);
+                if autoplay && !started {
+                    let _ = play_for_update.call::<bool>(component.clone())?;
+                }
+                if component.get::<bool>("__playing").unwrap_or(false) {
+                    let sound = component.get::<Value>("sound").unwrap_or(Value::Nil);
+                    if matches!(&sound, Value::UserData(_)) {
+                        let (x, y, _) = crate::window::get_global_transform(&entity)?;
+                        let audio: Table = lua.globals().get("audio")?;
+                        let _ = audio
+                            .get::<Function>("setPosition")?
+                            .call::<bool>((sound, x, y))?;
+                    }
+                }
+                Ok(())
+            })?,
+        )?;
+
+        spatial_sound.set(
+            "destroy",
+            lua.create_function(move |lua, (_entity, component): (Table, Table)| {
+                let sound = component.get::<Value>("sound").unwrap_or(Value::Nil);
+                if matches!(&sound, Value::UserData(_)) {
+                    let audio: Table = lua.globals().get("audio")?;
+                    audio.get::<Function>("stop")?.call::<()>(sound)?;
+                }
+                Ok(())
+            })?,
+        )?;
+        core_components.set("SpatialSound2D", spatial_sound)?;
+    }
+
     // Rect2d
     // basic renderer
     {
         let rect2d = create_basic_drawable(lua)?;
+        rect2d.set("__neolove_component", "Rect2D")?;
         let render_state = render_state.clone();
         rect2d.set(
             "update",
@@ -2545,6 +2845,7 @@ pub fn add_core_components(
     // renderer for box, circle, and right-triangle primitives
     {
         let shape2d = create_basic_drawable(lua)?;
+        shape2d.set("__neolove_component", "Shape2D")?;
         let render_state = render_state.clone();
         shape2d.set(
             "awake",
@@ -2672,6 +2973,273 @@ pub fn add_core_components(
         core_components.set("Shape2D", shape2d)?;
     }
 
+    // ParticleSystem2D
+    // A deterministic, allocation-bounded circle particle emitter.
+    {
+        let particles = create_basic_drawable(lua)?;
+        particles.set("__neolove_component", "ParticleSystem2D")?;
+        particles.set(
+            "awake",
+            lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "ParticleSystem2D")?;
+                component.set("visible", true)?;
+                component.set("shader", Value::Nil)?;
+                component.set("playing", true)?;
+                component.set("looping", true)?;
+                component.set("duration", 5.0)?;
+                component.set("emission_rate", 12.0)?;
+                component.set("max_particles", 256)?;
+                component.set("lifetime", 1.5)?;
+                component.set("speed", 80.0)?;
+                component.set("direction", -90.0)?;
+                component.set("spread", 30.0)?;
+                component.set("start_size", 8.0)?;
+                component.set("end_size", 2.0)?;
+                component.set("start_color", color4(ctx, 255, 184, 76, 255)?)?;
+                component.set("end_color", color4(ctx, 255, 92, 40, 0)?)?;
+                let color_sequence = ctx.create_table()?;
+                let color_start = ctx.create_table()?;
+                color_start.set("time", 0.0)?;
+                color_start.set("color", color4(ctx, 255, 184, 76, 255)?)?;
+                color_sequence.set(1, color_start)?;
+                let color_end = ctx.create_table()?;
+                color_end.set("time", 1.0)?;
+                color_end.set("color", color4(ctx, 255, 92, 40, 255)?)?;
+                color_sequence.set(2, color_end)?;
+                component.set("color_sequence", color_sequence)?;
+                let transparency_sequence = ctx.create_table()?;
+                let transparency_start = ctx.create_table()?;
+                transparency_start.set("time", 0.0)?;
+                transparency_start.set("value", 0.0)?;
+                transparency_sequence.set(1, transparency_start)?;
+                let transparency_end = ctx.create_table()?;
+                transparency_end.set("time", 1.0)?;
+                transparency_end.set("value", 1.0)?;
+                transparency_sequence.set(2, transparency_end)?;
+                component.set("transparency_sequence", transparency_sequence)?;
+                component.set("shape", "point")?;
+                component.set("radius", 32.0)?;
+                component.set("gravity_x", 0.0)?;
+                component.set("gravity_y", 60.0)?;
+                component.set("particle_count", 0)?;
+                component.set("__particles", ctx.create_table()?)?;
+                component.set("__emit_accumulator", 0.0)?;
+                component.set("__elapsed", 0.0)?;
+                component.set("__manual_emit", 0)?;
+                component.set("__rng", 0x6d2b_79f5_u32 as i64)?;
+                Ok(())
+            })?,
+        )?;
+
+        let play = lua.create_function(|_ctx, component: Table| {
+            component.set("playing", true)
+        })?;
+        particles.set("play", play.clone())?;
+        particles.set("Play", play)?;
+        let pause = lua.create_function(|_ctx, component: Table| {
+            component.set("playing", false)
+        })?;
+        particles.set("pause", pause.clone())?;
+        particles.set("Pause", pause)?;
+        let stop = lua.create_function(|ctx, component: Table| {
+            component.set("playing", false)?;
+            component.set("__particles", ctx.create_table()?)?;
+            component.set("__emit_accumulator", 0.0)?;
+            component.set("__elapsed", 0.0)?;
+            component.set("particle_count", 0)?;
+            Ok(())
+        })?;
+        particles.set("stop", stop.clone())?;
+        particles.set("Stop", stop)?;
+        let emit = lua.create_function(|_ctx, (component, count): (Table, Option<i32>)| {
+            let pending = component.get::<i32>("__manual_emit").unwrap_or(0);
+            component.set(
+                "__manual_emit",
+                pending.saturating_add(count.unwrap_or(1).max(0)),
+            )
+        })?;
+        particles.set("emit", emit.clone())?;
+        particles.set("Emit", emit)?;
+
+        let render_state = render_state.clone();
+        particles.set(
+            "update",
+            lua.create_function(move |ctx, (entity, component, dt): (Table, Table, f32)| {
+                let dt = dt.clamp(0.0, 0.25);
+                let visible = component.get::<bool>("visible").unwrap_or(true);
+                let mut playing = component.get::<bool>("playing").unwrap_or(true);
+                let looping = component.get::<bool>("looping").unwrap_or(true);
+                let duration = component.get::<f32>("duration").unwrap_or(5.0).max(0.0);
+                let mut elapsed = component.get::<f32>("__elapsed").unwrap_or(0.0);
+                if playing {
+                    elapsed += dt;
+                    if duration > 0.0 && elapsed >= duration {
+                        if looping {
+                            elapsed %= duration;
+                        } else {
+                            playing = false;
+                            component.set("playing", false)?;
+                        }
+                    }
+                    component.set("__elapsed", elapsed)?;
+                }
+
+                let lifetime = component.get::<f32>("lifetime").unwrap_or(1.5).max(0.001);
+                let max_particles = component
+                    .get::<i32>("max_particles")
+                    .unwrap_or(256)
+                    .clamp(1, 10_000) as usize;
+                let entity_scale = crate::window::get_global_scale(&entity)?.abs();
+                let gravity_x = component.get::<f32>("gravity_x").unwrap_or(0.0);
+                let gravity_y = component.get::<f32>("gravity_y").unwrap_or(60.0);
+                let start_size = component.get::<f32>("start_size").unwrap_or(8.0).max(0.0)
+                    * entity_scale;
+                let end_size = component.get::<f32>("end_size").unwrap_or(2.0).max(0.0)
+                    * entity_scale;
+                let start_color = color4_to_color(component.get("start_color")?)?;
+                let end_color = color4_to_color(component.get("end_color")?)?;
+                let color_sequence =
+                    read_particle_color_sequence(&component, start_color, end_color)?;
+                let transparency_sequence = read_particle_number_sequence(
+                    &component,
+                    1.0 - start_color.a as f32 / 255.0,
+                    1.0 - end_color.a as f32 / 255.0,
+                )?;
+                let shader = shader_from_component(&component)?;
+
+                let current = component
+                    .get::<Option<Table>>("__particles")?
+                    .unwrap_or(ctx.create_table()?);
+                let next = ctx.create_table()?;
+                let mut count = 0usize;
+                let mut draw = Vec::new();
+                for value in current.sequence_values::<Table>() {
+                    let particle = value?;
+                    let age = particle.get::<f32>("age").unwrap_or(0.0) + dt;
+                    let particle_lifetime = particle
+                        .get::<f32>("lifetime")
+                        .unwrap_or(lifetime)
+                        .max(0.001);
+                    if age >= particle_lifetime || count >= max_particles {
+                        continue;
+                    }
+                    let mut vx = particle.get::<f32>("vx").unwrap_or(0.0);
+                    let mut vy = particle.get::<f32>("vy").unwrap_or(0.0);
+                    let mut x = particle.get::<f32>("x").unwrap_or(0.0);
+                    let mut y = particle.get::<f32>("y").unwrap_or(0.0);
+                    vx += gravity_x * dt;
+                    vy += gravity_y * dt;
+                    x += vx * dt;
+                    y += vy * dt;
+                    particle.set("age", age)?;
+                    particle.set("x", x)?;
+                    particle.set("y", y)?;
+                    particle.set("vx", vx)?;
+                    particle.set("vy", vy)?;
+                    count += 1;
+                    next.raw_set(count, particle)?;
+                    if visible {
+                        let t = age / particle_lifetime;
+                        let size = start_size + (end_size - start_size) * t;
+                        let mut color = sample_particle_color(&color_sequence, t);
+                        color.a = ((1.0
+                            - sample_particle_number(&transparency_sequence, t).clamp(0.0, 1.0))
+                            * 255.0)
+                            .round() as u8;
+                        draw.push((x, y, size * 0.5, color));
+                    }
+                }
+
+                let rate = component.get::<f32>("emission_rate").unwrap_or(12.0).max(0.0);
+                let mut accumulator = component.get::<f32>("__emit_accumulator").unwrap_or(0.0);
+                if playing {
+                    accumulator += rate * dt;
+                }
+                let automatic = accumulator.floor().max(0.0) as usize;
+                accumulator -= automatic as f32;
+                let manual = component.get::<i32>("__manual_emit").unwrap_or(0).max(0) as usize;
+                component.set("__manual_emit", 0)?;
+                component.set("__emit_accumulator", accumulator)?;
+                let spawn_count = automatic
+                    .saturating_add(manual)
+                    .min(max_particles.saturating_sub(count));
+
+                let (origin_x, origin_y, rotation) = crate::window::get_global_transform(&entity)?;
+                let (entity_w, entity_h) = crate::window::get_global_size(&entity)?;
+                let speed = component.get::<f32>("speed").unwrap_or(80.0) * entity_scale;
+                let direction = component.get::<f32>("direction").unwrap_or(-90.0).to_radians();
+                let spread = component.get::<f32>("spread").unwrap_or(30.0).abs().to_radians();
+                let shape = component
+                    .get::<String>("shape")
+                    .unwrap_or_else(|_| "point".to_string())
+                    .to_ascii_lowercase();
+                let radius = component.get::<f32>("radius").unwrap_or(32.0).max(0.0) * entity_scale;
+                let mut seed = component.get::<i64>("__rng").unwrap_or(0x6d2b_79f5) as u32;
+
+                for _ in 0..spawn_count {
+                    let (local_x, local_y) = match shape.as_str() {
+                        "box" => (
+                            particle_random(&mut seed) * entity_w,
+                            particle_random(&mut seed) * entity_h,
+                        ),
+                        "circle" => {
+                            let angle = particle_random(&mut seed) * std::f32::consts::TAU;
+                            let distance = particle_random(&mut seed).sqrt() * radius;
+                            (angle.cos() * distance, angle.sin() * distance)
+                        }
+                        _ => (0.0, 0.0),
+                    };
+                    let (offset_x, offset_y) = rotate_local(local_x, local_y, rotation);
+                    let angle = direction + rotation + (particle_random(&mut seed) - 0.5) * spread;
+                    let particle = ctx.create_table()?;
+                    particle.set("x", origin_x + offset_x)?;
+                    particle.set("y", origin_y + offset_y)?;
+                    particle.set("vx", angle.cos() * speed)?;
+                    particle.set("vy", angle.sin() * speed)?;
+                    particle.set("age", 0.0)?;
+                    particle.set("lifetime", lifetime)?;
+                    count += 1;
+                    next.raw_set(count, particle)?;
+                    if visible {
+                        let mut color = sample_particle_color(&color_sequence, 0.0);
+                        color.a = ((1.0
+                            - sample_particle_number(&transparency_sequence, 0.0).clamp(0.0, 1.0))
+                            * 255.0)
+                            .round() as u8;
+                        draw.push((
+                            origin_x + offset_x,
+                            origin_y + offset_y,
+                            start_size * 0.5,
+                            color,
+                        ));
+                    }
+                }
+                component.set("__rng", seed as i64)?;
+                component.set("__particles", next)?;
+                component.set("particle_count", count)?;
+
+                if visible && !draw.is_empty() {
+                    let mut renderer = render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
+                    for (x, y, radius, color) in draw {
+                        if radius > 0.0 && color.a > 0 {
+                            renderer.queue(DrawCommand::Circle {
+                                center: Vec2 { x, y },
+                                radius,
+                                color,
+                                shader: shader.clone(),
+                            });
+                        }
+                    }
+                }
+                Ok(())
+            })?,
+        )?;
+
+        core_components.set("ParticleSystem2D", particles)?;
+    }
+
     // TextBox
     // bounded text with optional auto-fit scaling, alignment, wrapping, and font selection
     {
@@ -2699,6 +3267,7 @@ pub fn add_core_components(
                 component.set("line_spacing", 1.0)?;
                 component.set("letter_spacing", 0.0)?;
                 component.set("tab_size", 4.0)?;
+                component.set("antialiasing", "inherit")?;
                 component.set("font", Value::Nil)?;
                 component.set("scale_x", 0.0)?;
                 component.set("scale_y", 0.0)?;
@@ -2761,6 +3330,59 @@ pub fn add_core_components(
         add_rich_method("setColor", "color", true)?;
         add_rich_method("setSize", "size", true)?;
         add_rich_method("setFont", "font", true)?;
+        let set_offset = lua.create_function(|ctx, args: mlua::Variadic<Value>| {
+            let component = match args.first() {
+                Some(Value::Table(table)) => table.clone(),
+                _ => return Ok(()),
+            };
+            let number = |value: Option<&Value>, default: f32| match value {
+                Some(Value::Integer(value)) => *value as f32,
+                Some(Value::Number(value)) if value.is_finite() => *value as f32,
+                _ => default,
+            };
+            let start = number(args.get(1), 0.0).max(0.0) as usize;
+            let end = number(args.get(2), start as f32).max(start as f32) as usize;
+            let offset_x = number(args.get(3), 0.0);
+            let offset_y = number(args.get(4), 0.0);
+            let ranges = component.get::<Table>("__rich_text_ranges").or_else(|_| {
+                let ranges = ctx.create_table()?;
+                component.set("__rich_text_ranges", ranges.clone())?;
+                Ok::<_, mlua::Error>(ranges)
+            })?;
+            let range = ctx.create_table()?;
+            range.set("start", start)?;
+            range.set("end", end)?;
+            range.set("offset_x", offset_x)?;
+            range.set("offset_y", offset_y)?;
+            ranges.set(ranges.raw_len() + 1, range)
+        })?;
+        textbox.set("setOffset", set_offset.clone())?;
+        textbox.set("setPixelOffset", set_offset)?;
+
+        let set_character_offset = lua.create_function(|ctx, args: mlua::Variadic<Value>| {
+            let component = match args.first() {
+                Some(Value::Table(table)) => table.clone(),
+                _ => return Ok(()),
+            };
+            let number = |value: Option<&Value>, default: f32| match value {
+                Some(Value::Integer(value)) => *value as f32,
+                Some(Value::Number(value)) if value.is_finite() => *value as f32,
+                _ => default,
+            };
+            let index = number(args.get(1), 0.0).max(0.0) as usize;
+            let ranges = component.get::<Table>("__rich_text_ranges").or_else(|_| {
+                let ranges = ctx.create_table()?;
+                component.set("__rich_text_ranges", ranges.clone())?;
+                Ok::<_, mlua::Error>(ranges)
+            })?;
+            let range = ctx.create_table()?;
+            range.set("start", index)?;
+            range.set("end", index + 1)?;
+            range.set("offset_x", number(args.get(2), 0.0))?;
+            range.set("offset_y", number(args.get(3), 0.0))?;
+            ranges.set(ranges.raw_len() + 1, range)
+        })?;
+        textbox.set("setCharacterOffset", set_character_offset)?;
         textbox.set(
             "clearAllFormatting",
             lua.create_function(|ctx, component: Table| {
@@ -4858,6 +5480,7 @@ pub fn add_core_components(
     // draw an image repeatedly to fill entity size, with optional tile sizing and offset
     {
         let tile_texture2d = create_basic_drawable(lua)?;
+        tile_texture2d.set("__neolove_component", "TileTexture2D")?;
         let platform = platform.clone();
         let render_state = render_state.clone();
         tile_texture2d.set(
@@ -5047,6 +5670,129 @@ pub fn add_core_components(
         )?;
 
         core_components.set("TileTexture2D", tile_texture2d)?;
+    }
+
+    // Tilemap2D: render a finite grid of atlas tile ids. Tile id 0 addresses
+    // the first atlas cell and -1 is empty. `tiles` accepts either a flat Lua
+    // array or a comma/whitespace-separated string, which keeps editor scene
+    // JSON compact and hand-editable.
+    {
+        let tilemap = create_basic_drawable(lua)?;
+        tilemap.set("__neolove_component", "Tilemap2D")?;
+        tilemap.set(
+            "awake",
+            lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
+                component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
+                component.set("visible", true)?;
+                component.set("image", Value::Nil)?;
+                component.set("map_width", 1)?;
+                component.set("map_height", 1)?;
+                component.set("tile_width", 32.0)?;
+                component.set("tile_height", 32.0)?;
+                component.set("spacing", 0.0)?;
+                component.set("margin", 0.0)?;
+                component.set("tiles", "0")?;
+                Ok(())
+            })?,
+        )?;
+        let render_state = render_state.clone();
+        tilemap.set(
+            "update",
+            lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
+                if !component.get::<bool>("visible").unwrap_or(true) {
+                    return Ok(());
+                }
+                let map_width = component.get::<i32>("map_width").unwrap_or(1).max(1) as usize;
+                let map_height = component.get::<i32>("map_height").unwrap_or(1).max(1) as usize;
+                let tile_width = component.get::<f32>("tile_width").unwrap_or(32.0).max(1.0);
+                let tile_height = component.get::<f32>("tile_height").unwrap_or(32.0).max(1.0);
+                let spacing = component.get::<f32>("spacing").unwrap_or(0.0).max(0.0);
+                let margin = component.get::<f32>("margin").unwrap_or(0.0).max(0.0);
+                let image: Option<AnyUserData> = component.get("image")?;
+                let Some(image) = image else { return Ok(()); };
+                let image = image.borrow::<crate::assets::ImageHandle>()?;
+                image.ensure_uploaded()?;
+                let (image_width, image_height) = image.dimensions()?;
+                let atlas_columns = (((image_width as f32 - margin * 2.0 + spacing)
+                    / (tile_width + spacing))
+                    .floor() as i32)
+                    .max(1) as usize;
+                let atlas_rows = (((image_height as f32 - margin * 2.0 + spacing)
+                    / (tile_height + spacing))
+                    .floor() as i32)
+                    .max(1) as usize;
+                let atlas_len = atlas_columns.saturating_mul(atlas_rows);
+
+                let tiles = match component.get::<Value>("tiles")? {
+                    Value::Table(values) => values
+                        .sequence_values::<i32>()
+                        .filter_map(Result::ok)
+                        .collect::<Vec<_>>(),
+                    Value::String(value) => value
+                        .to_string_lossy()
+                        .split(|character: char| character == ',' || character.is_whitespace())
+                        .filter(|part| !part.is_empty())
+                        .filter_map(|part| part.parse::<i32>().ok())
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+
+                let (x, y, rotation) = crate::window::get_global_transform(&entity)?;
+                let (width, height) = crate::window::get_global_size(&entity)?;
+                if width <= 0.0 || height <= 0.0 {
+                    return Ok(());
+                }
+                let use_middle_pivot = crate::window::uses_middle_pivot(&entity);
+                let (base_x, base_y, pivot) = if use_middle_pivot {
+                    let (px, py) = crate::window::get_global_rotation_pivot(&entity)?;
+                    (px - width * 0.5, py - height * 0.5, Vec2 { x: px, y: py })
+                } else {
+                    (x, y, Vec2 { x, y })
+                };
+                let cell_width = width / map_width as f32;
+                let cell_height = height / map_height as f32;
+                let tint = color4_to_color(component.get("color")?)?;
+                let filter = app_texture_filter(ctx);
+                let shader = shader_from_component(&component)?;
+                let mut renderer = render_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
+                for row in 0..map_height {
+                    for column in 0..map_width {
+                        let index = row * map_width + column;
+                        let tile = tiles.get(index).copied().unwrap_or(-1);
+                        if tile < 0 || tile as usize >= atlas_len {
+                            continue;
+                        }
+                        let tile = tile as usize;
+                        let atlas_x = tile % atlas_columns;
+                        let atlas_y = tile / atlas_columns;
+                        renderer.queue(DrawCommand::Image {
+                            image: image.clone(),
+                            dest: Rect {
+                                x: base_x + column as f32 * cell_width,
+                                y: base_y + row as f32 * cell_height,
+                                w: cell_width,
+                                h: cell_height,
+                            },
+                            source: Some(Rect {
+                                x: margin + atlas_x as f32 * (tile_width + spacing),
+                                y: margin + atlas_y as f32 * (tile_height + spacing),
+                                w: tile_width,
+                                h: tile_height,
+                            }),
+                            rotation,
+                            pivot,
+                            tint,
+                            filter,
+                            shader: shader.clone(),
+                        });
+                    }
+                }
+                Ok(())
+            })?,
+        )?;
+        core_components.set("Tilemap2D", tilemap)?;
     }
 
     // Collider2D

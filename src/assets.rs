@@ -1,4 +1,7 @@
 use crate::platform::Color;
+use crate::platform::{lock_platform_state, SharedPlatformState};
+use crate::renderer::{last_frame_commands, SharedRenderState, SoftwareRenderer};
+use base64::Engine as _;
 use image::{Rgba, RgbaImage};
 use mlua::{Lua, Table, UserData, UserDataMethods, Value, Variadic};
 use std::collections::HashMap;
@@ -6,6 +9,8 @@ use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+#[cfg(not(target_os = "emscripten"))]
+use rodio::{Decoder as AudioDecoder, Source};
 
 #[derive(Debug)]
 struct ImageAsset {
@@ -46,7 +51,67 @@ pub(crate) struct AssetManager {
     resource_root: PathBuf,
     data_root: PathBuf,
     images: HashMap<PathBuf, Weak<Mutex<ImageAsset>>>,
+    encoded_images: HashMap<String, Weak<Mutex<ImageAsset>>>,
     sounds: HashMap<PathBuf, Weak<Mutex<SoundAsset>>>,
+}
+
+const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+fn has_explicit_base64_prefix(value: &str) -> bool {
+    let value = value.trim();
+    value
+        .get(.."data:image/png;base64,".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:image/png;base64,"))
+        || value
+            .get(.."base64:".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("base64:"))
+}
+
+/// Decode a raw base64 PNG or a `data:image/png;base64,...`/`base64:` value.
+/// A non-base64-looking string returns `Ok(None)` so callers can treat it as a
+/// normal path. Explicitly-prefixed malformed data returns a useful error.
+pub(crate) fn decode_base64_png(value: &str) -> Result<Option<(String, Vec<u8>)>, String> {
+    let value = value.trim();
+    let explicit = has_explicit_base64_prefix(value);
+    let payload = if value
+        .get(.."data:image/png;base64,".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:image/png;base64,"))
+    {
+        &value["data:image/png;base64,".len()..]
+    } else if value
+        .get(.."base64:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("base64:"))
+    {
+        &value["base64:".len()..]
+    } else {
+        value
+    };
+    let normalized: String = payload.chars().filter(|character| !character.is_ascii_whitespace()).collect();
+    let looks_encoded = normalized.len() >= 12
+        && normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_'));
+    if !explicit && !looks_encoded {
+        return Ok(None);
+    }
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&normalized)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&normalized))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&normalized))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&normalized));
+    let decoded = match decoded {
+        Ok(decoded) => decoded,
+        Err(error) if explicit => return Err(format!("invalid base64 PNG: {error}")),
+        Err(_) => return Ok(None),
+    };
+    if !decoded.starts_with(PNG_SIGNATURE) {
+        if explicit {
+            return Err("base64 image data is not a PNG".to_string());
+        }
+        return Ok(None);
+    }
+    Ok(Some((normalized, decoded)))
 }
 
 fn lua_color4(lua: &Lua, color: Color) -> mlua::Result<Table> {
@@ -391,7 +456,16 @@ impl SoundHandle {
             if sound.unloaded {
                 return Err(mlua::Error::external("sound is unloaded"));
             }
-            (sound.bytes.clone(), sound.export_root.clone())
+            let bytes = if sound.sample_rate > 0 && sound.channels > 0 && !sound.samples.is_empty() {
+                encode_wav_bytes(sound.sample_rate, sound.channels, &sound.samples)?
+            } else if sound.bytes.starts_with(b"RIFF") {
+                sound.bytes.clone()
+            } else {
+                return Err(mlua::Error::external(
+                    "decoded sample data is unavailable for WAV export on this target",
+                ));
+            };
+            (bytes, sound.export_root.clone())
         };
         let export_root = export_root
             .ok_or_else(|| mlua::Error::external("sound export is unavailable for this handle"))?;
@@ -555,6 +629,7 @@ impl AssetManager {
             resource_root,
             data_root,
             images: HashMap::new(),
+            encoded_images: HashMap::new(),
             sounds: HashMap::new(),
         }
     }
@@ -591,7 +666,17 @@ impl AssetManager {
     }
 
     pub(crate) fn load_image(&mut self, user_path: &str) -> mlua::Result<ImageHandle> {
+        if has_explicit_base64_prefix(user_path) {
+            return self.load_base64_image(user_path);
+        }
         let resolved = self.resolve_path(user_path);
+        if !resolved.exists() {
+            if let Some((cache_key, bytes)) =
+                decode_base64_png(user_path).map_err(mlua::Error::external)?
+            {
+                return self.load_decoded_png(cache_key, bytes);
+            }
+        }
         let cache_key = Self::canonical_for_cache(&resolved);
         if let Some(existing) = self.images.get(&cache_key).and_then(Weak::upgrade) {
             let unloaded = existing
@@ -619,9 +704,69 @@ impl AssetManager {
         Ok(ImageHandle(handle))
     }
 
+    pub(crate) fn load_base64_image(&mut self, encoded: &str) -> mlua::Result<ImageHandle> {
+        let explicitly_encoded;
+        let encoded = if has_explicit_base64_prefix(encoded) {
+            encoded
+        } else {
+            explicitly_encoded = format!("base64:{encoded}");
+            &explicitly_encoded
+        };
+        let Some((cache_key, bytes)) = decode_base64_png(encoded).map_err(mlua::Error::external)?
+        else {
+            return Err(mlua::Error::external(
+                "expected a base64-encoded PNG or data:image/png;base64 URI",
+            ));
+        };
+        self.load_decoded_png(cache_key, bytes)
+    }
+
+    fn load_decoded_png(
+        &mut self,
+        cache_key: String,
+        bytes: Vec<u8>,
+    ) -> mlua::Result<ImageHandle> {
+        if let Some(existing) = self
+            .encoded_images
+            .get(&cache_key)
+            .and_then(Weak::upgrade)
+        {
+            let unloaded = existing
+                .lock()
+                .map_err(|_| mlua::Error::external("image lock poisoned"))?
+                .unloaded;
+            if !unloaded {
+                return Ok(ImageHandle(existing));
+            }
+        }
+        let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+            .map_err(|error| mlua::Error::external(format!("failed to decode base64 PNG: {error}")))?
+            .to_rgba8();
+        let handle = Arc::new(Mutex::new(ImageAsset {
+            id: next_image_id(),
+            image,
+            unloaded: false,
+            revision: 0,
+            export_root: Some(self.data_root.clone()),
+        }));
+        self.encoded_images
+            .insert(cache_key, Arc::downgrade(&handle));
+        Ok(ImageHandle(handle))
+    }
+
     pub(crate) fn new_image(&mut self, width: u16, height: u16, color: Color) -> ImageHandle {
         let pixel = Rgba([color.r, color.g, color.b, color.a]);
         let image = RgbaImage::from_pixel(width as u32, height as u32, pixel);
+        ImageHandle(Arc::new(Mutex::new(ImageAsset {
+            id: next_image_id(),
+            image,
+            unloaded: false,
+            revision: 0,
+            export_root: Some(self.data_root.clone()),
+        })))
+    }
+
+    fn image_from_rgba(&self, image: RgbaImage) -> ImageHandle {
         ImageHandle(Arc::new(Mutex::new(ImageAsset {
             id: next_image_id(),
             image,
@@ -651,75 +796,50 @@ impl AssetManager {
             .and_then(|extension| extension.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if extension != "wav" {
-            #[cfg(target_os = "emscripten")]
-            {
-                if matches!(extension.as_str(), "mp3" | "ogg" | "oga" | "flac" | "aac" | "m4a" | "aiff" | "aif") {
-                    let handle = Arc::new(Mutex::new(SoundAsset {
-                        sample_rate: 0,
-                        channels: 0,
-                        samples: Vec::new(),
-                        bytes: file_bytes,
-                        unloaded: false,
-                        export_root: Some(self.data_root.clone()),
-                    }));
-                    self.sounds.insert(cache_key, Arc::downgrade(&handle));
-                    return Ok(SoundHandle(handle));
-                }
+        #[cfg(target_os = "emscripten")]
+        let (sample_rate, channels, samples) = {
+            if !matches!(
+                extension.as_str(),
+                "wav" | "mp3" | "ogg" | "oga" | "flac" | "aac" | "m4a" | "aiff" | "aif"
+            ) {
+                return Err(asset_decode_error(
+                    "sound",
+                    &resolved,
+                    format!("unsupported browser audio format '.{extension}'"),
+                ));
             }
-            #[cfg(not(target_os = "emscripten"))]
-            {
+            // The browser decodes encoded audio through WebAudio. Editable
+            // sample data is intentionally absent in this target.
+            (0, 0, Vec::new())
+        };
+
+        #[cfg(not(target_os = "emscripten"))]
+        let (sample_rate, channels, samples) = {
+            if !matches!(extension.as_str(), "wav" | "mp3" | "ogg" | "oga" | "flac") {
                 return Err(asset_decode_error(
                     "sound",
                     &resolved,
                     format!(
-                        "unsupported audio format '.{extension}' in this build; WAV is supported natively, while browsers may also decode MP3, OGG, FLAC, AAC/M4A, and AIFF"
+                        "unsupported audio format '.{extension}'; supported formats are WAV, MP3, OGG/Vorbis, and FLAC"
                     ),
                 ));
             }
-        }
-        let mut reader = hound::WavReader::new(Cursor::new(file_bytes.as_slice()))
-            .map_err(|error| asset_decode_error("wav file", &resolved, error))?;
-        let spec = reader.spec();
-        let mut samples = Vec::new();
-        match spec.sample_format {
-            hound::SampleFormat::Float => {
-                for sample in reader.samples::<f32>() {
-                    samples.push(
-                        sample
-                            .map_err(|error| asset_decode_error("wav sample", &resolved, error))?
-                            .clamp(-1.0, 1.0),
-                    );
-                }
-            }
-            hound::SampleFormat::Int => {
-                let max = ((1u64 << spec.bits_per_sample.saturating_sub(1)) as f32) - 1.0;
-                if spec.bits_per_sample <= 16 {
-                    for sample in reader.samples::<i16>() {
-                        samples.push(
-                            (sample.map_err(|error| {
-                                asset_decode_error("wav sample", &resolved, error)
-                            })? as f32
-                                / max)
-                                .clamp(-1.0, 1.0),
-                        );
-                    }
-                } else {
-                    for sample in reader.samples::<i32>() {
-                        samples.push(
-                            (sample.map_err(|error| {
-                                asset_decode_error("wav sample", &resolved, error)
-                            })? as f32
-                                / max)
-                                .clamp(-1.0, 1.0),
-                        );
-                    }
-                }
-            }
-        }
+            let decoder = AudioDecoder::new(Cursor::new(file_bytes.clone())).map_err(|error| {
+                asset_decode_error(
+                    if extension == "wav" { "wav file" } else { "sound" },
+                    &resolved,
+                    error,
+                )
+            })?;
+            let sample_rate = decoder.sample_rate();
+            let channels = decoder.channels();
+            let samples = decoder.convert_samples::<f32>().collect();
+            (sample_rate, channels, samples)
+        };
+
         let handle = Arc::new(Mutex::new(SoundAsset {
-            sample_rate: spec.sample_rate,
-            channels: spec.channels,
+            sample_rate,
+            channels,
             samples,
             bytes: file_bytes,
             unloaded: false,
@@ -747,6 +867,16 @@ impl AssetManager {
     }
 
     pub(crate) fn unload_image_path(&mut self, user_path: &str) -> bool {
+        if let Ok(Some((cache_key, _))) = decode_base64_png(user_path) {
+            if let Some(handle) = self
+                .encoded_images
+                .remove(&cache_key)
+                .and_then(|weak| weak.upgrade())
+            {
+                ImageHandle(handle).unload();
+                return true;
+            }
+        }
         let resolved = self.resolve_path(user_path);
         let Some(handle) = self
             .images
@@ -773,12 +903,14 @@ impl AssetManager {
     }
 
     pub(crate) fn gc(&mut self) -> (usize, usize) {
-        let before_images = self.images.len();
+        let before_images = self.images.len() + self.encoded_images.len();
         let before_sounds = self.sounds.len();
         self.images.retain(|_, weak| weak.strong_count() > 0);
+        self.encoded_images
+            .retain(|_, weak| weak.strong_count() > 0);
         self.sounds.retain(|_, weak| weak.strong_count() > 0);
         (
-            before_images - self.images.len(),
+            before_images - self.images.len() - self.encoded_images.len(),
             before_sounds - self.sounds.len(),
         )
     }
@@ -788,6 +920,8 @@ pub(crate) fn add_assets_module_with_data_root(
     lua: &Lua,
     resource_root: PathBuf,
     data_root: PathBuf,
+    platform: SharedPlatformState,
+    render_state: SharedRenderState,
 ) -> mlua::Result<()> {
     let manager = Arc::new(Mutex::new(AssetManager::with_data_root(
         resource_root,
@@ -804,6 +938,84 @@ pub(crate) fn add_assets_module_with_data_root(
                     .lock()
                     .map_err(|_| mlua::Error::external("asset manager lock poisoned"))?
                     .load_image(&path)?;
+                lua.create_userdata(handle)
+            })?,
+        )?;
+    }
+
+    {
+        let manager = manager.clone();
+        assets.set(
+            "snapPhoto",
+            lua.create_function(move |lua, (x, y, x2, y2): (f32, f32, f32, f32)| {
+                if ![x, y, x2, y2].iter().all(|value| value.is_finite()) {
+                    return Err(mlua::Error::external(
+                        "snapPhoto coordinates must be finite numbers",
+                    ));
+                }
+                if x2 <= x || y2 <= y {
+                    return Err(mlua::Error::external(
+                        "snapPhoto expects x2 > x and y2 > y",
+                    ));
+                }
+
+                let window = lock_platform_state(&platform).window();
+                let screen_width = window.width.max(1.0).ceil() as u32;
+                let screen_height = window.height.max(1.0).ceil() as u32;
+                let left = x.floor().clamp(0.0, screen_width as f32) as u32;
+                let top = y.floor().clamp(0.0, screen_height as f32) as u32;
+                let right = x2.ceil().clamp(0.0, screen_width as f32) as u32;
+                let bottom = y2.ceil().clamp(0.0, screen_height as f32) as u32;
+                if right <= left || bottom <= top {
+                    return Err(mlua::Error::external(
+                        "snapPhoto rectangle is outside the window",
+                    ));
+                }
+
+                let commands = last_frame_commands(&render_state)
+                    .map_err(mlua::Error::external)?
+                    .ok_or_else(|| {
+                        mlua::Error::external(
+                            "snapPhoto is unavailable before the first frame is rendered",
+                        )
+                    })?;
+                let mut renderer = SoftwareRenderer::new(screen_width, screen_height);
+                renderer
+                    .render_commands(&platform, commands)
+                    .map_err(|error| {
+                        mlua::Error::external(format!("snapPhoto failed to render frame: {error}"))
+                    })?;
+
+                let photo_width = right - left;
+                let photo_height = bottom - top;
+                let mut photo = RgbaImage::new(photo_width, photo_height);
+                let source = renderer.pixels();
+                let destination = photo.as_flat_samples_mut().samples;
+                for row in 0..photo_height {
+                    let source_start = (((top + row) * screen_width + left) * 4) as usize;
+                    let source_end = source_start + photo_width as usize * 4;
+                    let destination_start = (row * photo_width * 4) as usize;
+                    destination[destination_start..destination_start + photo_width as usize * 4]
+                        .copy_from_slice(&source[source_start..source_end]);
+                }
+                let handle = manager
+                    .lock()
+                    .map_err(|_| mlua::Error::external("asset manager lock poisoned"))?
+                    .image_from_rgba(photo);
+                lua.create_userdata(handle)
+            })?,
+        )?;
+    }
+
+    {
+        let manager = manager.clone();
+        assets.set(
+            "loadImageBase64",
+            lua.create_function(move |lua, encoded: String| {
+                let handle = manager
+                    .lock()
+                    .map_err(|_| mlua::Error::external("asset manager lock poisoned"))?
+                    .load_base64_image(&encoded)?;
                 lua.create_userdata(handle)
             })?,
         )?;
@@ -947,6 +1159,97 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         std::env::temp_dir().join(format!("neolove_{name}_{unique}"))
+    }
+
+    fn encoded_test_png() -> String {
+        let mut image = RgbaImage::new(2, 1);
+        image.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        image.put_pixel(1, 0, Rgba([0, 255, 0, 128]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+            .expect("encode test png");
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn load_image_accepts_raw_and_data_uri_base64_png() -> mlua::Result<()> {
+        let root = temp_root("asset_base64_png");
+        let mut manager = AssetManager::new(root);
+        let encoded = encoded_test_png();
+
+        let raw = manager.load_image(&encoded)?;
+        assert_eq!(raw.dimensions()?, (2, 1));
+        assert_eq!(raw.sample_rgba(0, 0)?, [255, 0, 0, 255]);
+        assert_eq!(raw.sample_rgba(1, 0)?, [0, 255, 0, 128]);
+
+        let uri = manager.load_image(&format!("data:image/png;base64,{encoded}"))?;
+        assert!(Arc::ptr_eq(&raw.0, &uri.0), "equivalent encodings should share the cache");
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_base64_image_rejects_non_png_data() {
+        let root = temp_root("asset_base64_not_png");
+        let mut manager = AssetManager::new(root);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"not a png");
+        let error = manager
+            .load_base64_image(&encoded)
+            .expect_err("non-PNG data must fail")
+            .to_string();
+        assert!(error.contains("not a PNG"));
+    }
+
+    #[test]
+    fn snap_photo_returns_clipped_region_as_image_handle() -> mlua::Result<()> {
+        let root = temp_root("asset_snap_photo");
+        fs::create_dir_all(&root).map_err(mlua::Error::external)?;
+        let platform = crate::platform::new_shared_platform_state();
+        {
+            let mut state = lock_platform_state(&platform);
+            state.set_window(crate::platform::WindowState {
+                width: 4.0,
+                height: 3.0,
+            });
+            state.set_clear_color(Color::rgba(10, 20, 30, 255));
+        }
+        let render_state = crate::renderer::new_shared_render_state();
+        render_state
+            .lock()
+            .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+            .queue(crate::renderer::DrawCommand::Rect {
+                x: 1.0,
+                y: 1.0,
+                w: 2.0,
+                h: 1.0,
+                rotation: 0.0,
+                offset: crate::renderer::Vec2::default(),
+                color: Color::rgba(200, 40, 50, 255),
+                shader: None,
+            });
+        let mut renderer = SoftwareRenderer::new(4, 3);
+        renderer
+            .render(&platform, &render_state)
+            .map_err(mlua::Error::external)?;
+
+        let lua = Lua::new();
+        add_assets_module_with_data_root(
+            &lua,
+            root.clone(),
+            root.clone(),
+            platform,
+            render_state,
+        )?;
+        let assets: Table = lua.globals().get("assets")?;
+        let snap: mlua::Function = assets.get("snapPhoto")?;
+        let userdata: mlua::AnyUserData = snap.call((-2.0, 0.0, 3.0, 2.0))?;
+        let photo = userdata.borrow::<ImageHandle>()?;
+        assert_eq!(photo.dimensions()?, (3, 2));
+        assert_eq!(photo.sample_rgba(0, 0)?, [10, 20, 30, 255]);
+        assert_eq!(photo.sample_rgba(1, 1)?, [200, 40, 50, 255]);
+
+        fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
     }
 
     #[test]

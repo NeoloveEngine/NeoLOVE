@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::assets::ImageHandle;
-use crate::platform::{Color, SharedPlatformState, lock_platform_state};
+use crate::platform::{Antialiasing, Color, SharedPlatformState, lock_platform_state};
 use fontdue::Font;
 use image::{ImageBuffer, Rgba, RgbaImage};
 use std::collections::hash_map::DefaultHasher;
@@ -27,6 +27,14 @@ pub(crate) struct Rect {
 pub(crate) enum TextureFilter {
     Nearest,
     Linear,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum TextAntialiasing {
+    Off,
+    Standard,
+    #[default]
+    High,
 }
 
 const DEFAULT_FONT_CACHE_KEY: &str = "__neolove_default_font__";
@@ -79,6 +87,8 @@ pub(crate) struct TextStyleRange {
     pub color: Option<[u8; 4]>,
     pub size: Option<u32>,
     pub font: Option<FontHandle>,
+    pub offset_x: Option<u32>,
+    pub offset_y: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +113,7 @@ pub(crate) struct TextRenderRequest {
     pub stretch_width: f32,
     pub stretch_height: f32,
     pub rich_text: Vec<TextStyleRange>,
+    pub antialiasing: TextAntialiasing,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -156,6 +167,7 @@ pub(crate) enum DrawCommand {
 pub(crate) struct RenderState {
     commands: Vec<DrawCommand>,
     overlay_commands: Vec<DrawCommand>,
+    last_frame_commands: Option<Vec<DrawCommand>>,
 }
 
 pub(crate) type SharedRenderState = Arc<Mutex<RenderState>>;
@@ -204,6 +216,7 @@ struct TextSpriteCacheKey {
     stretch_width: u32,
     stretch_height: u32,
     rich_text: Vec<TextStyleRange>,
+    antialiasing: TextAntialiasing,
 }
 
 const TEXT_SPRITE_CACHE_LIMIT: usize = 256;
@@ -220,6 +233,7 @@ impl RenderState {
     pub(crate) fn drain(&mut self) -> Vec<DrawCommand> {
         let mut out = self.commands.drain(..).collect::<Vec<_>>();
         out.extend(self.overlay_commands.drain(..));
+        self.last_frame_commands = Some(out.clone());
         out
     }
 }
@@ -285,6 +299,7 @@ fn text_sprite_cache_key(request: &TextRenderRequest) -> TextSpriteCacheKey {
         stretch_width: f32_cache_key(request.stretch_width),
         stretch_height: f32_cache_key(request.stretch_height),
         rich_text: request.rich_text.clone(),
+        antialiasing: request.antialiasing,
     }
 }
 
@@ -326,6 +341,7 @@ pub(crate) fn text_render_request_cache_id(request: &TextRenderRequest) -> u64 {
     f32_cache_key(request.stretch_width).hash(&mut hasher);
     f32_cache_key(request.stretch_height).hash(&mut hasher);
     request.rich_text.hash(&mut hasher);
+    request.antialiasing.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -401,6 +417,15 @@ pub(crate) fn drain_commands(render_state: &SharedRenderState) -> Result<Vec<Dra
         .map(|mut state| state.drain())
 }
 
+pub(crate) fn last_frame_commands(
+    render_state: &SharedRenderState,
+) -> Result<Option<Vec<DrawCommand>>, String> {
+    render_state
+        .lock()
+        .map_err(|_| "render state lock poisoned".to_string())
+        .map(|state| state.last_frame_commands.clone())
+}
+
 fn command_uses_custom_shader(command: &DrawCommand) -> bool {
     match command {
         DrawCommand::Rect { shader, .. }
@@ -434,6 +459,8 @@ struct ResolvedTextStyle {
     color: Color,
     scale: f32,
     font: FontHandle,
+    offset_x: f32,
+    offset_y: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -665,14 +692,20 @@ fn layout_lines_for(
     lines
 }
 
-fn style_for_index(request: &TextRenderRequest, index: usize) -> ResolvedTextStyle {
+fn style_for_index(
+    request: &TextRenderRequest,
+    index: usize,
+    base_scale: f32,
+) -> ResolvedTextStyle {
     let mut style = ResolvedTextStyle {
         bold: false,
         italic: false,
         underline: false,
         color: request.color,
-        scale: request.scale.max(1.0),
+        scale: base_scale.max(1.0),
         font: request.font.clone(),
+        offset_x: 0.0,
+        offset_y: 0.0,
     };
     for range in &request.rich_text {
         if index >= range.start && index < range.end {
@@ -683,10 +716,16 @@ fn style_for_index(request: &TextRenderRequest, index: usize) -> ResolvedTextSty
                 style.color = Color::rgba(r, g, b, a);
             }
             if let Some(bits) = range.size {
-                style.scale = (request.scale * f32::from_bits(bits)).max(1.0);
+                style.scale = (base_scale * f32::from_bits(bits)).max(1.0);
             }
             if let Some(font) = &range.font {
                 style.font = font.clone();
+            }
+            if let Some(bits) = range.offset_x {
+                style.offset_x = f32::from_bits(bits);
+            }
+            if let Some(bits) = range.offset_y {
+                style.offset_y = f32::from_bits(bits);
             }
         }
     }
@@ -831,7 +870,7 @@ fn prepare_text_layout_uncached(request: &TextRenderRequest) -> Option<PreparedT
 
         for (char_index, ch) in line.text.chars().enumerate() {
             let global_index = glyphs.len();
-            let style = style_for_index(request, global_index);
+            let style = style_for_index(request, global_index, used_scale);
             let glyph_font = load_font(&style.font).unwrap_or_else(|| font.clone());
             let glyph_px = style.scale.max(1.0);
             if char_index > 0 {
@@ -844,11 +883,11 @@ fn prepare_text_layout_uncached(request: &TextRenderRequest) -> Option<PreparedT
             let metrics = glyph_font.metrics(render_ch, glyph_px);
             let advance_width = glyph_advance_width(&glyph_font, ch, glyph_px, request.tab_size);
             let italic_slant = if style.italic { glyph_px * 0.18 } else { 0.0 };
-            let cell_x = line_start_x + pen_x;
-            let cell_y = start_y + line_advance * line_index as f32;
+            let cell_x = line_start_x + pen_x + style.offset_x;
+            let cell_y = start_y + line_advance * line_index as f32 + style.offset_y;
             let cell_w = advance_width.max(0.0);
-            let glyph_x = line_start_x + pen_x + metrics.xmin as f32;
-            let glyph_y = baseline_y - metrics.height as f32 - metrics.ymin as f32;
+            let glyph_x = line_start_x + pen_x + metrics.xmin as f32 + style.offset_x;
+            let glyph_y = baseline_y - metrics.height as f32 - metrics.ymin as f32 + style.offset_y;
             let bounds = Rect {
                 x: glyph_x,
                 y: glyph_y,
@@ -964,6 +1003,69 @@ pub(crate) fn text_letter_bounds(request: &TextRenderRequest) -> Vec<Rect> {
         .unwrap_or_default()
 }
 
+fn blend_text_pixel(image: &mut RgbaImage, x: u32, y: u32, source: [u8; 4]) {
+    let destination = image.get_pixel(x, y).0;
+    let source_alpha = source[3] as f32 / 255.0;
+    let destination_alpha = destination[3] as f32 / 255.0;
+    let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
+    if output_alpha <= f32::EPSILON {
+        return;
+    }
+    let channel = |index: usize| {
+        ((source[index] as f32 * source_alpha
+            + destination[index] as f32 * destination_alpha * (1.0 - source_alpha))
+            / output_alpha)
+            .round() as u8
+    };
+    image.put_pixel(
+        x,
+        y,
+        Rgba([
+            channel(0),
+            channel(1),
+            channel(2),
+            (output_alpha * 255.0).round() as u8,
+        ]),
+    );
+}
+
+fn downsample_text_image(source: &RgbaImage, factor: u32, width: u32, height: u32) -> RgbaImage {
+    let mut output = ImageBuffer::from_pixel(width, height, Rgba([0, 0, 0, 0]));
+    let sample_count = (factor * factor) as f32;
+    for y in 0..height {
+        for x in 0..width {
+            let mut alpha_sum = 0.0f32;
+            let mut premultiplied = [0.0f32; 3];
+            for sy in 0..factor {
+                for sx in 0..factor {
+                    let pixel = source.get_pixel(x * factor + sx, y * factor + sy).0;
+                    let alpha = pixel[3] as f32 / 255.0;
+                    alpha_sum += alpha;
+                    for channel in 0..3 {
+                        premultiplied[channel] += pixel[channel] as f32 * alpha;
+                    }
+                }
+            }
+            let output_alpha = alpha_sum / sample_count;
+            if output_alpha <= f32::EPSILON {
+                continue;
+            }
+            let color_divisor = alpha_sum.max(f32::EPSILON);
+            output.put_pixel(
+                x,
+                y,
+                Rgba([
+                    (premultiplied[0] / color_divisor).round() as u8,
+                    (premultiplied[1] / color_divisor).round() as u8,
+                    (premultiplied[2] / color_divisor).round() as u8,
+                    (output_alpha * 255.0).round() as u8,
+                ]),
+            );
+        }
+    }
+    output
+}
+
 pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<RasterizedTextSprite> {
     if cfg!(target_os = "emscripten") {
         return None;
@@ -996,19 +1098,46 @@ pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<Raste
     };
     let width = (max_x - min_x).ceil().max(1.0) as u32 + border * 2;
     let height = (max_y - min_y).ceil().max(1.0) as u32 + border * 2;
-    let mut text_image: RgbaImage = ImageBuffer::from_pixel(width, height, Rgba([0, 0, 0, 0]));
+    let supersample = match request.antialiasing {
+        TextAntialiasing::High => 2u32,
+        TextAntialiasing::Off | TextAntialiasing::Standard => 1u32,
+    };
+    let mut text_image: RgbaImage = ImageBuffer::from_pixel(
+        width * supersample,
+        height * supersample,
+        Rgba([0, 0, 0, 0]),
+    );
 
     for glyph in layout.glyphs {
         let glyph_font = load_font(&glyph.style.font).unwrap_or_else(|| font.clone());
-        let (metrics, bitmap) = glyph_font.rasterize(glyph.ch, glyph.style.scale.max(1.0));
-        let base_x = (glyph.x - min_x).round() as i32 + border as i32;
-        let top_y = (glyph.y - min_y).round() as i32 + border as i32;
+        let layout_metrics = glyph_font.metrics(glyph.ch, glyph.style.scale.max(1.0));
+        let (metrics, bitmap) = glyph_font.rasterize(
+            glyph.ch,
+            glyph.style.scale.max(1.0) * supersample as f32,
+        );
+        let glyph_origin_x = glyph.x - layout_metrics.xmin as f32;
+        let glyph_baseline_y =
+            glyph.y + layout_metrics.height as f32 + layout_metrics.ymin as f32;
+        let base_x = ((glyph_origin_x - min_x) * supersample as f32
+            + metrics.xmin as f32)
+            .round() as i32
+            + (border * supersample) as i32;
+        let top_y = ((glyph_baseline_y - min_y) * supersample as f32
+            - metrics.height as f32
+            - metrics.ymin as f32)
+            .round() as i32
+            + (border * supersample) as i32;
         let passes = if glyph.style.bold { 2 } else { 1 };
         for pass in 0..passes {
             for gy in 0..metrics.height {
                 for gx in 0..metrics.width {
-                    let alpha =
-                        modulate_alpha(bitmap[gy * metrics.width + gx], glyph.style.color.a);
+                    let coverage = bitmap[gy * metrics.width + gx];
+                    let coverage = if matches!(request.antialiasing, TextAntialiasing::Off) {
+                        if coverage >= 128 { 255 } else { 0 }
+                    } else {
+                        coverage
+                    };
+                    let alpha = modulate_alpha(coverage, glyph.style.color.a);
                     if alpha == 0 {
                         continue;
                     }
@@ -1017,40 +1146,60 @@ pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<Raste
                     } else {
                         0
                     };
-                    let tx = base_x + gx as i32 + pass as i32 + slant;
+                    let tx = base_x
+                        + gx as i32
+                        + pass as i32 * supersample as i32
+                        + slant;
                     let ty = top_y + gy as i32;
-                    if tx < 0 || ty < 0 || tx >= width as i32 || ty >= height as i32 {
+                    if tx < 0
+                        || ty < 0
+                        || tx >= text_image.width() as i32
+                        || ty >= text_image.height() as i32
+                    {
                         continue;
                     }
-                    text_image.put_pixel(
+                    blend_text_pixel(
+                        &mut text_image,
                         tx as u32,
                         ty as u32,
-                        Rgba([
+                        [
                             glyph.style.color.r,
                             glyph.style.color.g,
                             glyph.style.color.b,
                             alpha,
-                        ]),
+                        ],
                     );
                 }
             }
         }
         if glyph.style.underline {
-            let y = (top_y + metrics.height as i32 + 1).clamp(0, height as i32 - 1);
-            for x in base_x.max(0)..(base_x + glyph.bounds.w.ceil() as i32).min(width as i32) {
-                text_image.put_pixel(
-                    x as u32,
-                    y as u32,
-                    Rgba([
-                        glyph.style.color.r,
-                        glyph.style.color.g,
-                        glyph.style.color.b,
-                        glyph.style.color.a,
-                    ]),
-                );
+            let y = (top_y + metrics.height as i32 + supersample as i32)
+                .clamp(0, text_image.height() as i32 - 1);
+            let end_x = (base_x + (glyph.bounds.w * supersample as f32).ceil() as i32)
+                .min(text_image.width() as i32);
+            for underline_y in y..(y + supersample as i32).min(text_image.height() as i32) {
+                for x in base_x.max(0)..end_x {
+                    blend_text_pixel(
+                        &mut text_image,
+                        x as u32,
+                        underline_y as u32,
+                        [
+                            glyph.style.color.r,
+                            glyph.style.color.g,
+                            glyph.style.color.b,
+                            glyph.style.color.a,
+                        ],
+                    );
+                }
             }
         }
     }
+
+    let text_image = if supersample > 1 {
+        downsample_text_image(&text_image, supersample, width, height)
+    } else {
+        text_image
+    };
 
     let filter = if request.stretch_width > 0.0 && request.stretch_height > 0.0 {
         TextureFilter::Nearest
@@ -1423,6 +1572,7 @@ pub(crate) struct SoftwareRenderer {
     width: u32,
     height: u32,
     pixels: Vec<u8>,
+    antialiasing: Antialiasing,
 }
 
 impl SoftwareRenderer {
@@ -1431,6 +1581,7 @@ impl SoftwareRenderer {
             width: width.max(1),
             height: height.max(1),
             pixels: vec![0; width.max(1) as usize * height.max(1) as usize * 4],
+            antialiasing: Antialiasing::High,
         }
     }
 
@@ -1479,7 +1630,10 @@ impl SoftwareRenderer {
             return Err(shader_error);
         }
 
-        let clear = lock_platform_state(platform).clear_color();
+        let state = lock_platform_state(platform);
+        let clear = state.clear_color();
+        self.antialiasing = state.antialiasing();
+        drop(state);
         self.clear_to_color(clear);
         self.draw_unshaded_commands(commands)
     }
@@ -1525,6 +1679,10 @@ impl SoftwareRenderer {
                 color,
                 ..
             } => {
+                if rotation.abs() <= 0.0001 {
+                    self.fill_axis_aligned_rect(x, y, w, h, color);
+                    return Ok(());
+                }
                 let pivot_x = x + w * offset.x;
                 let pivot_y = y + h * offset.y;
                 let p0 = self.to_world(x, y, pivot_x, pivot_y, rotation);
@@ -1566,18 +1724,82 @@ impl SoftwareRenderer {
         }
     }
 
+    fn fill_axis_aligned_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let min_x = x.floor().max(0.0) as i32;
+        let max_x = (x + w).ceil().min(self.width as f32) as i32;
+        let min_y = y.floor().max(0.0) as i32;
+        let max_y = (y + h).ceil().min(self.height as f32) as i32;
+        for py in min_y..max_y {
+            for px in min_x..max_x {
+                let coverage = if matches!(self.antialiasing, Antialiasing::Off) {
+                    let cx = px as f32 + 0.5;
+                    let cy = py as f32 + 0.5;
+                    if cx >= x && cx <= x + w && cy >= y && cy <= y + h {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                } else {
+                    let overlap_x = ((px as f32 + 1.0).min(x + w) - (px as f32).max(x))
+                        .clamp(0.0, 1.0);
+                    let overlap_y = ((py as f32 + 1.0).min(y + h) - (py as f32).max(y))
+                        .clamp(0.0, 1.0);
+                    overlap_x * overlap_y
+                };
+                if coverage > 0.0 {
+                    let mut sampled = color;
+                    sampled.a = (color.a as f32 * coverage).round() as u8;
+                    self.put_pixel(px as u32, py as u32, sampled);
+                }
+            }
+        }
+    }
+
     fn fill_circle(&mut self, center: Vec2, radius: f32, color: Color) {
         let min_x = (center.x - radius).floor().max(0.0) as i32;
         let max_x = (center.x + radius).ceil().min(self.width as f32 - 1.0) as i32;
         let min_y = (center.y - radius).floor().max(0.0) as i32;
         let max_y = (center.y + radius).ceil().min(self.height as f32 - 1.0) as i32;
+        let samples = match self.antialiasing {
+            Antialiasing::Off => 1,
+            Antialiasing::Standard => 2,
+            Antialiasing::High => 4,
+        };
+        let total_samples = (samples * samples) as u32;
         let rr = radius * radius;
         for py in min_y..=max_y {
             for px in min_x..=max_x {
-                let dx = px as f32 + 0.5 - center.x;
-                let dy = py as f32 + 0.5 - center.y;
-                if dx * dx + dy * dy <= rr {
+                let center_dx = px as f32 + 0.5 - center.x;
+                let center_dy = py as f32 + 0.5 - center.y;
+                let center_distance = (center_dx * center_dx + center_dy * center_dy).sqrt();
+                if center_distance <= radius - std::f32::consts::FRAC_1_SQRT_2 {
                     self.put_pixel(px as u32, py as u32, color);
+                    continue;
+                }
+                if center_distance >= radius + std::f32::consts::FRAC_1_SQRT_2 {
+                    continue;
+                }
+                let mut covered = 0u32;
+                for sample_y in 0..samples {
+                    for sample_x in 0..samples {
+                        let dx = px as f32
+                            + (sample_x as f32 + 0.5) / samples as f32
+                            - center.x;
+                        let dy = py as f32
+                            + (sample_y as f32 + 0.5) / samples as f32
+                            - center.y;
+                        if dx * dx + dy * dy <= rr {
+                            covered += 1;
+                        }
+                    }
+                }
+                if covered > 0 {
+                    let mut sampled = color;
+                    sampled.a = ((color.a as u32 * covered) / total_samples) as u8;
+                    self.put_pixel(px as u32, py as u32, sampled);
                 }
             }
         }
@@ -1596,19 +1818,69 @@ impl SoftwareRenderer {
         if area.abs() < 0.0001 {
             return;
         }
+        let samples = match self.antialiasing {
+            Antialiasing::Off => 1,
+            Antialiasing::Standard => 2,
+            Antialiasing::High => 4,
+        };
+        let total_samples = (samples * samples) as u32;
         for py in min_y..=max_y {
             for px in min_x..=max_x {
-                let point = Vec2 {
-                    x: px as f32 + 0.5,
-                    y: py as f32 + 0.5,
+                let corners = [
+                    Vec2 { x: px as f32, y: py as f32 },
+                    Vec2 { x: px as f32 + 1.0, y: py as f32 },
+                    Vec2 { x: px as f32, y: py as f32 + 1.0 },
+                    Vec2 { x: px as f32 + 1.0, y: py as f32 + 1.0 },
+                ];
+                let inside = |point: Vec2| {
+                    let w0 = Self::edge(b, c, point);
+                    let w1 = Self::edge(c, a, point);
+                    let w2 = Self::edge(a, b, point);
+                    (area > 0.0 && w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0)
+                        || (area < 0.0 && w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0)
                 };
-                let w0 = Self::edge(b, c, point);
-                let w1 = Self::edge(c, a, point);
-                let w2 = Self::edge(a, b, point);
-                if (area > 0.0 && w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0)
-                    || (area < 0.0 && w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0)
-                {
+                if corners.iter().copied().all(inside) {
                     self.put_pixel(px as u32, py as u32, color);
+                    continue;
+                }
+                let fully_outside_edge = |edge_a: Vec2, edge_b: Vec2| {
+                    if area > 0.0 {
+                        corners
+                            .iter()
+                            .all(|point| Self::edge(edge_a, edge_b, *point) < 0.0)
+                    } else {
+                        corners
+                            .iter()
+                            .all(|point| Self::edge(edge_a, edge_b, *point) > 0.0)
+                    }
+                };
+                if fully_outside_edge(b, c)
+                    || fully_outside_edge(c, a)
+                    || fully_outside_edge(a, b)
+                {
+                    continue;
+                }
+                let mut covered = 0u32;
+                for sample_y in 0..samples {
+                    for sample_x in 0..samples {
+                        let point = Vec2 {
+                            x: px as f32 + (sample_x as f32 + 0.5) / samples as f32,
+                            y: py as f32 + (sample_y as f32 + 0.5) / samples as f32,
+                        };
+                        let w0 = Self::edge(b, c, point);
+                        let w1 = Self::edge(c, a, point);
+                        let w2 = Self::edge(a, b, point);
+                        if (area > 0.0 && w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0)
+                            || (area < 0.0 && w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0)
+                        {
+                            covered += 1;
+                        }
+                    }
+                }
+                if covered > 0 {
+                    let mut sampled = color;
+                    sampled.a = ((color.a as u32 * covered) / total_samples) as u8;
+                    self.put_pixel(px as u32, py as u32, sampled);
                 }
             }
         }
@@ -1883,6 +2155,7 @@ mod tests {
             stretch_width: 0.0,
             stretch_height: 0.0,
             rich_text: Vec::new(),
+            antialiasing: TextAntialiasing::High,
         };
 
         assert!(command_intersects_viewport(
@@ -1920,6 +2193,7 @@ mod tests {
             stretch_width: 0.0,
             stretch_height: 0.0,
             rich_text: Vec::new(),
+            antialiasing: TextAntialiasing::High,
         };
 
         let sprite = rasterize_text_sprite(&request).expect("expected rasterized text sprite");
@@ -1927,6 +2201,55 @@ mod tests {
         assert!(sprite.dest.h > 0.0);
         assert!(sprite.image.width() > 0);
         assert!(sprite.image.height() > 0);
+    }
+
+    #[test]
+    fn fitted_text_rasterizes_at_used_scale() {
+        let request = TextRenderRequest {
+            text: "Text".to_string(),
+            bounds: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 120.0,
+                h: 60.0,
+            },
+            rotation: 0.0,
+            pivot: Vec2::default(),
+            color: Color::WHITE,
+            font: FontHandle::Default,
+            scale: 3500.0,
+            min_scale: 1.0,
+            text_scale: TextScaleMode::Fit,
+            align_x: TextAlignX::Center,
+            align_y: TextAlignY::Center,
+            wrap: TextWrapMode::None,
+            padding_x: 0.0,
+            padding_y: 0.0,
+            line_spacing: 1.0,
+            letter_spacing: 0.0,
+            tab_size: 4.0,
+            stretch_width: 0.0,
+            stretch_height: 0.0,
+            rich_text: Vec::new(),
+            antialiasing: TextAntialiasing::High,
+        };
+
+        let metrics = measure_text(&request).expect("metrics");
+        assert!(metrics.used_scale < 3500.0);
+        assert!(metrics.used_scale > 1.0);
+        let sprite = rasterize_text_sprite(&request).expect("sprite");
+        assert!(
+            sprite.dest.w <= request.bounds.w + 2.0,
+            "sprite width {} exceeded bounds {}",
+            sprite.dest.w,
+            request.bounds.w
+        );
+        assert!(
+            sprite.dest.h <= request.bounds.h + 2.0,
+            "sprite height {} exceeded bounds {}",
+            sprite.dest.h,
+            request.bounds.h
+        );
     }
 
     #[test]
@@ -1957,6 +2280,7 @@ mod tests {
             stretch_width: 0.0,
             stretch_height: 0.0,
             rich_text: Vec::new(),
+            antialiasing: TextAntialiasing::High,
         };
 
         let metrics = measure_text(&request).expect("expected text metrics");
@@ -1995,6 +2319,7 @@ mod tests {
             stretch_width: 0.0,
             stretch_height: 0.0,
             rich_text: Vec::new(),
+            antialiasing: TextAntialiasing::High,
         };
 
         let metrics = measure_text(&request).expect("expected text metrics");
@@ -2030,6 +2355,7 @@ mod tests {
             stretch_width: 0.0,
             stretch_height: 0.0,
             rich_text: Vec::new(),
+            antialiasing: TextAntialiasing::High,
         };
         let narrow_metrics = measure_text(&narrow).expect("expected text metrics");
 
@@ -2069,6 +2395,7 @@ mod tests {
             stretch_width: 0.0,
             stretch_height: 0.0,
             rich_text: Vec::new(),
+            antialiasing: TextAntialiasing::High,
         };
 
         let sprite = rasterize_text_sprite(&request).expect("expected rasterized text sprite");
@@ -2081,5 +2408,123 @@ mod tests {
 
         assert!(max_alpha > 0);
         assert!(max_alpha <= request.color.a);
+    }
+
+    #[test]
+    fn high_quality_text_has_smooth_coverage_while_off_is_pixel_hard() {
+        let mut request = TextRenderRequest {
+            text: "Quality".to_string(),
+            bounds: Rect::default(),
+            rotation: 0.0,
+            pivot: Vec2::default(),
+            color: Color::WHITE,
+            font: FontHandle::Default,
+            scale: 19.0,
+            min_scale: 19.0,
+            text_scale: TextScaleMode::None,
+            align_x: TextAlignX::Left,
+            align_y: TextAlignY::Top,
+            wrap: TextWrapMode::None,
+            padding_x: 0.0,
+            padding_y: 0.0,
+            line_spacing: 1.0,
+            letter_spacing: 0.0,
+            tab_size: 4.0,
+            stretch_width: 0.0,
+            stretch_height: 0.0,
+            rich_text: Vec::new(),
+            antialiasing: TextAntialiasing::Off,
+        };
+        let hard = rasterize_text_sprite(&request).expect("hard text");
+        assert!(hard
+            .image
+            .pixels()
+            .all(|pixel| matches!(pixel.0[3], 0 | 255)));
+
+        request.antialiasing = TextAntialiasing::High;
+        let smooth = rasterize_text_sprite(&request).expect("smooth text");
+        assert!(smooth
+            .image
+            .pixels()
+            .any(|pixel| pixel.0[3] > 0 && pixel.0[3] < 255));
+    }
+
+    #[test]
+    fn rich_text_character_offsets_move_visual_and_letter_bounds() {
+        let base = TextRenderRequest {
+            text: "AB".to_string(),
+            bounds: Rect::default(),
+            rotation: 0.0,
+            pivot: Vec2::default(),
+            color: Color::WHITE,
+            font: FontHandle::Default,
+            scale: 20.0,
+            min_scale: 20.0,
+            text_scale: TextScaleMode::None,
+            align_x: TextAlignX::Left,
+            align_y: TextAlignY::Top,
+            wrap: TextWrapMode::None,
+            padding_x: 0.0,
+            padding_y: 0.0,
+            line_spacing: 1.0,
+            letter_spacing: 0.0,
+            tab_size: 4.0,
+            stretch_width: 0.0,
+            stretch_height: 0.0,
+            rich_text: Vec::new(),
+            antialiasing: TextAntialiasing::High,
+        };
+        let original = measure_text(&base).expect("base metrics");
+        let mut offset = base;
+        offset.rich_text.push(TextStyleRange {
+            start: 1,
+            end: 2,
+            bold: false,
+            italic: false,
+            underline: false,
+            color: None,
+            size: None,
+            font: None,
+            offset_x: Some(6.0f32.to_bits()),
+            offset_y: Some((-4.0f32).to_bits()),
+        });
+        let moved = measure_text(&offset).expect("offset metrics");
+        assert!((moved.letter_bounds[0].x - original.letter_bounds[0].x).abs() < 0.01);
+        assert!((moved.letter_bounds[0].y - original.letter_bounds[0].y).abs() < 0.01);
+        assert!((moved.letter_bounds[1].x - original.letter_bounds[1].x - 6.0).abs() < 0.01);
+        assert!((moved.letter_bounds[1].y - original.letter_bounds[1].y + 4.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn software_geometry_antialiasing_is_configurable() {
+        let platform = crate::platform::new_shared_platform_state();
+        {
+            let mut state = lock_platform_state(&platform);
+            state.set_clear_color(Color::rgba(0, 0, 0, 0));
+            state.set_antialiasing(Antialiasing::Off);
+        }
+        let command = DrawCommand::Circle {
+            center: Vec2 { x: 8.2, y: 8.4 },
+            radius: 4.3,
+            color: Color::WHITE,
+            shader: None,
+        };
+        let mut renderer = SoftwareRenderer::new(18, 18);
+        renderer
+            .render_commands(&platform, vec![command.clone()])
+            .expect("hard circle");
+        assert!(renderer
+            .pixels()
+            .chunks_exact(4)
+            .all(|pixel| matches!(pixel[3], 0 | 255)));
+
+        lock_platform_state(&platform).set_antialiasing(Antialiasing::High);
+        renderer
+            .render_commands(&platform, vec![command])
+            .expect("smooth circle");
+        assert!(renderer
+            .pixels()
+            .chunks_exact(4)
+            .any(|pixel| pixel[3] > 0 && pixel[3] < 255));
     }
 }

@@ -74,6 +74,8 @@ export type Entity = {
 	GetWorldPosition: (self: Entity) -> (number, number),
 	getWorldRotation: (self: Entity) -> number,
 	GetWorldRotation: (self: Entity) -> number,
+	isInside: (self: Entity, world_x: number, world_y: number) -> boolean,
+	IsInside: (self: Entity, world_x: number, world_y: number) -> boolean,
 	[string]: any,
 }
 
@@ -168,6 +170,7 @@ export type RaycastOptions = {
 
 export type AppModule = {
 	bg: Color4Value,
+	antiAliasing: "off" | "standard" | "high",
 	setMaxFps: (fps: number?) -> (),
 	getMaxFps: () -> number?,
 	setShowFps: (enabled: boolean?) -> (),
@@ -175,6 +178,8 @@ export type AppModule = {
 	nearestNeighborScaling: boolean,
 	setNearestNeighborScaling: (enabled: boolean?) -> (),
 	getNearestNeighborScaling: () -> boolean,
+	setAntiAliasing: (mode: ("off" | "standard" | "high")?) -> (),
+	getAntiAliasing: () -> "off" | "standard" | "high",
 }
 
 export type InputModule = {
@@ -196,7 +201,9 @@ export type InputModule = {
 }
 
 export type AssetsModule = {
-	loadImage: (path: string) -> ImageHandle,
+	loadImage: (pathOrBase64Png: string) -> ImageHandle,
+	loadImageBase64: (base64Png: string) -> ImageHandle,
+	snapPhoto: (x: number, y: number, x2: number, y2: number) -> ImageHandle,
 	newImage: (width: number, height: number, color: Color4Value?) -> ImageHandle,
 	loadSound: (path: string) -> SoundHandle,
 	newSound: (sampleRate: number, channels: number, len: number, fill: number?) -> SoundHandle,
@@ -210,6 +217,9 @@ export type AudioModule = {
 	playOnce: (sound: SoundHandle, volume: number?) -> (),
 	stop: (sound: SoundHandle) -> (),
 	setVolume: (sound: SoundHandle, volume: number) -> (),
+	playSpatial: (sound: SoundHandle, x: number, y: number, looped: boolean?, volume: number?) -> (),
+	setPosition: (sound: SoundHandle, x: number, y: number) -> boolean,
+	setListenerPosition: (x: number, y: number) -> (),
 }
 
 export type FsWalkEntry = {
@@ -399,6 +409,7 @@ export type EcsModule = {
 	root: Entity,
 	addComponent: (entity: Entity, component: Component) -> ComponentInstance,
 	removeComponent: (entity: Entity, target: number | ComponentInstance) -> boolean,
+	loadScene: (path: string) -> (),
 }
 
 export type PrefabTemplate = {
@@ -435,6 +446,7 @@ export type PrefabUiModule = {
 export type PrefabsModule = {
 	capture: (entity: Entity) -> PrefabTemplate,
 	component: <T>(source: T & Component, overrides: { [string]: any }?) -> T & Component,
+	load: (path: string) -> PrefabTemplate,
 	register: (name: string, source: string | Entity | PrefabTemplate) -> PrefabTemplate,
 	get: (name: string) -> PrefabTemplate?,
 	remove: (name: string) -> boolean,
@@ -500,6 +512,33 @@ export type TweeningModule = {
 	update: (dt: number) -> (),
 }
 
+export type AnimationKeyframe = { time: number, value: number }
+export type AnimationTrack = {
+	property: string,
+	interpolation: "linear" | "step" | "hold"?,
+	keys: { AnimationKeyframe },
+}
+export type AnimationClip = {
+	duration: number?,
+	looping: boolean?,
+	looped: boolean?,
+	tracks: { AnimationTrack },
+}
+export type AnimationHandle = {
+	id: number,
+	play: (self: AnimationHandle) -> (),
+	pause: (self: AnimationHandle) -> (),
+	stop: (self: AnimationHandle) -> (),
+	seek: (self: AnimationHandle, time: number) -> (),
+	setSpeed: (self: AnimationHandle, speed: number) -> (),
+	isPlaying: (self: AnimationHandle) -> boolean,
+}
+export type AnimationModule = {
+	new: (target: { [any]: any }, clip: AnimationClip) -> AnimationHandle,
+	create: (target: { [any]: any }, clip: AnimationClip) -> AnimationHandle,
+	play: (target: { [any]: any }, clip: AnimationClip) -> AnimationHandle,
+}
+
 export type BaseDrawableComponent = ComponentInstance & {
 	NEOLOVE_RENDERING: boolean,
 	color: Color4Value,
@@ -508,6 +547,33 @@ export type BaseDrawableComponent = ComponentInstance & {
 }
 
 export type Rect2D = BaseDrawableComponent
+
+export type EntityScaler = ComponentInstance & {
+	__neolove_component: "EntityScaler",
+	enabled: boolean,
+	edit_with_percent: boolean,
+	editWithPercent: boolean?,
+	x_percent: number,
+	y_percent: number,
+	size_x_percent: number,
+	size_y_percent: number,
+	xPercent: number?,
+	yPercent: number?,
+	sizeXPercent: number?,
+	sizeYPercent: number?,
+	percent_x: number?,
+	percent_y: number?,
+	percentX: number?,
+	percentY: number?,
+	offset_x: number,
+	offset_y: number,
+	offsetX: number?,
+	offsetY: number?,
+	pivot_x: number,
+	pivot_y: number,
+	pivotX: number?,
+	pivotY: number?,
+}
 
 export type Shape2DShape = "box" | "circle" | "triangle" | "right_triangle" | "righttriangle" | "rightangledtriangle"
 export type TriangleCorner = "bl" | "br" | "tl" | "tr" | "bottomright" | "rightbottom" | "topleft" | "lefttop" | "topright" | "righttop"
@@ -519,6 +585,54 @@ export type Shape2D = BaseDrawableComponent & {
 	offset_y: number,
 	size_x: number,
 	size_y: number,
+}
+
+export type ParticleEmitterShape = "point" | "box" | "circle"
+export type ParticleColorKeypoint = { time: number, color: Color4Value }
+export type ParticleNumberKeypoint = { time: number, value: number }
+
+export type ParticleSystem2D = BaseDrawableComponent & {
+	__neolove_component: "ParticleSystem2D",
+	playing: boolean,
+	looping: boolean,
+	duration: number,
+	emission_rate: number,
+	max_particles: number,
+	lifetime: number,
+	speed: number,
+	direction: number,
+	spread: number,
+	start_size: number,
+	end_size: number,
+	start_color: Color4Value,
+	end_color: Color4Value,
+	color_sequence: { ParticleColorKeypoint },
+	transparency_sequence: { ParticleNumberKeypoint },
+	shape: ParticleEmitterShape,
+	radius: number,
+	gravity_x: number,
+	gravity_y: number,
+	particle_count: number,
+	play: (self: ParticleSystem2D) -> (),
+	Play: (self: ParticleSystem2D) -> (),
+	pause: (self: ParticleSystem2D) -> (),
+	Pause: (self: ParticleSystem2D) -> (),
+	stop: (self: ParticleSystem2D) -> (),
+	Stop: (self: ParticleSystem2D) -> (),
+	emit: (self: ParticleSystem2D, count: number?) -> (),
+	Emit: (self: ParticleSystem2D, count: number?) -> (),
+}
+
+export type SpatialSound2D = ComponentInstance & {
+	__neolove_component: "SpatialSound2D",
+	sound: SoundHandle?,
+	volume: number,
+	looping: boolean,
+	autoplay: boolean,
+	play: (self: SpatialSound2D) -> boolean,
+	Play: (self: SpatialSound2D) -> boolean,
+	stop: (self: SpatialSound2D) -> (),
+	Stop: (self: SpatialSound2D) -> (),
 }
 
 export type TextScaleMode = "none" | "fit" | "fit_width" | "fit_height"
@@ -552,6 +666,7 @@ export type UiTextStyle = {
 	tab_size: number,
 	tab_width: number?,
 	font: TextFont?,
+	antialiasing: "inherit" | "off" | "standard" | "high",
 }
 
 export type TextBox = BaseDrawableComponent & UiTextStyle & {
@@ -566,9 +681,12 @@ export type TextBox = BaseDrawableComponent & UiTextStyle & {
 	setBold: (self: TextBox, startIndex: number, endIndex: number) -> (),
 	setItalic: (self: TextBox, startIndex: number, endIndex: number) -> (),
 	setUnderline: (self: TextBox, startIndex: number, endIndex: number) -> (),
-	setColor: (self: TextBox, startIndex: number, endIndex: number, color: Color4) -> (),
+	setColor: (self: TextBox, startIndex: number, endIndex: number, color: Color4Value) -> (),
 	setSize: (self: TextBox, startIndex: number, endIndex: number, scale: number) -> (),
 	setFont: (self: TextBox, startIndex: number, endIndex: number, fontPath: string) -> (),
+	setOffset: (self: TextBox, startIndex: number, endIndex: number, x: number, y: number) -> (),
+	setPixelOffset: (self: TextBox, startIndex: number, endIndex: number, x: number, y: number) -> (),
+	setCharacterOffset: (self: TextBox, charIndex: number, x: number, y: number) -> (),
 	clearFormatting: (self: TextBox, startIndex: number?, endIndex: number?) -> (),
 	clearAllFormatting: (self: TextBox) -> (),
 	getLetterCount: (self: TextBox) -> number,
@@ -631,6 +749,17 @@ export type TileTexture2D = BaseDrawableComponent & {
 	tile_height: number,
 	offset_x: number,
 	offset_y: number,
+}
+
+export type Tilemap2D = BaseDrawableComponent & {
+	image: ImageHandle?,
+	map_width: number,
+	map_height: number,
+	tile_width: number,
+	tile_height: number,
+	tiles: string | { number },
+	spacing: number,
+	margin: number,
 }
 
 export type Spritebox2D = ComponentInstance & {
@@ -773,7 +902,10 @@ export type Rope2D = ComponentInstance & {
 
 export type CoreModule = {
 	Rect2D: Rect2D,
+	EntityScaler: EntityScaler,
 	Shape2D: Shape2D,
+	ParticleSystem2D: ParticleSystem2D,
+	SpatialSound2D: SpatialSound2D,
 	TextBox: TextBox,
 	TextLabel: TextLabel,
 	RudimentaryTextLabel: RudimentaryTextLabel,
@@ -782,6 +914,7 @@ export type CoreModule = {
 	NineSliceSprite2D: NineSliceSprite2D,
 	["9SliceSprite2D"]: NineSliceSprite2D,
 	TileTexture2D: TileTexture2D,
+	Tilemap2D: Tilemap2D,
 	Spritebox2D: Spritebox2D,
 	Collider2D: Collider2D,
 	Rigidbody2D: Rigidbody2D,
@@ -792,6 +925,11 @@ export type CoreModule = {
 }
 
 declare function Color4(r: number, g: number, b: number, a: number?): Color4Value
+declare function Inspector<T>(defaultValue: T, max: number?, fractional: boolean?): T
+-- Inspector reference placeholders. The visual editor replaces these with a
+-- selected scene entity/component when it generates the scene.
+declare IEntity: Entity
+declare IComponent: ComponentInstance
 declare function die(): ()
 declare function softrequire(modulePathOrSource: string, allowedModules: { [string]: any } | { string }?): any
 
@@ -811,6 +949,8 @@ declare prefabs: PrefabsModule
 declare prefab: PrefabsModule
 declare tweening: TweeningModule
 declare tween: TweeningModule
+declare animation: AnimationModule
+declare animations: AnimationModule
 declare transform: TransformModule
 declare transforms: TransformModule
 declare core: CoreModule
