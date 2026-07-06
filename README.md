@@ -61,6 +61,11 @@ On Windows PowerShell:
 Pass `-Vulkan On` or `-Vulkan Off` to override Vulkan detection. The Windows
 installer also installs the Visual Studio 2022 Desktop C++ build workload.
 
+Both installers are safe to re-run. Existing installations are updated without
+overwriting local changes, interrupted installer staging is cleaned up, and a
+recognizable incomplete NeoLOVE checkout is preserved as a timestamped backup
+before a fresh clone is created.
+
 ### Manual install
 
 Build and install the CLI from source:
