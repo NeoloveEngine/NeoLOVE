@@ -1,5 +1,0 @@
-[package]
-name = "physics_repeatability"
-version = "0.1.0"
-
-[dependencies]

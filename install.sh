@@ -44,6 +44,18 @@ install_macos_dependencies() {
 }
 
 install_linux_dependencies() {
+    if command -v git >/dev/null 2>&1 &&
+        command -v curl >/dev/null 2>&1 &&
+        command -v cc >/dev/null 2>&1 &&
+        command -v c++ >/dev/null 2>&1 &&
+        command -v make >/dev/null 2>&1 &&
+        command -v pkg-config >/dev/null 2>&1 &&
+        pkg-config --exists alsa &&
+        command -v vulkaninfo >/dev/null 2>&1; then
+        log "Linux build dependencies already installed"
+        return
+    fi
+
     log "Installing Git and native build dependencies"
     if command -v apt-get >/dev/null 2>&1; then
         as_root apt-get update
@@ -64,42 +76,117 @@ install_linux_dependencies() {
 }
 
 install_rust() {
+    if [[ -f "$HOME/.cargo/env" ]]; then
+        # shellcheck disable=SC1090
+        source "$HOME/.cargo/env"
+    fi
+
     if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
         log "Rust toolchain already installed: $(rustc --version)"
         return
     fi
 
-    command -v curl >/dev/null 2>&1 || fail "curl is required to install Rust."
-    log "Installing the stable Rust toolchain"
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
-        sh -s -- -y --profile minimal --default-toolchain stable
+    if command -v rustup >/dev/null 2>&1; then
+        log "Completing the existing Rust toolchain installation"
+        rustup toolchain install stable --profile minimal
+        rustup default stable
+    else
+        command -v curl >/dev/null 2>&1 || fail "curl is required to install Rust."
+        log "Installing the stable Rust toolchain"
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+            sh -s -- -y --profile minimal --default-toolchain stable
+    fi
 
     # rustup updates future shells; this makes Cargo available to this process.
     # shellcheck disable=SC1090
     source "$HOME/.cargo/env"
+    command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1 ||
+        fail "The Rust toolchain installation did not complete successfully. Re-run this script to resume setup."
+}
+
+repository_remote() {
+    git -C "$1" remote get-url origin 2>/dev/null || true
+}
+
+repository_remote_matches() {
+    local remote
+    remote=$(repository_remote "$1")
+    [[ "$remote" == "$REPOSITORY_URL" || "$remote" == "${REPOSITORY_URL%.git}" ]]
+}
+
+repository_is_complete() {
+    repository_remote_matches "$1" &&
+        git -C "$1" rev-parse --verify HEAD >/dev/null 2>&1 &&
+        [[ -f "$1/Cargo.toml" ]]
+}
+
+cleanup_stale_staging_repository() {
+    local staging=$1
+    local marker="$staging/.neolove-installer"
+    [[ -e "$staging" ]] || return 0
+
+    if [[ ! -f "$marker" || "$(sed -n '1p' "$marker")" != "$REPOSITORY_URL" ]]; then
+        fail "$staging already exists and was not created by the NeoLOVE installer. Move it elsewhere and re-run this script."
+    fi
+
+    local owner_pid
+    owner_pid=$(sed -n '2p' "$marker")
+    if [[ "$owner_pid" =~ ^[0-9]+$ && "$owner_pid" != "$$" ]] && kill -0 "$owner_pid" 2>/dev/null; then
+        fail "Another NeoLOVE installer is currently using $staging (process $owner_pid)."
+    fi
+
+    log "Cleaning up an interrupted NeoLOVE clone"
+    rm -rf -- "$staging"
+}
+
+clone_repository_transactionally() {
+    local destination=$1
+    local staging="${destination}.installing"
+
+    cleanup_stale_staging_repository "$staging"
+    mkdir -p "$staging"
+    printf '%s\n%s\n' "$REPOSITORY_URL" "$$" >"$staging/.neolove-installer"
+
+    log "Cloning NeoLOVE into $destination"
+    git clone "$REPOSITORY_URL" "$staging/checkout"
+    [[ ! -e "$destination" ]] || fail "$destination appeared while NeoLOVE was being cloned. The completed clone remains in $staging/checkout."
+    mv "$staging/checkout" "$destination"
+    rm "$staging/.neolove-installer"
+    rmdir "$staging"
 }
 
 clone_or_update_repository() {
     local destination=$1
-    mkdir -p "$(dirname "$destination")"
+    local parent
+    parent=$(dirname "$destination")
+    mkdir -p "$parent"
+    cleanup_stale_staging_repository "${destination}.installing"
 
-    if [[ -d "$destination/.git" ]]; then
-        local remote
-        remote=$(git -C "$destination" remote get-url origin 2>/dev/null || true)
-        [[ "$remote" == "$REPOSITORY_URL" || "$remote" == "${REPOSITORY_URL%.git}" ]] ||
-            fail "$destination exists but is not a clone of $REPOSITORY_URL"
-
+    if repository_is_complete "$destination"; then
+        log "Existing NeoLOVE installation found"
         if [[ -z "$(git -C "$destination" status --porcelain)" ]]; then
             log "Updating the existing NeoLOVE clone"
             git -C "$destination" pull --ff-only
         else
             log "Existing clone has local changes; leaving them untouched"
         fi
+    elif [[ -e "$destination/.git" ]]; then
+        repository_remote_matches "$destination" ||
+            fail "$destination exists but is not a clone of $REPOSITORY_URL"
+
+        local backup="${destination}.incomplete-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+        log "Preserving an incomplete NeoLOVE checkout at $backup"
+        mv "$destination" "$backup"
+        clone_repository_transactionally "$destination"
     elif [[ -e "$destination" ]]; then
-        fail "$destination already exists and is not a Git repository."
+        if [[ -d "$destination" && -z "$(find "$destination" -mindepth 1 -print -quit)" ]]; then
+            rmdir "$destination"
+            clone_repository_transactionally "$destination"
+        else
+            fail "$destination already exists and is not a Git repository. Move it elsewhere and re-run this script."
+        fi
     else
-        log "Cloning NeoLOVE into $destination"
-        git clone "$REPOSITORY_URL" "$destination"
+        clone_repository_transactionally "$destination"
     fi
 
     chmod 700 "$destination" 2>/dev/null || true
