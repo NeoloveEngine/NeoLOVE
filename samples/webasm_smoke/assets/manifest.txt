@@ -1,5 +1,0 @@
-NeoLOVE webasm smoke sample
-- Preloaded assets: me.png, sfx.wav, manifest.txt
-- Runtime checks: fs read/write/copy/rename/remove/walk
-- Asset checks: loadImage/loadSound/newImage/newSound/export/reload
-- HTTP check: reports current engine support status on web builds

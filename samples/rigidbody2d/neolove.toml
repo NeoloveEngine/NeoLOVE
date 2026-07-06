@@ -1,5 +1,0 @@
-[package]
-name = "rigidbody2d"
-version = "0.1.0"
-
-[dependencies]
