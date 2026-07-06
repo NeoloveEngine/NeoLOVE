@@ -362,6 +362,19 @@ enum SequenceValue {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct SequenceColorPicker {
+    rgba: [u8; 4],
+    hue: f32,
+}
+
+struct ColorPickerPanelResponse {
+    rgba: [u8; 4],
+    hue: f32,
+    changed: bool,
+    open: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct AssetTarget {
     entity: u64,
     component: usize,
@@ -394,6 +407,8 @@ enum Popup {
         kind: SequenceKind,
         value: SequenceValue,
         selected: usize,
+        dragging: Option<usize>,
+        color_picker: Option<SequenceColorPicker>,
     },
     /// A runtime error captured from a failed `Run`, with a copy button.
     Error { message: String, copied: bool },
@@ -3643,6 +3658,8 @@ impl EditorApp {
                 kind,
                 value,
                 selected: 0,
+                dragging: None,
+                color_picker: None,
             });
         }
     }
@@ -4670,8 +4687,8 @@ impl EditorApp {
             } => {
                 self.draw_asset_picker(ui, target, kind, files, query, scroll, w, h, interactive)
             }
-            Popup::Sequence { target, kind, value, selected } => {
-                self.draw_sequence_editor(ui, target, kind, value, selected, w, h, interactive)
+            Popup::Sequence { target, kind, value, selected, dragging, color_picker } => {
+                self.draw_sequence_editor(ui, target, kind, value, selected, dragging, color_picker, w, h, interactive)
             }
             Popup::Error { message, copied } => self.draw_error(ui, message, copied, w, h, interactive),
         }
@@ -4685,6 +4702,8 @@ impl EditorApp {
         kind: SequenceKind,
         mut value: SequenceValue,
         mut selected: usize,
+        mut dragging: Option<usize>,
+        mut color_picker: Option<SequenceColorPicker>,
         w: f32,
         h: f32,
         interactive: bool,
@@ -4697,6 +4716,16 @@ impl EditorApp {
         ui.painter.fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 120]);
         ui.painter.fill_round_rect(panel, 6.0, self.config.theme.panel);
         ui.painter.stroke_round_rect(panel, 6.0, self.config.theme.accent);
+        let picker_was_open = color_picker.is_some();
+        let raw_mouse_pressed = ui.input.mouse_pressed;
+        let raw_mouse_down = ui.input.mouse_down;
+        if picker_was_open {
+            // The nested picker owns pointer input while it is open. This also
+            // prevents clicks in it from activating obscured sequence controls.
+            ui.input.mouse_pressed = false;
+            ui.input.mouse_down = false;
+        }
+        let sequence_interactive = interactive && !picker_was_open;
         let title = match kind {
             SequenceKind::Color => "Particle Color Over Lifetime",
             SequenceKind::Transparency => "Particle Transparency Over Lifetime",
@@ -4712,6 +4741,7 @@ impl EditorApp {
             SequenceValue::Numbers(keypoints) => keypoints.iter().map(|keypoint| keypoint.time).collect(),
         };
         selected = selected.min(times.len().saturating_sub(1));
+        let mut changed = false;
         let mut marker_hit = None;
         for (index, time) in times.iter().enumerate() {
             let marker_x = strip.x + strip.w * time.clamp(0.0, 1.0);
@@ -4732,7 +4762,7 @@ impl EditorApp {
                 (marker_x, strip.bottom() + 1.0),
                 color,
             );
-            if interactive
+            if sequence_interactive
                 && ui.input.mouse_pressed
                 && (ui.input.mouse_x - marker_x).abs() <= 9.0
                 && ui.input.mouse_y >= strip.y - 12.0
@@ -4743,11 +4773,37 @@ impl EditorApp {
         }
         if let Some(index) = marker_hit {
             selected = index;
+            dragging = (index > 0 && index + 1 < times.len()).then_some(index);
+            ui.clear_focus();
         }
 
-        let mut changed = false;
-        if interactive
+        if let Some(index) = dragging {
+            if !ui.input.mouse_down {
+                dragging = None;
+            } else if index > 0 && index + 1 < times.len() {
+                let requested = ((ui.input.mouse_x - strip.x) / strip.w).clamp(0.001, 0.999);
+                let lower = times[index - 1] + 0.001;
+                let upper = times[index + 1] - 0.001;
+                if lower <= upper {
+                    let time = requested.clamp(lower, upper);
+                    match &mut value {
+                        SequenceValue::Colors(keypoints) => keypoints[index].time = time,
+                        SequenceValue::Numbers(keypoints) => keypoints[index].time = time,
+                    }
+                    if (time - times[index]).abs() > f32::EPSILON {
+                        changed = true;
+                    }
+                    selected = index;
+                    ui.wants_redraw = true;
+                }
+            } else {
+                dragging = None;
+            }
+        }
+
+        if sequence_interactive
             && marker_hit.is_none()
+            && dragging.is_none()
             && strip.contains(ui.input.mouse_x, ui.input.mouse_y)
             && ui.input.mouse_pressed
         {
@@ -4822,8 +4878,14 @@ impl EditorApp {
                 ui.painter.text(x + 178.0, controls_y + 5.0, "Color", 14.0, self.config.theme.text_dim);
                 if let Some(keypoint) = keypoints.get_mut(selected) {
                     let swatch = Rect::new(x + 222.0, controls_y, 24.0, FIELD_H);
-                    ui.painter.fill_rect(swatch, keypoint.color);
-                    ui.painter.stroke_rect(swatch, self.config.theme.border);
+                    if sequence_interactive && ui.swatch_button(swatch, keypoint.color) {
+                        color_picker = Some(SequenceColorPicker {
+                            rgba: keypoint.color,
+                            hue: rgb_to_hsv(keypoint.color).0,
+                        });
+                        ui.clear_focus();
+                    }
+                    ui.tooltip(swatch, "Open color picker");
                     let labels = ["R", "G", "B"];
                     for index in 0..3 {
                         let field_x = x + 252.0 + index as f32 * 76.0;
@@ -4873,7 +4935,8 @@ impl EditorApp {
         let delete = Rect::new(x + 104.0, buttons_y, 80.0, 26.0);
         let reset = Rect::new(panel.right() - 184.0, buttons_y, 78.0, 26.0);
         let close = Rect::new(panel.right() - 98.0, buttons_y, 80.0, 26.0);
-        if interactive && ui.button(add, "Add Key") {
+        if sequence_interactive && ui.button(add, "Add Key") {
+            dragging = None;
             match &mut value {
                 SequenceValue::Colors(keypoints) => {
                     let time = largest_color_gap_midpoint(keypoints);
@@ -4896,7 +4959,8 @@ impl EditorApp {
             SequenceValue::Colors(keypoints) => keypoints.len(),
             SequenceValue::Numbers(keypoints) => keypoints.len(),
         };
-        if interactive && ui.button(delete, "Delete") && selected > 0 && selected + 1 < sequence_len {
+        if sequence_interactive && ui.button(delete, "Delete") && selected > 0 && selected + 1 < sequence_len {
+            dragging = None;
             match &mut value {
                 SequenceValue::Colors(keypoints) => {
                     keypoints.remove(selected);
@@ -4908,7 +4972,9 @@ impl EditorApp {
             selected = selected.saturating_sub(1);
             changed = true;
         }
-        if interactive && ui.button(reset, "Reset") {
+        if sequence_interactive && ui.button(reset, "Reset") {
+            dragging = None;
+            color_picker = None;
             value = match kind {
                 SequenceKind::Color => SequenceValue::Colors(vec![
                     ColorKeypoint { time: 0.0, color: [255, 184, 76, 255] },
@@ -4922,14 +4988,48 @@ impl EditorApp {
             selected = 0;
             changed = true;
         }
-        let close_clicked = interactive && ui.button(close, "Close");
+        let close_clicked = sequence_interactive && ui.button(close, "Close");
+
+        ui.input.mouse_pressed = raw_mouse_pressed;
+        ui.input.mouse_down = raw_mouse_down;
+        if let Some(picker) = color_picker {
+            let response = self.draw_color_picker_panel(
+                ui,
+                x + 222.0,
+                controls_y + FIELD_H + 2.0,
+                picker.rgba,
+                picker.hue,
+                w,
+                h,
+                interactive && picker_was_open,
+            );
+            if response.changed {
+                if let SequenceValue::Colors(keypoints) = &mut value {
+                    if let Some(keypoint) = keypoints.get_mut(selected) {
+                        keypoint.color = response.rgba;
+                        changed = true;
+                    }
+                }
+            }
+            color_picker = response.open.then_some(SequenceColorPicker {
+                rgba: response.rgba,
+                hue: response.hue,
+            });
+        }
         if changed {
             self.assign_sequence(target, &value);
         }
         if close_clicked {
             ui.clear_focus();
         } else {
-            self.popup = Some(Popup::Sequence { target, kind, value, selected });
+            self.popup = Some(Popup::Sequence {
+                target,
+                kind,
+                value,
+                selected,
+                dragging,
+                color_picker,
+            });
         }
     }
 
@@ -5228,7 +5328,25 @@ impl EditorApp {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_color_picker(&mut self, ui: &mut Ui, target: ColorTarget, x: f32, y: f32, mut rgba: [u8; 4], mut hue: f32, w: f32, h: f32, interactive: bool) {
+    fn draw_color_picker(&mut self, ui: &mut Ui, target: ColorTarget, x: f32, y: f32, rgba: [u8; 4], hue: f32, w: f32, h: f32, interactive: bool) {
+        let response = self.draw_color_picker_panel(ui, x, y, rgba, hue, w, h, interactive);
+        if response.changed {
+            self.set_target_color(&target, response.rgba);
+            self.mark_dirty();
+        }
+        if response.open {
+            self.popup = Some(Popup::Color {
+                target,
+                x,
+                y,
+                rgba: response.rgba,
+                hue: response.hue,
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_color_picker_panel(&mut self, ui: &mut Ui, x: f32, y: f32, mut rgba: [u8; 4], mut hue: f32, w: f32, h: f32, interactive: bool) -> ColorPickerPanelResponse {
         let hsv = self.config.layout.hsv_picker;
         let width = 244.0;
         let height = if hsv { 196.0 } else { 150.0 };
@@ -5269,7 +5387,7 @@ impl EditorApp {
 
             // Interaction.
             let (_, mut s, mut v) = rgb_to_hsv(rgba);
-            if ui.input.mouse_down && sq.contains(ui.input.mouse_x, ui.input.mouse_y) {
+            if interactive && ui.input.mouse_down && sq.contains(ui.input.mouse_x, ui.input.mouse_y) {
                 s = ((ui.input.mouse_x - sq.x) / sq.w).clamp(0.0, 1.0);
                 v = (1.0 - (ui.input.mouse_y - sq.y) / sq.h).clamp(0.0, 1.0);
                 let c = hsv_to_rgb(hue, s, v);
@@ -5277,7 +5395,7 @@ impl EditorApp {
                 changed = true;
                 ui.wants_redraw = true;
             }
-            if ui.input.mouse_down && strip.contains(ui.input.mouse_x, ui.input.mouse_y) {
+            if interactive && ui.input.mouse_down && strip.contains(ui.input.mouse_x, ui.input.mouse_y) {
                 hue = ((ui.input.mouse_y - strip.y) / strip.h * 360.0).clamp(0.0, 359.999);
                 let c = hsv_to_rgb(hue, s, v);
                 rgba = [c[0], c[1], c[2], rgba[3]];
@@ -5293,7 +5411,10 @@ impl EditorApp {
             ui.painter.fill_round_rect(Rect::new(px + 196.0, py + 32.0, 38.0, 26.0), 4.0, [rgba[0], rgba[1], rgba[2], 255]);
             ui.painter.stroke_round_rect(Rect::new(px + 196.0, py + 32.0, 38.0, 26.0), 4.0, self.config.theme.border);
             ui.label(px + 10.0, py + 160.0, "A", self.config.theme.text);
-            if let Some(a) = ui.slider(Rect::new(px + 26.0, py + 158.0, 130.0, 18.0), rgba[3] as f32, 0.0, 255.0) {
+            if let Some(a) = interactive
+                .then(|| ui.slider(Rect::new(px + 26.0, py + 158.0, 130.0, 18.0), rgba[3] as f32, 0.0, 255.0))
+                .flatten()
+            {
                 rgba[3] = a.round() as u8;
                 changed = true;
             }
@@ -5312,7 +5433,10 @@ impl EditorApp {
             for i in 0..4 {
                 let ry = py + 32.0 + i as f32 * 26.0;
                 ui.label(px + 60.0, ry + 2.0, labels[i], self.config.theme.text);
-                if let Some(v) = ui.slider(Rect::new(px + 78.0, ry, 90.0, 18.0), rgba[i] as f32, 0.0, 255.0) {
+                if let Some(v) = interactive
+                    .then(|| ui.slider(Rect::new(px + 78.0, ry, 90.0, 18.0), rgba[i] as f32, 0.0, 255.0))
+                    .flatten()
+                {
                     rgba[i] = v.round() as u8;
                     changed = true;
                 }
@@ -5327,16 +5451,14 @@ impl EditorApp {
             hue = rgb_to_hsv(rgba).0;
         }
 
-        if changed {
-            self.set_target_color(&target, rgba);
-            self.mark_dirty();
-        }
-
         let clicked_outside = interactive
             && ui.input.mouse_pressed
             && !rect.contains(ui.input.mouse_x, ui.input.mouse_y);
-        if !clicked_outside {
-            self.popup = Some(Popup::Color { target, x, y, rgba, hue });
+        ColorPickerPanelResponse {
+            rgba,
+            hue,
+            changed,
+            open: !clicked_outside,
         }
     }
 
@@ -7995,9 +8117,102 @@ mod tests {
                 ColorKeypoint { time: 1.0, color: [0, 0, 255, 255] },
             ]),
             selected: 0,
+            dragging: None,
+            color_picker: None,
         });
         h.frame(FrameInput::default());
         assert!(matches!(h.app.popup, Some(Popup::Sequence { .. })));
+    }
+
+    #[test]
+    fn particle_sequence_keypoint_can_be_dragged() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        scene.entity_mut(id).expect("entity").components.push(Component::core("ParticleSystem2D"));
+        let value = SequenceValue::Colors(vec![
+            ColorKeypoint { time: 0.0, color: [255, 0, 0, 255] },
+            ColorKeypoint { time: 0.5, color: [0, 255, 0, 255] },
+            ColorKeypoint { time: 1.0, color: [0, 0, 255, 255] },
+        ]);
+        let mut h = Harness::new(scene);
+        h.app.popup = Some(Popup::Sequence {
+            target: AssetTarget { entity: id, component: 0, prop: 12 },
+            kind: SequenceKind::Color,
+            value,
+            selected: 1,
+            dragging: None,
+            color_picker: None,
+        });
+
+        // At 1280x760 the strip runs from x=348 to x=932. Grab the middle
+        // marker above the strip, then drag it from 50% to 75%.
+        h.frame(FrameInput {
+            mouse_x: 640.0,
+            mouse_y: 304.0,
+            mouse_pressed: true,
+            mouse_down: true,
+            ..Default::default()
+        });
+        h.frame(FrameInput { mouse_x: 786.0, mouse_y: 304.0, mouse_down: true, ..Default::default() });
+
+        let Some(Popup::Sequence { value: SequenceValue::Colors(keypoints), dragging, .. }) = &h.app.popup else {
+            panic!("sequence editor should remain open");
+        };
+        assert_eq!(*dragging, Some(1));
+        assert!((keypoints[1].time - 0.75).abs() < 0.002);
+        let Component::Core { props, .. } = &h.app.scene.entity(id).expect("entity").components[0] else {
+            panic!("particle component");
+        };
+        let PropValue::ColorSequence(saved) = &props[12].value else {
+            panic!("color sequence property");
+        };
+        assert!((saved[1].time - 0.75).abs() < 0.002);
+    }
+
+    #[test]
+    fn particle_sequence_swatch_opens_picker_and_recolors_keypoint() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        scene.entity_mut(id).expect("entity").components.push(Component::core("ParticleSystem2D"));
+        let mut h = Harness::new(scene);
+        h.app.popup = Some(Popup::Sequence {
+            target: AssetTarget { entity: id, component: 0, prop: 12 },
+            kind: SequenceKind::Color,
+            value: SequenceValue::Colors(vec![
+                ColorKeypoint { time: 0.0, color: [255, 0, 0, 255] },
+                ColorKeypoint { time: 1.0, color: [0, 0, 255, 255] },
+            ]),
+            selected: 0,
+            dragging: None,
+            color_picker: None,
+        });
+
+        // Click the sequence color swatch, then choose a point in the HSV
+        // saturation/value square on the following frame.
+        h.frame(FrameInput {
+            mouse_x: 564.0,
+            mouse_y: 406.0,
+            mouse_pressed: true,
+            mouse_down: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            &h.app.popup,
+            Some(Popup::Sequence { color_picker: Some(_), .. })
+        ));
+        h.frame(FrameInput { mouse_x: 637.0, mouse_y: 513.0, mouse_down: true, ..Default::default() });
+
+        let Some(Popup::Sequence { value: SequenceValue::Colors(keypoints), .. }) = &h.app.popup else {
+            panic!("sequence editor should remain open");
+        };
+        assert_ne!(keypoints[0].color, [255, 0, 0, 255]);
+        let Component::Core { props, .. } = &h.app.scene.entity(id).expect("entity").components[0] else {
+            panic!("particle component");
+        };
+        let PropValue::ColorSequence(saved) = &props[12].value else {
+            panic!("color sequence property");
+        };
+        assert_eq!(saved[0].color, keypoints[0].color);
     }
 
     #[test]
