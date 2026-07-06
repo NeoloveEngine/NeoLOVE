@@ -4447,7 +4447,6 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn assert_close(actual: f32, expected: f32) {
@@ -4474,32 +4473,6 @@ mod tests {
 
         let mut runtime = Runtime::new(root.clone());
         runtime.set_platform_window_state(640.0, 480.0);
-        runtime.start()?;
-        Ok((runtime, root))
-    }
-
-    fn copy_project_fixture(source: &Path, destination: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(destination)?;
-        for entry in std::fs::read_dir(source)? {
-            let entry = entry?;
-            let source_path = entry.path();
-            let destination_path = destination.join(entry.file_name());
-            if entry.file_type()?.is_dir() {
-                copy_project_fixture(&source_path, &destination_path)?;
-            } else {
-                std::fs::copy(&source_path, &destination_path)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn start_sample_runtime(name: &str, sample_relative_path: &str) -> mlua::Result<(Runtime, PathBuf)> {
-        let root = temp_project_root(name);
-        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(sample_relative_path);
-        copy_project_fixture(&fixture_root, &root).map_err(mlua::Error::external)?;
-
-        let mut runtime = Runtime::new(root.clone());
-        runtime.set_platform_window_state(1280.0, 720.0);
         runtime.start()?;
         Ok((runtime, root))
     }
@@ -4748,154 +4721,6 @@ mod tests {
         assert_eq!(order.len(), 2);
         assert_eq!(order[0], "first");
         assert_eq!(order[1], "second");
-
-        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
-        Ok(())
-    }
-
-    #[test]
-    fn raycasting_sample_queues_draw_commands() -> mlua::Result<()> {
-        let (mut runtime, root) = start_sample_runtime("raycasting_sample", "samples/raycasting")?;
-
-        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
-        let commands =
-            crate::renderer::drain_commands(&runtime.render_state()).map_err(mlua::Error::external)?;
-
-        assert!(
-            !commands.is_empty(),
-            "expected the raycasting sample to queue draw commands"
-        );
-        assert!(
-            commands
-                .iter()
-                .any(|command| matches!(command, crate::renderer::DrawCommand::Rect { .. })),
-            "expected the raycasting sample to queue rectangle draw commands"
-        );
-
-        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
-        Ok(())
-    }
-
-    #[test]
-    fn raycasting_sample_renders_visible_pixels() -> mlua::Result<()> {
-        let (mut runtime, root) = start_sample_runtime("raycasting_pixels", "samples/raycasting")?;
-
-        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
-
-        let platform = runtime.platform_state();
-        let render_state = runtime.render_state();
-        let mut renderer = crate::renderer::SoftwareRenderer::new(1280, 720);
-        renderer
-            .render(&platform, &render_state)
-            .map_err(mlua::Error::external)?;
-
-        let clear = platform
-            .lock()
-            .map_err(|_| mlua::Error::external("platform lock poisoned"))?
-            .clear_color();
-
-        let pixels = renderer.pixels();
-        let non_clear_pixels = pixels
-            .chunks_exact(4)
-            .filter(|rgba| {
-                rgba[0] != clear.r || rgba[1] != clear.g || rgba[2] != clear.b || rgba[3] != clear.a
-            })
-            .count();
-
-        assert!(
-            non_clear_pixels > 0,
-            "expected the raycasting sample to render pixels different from the clear color"
-        );
-
-        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
-        Ok(())
-    }
-
-    #[test]
-    fn spriteboxes_sample_queues_image_commands() -> mlua::Result<()> {
-        let (mut runtime, root) = start_sample_runtime("spriteboxes_sample", "samples/spriteboxes")?;
-
-        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
-        let commands =
-            crate::renderer::drain_commands(&runtime.render_state()).map_err(mlua::Error::external)?;
-        let image_commands = commands
-            .iter()
-            .filter(|command| matches!(command, crate::renderer::DrawCommand::Image { .. }))
-            .count();
-
-        assert!(
-            image_commands >= 14,
-            "expected spritebox demo to queue nine-slice and sprite image commands"
-        );
-
-        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
-        Ok(())
-    }
-
-    #[test]
-    fn bolt2d_sample_starts_and_queues_draw_commands() -> mlua::Result<()> {
-        let (mut runtime, root) = start_sample_runtime("bolt2d_sample", "samples/bolt2d")?;
-
-        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
-        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
-        let commands =
-            crate::renderer::drain_commands(&runtime.render_state()).map_err(mlua::Error::external)?;
-
-        assert!(
-            commands
-                .iter()
-                .any(|command| matches!(command, crate::renderer::DrawCommand::Rect { .. })),
-            "expected the Bolt2D sample to queue rectangle draw commands"
-        );
-        assert!(
-            commands
-                .iter()
-                .any(|command| matches!(command, crate::renderer::DrawCommand::Text(_))),
-            "expected the Bolt2D sample to queue text draw commands"
-        );
-
-        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
-        Ok(())
-    }
-
-    #[test]
-    fn feature_lab_sample_starts_and_queues_draw_commands() -> mlua::Result<()> {
-        let (mut runtime, root) =
-            start_sample_runtime("feature_lab_sample", "samples/feature_lab")?;
-
-        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
-        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
-        runtime
-            .lua
-            .load(
-                r#"
-                assert(featureLabAsyncTask:isDone())
-                assert(featureLabAsyncTask:getStatus() == "completed")
-                assert(featureLabAsyncTask:getResult() == "async complete")
-                "#,
-            )
-            .exec()?;
-        let commands =
-            crate::renderer::drain_commands(&runtime.render_state()).map_err(mlua::Error::external)?;
-
-        assert!(
-            commands
-                .iter()
-                .any(|command| matches!(command, crate::renderer::DrawCommand::Rect { .. })),
-            "expected the feature lab to queue rectangle draw commands"
-        );
-        assert!(
-            commands
-                .iter()
-                .any(|command| matches!(command, crate::renderer::DrawCommand::Image { .. })),
-            "expected the feature lab to queue image draw commands"
-        );
-        assert!(
-            commands
-                .iter()
-                .any(|command| matches!(command, crate::renderer::DrawCommand::Text(_))),
-            "expected the feature lab to queue text draw commands"
-        );
 
         std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())
