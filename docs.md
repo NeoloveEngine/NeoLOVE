@@ -1,7 +1,7 @@
 <!-- page: overview | Overview -->
 # Overview
 
-NeoLOVE is a Rust game engine for Luau projects. A project is a directory with a `main.luau` file and, optionally, a `neolove.toml`, assets, components, modules, and generated web output. Runtime APIs are exposed as Luau globals such as `ecs`, `core`, `assets`, `input`, `audio`, `fs`, `servers`, `shaders`, `tweening`, `animation`, and `async`.
+NeoLOVE is a Rust game engine for Luau projects. A project is a directory with a `main.luau` file and, optionally, a `neolove.toml`, assets, components, modules, and generated build output. Runtime APIs are exposed as Luau globals such as `ecs`, `core`, `assets`, `input`, `audio`, `fs`, `android`, `mobile`, `servers`, `shaders`, `tweening`, `animation`, and `async`.
 
 The generated type surface is also available in `neolove_engine_api.d.luau`. New projects receive a copy from `src/project_template/neolove_engine_api.d.luau`.
 
@@ -10,9 +10,9 @@ The generated type surface is also available in `neolove_engine_api.d.luau`. New
 
 ```bash
 neolove new <project-name>
-neolove run [project-dir]
+neolove run [project-dir] [--mobile] [--portrait|--landscape] [--wifi|--cellular|--offline]
 neolove editor [project-dir]
-neolove build [project-dir] [--webasm]
+neolove build [project-dir] [--webasm|--android|--ios]
 neolove api [project-dir]
 neolove update
 neolove setup-path
@@ -29,6 +29,15 @@ blocking startup and asks before launching the updater.
 
 `neolove build --webasm` creates an HTML5 bundle in `dist/webasm/` and a zip at `dist/<project-name>-webasm.zip`. Serve web builds over `http://` or `https://`; browsers will not reliably load the bundle from `file://`.
 
+`neolove build --android` creates a signed arm64 APK at `dist/<project-name>-android-arm64.apk`. `--apk` is accepted as an alias. The first Android build may install the Android Rust target plus a local JDK, SDK, build-tools, and NDK under `~/.neolove/toolchains/`.
+
+`neolove build --ios` creates an iOS simulator `.app` at `dist/<project-name>-ios-simulator.app`. It requires macOS with Xcode installed.
+
+`neolove run --mobile` starts the desktop mobile emulator. The window is locked
+to the emulated device size; use `--portrait` or `--landscape` to rotate it.
+The emulator disables keyboard events and exposes mobile/network state through
+the `mobile` global.
+
 Release builds are size-oriented by default:
 
 ```bash
@@ -36,7 +45,13 @@ cargo build --release
 cargo build --release --features vulkan
 ```
 
-The default desktop binary uses the software renderer and omits Vulkan to reduce executable size. Use `--features vulkan` for GPU acceleration and custom shader rendering. Image codecs include PNG, JPEG, GIF, BMP, TGA, TIFF, PNM, WebP, HDR, and DDS. Native audio supports WAV, MP3, OGG/Vorbis, and FLAC; web builds can also play browser-decodable AAC/M4A and AIFF.
+The default desktop binary uses the software renderer and omits Vulkan to keep
+setup simple. Use `--features vulkan` for GPU acceleration and custom shader
+rendering. Desktop game exports rebuild a compact packaged runtime before
+appending the compressed project payload. Image codecs include PNG, JPEG, GIF,
+BMP, TGA, TIFF, PNM, WebP, HDR, and DDS. Native audio supports WAV, MP3,
+OGG/Vorbis, and FLAC; web builds can also play browser-decodable AAC/M4A and
+AIFF.
 
 <!-- page: project-model | Project Model -->
 # Project Model
@@ -58,13 +73,32 @@ Common project layout:
 my-game/
   main.luau
   scene.neoscene
-  editor.json
   neolove.toml
   assets/
   components/
   shaders/
   neolove_engine_api.d.luau
 ```
+
+`neolove.toml` can set package and desktop window defaults:
+
+```toml
+[package]
+name = "my-game"
+
+[window]
+title = "My Game"
+icon = "assets/icon.png"
+width = 1280
+height = 720
+fullscreen = false
+resizable = true
+```
+
+`width` and `height` are the logical starting resolution and are clamped to
+`1..16384`. `fullscreen` and `resizable` accept boolean-style values such as
+`true`, `false`, `on`, `off`, `1`, and `0`. The visual editor uses the same
+width and height for the default window-bounds overlay.
 
 <!-- page: visual-editor | Visual Editor -->
 # Visual Editor
@@ -76,17 +110,22 @@ neolove editor
 neolove editor path/to/my-game
 ```
 
-The editor opens a native window with a toolbar, document tabs, a dockable Hierarchy, a 2D
-Viewport, an Inspector, and a bottom Project browser. It does not require a
+The editor opens a native window with a toolbar, document tabs, a dockable or
+detachable Hierarchy, a 2D Viewport, an Inspector, and a bottom Project
+browser. It does not require a
 `main.luau` file to open; it loads `scene.neoscene` when present and creates a
 starter scene otherwise.
 
 Editor files:
 
 - `scene.neoscene`: JSON scene data authored by the editor.
-- `editor.json`: theme, dock layout, grid, snapping, and panel-size settings.
+- Global `editor.json`: editor-wide theme, font, tooltip, overlay, autosave,
+  dock layout, grid, snapping, and panel-size settings. NeoLOVE stores this in
+  the operating system user config directory and reads older project-local
+  `editor.json` files as a fallback.
 - `main.luau`: generated by **Export** or **Run** from the current scene.
 - `*.neoprefab`: JSON prefab files saved from editor entities.
+- `*.neoanim`: JSON animation clips authored by the animation editor.
 
 Toolbar actions:
 
@@ -97,11 +136,18 @@ Toolbar actions:
 - **Run** exports `main.luau` and launches a live preview. If the preview exits
   with an error, the editor shows a dismissible **Runtime Error** dialog with the
   captured output and a copy button.
+- **Mobile** opens the mobile emulator settings. Mobile mode locks the preview
+  to a phone-sized portrait or landscape resolution, disables keyboard input in
+  the launched game, and exposes Wi-Fi/cellular/low-power toggles through the
+  runtime `mobile` global.
+- **Build** exports `main.luau`, asks which platform to build, and packages the
+  project into `dist/` without blocking the editor UI.
 - **Entity** adds an entity to the scene.
 
-The toolbar also has a reset-camera button (returns the viewport to the origin),
-snap and grid-visibility toggles, a grid-size field, and a scene-rename field;
-renaming a scene also renames its `.neoscene` file.
+The toolbar also has move, scale, and rotate scene tools, a Window dropdown,
+an editor Settings button, a reset-camera button, snap and grid-visibility
+toggles, a grid-size field, and a scene-rename field; renaming a scene also
+renames its `.neoscene` file.
 
 ## Editing Scenes
 
@@ -121,9 +167,10 @@ scale, and anchors), scene background color, attached components, and script
 public variables. The editor's built-in component menu is backed by the real
 engine component names:
 
-- Common: `Rect2D`, `Shape2D`, `ParticleSystem2D`, `SpatialSound2D`, `TextBox`, `TextLabel`,
-  `Sprite2D`, `Image2D`, `NineSliceSprite2D`, `Tilemap2D`, `TileTexture2D`,
-  `EntityScaler`, `Collider2D`, and `Rigidbody2D`.
+- Common: `Rect2D`, `Shape2D`, `ParticleSystem2D`, `AnimationController`,
+  `SpatialSound2D`, `TextBox`, `TextLabel`, `Sprite2D`, `Image2D`,
+  `NineSliceSprite2D`, `Tilemap2D`, `TileTexture2D`, `EntityScaler`,
+  `Collider2D`, and `Rigidbody2D`.
 - Advanced: `Spritebox2D`, `Bolt2D`, `Rope2D`, `LegacyBolt2D`, `String2D`,
   and `RudimentaryTextLabel`.
 - Drag a `.luau` or `.lua` component script from the Project browser onto an
@@ -141,6 +188,10 @@ local Component = {
     stats = Inspector({ health = 100, mana = 40 }), -- dictionary
     target = Inspector(IEntity),               -- scene entity reference
     renderer = Inspector(IComponent),          -- scene component reference
+    sprite = Inspector(IImage),                -- image asset
+    sound = Inspector(IAudio),                 -- sound asset
+    material = Inspector(IShader),             -- fragment shader asset
+    clip = Inspector(IAnimation),              -- animation clip asset
 }
 ```
 
@@ -162,28 +213,32 @@ Components can be reordered by removing and re-adding them. Each component
 header has a copy button, and the **Add Component** menu offers **Paste** to
 apply a copied component to another entity. Color properties (and the scene
 background) open a picker that toggles between an HSV square with a hue strip
-and plain RGBA sliders; the choice is remembered in `editor.json`. Selecting an
-entity with a `Collider2D` previews the collider's shape and size as a green
-outline, since it can differ from the entity bounds.
+and plain RGBA sliders; the choice is remembered in the global editor config.
+Selecting an entity with a `Collider2D` previews the collider's shape and size
+as a green outline, since it can differ from the entity bounds.
 
 Image properties use project-relative paths or base64 PNG data. The editor
 generates an `images.luau` cache and requires script component modules at the
 top of `main.luau`, so images and code are loaded once in the appropriate
 place. The viewport previews image components with the real asset, including
-nine-slice and tiled rendering.
+nine-slice and tiled rendering. Script inspector asset handles export through
+`assets.loadImage`, `assets.loadSound`, `shaders.loadFragment`, and
+`animation.load`.
 
 ### Particle System 2D
 
-`ParticleSystem2D` is a bounded circle-particle emitter with point, box, and
+`ParticleSystem2D` is a bounded particle emitter with point, box, and
 circle emission shapes. The visual editor exposes emission rate, maximum
 particles, duration/looping, lifetime, speed, direction/spread, start/end size,
-colour and transparency keypoints over normalized lifetime, radius, and gravity.
-Clicking either sequence strip opens a Roblox-style keypoint editor. Its deterministic editor preview shows a
+an optional particle image, colour and transparency keypoints over normalized
+lifetime, radius, and gravity. Clicking either sequence strip opens a
+Roblox-style keypoint editor. Its deterministic editor preview shows a
 representative spread without changing the saved scene.
 
 ```luau
 local emitter = ecs.newEntity("Sparks", ecs.root, 320, 240)
 local particles = emitter:AddComponent(core.ParticleSystem2D)
+particles.image = assets.loadImage("assets/spark.png")
 particles.emission_rate = 40
 particles.lifetime = 0.8
 particles.speed = 140
@@ -206,13 +261,29 @@ particles:stop()   -- stops and clears live particles
 
 ## Viewport And Project Browser
 
-The Viewport supports entity selection and dragging, right-click creation,
-middle-mouse panning, scroll-wheel zoom, grid display, grid snapping, and a
-live transform/zoom overlay. The toolbar grid field controls the snap step.
+The Viewport supports entity selection, right-click creation, middle-mouse
+panning, scroll-wheel zoom, grid display, grid snapping, a default window-bounds
+overlay, and a live transform/zoom overlay. The toolbar grid field controls the
+snap step.
+
+Scene tools:
+
+- Move uses a center handle and drag gestures for selected entities.
+- Scale uses corner handles.
+- Rotate uses a rotation knob.
+- When a transform handle overlaps an entity, pressing the handle starts that
+  handle operation instead of selecting the entity behind it.
+- Holding `Ctrl` while moving an entity moves it independently of descendants by
+  updating descendant local positions so their world positions stay stable.
+- Holding `Ctrl` while dragging a scale handle preserves the entity aspect ratio.
+
+The Window dropdown can close, restore, dock, or undock the Hierarchy,
+Inspector, and Project browser. Undocked widgets are shown as separate native
+editor windows. Their header button docks them back into the main editor.
 
 The Project browser opens project files with the OS default handler, creates
-folders and Luau script templates, reveals folders in the OS file manager, and
-handles editor prefabs:
+folders, Luau script templates, fragment shader templates, and animation clips,
+reveals folders in the OS file manager, and handles editor prefabs:
 
 - Drag an entity from the Hierarchy to the Project browser to save a
   `.neoprefab` containing that entity and its descendants.
@@ -221,6 +292,9 @@ handles editor prefabs:
 - Double-click a `.neoscene` or `.neoprefab` to open it in a tab. A prefab tab
   contains only that prefab. Saving it refreshes linked instances in open and
   on-disk scenes while preserving each instance root's placement.
+- Double-click a `.neoanim` to open it in the animation editor.
+- A selected `Tilemap2D` component can enter Paint mode from the Inspector.
+  Drag over the entity grid to write the selected tile id; tile `-1` erases.
 
 Useful shortcuts:
 
@@ -242,7 +316,7 @@ Useful shortcuts:
 - Arrow keys: nudge the selected entity by one unit; hold `Shift` to nudge by
   the grid step.
 - Hold `Ctrl` while dragging a resize handle to preserve the entity's aspect
-  ratio.
+  ratio; hold `Ctrl` while moving to keep descendants in place.
 
 ## Runtime Loading
 
@@ -265,7 +339,7 @@ Each frame:
 1. Input state is refreshed.
 2. HTTP and server callbacks are polled.
 3. Luau `async` tasks are resumed once.
-4. Tweening and entity listeners are updated.
+4. Tweening, animation players, and entity listeners are updated.
 5. System and non-rendering component `update` callbacks run.
 6. Physics and rope constraints are simulated.
 7. Rendering component updates run in stable draw order.
@@ -402,6 +476,8 @@ input.isKeyPressed("a")
 input.isKeyReleased("escape")
 input.getLastKeyPressed()
 input.getCharPressed()
+input.showKeyboard()
+input.hideKeyboard()
 ```
 
 Mouse:
@@ -426,6 +502,14 @@ input.getScrollInAmount()
 Edges:
 
 - Pressed and released states are frame-local.
+- `input.showKeyboard()` / `input.openKeyboard()` request the on-screen
+  keyboard on supported mobile builds and return whether the platform handled
+  the request. The optional boolean is passed as Android's implicit-show flag
+  and defaults to `true`.
+- `input.hideKeyboard()` / `input.closeKeyboard()` request that the on-screen
+  keyboard close on supported mobile builds and return whether the platform
+  handled the request. The optional boolean is passed as Android's
+  implicit-only hide flag and defaults to `false`.
 - Mouse positions are exposed through global `mouse.x` and `mouse.y`.
 - `window.x` and `window.y` contain the current logical window size.
 
@@ -546,6 +630,8 @@ Global: `fs`
 
 ```luau
 local runningOnWeb = fs.isWebasm()
+local runningOnMobile = fs.isMobile()
+local runningOnAndroid = fs.isAndroid()
 local filePath = fs.openFilePicker()
 local folderPath = fs.openFolderPicker()
 local dataDirectory = fs.getDataDirectory()
@@ -569,9 +655,12 @@ Edges:
 
 - `fs.isWebasm()` and `fs.isWebAssembly()` return whether the game is running
   in the WebAssembly/browser build.
+- `fs.isMobile()` returns whether the game is running on a mobile target or in
+  the desktop mobile emulator.
+- `fs.isAndroid()` returns whether the game is running on Android.
 - `fs.openFilePicker()` and `fs.openFolderPicker()` return an absolute path
   string selected by the user, or `nil` when cancelled or unavailable. They use
-  native desktop dialogs and return `nil` on WebAssembly.
+  native desktop dialogs and return `nil` on WebAssembly and Android.
 - Relative writes use the writable game data directory.
 - Relative reads check writable game data first, then bundled project
   resources. Packaged games can therefore load embedded defaults and override
@@ -601,6 +690,51 @@ image:export("/tmp/neolove/generated/icon.png")
 The default data directory is still used for relative writes. To write
 somewhere else, pass an absolute or parent-relative destination.
 :::
+
+<!-- page: mobile | Mobile -->
+# Mobile
+
+Global: `mobile`
+
+```luau
+if mobile.isMobile() then
+    local width, height = mobile.getDeviceSize()
+    local network = mobile.getNetworkType()
+    local top, right, bottom, left = mobile.getSafeAreaInsets()
+end
+```
+
+Functions:
+
+- `mobile.isMobile()` returns `true` on mobile builds and in the desktop mobile
+  emulator.
+- `mobile.isEmulated()` returns whether the current run is the desktop mobile
+  emulator.
+- `mobile.isOnline()` returns whether the emulated or platform network is
+  available.
+- `mobile.isWifiEnabled()` and `mobile.isCellularEnabled()` expose emulator
+  network toggles.
+- `mobile.isLowPowerMode()` exposes the emulator low-power toggle.
+- `mobile.getNetworkType()` returns `"wifi"`, `"cellular"`, or `"offline"`.
+- `mobile.getOrientation()` returns `"portrait"` or `"landscape"`.
+- `mobile.isLandscape()` returns whether the current mobile orientation is
+  landscape.
+- `mobile.getDeviceSize()` returns the locked logical mobile width and height.
+- `mobile.getSafeAreaInsets()` returns top, right, bottom, and left safe-area
+  insets.
+
+Desktop emulator:
+
+```bash
+neolove run . --mobile --portrait --wifi
+neolove run . --mobile --landscape --offline
+neolove run . --mobile --mobile-size=430x932 --cellular --low-power
+```
+
+In emulator mode the game window is not resizable. Use portrait or landscape
+rotation instead of arbitrary resizing. Keyboard events are suppressed so games
+must use mouse/touch-style controls or request the on-screen keyboard through
+`input.showKeyboard()` where the target platform supports it.
 
 <!-- page: commands | Commands -->
 # Commands
@@ -757,7 +891,8 @@ Edges:
 Globals: `animation`, `animations`
 
 Animation clips contain numeric property tracks and advance automatically
-before game systems update. Tracks support linear and step/hold interpolation.
+before game systems update. Tracks support linear, Bezier, and step/hold
+interpolation. `.neoanim` files created by the editor can be loaded directly.
 
 ```luau
 local clip = {
@@ -771,12 +906,34 @@ local clip = {
     },
 }
 
-local player = animation.play(entity, clip)
+local fileClip = animation.load("walk.neoanim")
+local player = animation.play(entity, fileClip or clip)
 player:pause()
 player:seek(0.25)
 player:setSpeed(2)
 player:play()
 ```
+
+Bezier keyframes use `interpolation = "bezier"` and optional handle fields
+`out_x`, `out_y`, `in_x`, and `in_y`. Handles are normalized against the span
+between adjacent keyframes.
+
+`core.AnimationController` manages one clip on an entity:
+
+```luau
+local controller = entity:AddComponent(core.AnimationController)
+controller.animation = animation.load("walk.neoanim")
+controller.autoplay = true
+controller.looping = true
+controller.speed = 1
+
+controller:pause()
+controller:play()
+controller:stop()
+```
+
+Controller fields are `animation`, `autoplay`, `looping`, `playing`, and
+`speed`. `Play`, `Pause`, and `Stop` PascalCase aliases are also available.
 
 <!-- page: ecs | ECS -->
 # ECS
@@ -843,7 +1000,7 @@ Component shape:
 
 ```luau
 local component = {
-    awake = function(entity, component) end,
+    awake = function(entity, component) end, -- optional
     update = function(entity, component, dt) end,
     destroy = function(entity, component) end,
 }
@@ -859,7 +1016,8 @@ component:GetEntity()
 Edges:
 
 - `ecs.addComponent` deep-copies the component prototype.
-- Component `awake` runs before the component is pushed into `entity.components`.
+- Component `awake` is optional. When present, it runs before the component is
+  pushed into `entity.components`.
 - Component `destroy` runs when removed; `onDestroy` is used as a fallback.
 - Component prototypes must be tables.
 - Runtime errors in callbacks are reported with component context.
@@ -873,7 +1031,7 @@ Systems are tables passed to `ecs.addSystem`.
 
 ```luau
 ecs.addSystem({
-    awake = function(self) end,
+    awake = function(self) end, -- optional
     update = function(self, dt) end,
     lateUpdate = function(self, dt) end,
     fixedUpdate = function(self, dt) end,
@@ -881,6 +1039,7 @@ ecs.addSystem({
 ```
 
 Use systems for global simulation, managers, spawning, and logic that does not naturally belong to one entity.
+System `awake` is optional and runs once on registration when present.
 
 <!-- page: transforms | Transforms -->
 # Transforms
@@ -954,6 +1113,8 @@ Supported events:
 - `middleClick`
 - `scrollUp`
 - `scrollDown`
+- `mouseEntered`
+- `mouseExited`
 
 Example:
 
@@ -1046,6 +1207,27 @@ Fields:
 - `size_x`, `size_y`
 
 If `size_x` or `size_y` is `0`, the entity size is used.
+
+## `core.ParticleSystem2D`
+
+Emits bounded particles from the entity transform. Without an image, particles
+draw as tinted circles. When `image` is assigned, each particle draws the image
+at its sampled particle size.
+
+Common fields:
+
+- `image`
+- `playing`, `looping`, `visible`
+- `duration`, `emission_rate`, `max_particles`
+- `lifetime`, `speed`, `direction`, `spread`
+- `start_size`, `end_size`
+- `color_sequence`, `transparency_sequence`
+- `shape`: `point`, `box`, or `circle`
+- `radius`, `gravity_x`, `gravity_y`
+- `shader`
+
+Methods are `play`, `pause`, `stop`, and `emit`; PascalCase aliases are
+available.
 
 ## `core.TextBox`
 
@@ -1165,7 +1347,9 @@ Edges:
 Draws a finite grid from an atlas. Set `map_width`, `map_height`, `tile_width`,
 and `tile_height`. `tiles` is a flat numeric array or a comma/whitespace-separated
 string. Tile `0` is the first atlas cell and `-1` is empty. `spacing` and
-`margin` support packed atlases.
+`margin` support packed atlases. In the visual editor, select a `Tilemap2D`
+component and use Paint mode in the Inspector to edit `tiles` directly inside
+the entity bounds.
 
 <!-- page: spritebox2d | Spritebox2D -->
 # Spritebox2D
@@ -1431,6 +1615,61 @@ Edges:
 - Web audio requires browser permission or user gesture.
 - Web shader effects are rendered through WebGL and composited with the software-rendered scene; unshaded software chunks are dirty-rect composited to avoid full-canvas copies around shader draws.
 
+<!-- page: android | Android -->
+# Android
+
+`neolove build --android` emits a signed APK:
+
+- `dist/<project-name>-android-arm64.apk`
+
+The APK contains the optimized NeoLOVE Android runtime plus the compressed
+project payload in the APK assets. On first use, the builder installs missing
+toolchain pieces into `~/.neolove/toolchains/`: a JDK, Android command-line
+tools, build-tools, platform SDK, NDK, and the `aarch64-linux-android` Rust
+target.
+
+Global: `android`
+
+```luau
+if fs.isAndroid() then
+    local id = android.getDeviceId()
+    local sdk = android.getSdkInt()
+    local model = android.getModel()
+    android.showKeyboard()
+end
+```
+
+Functions:
+
+- `android.isAndroid()` returns whether the game is running on Android.
+- `android.getDeviceId()` returns Android's app-scoped secure device ID when available.
+- `android.getSdkInt()` and `android.getApiLevel()` return the Android SDK/API level.
+- `android.getBrand()`, `android.getManufacturer()`, `android.getModel()`,
+  `android.getDevice()`, and `android.getProduct()` return Android build fields
+  when available.
+- `android.showKeyboard()` / `android.openKeyboard()` request the on-screen
+  keyboard and return `true` when the Android runtime is available.
+- `android.hideKeyboard()` / `android.closeKeyboard()` request that the
+  on-screen keyboard close and return `true` when the Android runtime is
+  available.
+
+On non-Android targets, `android.isAndroid()` returns `false` and the data
+getters return `nil`; keyboard functions return `false`.
+
+<!-- page: ios | iOS -->
+# iOS
+
+`neolove build --ios` emits an iOS simulator app on macOS:
+
+- `dist/<project-name>-ios-simulator.app`
+
+The iOS builder wraps the WebAssembly output in a generated Xcode project and
+uses `xcodebuild` with the `iphonesimulator` SDK. It requires macOS with Xcode
+installed. Code signing is disabled for simulator builds.
+
+On non-macOS hosts, the command fails immediately with a platform requirement
+message instead of attempting a partial build.
+
 <!-- page: performance | Performance Guidance -->
 # Performance Guidance
 
@@ -1449,7 +1688,6 @@ Edges:
 # Troubleshooting
 
 - `component prototype is nil`: the component table does not exist. Check spelling, especially `core["9SliceSprite2D"]` bracket access.
-- `component has no awake function`: custom components need at least `awake`.
 - `image is unloaded`: a handle was unloaded and then reused.
 - Files fail to save beside packaged resources: use a relative `fs` path or
   `fs.dataPath()` so the writable game data directory is used.

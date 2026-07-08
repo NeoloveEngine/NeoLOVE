@@ -184,6 +184,28 @@ pub(crate) fn add_user_input_module(lua: &Lua, platform: SharedPlatformState) ->
         )?;
     }
 
+    input.set(
+        "showKeyboard",
+        lua.create_function(|_lua, implicit: Option<bool>| {
+            Ok(crate::android_module::show_keyboard(
+                implicit.unwrap_or(true),
+            ))
+        })?,
+    )?;
+    input.set("openKeyboard", input.get::<mlua::Function>("showKeyboard")?)?;
+    input.set(
+        "hideKeyboard",
+        lua.create_function(|_lua, implicit_only: Option<bool>| {
+            Ok(crate::android_module::hide_keyboard(
+                implicit_only.unwrap_or(false),
+            ))
+        })?,
+    )?;
+    input.set(
+        "closeKeyboard",
+        input.get::<mlua::Function>("hideKeyboard")?,
+    )?;
+
     lua.globals().set("input", input.clone())?;
     lua.globals().set("userInput", input)?;
     Ok(())

@@ -14,7 +14,7 @@ export type Vec2 = {
 
 export type PositionPivot = "center" | "top_right"
 
-export type EntityListenEvent = "leftClick" | "rightClick" | "middleClick" | "scrollUp" | "scrollDown"
+export type EntityListenEvent = "leftClick" | "rightClick" | "middleClick" | "scrollUp" | "scrollDown" | "mouseEntered" | "mouseExited"
 
 export type EntityListenInfo = {
 	kind: EntityListenEvent,
@@ -198,6 +198,10 @@ export type InputModule = {
 	isMouseLocked: () -> boolean,
 	getLastKeyPressed: () -> string?,
 	getCharPressed: () -> string?,
+	showKeyboard: (implicit: boolean?) -> boolean,
+	openKeyboard: (implicit: boolean?) -> boolean,
+	hideKeyboard: (implicitOnly: boolean?) -> boolean,
+	closeKeyboard: (implicitOnly: boolean?) -> boolean,
 }
 
 export type AssetsModule = {
@@ -235,6 +239,8 @@ export type FsWalkEntry = {
 export type FsModule = {
 	isWebasm: () -> boolean,
 	isWebAssembly: () -> boolean,
+	isMobile: () -> boolean,
+	isAndroid: () -> boolean,
 	openFilePicker: () -> string?,
 	openFolderPicker: () -> string?,
 	getDataDirectory: () -> string,
@@ -250,6 +256,36 @@ export type FsModule = {
 	rename: (from: string, to: string) -> (),
 	copy: (from: string, to: string) -> (),
 	removeFile: (path: string) -> boolean,
+}
+
+export type AndroidModule = {
+	isAndroid: () -> boolean,
+	getDeviceId: () -> string?,
+	getSdkInt: () -> number?,
+	getApiLevel: () -> number?,
+	getBrand: () -> string?,
+	getManufacturer: () -> string?,
+	getModel: () -> string?,
+	getDevice: () -> string?,
+	getProduct: () -> string?,
+	showKeyboard: (implicit: boolean?) -> boolean,
+	openKeyboard: (implicit: boolean?) -> boolean,
+	hideKeyboard: (implicitOnly: boolean?) -> boolean,
+	closeKeyboard: (implicitOnly: boolean?) -> boolean,
+}
+
+export type MobileModule = {
+	isMobile: () -> boolean,
+	isEmulated: () -> boolean,
+	isOnline: () -> boolean,
+	isWifiEnabled: () -> boolean,
+	isCellularEnabled: () -> boolean,
+	isLowPowerMode: () -> boolean,
+	getNetworkType: () -> "wifi" | "cellular" | "offline",
+	getOrientation: () -> "portrait" | "landscape",
+	isLandscape: () -> boolean,
+	getDeviceSize: () -> (number, number),
+	getSafeAreaInsets: () -> (number, number, number, number),
 }
 
 export type AsyncTask = {
@@ -512,10 +548,17 @@ export type TweeningModule = {
 	update: (dt: number) -> (),
 }
 
-export type AnimationKeyframe = { time: number, value: number }
+export type AnimationKeyframe = {
+	time: number,
+	value: number,
+	out_x: number?,
+	out_y: number?,
+	in_x: number?,
+	in_y: number?,
+}
 export type AnimationTrack = {
 	property: string,
-	interpolation: "linear" | "step" | "hold"?,
+	interpolation: "linear" | "step" | "hold" | "bezier"?,
 	keys: { AnimationKeyframe },
 }
 export type AnimationClip = {
@@ -534,6 +577,8 @@ export type AnimationHandle = {
 	isPlaying: (self: AnimationHandle) -> boolean,
 }
 export type AnimationModule = {
+	load: (path: string) -> AnimationClip,
+	Load: (path: string) -> AnimationClip,
 	new: (target: { [any]: any }, clip: AnimationClip) -> AnimationHandle,
 	create: (target: { [any]: any }, clip: AnimationClip) -> AnimationHandle,
 	play: (target: { [any]: any }, clip: AnimationClip) -> AnimationHandle,
@@ -593,6 +638,7 @@ export type ParticleNumberKeypoint = { time: number, value: number }
 
 export type ParticleSystem2D = BaseDrawableComponent & {
 	__neolove_component: "ParticleSystem2D",
+	image: ImageHandle?,
 	playing: boolean,
 	looping: boolean,
 	duration: number,
@@ -621,6 +667,21 @@ export type ParticleSystem2D = BaseDrawableComponent & {
 	Stop: (self: ParticleSystem2D) -> (),
 	emit: (self: ParticleSystem2D, count: number?) -> (),
 	Emit: (self: ParticleSystem2D, count: number?) -> (),
+}
+
+export type AnimationController = ComponentInstance & {
+	__neolove_component: "AnimationController",
+	animation: AnimationClip?,
+	autoplay: boolean,
+	looping: boolean,
+	playing: boolean,
+	speed: number,
+	play: (self: AnimationController) -> (),
+	Play: (self: AnimationController) -> (),
+	pause: (self: AnimationController) -> (),
+	Pause: (self: AnimationController) -> (),
+	stop: (self: AnimationController) -> (),
+	Stop: (self: AnimationController) -> (),
 }
 
 export type SpatialSound2D = ComponentInstance & {
@@ -905,6 +966,7 @@ export type CoreModule = {
 	EntityScaler: EntityScaler,
 	Shape2D: Shape2D,
 	ParticleSystem2D: ParticleSystem2D,
+	AnimationController: AnimationController,
 	SpatialSound2D: SpatialSound2D,
 	TextBox: TextBox,
 	TextLabel: TextLabel,
@@ -930,6 +992,10 @@ declare function Inspector<T>(defaultValue: T, max: number?, fractional: boolean
 -- selected scene entity/component when it generates the scene.
 declare IEntity: Entity
 declare IComponent: ComponentInstance
+declare IImage: ImageHandle
+declare IAudio: SoundHandle
+declare IShader: ShaderHandle
+declare IAnimation: AnimationClip
 declare function die(): ()
 declare function softrequire(modulePathOrSource: string, allowedModules: { [string]: any } | { string }?): any
 
@@ -939,6 +1005,8 @@ declare userInput: InputModule
 declare assets: AssetsModule
 declare audio: AudioModule
 declare fs: FsModule
+declare android: AndroidModule
+declare mobile: MobileModule
 declare http: HttpModule
 declare commands: CommandsModule
 declare command: CommandsModule

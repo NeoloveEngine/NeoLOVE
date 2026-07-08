@@ -69,6 +69,19 @@ pub(crate) fn parse_inspector_variables(
             create_reference_stub(&lua, "component").map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
+    for (global, kind) in [
+        ("IImage", "image"),
+        ("IAudio", "audio"),
+        ("IShader", "shader"),
+        ("IAnimation", "animation"),
+    ] {
+        environment
+            .raw_set(
+                global,
+                create_reference_stub(&lua, kind).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+    }
 
     // Preserve reference types for concrete values created at module scope,
     // such as `local target = ecs.newEntity(...)` and
@@ -233,7 +246,7 @@ fn create_lenient_stub(lua: &Lua) -> mlua::Result<Table> {
     Ok(stub)
 }
 
-fn create_reference_stub<'lua>(lua: &'lua Lua, kind: &str) -> mlua::Result<Table> {
+fn create_reference_stub(lua: &Lua, kind: &str) -> mlua::Result<Table> {
     let stub = create_lenient_stub(lua)?;
     stub.raw_set("__neolove_inspector_reference", kind)?;
     Ok(stub)
@@ -353,6 +366,10 @@ fn table_to_var(table: Table, visiting: &mut HashSet<usize>) -> Result<VarValue,
     {
         Some("entity") => return Ok(VarValue::Entity(None)),
         Some("component") => return Ok(VarValue::Component(None)),
+        Some("image") => return Ok(VarValue::Image(String::new())),
+        Some("audio") => return Ok(VarValue::Audio(String::new())),
+        Some("shader") => return Ok(VarValue::Shader(String::new())),
+        Some("animation") => return Ok(VarValue::Animation(String::new())),
         _ => {}
     }
 

@@ -5,8 +5,8 @@ use crate::lua_error::protect_lua_call;
 use crate::platform::{Color, InputState, SharedPlatformState, WindowState, lock_platform_state};
 use crate::renderer::{
     DrawCommand, FontHandle, Rect, RenderState, SharedRenderState, TextAlignX, TextAlignY,
-    TextAntialiasing, TextRenderRequest, TextScaleMode, TextStyleRange, TextWrapMode, TextureFilter,
-    Vec2,
+    TextAntialiasing, TextRenderRequest, TextScaleMode, TextStyleRange, TextWrapMode,
+    TextureFilter, Vec2,
 };
 use mlua::{AnyUserData, Function, Lua, Table, UserData, Value};
 use std::path::{Component, Path, PathBuf};
@@ -110,9 +110,7 @@ fn particle_random(seed: &mut u32) -> f32 {
 }
 
 fn lerp_particle_color(start: Color, end: Color, t: f32) -> Color {
-    let mix = |a: u8, b: u8| {
-        (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)).round() as u8
-    };
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)).round() as u8;
     Color::rgba(
         mix(start.r, end.r),
         mix(start.g, end.g),
@@ -181,7 +179,10 @@ fn sample_particle_color(keypoints: &[(f32, Color)], time: f32) -> Color {
             return lerp_particle_color(pair[0].1, pair[1].1, amount);
         }
     }
-    keypoints.last().map(|keypoint| keypoint.1).unwrap_or(first.1)
+    keypoints
+        .last()
+        .map(|keypoint| keypoint.1)
+        .unwrap_or(first.1)
 }
 
 fn sample_particle_number(keypoints: &[(f32, f32)], time: f32) -> f32 {
@@ -198,7 +199,10 @@ fn sample_particle_number(keypoints: &[(f32, f32)], time: f32) -> f32 {
             return pair[0].1 + (pair[1].1 - pair[0].1) * amount;
         }
     }
-    keypoints.last().map(|keypoint| keypoint.1).unwrap_or(first.1)
+    keypoints
+        .last()
+        .map(|keypoint| keypoint.1)
+        .unwrap_or(first.1)
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -1914,8 +1918,14 @@ fn build_textbox_render_request(
     let min_scale = component.get::<f32>("min_scale").unwrap_or(1.0).max(1.0);
     let color: Color = color4_to_color(component.get("color")?)?;
     let padding = component.get::<f32>("padding").unwrap_or(0.0).max(0.0);
-    let padding_x = component.get::<f32>("padding_x").unwrap_or(padding).max(0.0);
-    let padding_y = component.get::<f32>("padding_y").unwrap_or(padding).max(0.0);
+    let padding_x = component
+        .get::<f32>("padding_x")
+        .unwrap_or(padding)
+        .max(0.0);
+    let padding_y = component
+        .get::<f32>("padding_y")
+        .unwrap_or(padding)
+        .max(0.0);
     let line_spacing = component.get::<f32>("line_spacing").unwrap_or(1.0);
     let letter_spacing = component.get::<f32>("letter_spacing").unwrap_or(0.0);
     let tab_size = component
@@ -1944,8 +1954,7 @@ fn build_textbox_render_request(
     let size_mode_uses_entity = uses_entity_text_bounds(component);
     let legacy_scale_x = component.get::<f32>("scale_x").unwrap_or(0.0);
     let legacy_scale_y = component.get::<f32>("scale_y").unwrap_or(0.0);
-    let use_legacy_stretch =
-        !size_mode_uses_entity && legacy_scale_x > 0.0 && legacy_scale_y > 0.0;
+    let use_legacy_stretch = !size_mode_uses_entity && legacy_scale_x > 0.0 && legacy_scale_y > 0.0;
     let font = parse_font_handle(root, component.get::<Value>("font").unwrap_or(Value::Nil));
     let effective_scale = if use_legacy_stretch {
         legacy_scale_y.max(1.0)
@@ -2325,15 +2334,7 @@ fn get_closest_letter_index_value(
         let rect = rect_from_table(&entry)?;
         let top = rect.y as f64;
         let bottom = (rect.y + rect.h) as f64;
-        consider_caret_candidate(
-            &mut best,
-            index - 1,
-            x,
-            y,
-            rect.x as f64,
-            top,
-            bottom,
-        );
+        consider_caret_candidate(&mut best, index - 1, x, y, rect.x as f64, top, bottom);
         consider_caret_candidate(
             &mut best,
             index,
@@ -2345,7 +2346,9 @@ fn get_closest_letter_index_value(
         );
     }
 
-    Ok(Value::Integer(best.map(|(index, _)| index as mlua::Integer).unwrap_or(0)))
+    Ok(Value::Integer(
+        best.map(|(index, _)| index as mlua::Integer).unwrap_or(0),
+    ))
 }
 
 fn get_closest_letter_index_from_args(
@@ -2669,14 +2672,12 @@ pub fn add_core_components(
                     .or_else(|| get_number_field(&component, "percent_y", "percentY"))
                     .unwrap_or(0.0)
                     .clamp(0.0, 1.0);
-                let size_x_percent =
-                    get_number_field(&component, "size_x_percent", "sizeXPercent")
-                        .unwrap_or(0.0)
-                        .clamp(0.0, 1.0);
-                let size_y_percent =
-                    get_number_field(&component, "size_y_percent", "sizeYPercent")
-                        .unwrap_or(0.0)
-                        .clamp(0.0, 1.0);
+                let size_x_percent = get_number_field(&component, "size_x_percent", "sizeXPercent")
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                let size_y_percent = get_number_field(&component, "size_y_percent", "sizeYPercent")
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
                 let offset_x = get_number_field(&component, "offset_x", "offsetX").unwrap_or(0.0);
                 let offset_y = get_number_field(&component, "offset_y", "offsetY").unwrap_or(0.0);
                 let pivot_x = get_number_field(&component, "pivot_x", "pivotX")
@@ -2736,7 +2737,10 @@ pub fn add_core_components(
             let entity: Table = component.get("entity")?;
             let (x, y, _) = crate::window::get_global_transform(&entity)?;
             let looping = component.get::<bool>("looping").unwrap_or(false);
-            let volume = component.get::<f32>("volume").unwrap_or(1.0).clamp(0.0, 1.0);
+            let volume = component
+                .get::<f32>("volume")
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
             let audio: Table = lua.globals().get("audio")?;
             audio
                 .get::<Function>("playSpatial")?
@@ -2764,9 +2768,7 @@ pub fn add_core_components(
             "update",
             lua.create_function(move |lua, (entity, component, _dt): (Table, Table, f32)| {
                 let autoplay = component.get::<bool>("autoplay").unwrap_or(false);
-                let started = component
-                    .get::<bool>("__autoplay_started")
-                    .unwrap_or(false);
+                let started = component.get::<bool>("__autoplay_started").unwrap_or(false);
                 if autoplay && !started {
                     let _ = play_for_update.call::<bool>(component.clone())?;
                 }
@@ -2983,6 +2985,7 @@ pub fn add_core_components(
             lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
                 component.set("__neolove_component", "ParticleSystem2D")?;
                 component.set("visible", true)?;
+                component.set("image", Value::Nil)?;
                 component.set("shader", Value::Nil)?;
                 component.set("playing", true)?;
                 component.set("looping", true)?;
@@ -3031,14 +3034,11 @@ pub fn add_core_components(
             })?,
         )?;
 
-        let play = lua.create_function(|_ctx, component: Table| {
-            component.set("playing", true)
-        })?;
+        let play = lua.create_function(|_ctx, component: Table| component.set("playing", true))?;
         particles.set("play", play.clone())?;
         particles.set("Play", play)?;
-        let pause = lua.create_function(|_ctx, component: Table| {
-            component.set("playing", false)
-        })?;
+        let pause =
+            lua.create_function(|_ctx, component: Table| component.set("playing", false))?;
         particles.set("pause", pause.clone())?;
         particles.set("Pause", pause)?;
         let stop = lua.create_function(|ctx, component: Table| {
@@ -3092,10 +3092,10 @@ pub fn add_core_components(
                 let entity_scale = crate::window::get_global_scale(&entity)?.abs();
                 let gravity_x = component.get::<f32>("gravity_x").unwrap_or(0.0);
                 let gravity_y = component.get::<f32>("gravity_y").unwrap_or(60.0);
-                let start_size = component.get::<f32>("start_size").unwrap_or(8.0).max(0.0)
-                    * entity_scale;
-                let end_size = component.get::<f32>("end_size").unwrap_or(2.0).max(0.0)
-                    * entity_scale;
+                let start_size =
+                    component.get::<f32>("start_size").unwrap_or(8.0).max(0.0) * entity_scale;
+                let end_size =
+                    component.get::<f32>("end_size").unwrap_or(2.0).max(0.0) * entity_scale;
                 let start_color = color4_to_color(component.get("start_color")?)?;
                 let end_color = color4_to_color(component.get("end_color")?)?;
                 let color_sequence =
@@ -3106,6 +3106,8 @@ pub fn add_core_components(
                     1.0 - end_color.a as f32 / 255.0,
                 )?;
                 let shader = shader_from_component(&component)?;
+                let image = get_image_field(&component, "image")?;
+                let filter = app_texture_filter(ctx);
 
                 let current = component
                     .get::<Option<Table>>("__particles")?
@@ -3146,11 +3148,14 @@ pub fn add_core_components(
                             - sample_particle_number(&transparency_sequence, t).clamp(0.0, 1.0))
                             * 255.0)
                             .round() as u8;
-                        draw.push((x, y, size * 0.5, color));
+                        draw.push((x, y, size, color));
                     }
                 }
 
-                let rate = component.get::<f32>("emission_rate").unwrap_or(12.0).max(0.0);
+                let rate = component
+                    .get::<f32>("emission_rate")
+                    .unwrap_or(12.0)
+                    .max(0.0);
                 let mut accumulator = component.get::<f32>("__emit_accumulator").unwrap_or(0.0);
                 if playing {
                     accumulator += rate * dt;
@@ -3167,8 +3172,15 @@ pub fn add_core_components(
                 let (origin_x, origin_y, rotation) = crate::window::get_global_transform(&entity)?;
                 let (entity_w, entity_h) = crate::window::get_global_size(&entity)?;
                 let speed = component.get::<f32>("speed").unwrap_or(80.0) * entity_scale;
-                let direction = component.get::<f32>("direction").unwrap_or(-90.0).to_radians();
-                let spread = component.get::<f32>("spread").unwrap_or(30.0).abs().to_radians();
+                let direction = component
+                    .get::<f32>("direction")
+                    .unwrap_or(-90.0)
+                    .to_radians();
+                let spread = component
+                    .get::<f32>("spread")
+                    .unwrap_or(30.0)
+                    .abs()
+                    .to_radians();
                 let shape = component
                     .get::<String>("shape")
                     .unwrap_or_else(|_| "point".to_string())
@@ -3206,12 +3218,7 @@ pub fn add_core_components(
                             - sample_particle_number(&transparency_sequence, 0.0).clamp(0.0, 1.0))
                             * 255.0)
                             .round() as u8;
-                        draw.push((
-                            origin_x + offset_x,
-                            origin_y + offset_y,
-                            start_size * 0.5,
-                            color,
-                        ));
+                        draw.push((origin_x + offset_x, origin_y + offset_y, start_size, color));
                     }
                 }
                 component.set("__rng", seed as i64)?;
@@ -3222,14 +3229,32 @@ pub fn add_core_components(
                     let mut renderer = render_state
                         .lock()
                         .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
-                    for (x, y, radius, color) in draw {
-                        if radius > 0.0 && color.a > 0 {
-                            renderer.queue(DrawCommand::Circle {
-                                center: Vec2 { x, y },
-                                radius,
-                                color,
-                                shader: shader.clone(),
-                            });
+                    for (x, y, size, color) in draw {
+                        if size > 0.0 && color.a > 0 {
+                            if let Some(image) = &image {
+                                renderer.queue(DrawCommand::Image {
+                                    image: image.clone(),
+                                    dest: Rect {
+                                        x: x - size * 0.5,
+                                        y: y - size * 0.5,
+                                        w: size,
+                                        h: size,
+                                    },
+                                    source: None,
+                                    rotation: 0.0,
+                                    pivot: Vec2 { x, y },
+                                    tint: color,
+                                    filter,
+                                    shader: shader.clone(),
+                                });
+                            } else {
+                                renderer.queue(DrawCommand::Circle {
+                                    center: Vec2 { x, y },
+                                    radius: size * 0.5,
+                                    color,
+                                    shader: shader.clone(),
+                                });
+                            }
                         }
                     }
                 }
@@ -3238,6 +3263,98 @@ pub fn add_core_components(
         )?;
 
         core_components.set("ParticleSystem2D", particles)?;
+    }
+
+    // AnimationController: owns a single clip/table and plays it against the
+    // entity transform/properties through the animation module.
+    {
+        let controller = lua.create_table()?;
+        controller.set("__neolove_component", "AnimationController")?;
+        controller.set(
+            "awake",
+            lua.create_function(move |_ctx, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "AnimationController")?;
+                component.set("animation", Value::Nil)?;
+                component.set("autoplay", true)?;
+                component.set("looping", true)?;
+                component.set("playing", false)?;
+                component.set("speed", 1.0)?;
+                component.set("__player", Value::Nil)?;
+                Ok(())
+            })?,
+        )?;
+
+        let play = lua.create_function(|_ctx, component: Table| {
+            component.set("playing", true)?;
+            if let Ok(player) = component.get::<Table>("__player") {
+                let play: Function = player.get("play")?;
+                play.call::<()>(player)?;
+            }
+            Ok(())
+        })?;
+        controller.set("play", play.clone())?;
+        controller.set("Play", play)?;
+
+        let pause = lua.create_function(|_ctx, component: Table| {
+            component.set("playing", false)?;
+            if let Ok(player) = component.get::<Table>("__player") {
+                let pause: Function = player.get("pause")?;
+                pause.call::<()>(player)?;
+            }
+            Ok(())
+        })?;
+        controller.set("pause", pause.clone())?;
+        controller.set("Pause", pause)?;
+
+        let stop = lua.create_function(|_ctx, component: Table| {
+            component.set("playing", false)?;
+            if let Ok(player) = component.get::<Table>("__player") {
+                let stop: Function = player.get("stop")?;
+                stop.call::<()>(player)?;
+            }
+            Ok(())
+        })?;
+        controller.set("stop", stop.clone())?;
+        controller.set("Stop", stop)?;
+
+        controller.set(
+            "update",
+            lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
+                let Some(clip) = component.get::<Option<Table>>("animation")? else {
+                    component.set("__player", Value::Nil)?;
+                    return Ok(());
+                };
+                clip.set("looping", component.get::<bool>("looping").unwrap_or(true))?;
+
+                let player = match component.get::<Table>("__player") {
+                    Ok(player) => player,
+                    Err(_) => {
+                        let animations: Table = ctx.globals().get("animation")?;
+                        let create: Function = animations.get("create")?;
+                        let player: Table = create.call((entity.clone(), clip))?;
+                        component.set("__player", player.clone())?;
+                        if component.get::<bool>("autoplay").unwrap_or(true) {
+                            component.set("playing", true)?;
+                        }
+                        player
+                    }
+                };
+
+                let speed = component.get::<f32>("speed").unwrap_or(1.0).max(0.0);
+                let set_speed: Function = player.get("setSpeed")?;
+                set_speed.call::<()>((player.clone(), speed as f64))?;
+                let should_play = component.get::<bool>("playing").unwrap_or(false);
+                let command: Function = if should_play {
+                    player.get("play")?
+                } else {
+                    player.get("pause")?
+                };
+                command.call::<()>(player)?;
+                Ok(())
+            })?,
+        )?;
+
+        core_components.set("AnimationController", controller)?;
     }
 
     // TextBox
@@ -5709,7 +5826,9 @@ pub fn add_core_components(
                 let spacing = component.get::<f32>("spacing").unwrap_or(0.0).max(0.0);
                 let margin = component.get::<f32>("margin").unwrap_or(0.0).max(0.0);
                 let image: Option<AnyUserData> = component.get("image")?;
-                let Some(image) = image else { return Ok(()); };
+                let Some(image) = image else {
+                    return Ok(());
+                };
                 let image = image.borrow::<crate::assets::ImageHandle>()?;
                 image.ensure_uploaded()?;
                 let (image_width, image_height) = image.dimensions()?;
@@ -6198,10 +6317,9 @@ mod tests {
     fn unbound_letter_bounds_callback_rejects_dot_call_without_panicking() -> mlua::Result<()> {
         let lua = Lua::new();
         let component = component_with_letter_bounds(&lua)?;
-        let get_letter_bounds =
-            lua.create_function(|ctx, args: mlua::Variadic<Value>| {
-                get_letter_bounds_from_args(ctx, None, None, args)
-            })?;
+        let get_letter_bounds = lua.create_function(|ctx, args: mlua::Variadic<Value>| {
+            get_letter_bounds_from_args(ctx, None, None, args)
+        })?;
         component.set("getLetterBounds", get_letter_bounds)?;
 
         let script = r#"

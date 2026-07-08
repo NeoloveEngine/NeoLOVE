@@ -26,7 +26,7 @@ use crate::scene::{
 use crate::update::AvailableUpdate;
 
 use super::inspector::parse_inspector_variables;
-use super::ui::{icon, Painter, Rect, Theme, Ui};
+use super::ui::{icon, Painter, Rect, Rgba, Theme, Ui};
 
 const TOOLBAR_H: f32 = 40.0;
 const STATUS_H: f32 = 24.0;
@@ -42,6 +42,13 @@ const PREVIEW_ROOT_WIDTH: f32 = 1280.0;
 const PREVIEW_ROOT_HEIGHT: f32 = 720.0;
 /// Screen-space length of the rotation gizmo's stalk above the entity.
 const ROT_HANDLE_DIST: f32 = 28.0;
+
+/// Move gizmo axis colors: X (horizontal) red, Y (vertical) green, matching the
+/// convention used by Unity/Godot so the axes read at a glance.
+const MOVE_X_COLOR: Rgba = [231, 76, 76, 255];
+const MOVE_Y_COLOR: Rgba = [122, 204, 106, 255];
+/// Scale gizmo corner-handle color (blue), distinct from the move axes.
+const SCALE_HANDLE_COLOR: Rgba = [86, 156, 214, 255];
 
 /// Rotate the screen point `(px, py)` by `angle` radians about `(cx, cy)`.
 fn rotate_point_about(px: f32, py: f32, cx: f32, cy: f32, angle: f32) -> (f32, f32) {
@@ -109,12 +116,29 @@ enum Panel {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EditorWidget {
+    Hierarchy,
+    Inspector,
+    Project,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Splitter {
     LeftWidth,
     RightWidth,
     LeftSplit,
     RightSplit,
     BinHeight,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ViewTool {
+    Move,
+    Scale,
+    Rotate,
+    /// Combined gizmo: scale corners + rotate knob at once. The body stays
+    /// draggable to move, but the dedicated move handle is not shown.
+    Transform,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +173,16 @@ pub struct Layout {
     pub hsv_picker: bool,
     /// Whether the bottom Project browser is visible.
     pub show_project: bool,
+    /// Whether the Hierarchy panel is visible.
+    pub show_hierarchy: bool,
+    /// Whether the Inspector panel is visible.
+    pub show_inspector: bool,
+    /// Whether panels are rendered in separate editor windows.
+    pub undock_hierarchy: bool,
+    pub undock_inspector: bool,
+    pub undock_project: bool,
+    /// Active Scene view transform tool.
+    pub view_tool: ViewTool,
 }
 
 impl Default for Layout {
@@ -166,6 +200,12 @@ impl Default for Layout {
             bin_h: 170.0,
             hsv_picker: true,
             show_project: true,
+            show_hierarchy: true,
+            show_inspector: true,
+            undock_hierarchy: false,
+            undock_inspector: false,
+            undock_project: false,
+            view_tool: ViewTool::Move,
         }
     }
 }
@@ -180,11 +220,94 @@ enum AlignKind {
     Bottom,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ZMove {
+    Front,
+    Back,
+    Forward,
+    Backward,
+}
+
+type ScriptSchemaCache = HashMap<String, (Option<SystemTime>, Result<Vec<ScriptVar>, String>)>;
+
+struct EnumPropMenuTarget {
+    entity: u64,
+    component: usize,
+    prop: usize,
+    options: Vec<String>,
+    current: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EditorConfig {
     pub theme: Theme,
     pub layout: Layout,
+    pub settings: EditorSettings,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorSettings {
+    pub theme_name: String,
+    pub font_path: String,
+    pub show_tooltips: bool,
+    pub show_window_bounds: bool,
+    pub show_transform_hud: bool,
+    pub autosave_before_run: bool,
+    pub autosave_before_build: bool,
+    pub mobile_emulator: bool,
+    pub mobile_orientation: String,
+    pub mobile_wifi: bool,
+    pub mobile_cellular: bool,
+    pub mobile_low_power: bool,
+}
+
+impl Default for EditorSettings {
+    fn default() -> Self {
+        Self {
+            theme_name: "dark_plus".to_string(),
+            font_path: String::new(),
+            show_tooltips: true,
+            show_window_bounds: true,
+            show_transform_hud: true,
+            autosave_before_run: true,
+            autosave_before_build: true,
+            mobile_emulator: false,
+            mobile_orientation: "portrait".to_string(),
+            mobile_wifi: true,
+            mobile_cellular: false,
+            mobile_low_power: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuildTarget {
+    Desktop,
+    Webasm,
+    Android,
+    Ios,
+}
+
+impl BuildTarget {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Desktop => "Desktop",
+            Self::Webasm => "WebAssembly",
+            Self::Android => "Android APK",
+            Self::Ios => "iOS Simulator",
+        }
+    }
+
+    fn cli_arg(self) -> Option<&'static str> {
+        match self {
+            Self::Desktop => None,
+            Self::Webasm => Some("--webasm"),
+            Self::Android => Some("--android"),
+            Self::Ios => Some("--ios"),
+        }
+    }
 }
 
 /// A target a color picker writes back to.
@@ -226,37 +349,175 @@ enum Action {
     ToggleActive(u64),
     NewFolder,
     NewScript,
+    NewShader,
+    NewAnimation,
     RevealInExplorer,
     OpenProjectInVscode,
     OpenPath(PathBuf),
+    OpenAnimation(PathBuf),
     OpenScene(PathBuf),
     EnterFolder(PathBuf),
     OpenSelectionTools(f32, f32),
     OpenHierarchyTools(f32, f32),
     OpenArrangeTools(f32, f32),
     OpenViewTools(f32, f32),
+    OpenEditorSettings,
+    OpenProjectWindowSettings,
+    OpenMobileEmulator,
+    BuildProject,
+    ToggleHierarchy,
+    ToggleInspector,
+    ToggleHierarchyUndocked,
+    ToggleInspectorUndocked,
+    ToggleProjectUndocked,
+    SetSceneAntialiasing(String),
+    SetPropEnum {
+        entity: u64,
+        component: usize,
+        prop: usize,
+        value: String,
+    },
     SelectAll,
     InvertSelection,
     SelectChildren,
     SelectParent,
+    SelectRoots,
+    SelectLeaves,
+    SelectVisible,
+    SelectHidden,
+    SelectLocked,
+    SelectActive,
+    SelectInactive,
+    SelectSiblings,
+    SelectNext,
+    SelectPrevious,
     DuplicateSelection,
     GroupSelected,
     UnparentSelected,
     HideSelected,
+    HideUnselected,
+    IsolateSelection,
     ShowAllHidden,
+    ShowSelected,
     LockSelected,
+    LockUnselected,
+    UnlockSelection,
     UnlockAll,
+    ToggleActiveSelection,
     CollapseSelected,
     ExpandSelected,
     CollapseAll,
     ExpandAll,
     SnapSelected,
+    SnapSelectedSize,
     ResetSelected,
+    ResetSelectedRotation,
+    ResetSelectedScale,
+    ResetSelectedAnchors,
+    FitSelectionToWindow,
+    CenterSelectionInWindow,
+    NormalizeSelectedSizes,
     Align(AlignKind),
+    BringToFront,
+    SendToBack,
+    BringForward,
+    SendBackward,
+    NudgeZ(f32),
+    RefreshProject,
+    RevealSceneFile,
+    OpenProjectRoot,
     FrameAll,
     Zoom100,
     ToggleMaximize,
     ToggleProject,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectWindowSettings {
+    width: f32,
+    height: f32,
+    fullscreen: bool,
+    resizable: bool,
+}
+
+impl Default for ProjectWindowSettings {
+    fn default() -> Self {
+        Self {
+            width: PREVIEW_ROOT_WIDTH,
+            height: PREVIEW_ROOT_HEIGHT,
+            fullscreen: false,
+            resizable: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct AnimationClipAsset {
+    duration: f32,
+    looping: bool,
+    tracks: Vec<AnimationTrackAsset>,
+}
+
+impl Default for AnimationClipAsset {
+    fn default() -> Self {
+        Self {
+            duration: 1.0,
+            looping: false,
+            tracks: vec![AnimationTrackAsset::default()],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct AnimationTrackAsset {
+    property: String,
+    interpolation: String,
+    keys: Vec<AnimationKeyAsset>,
+}
+
+impl Default for AnimationTrackAsset {
+    fn default() -> Self {
+        Self {
+            property: "x".to_string(),
+            interpolation: "linear".to_string(),
+            keys: vec![
+                AnimationKeyAsset::new(0.0, 0.0),
+                AnimationKeyAsset::new(1.0, 100.0),
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct AnimationKeyAsset {
+    time: f32,
+    value: f32,
+    out_x: f32,
+    out_y: f32,
+    in_x: f32,
+    in_y: f32,
+}
+
+impl AnimationKeyAsset {
+    fn new(time: f32, value: f32) -> Self {
+        Self {
+            time,
+            value,
+            out_x: 0.333,
+            out_y: 0.0,
+            in_x: 0.667,
+            in_y: 1.0,
+        }
+    }
+}
+
+impl Default for AnimationKeyAsset {
+    fn default() -> Self {
+        Self::new(0.0, 0.0)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -273,6 +534,19 @@ struct ViewportDrag {
     grab_x: f32,
     grab_y: f32,
     start_world: Vec<(u64, f32, f32)>,
+    descendant_start_world: Vec<(u64, f32, f32)>,
+    /// When set, the drag is constrained to this world-space unit axis (the
+    /// move gizmo's X or Y arrow); otherwise the entity moves freely in 2D.
+    axis: Option<(f32, f32)>,
+}
+
+/// Active rotation drag via the gizmo knob. The pivot is the entity's world
+/// center captured at drag start, so rotating spins the entity in place.
+#[derive(Clone, Copy, Debug)]
+struct RotateDrag {
+    id: u64,
+    center_x: f32,
+    center_y: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -301,6 +575,8 @@ enum Pending {
     RenameScene,
     CreateFolder,
     CreateScript,
+    CreateShader,
+    CreateAnimation,
     RenameEntity(u64),
     UpdateEngine,
 }
@@ -311,6 +587,7 @@ enum AssetKind {
     Font,
     Sound,
     Shader,
+    Animation,
 }
 
 impl AssetKind {
@@ -320,6 +597,7 @@ impl AssetKind {
             Self::Font => "Choose Font",
             Self::Sound => "Choose Sound",
             Self::Shader => "Choose Fragment Shader",
+            Self::Animation => "Choose Animation",
         }
     }
 
@@ -329,6 +607,7 @@ impl AssetKind {
             Self::Font => icon::FONT_DOWNLOAD,
             Self::Sound => icon::AUDIOTRACK,
             Self::Shader => icon::DATA_OBJECT,
+            Self::Animation => icon::PLAY,
         }
     }
 
@@ -345,6 +624,7 @@ impl AssetKind {
             Self::Font => matches_ignore_ascii_case(extension, &["ttf", "otf"]),
             Self::Sound => matches_ignore_ascii_case(extension, &["wav", "mp3", "ogg", "oga", "flac"]),
             Self::Shader => matches_ignore_ascii_case(extension, &["glsl", "frag", "fs", "shader"]),
+            Self::Animation => matches_ignore_ascii_case(extension, &["neoanim", "animation", "anim"]),
         }
     }
 }
@@ -374,11 +654,19 @@ struct ColorPickerPanelResponse {
     open: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct AssetTarget {
-    entity: u64,
-    component: usize,
-    prop: usize,
+#[derive(Clone, Debug)]
+enum AssetTarget {
+    Prop {
+        entity: u64,
+        component: usize,
+        prop: usize,
+    },
+    ScriptVar {
+        entity: u64,
+        component: usize,
+        var: usize,
+        path: Vec<VarPathPart>,
+    },
 }
 
 /// An overlay drawn above everything, with input precedence.
@@ -412,6 +700,35 @@ enum Popup {
     },
     /// A runtime error captured from a failed `Run`, with a copy button.
     Error { message: String, copied: bool },
+    BuildTarget,
+    ProjectWindow {
+        width: String,
+        height: String,
+        fullscreen: bool,
+        resizable: bool,
+    },
+    MobileEmulator {
+        enabled: bool,
+        orientation: String,
+        wifi: bool,
+        cellular: bool,
+        low_power: bool,
+    },
+    EditorSettings {
+        theme_name: String,
+        font_path: String,
+        show_tooltips: bool,
+        show_window_bounds: bool,
+        show_transform_hud: bool,
+        autosave_before_run: bool,
+        autosave_before_build: bool,
+    },
+    AnimationEditor {
+        path: PathBuf,
+        clip: AnimationClipAsset,
+        selected_track: usize,
+        selected_key: usize,
+    },
 }
 
 pub struct EditorApp {
@@ -423,6 +740,7 @@ pub struct EditorApp {
     active_document: usize,
     document_kind: DocumentKind,
     config: EditorConfig,
+    project_window: ProjectWindowSettings,
     selected: Option<u64>,
     selected_ids: HashSet<u64>,
     dragging: Option<ViewportDrag>,
@@ -432,8 +750,8 @@ pub struct EditorApp {
     /// corner is being dragged so resizes stay correct when the entity is
     /// rotated.
     resizing: Option<(u64, f32, f32, f32, f32)>,
-    /// Active rotation drag via the gizmo knob: the entity being rotated.
-    rotating: Option<u64>,
+    /// Active rotation drag via the gizmo knob.
+    rotating: Option<RotateDrag>,
     active_splitter: Option<Splitter>,
     hierarchy_scroll: f32,
     inspector_scroll: f32,
@@ -482,14 +800,19 @@ pub struct EditorApp {
     prefab_drag: Option<PathBuf>,
     /// A Luau component script being dragged onto a hierarchy or viewport entity.
     script_drag: Option<PathBuf>,
+    /// Active tilemap paint target (entity id, component index) and selected tile id.
+    tile_paint: Option<(u64, usize)>,
+    tile_paint_tile: i32,
     popup: Option<Popup>,
     /// Lazily-loaded image assets for accurate viewport previews. `None` marks
     /// a path that failed to load so we don't retry it every frame.
     image_cache: RefCell<HashMap<String, EditorImageCacheEntry>>,
     /// Parsed Inspector schemas cached by source path and modification time.
-    script_schema_cache: HashMap<String, (Option<SystemTime>, Result<Vec<ScriptVar>, String>)>,
+    script_schema_cache: ScriptSchemaCache,
     /// Receiver for the outcome of a launched `Run` (None when finished).
     run_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
+    /// Receiver for the outcome of a launched `Build` (None when finished).
+    build_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// A freshly created logger IPC session waiting to be picked up by the
     /// windowing layer to open/show the logger window.
     pending_logger_session: Option<crate::editor_ipc::LoggerSession>,
@@ -506,6 +829,7 @@ pub struct EditorApp {
 }
 
 impl EditorApp {
+    #[allow(dead_code)]
     pub fn new(
         project_root: PathBuf,
         scene_path: PathBuf,
@@ -513,7 +837,18 @@ impl EditorApp {
         config: EditorConfig,
     ) -> Self {
         let config_path = project_root.join("editor.json");
+        Self::new_with_config_path(project_root, scene_path, scene, config, config_path)
+    }
+
+    pub fn new_with_config_path(
+        project_root: PathBuf,
+        scene_path: PathBuf,
+        scene: Scene,
+        config: EditorConfig,
+        config_path: PathBuf,
+    ) -> Self {
         let scene_json = scene.to_json().unwrap_or_default();
+        let project_window = load_project_window_settings(&project_root);
         let documents = vec![OpenDocument {
             path: scene_path.clone(),
             scene: scene.clone(),
@@ -530,6 +865,7 @@ impl EditorApp {
             active_document: 0,
             document_kind: DocumentKind::Scene,
             config,
+            project_window,
             selected: None,
             selected_ids: HashSet::new(),
             dragging: None,
@@ -565,10 +901,13 @@ impl EditorApp {
             inspector_reference_drag: None,
             prefab_drag: None,
             script_drag: None,
+            tile_paint: None,
+            tile_paint_tile: 0,
             popup: None,
             image_cache: RefCell::new(HashMap::new()),
             script_schema_cache: HashMap::new(),
             run_rx: None,
+            build_rx: None,
             pending_logger_session: None,
             update_rx: None,
             pending_update: None,
@@ -588,6 +927,90 @@ impl EditorApp {
 
     pub fn theme(&self) -> Theme {
         self.config.theme.clone()
+    }
+
+    pub(crate) fn widget_title(widget: EditorWidget) -> &'static str {
+        match widget {
+            EditorWidget::Hierarchy => "NeoLOVE - Hierarchy",
+            EditorWidget::Inspector => "NeoLOVE - Inspector",
+            EditorWidget::Project => "NeoLOVE - Project",
+        }
+    }
+
+    pub(crate) fn widget_undocked(&self, widget: EditorWidget) -> bool {
+        match widget {
+            EditorWidget::Hierarchy => {
+                self.config.layout.show_hierarchy && self.config.layout.undock_hierarchy
+            }
+            EditorWidget::Inspector => {
+                self.config.layout.show_inspector && self.config.layout.undock_inspector
+            }
+            EditorWidget::Project => {
+                self.config.layout.show_project && self.config.layout.undock_project
+            }
+        }
+    }
+
+    pub(crate) fn close_detached_widget(&mut self, widget: EditorWidget) {
+        match widget {
+            EditorWidget::Hierarchy => {
+                self.config.layout.show_hierarchy = false;
+                self.config.layout.undock_hierarchy = false;
+            }
+            EditorWidget::Inspector => {
+                self.config.layout.show_inspector = false;
+                self.config.layout.undock_inspector = false;
+            }
+            EditorWidget::Project => {
+                self.config.layout.show_project = false;
+                self.config.layout.undock_project = false;
+            }
+        }
+        self.dirty = true;
+    }
+
+    pub(crate) fn dock_widget(&mut self, widget: EditorWidget) {
+        match widget {
+            EditorWidget::Hierarchy => {
+                self.config.layout.show_hierarchy = true;
+                self.config.layout.undock_hierarchy = false;
+            }
+            EditorWidget::Inspector => {
+                self.config.layout.show_inspector = true;
+                self.config.layout.undock_inspector = false;
+            }
+            EditorWidget::Project => {
+                self.config.layout.show_project = true;
+                self.config.layout.undock_project = false;
+            }
+        }
+        self.dirty = true;
+    }
+
+    pub(crate) fn frame_detached_widget(&mut self, ui: &mut Ui, widget: EditorWidget) {
+        let w = ui.painter.width();
+        let h = ui.painter.height();
+        let area = Rect::new(0.0, 0.0, w, h);
+        let raw_left = ui.input.mouse_pressed;
+        let raw_right = ui.input.right_pressed;
+        let popup_interactive = self.popup.is_some();
+        if self.popup.is_some() {
+            ui.input.mouse_pressed = false;
+            ui.input.right_pressed = false;
+        }
+        ui.painter.clear(self.config.theme.panel);
+        match widget {
+            EditorWidget::Hierarchy => self.render_panel(ui, area, Panel::Hierarchy),
+            EditorWidget::Inspector => self.render_panel(ui, area, Panel::Inspector),
+            EditorWidget::Project => self.project_bin(ui, area),
+        }
+        ui.input.mouse_pressed = raw_left;
+        ui.input.right_pressed = raw_right;
+        self.handle_popup(ui, w, h, popup_interactive);
+        self.commit_undo_if_settled(ui);
+        if self.config.settings.show_tooltips {
+            ui.draw_tooltip();
+        }
     }
 
     pub fn take_focus(&mut self) -> Option<String> {
@@ -1220,6 +1643,270 @@ impl EditorApp {
         self.status = "Aligned selection".to_string();
     }
 
+    fn select_by_filter<F>(&mut self, message: &str, predicate: F)
+    where
+        F: Fn(&Self, &Entity) -> bool,
+    {
+        let ids = self
+            .scene
+            .entities
+            .iter()
+            .filter(|entity| predicate(self, entity))
+            .map(|entity| entity.id)
+            .collect::<Vec<_>>();
+        self.select_many(ids, false);
+        self.status = format!("{message} ({})", self.selection_count());
+    }
+
+    fn select_siblings(&mut self) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        let parent = self.scene.entity(id).and_then(|entity| entity.parent);
+        let ids = self
+            .scene
+            .entities
+            .iter()
+            .filter(|entity| entity.parent == parent)
+            .map(|entity| entity.id)
+            .collect::<Vec<_>>();
+        self.select_many(ids, false);
+        self.status = "Selected siblings".to_string();
+    }
+
+    fn select_relative(&mut self, offset: isize) {
+        if self.scene.entities.is_empty() {
+            return;
+        }
+        let current = self
+            .selected
+            .and_then(|id| self.scene.entities.iter().position(|entity| entity.id == id))
+            .unwrap_or(0);
+        let len = self.scene.entities.len() as isize;
+        let next = (current as isize + offset).rem_euclid(len) as usize;
+        let id = self.scene.entities[next].id;
+        self.select_only(id);
+        self.status = format!("Selected {}", self.scene.entities[next].name);
+    }
+
+    fn hide_unselected(&mut self) {
+        let selected: HashSet<u64> = self.selection_ids_ordered().into_iter().collect();
+        if selected.is_empty() {
+            return;
+        }
+        self.hidden_ids = self
+            .scene
+            .entities
+            .iter()
+            .filter(|entity| !selected.contains(&entity.id))
+            .map(|entity| entity.id)
+            .collect();
+        self.status = "Hidden unselected entities in Scene view".to_string();
+    }
+
+    fn lock_unselected(&mut self) {
+        let selected: HashSet<u64> = self.selection_ids_ordered().into_iter().collect();
+        if selected.is_empty() {
+            return;
+        }
+        self.locked_ids = self
+            .scene
+            .entities
+            .iter()
+            .filter(|entity| !selected.contains(&entity.id))
+            .map(|entity| entity.id)
+            .collect();
+        self.status = "Locked unselected entities".to_string();
+    }
+
+    fn toggle_active_selection(&mut self) {
+        let ids = self.selection_ids_ordered();
+        if ids.is_empty() {
+            return;
+        }
+        let all_active = ids
+            .iter()
+            .all(|id| self.scene.entity(*id).is_some_and(|entity| entity.enabled));
+        for id in ids {
+            if let Some(entity) = self.scene.entity_mut(id) {
+                entity.enabled = !all_active;
+            }
+        }
+        self.mark_dirty();
+        self.status = if all_active {
+            "Deactivated selection".to_string()
+        } else {
+            "Activated selection".to_string()
+        };
+    }
+
+    fn snap_selected_size(&mut self) {
+        let grid = self.config.layout.grid.max(1.0);
+        for id in self.selection_ids_ordered() {
+            if let Some(entity) = self.scene.entity_mut(id) {
+                entity.size_x = ((entity.size_x / grid).round() * grid).max(1.0);
+                entity.size_y = ((entity.size_y / grid).round() * grid).max(1.0);
+            }
+        }
+        self.mark_dirty();
+        self.status = "Snapped selection size to grid".to_string();
+    }
+
+    fn reset_selected_rotation(&mut self) {
+        for id in self.selection_ids_ordered() {
+            if let Some(entity) = self.scene.entity_mut(id) {
+                entity.rotation = 0.0;
+            }
+        }
+        self.mark_dirty();
+        self.status = "Reset selected rotation".to_string();
+    }
+
+    fn reset_selected_scale(&mut self) {
+        for id in self.selection_ids_ordered() {
+            if let Some(entity) = self.scene.entity_mut(id) {
+                entity.scale = 1.0;
+            }
+        }
+        self.mark_dirty();
+        self.status = "Reset selected scale".to_string();
+    }
+
+    fn reset_selected_anchors(&mut self) {
+        for id in self.selection_ids_ordered() {
+            if let Some(entity) = self.scene.entity_mut(id) {
+                entity.anchor_x = 0.0;
+                entity.anchor_y = 0.0;
+            }
+        }
+        self.mark_dirty();
+        self.status = "Reset selected anchors".to_string();
+    }
+
+    fn normalize_selected_sizes(&mut self) {
+        for id in self.selection_ids_ordered() {
+            if let Some(entity) = self.scene.entity_mut(id) {
+                if entity.size_x < 0.0 {
+                    entity.x += entity.size_x;
+                    entity.size_x = entity.size_x.abs();
+                }
+                if entity.size_y < 0.0 {
+                    entity.y += entity.size_y;
+                    entity.size_y = entity.size_y.abs();
+                }
+            }
+        }
+        self.mark_dirty();
+        self.status = "Normalized selected sizes".to_string();
+    }
+
+    fn fit_selection_to_window(&mut self) {
+        let (root_w, root_h) = self.preview_root_size();
+        for id in self.selection_ids_ordered() {
+            if let Some(entity) = self.scene.entity_mut(id) {
+                entity.x = 0.0;
+                entity.y = 0.0;
+                entity.size_x = root_w;
+                entity.size_y = root_h;
+            }
+        }
+        self.mark_dirty();
+        self.status = "Fit selection to default window".to_string();
+    }
+
+    fn center_selection_in_window(&mut self) {
+        let root_size = self.preview_root_size();
+        let updates = self
+            .selection_ids_ordered()
+            .into_iter()
+            .filter_map(|id| {
+                let entity = self.scene.entity(id)?;
+                let (parent_w, parent_h) = editor_parent_size(&self.scene, entity, root_size);
+                let (size_x, size_y) = editor_entity_size(&self.scene, entity, root_size);
+                Some((id, (parent_w - size_x) * 0.5, (parent_h - size_y) * 0.5))
+            })
+            .collect::<Vec<_>>();
+        for (id, x, y) in updates {
+            if let Some(entity) = self.scene.entity_mut(id) {
+                entity.x = x;
+                entity.y = y;
+            }
+        }
+        self.mark_dirty();
+        self.status = "Centered selection in parent/window".to_string();
+    }
+
+    fn move_selection_z(&mut self, mode: ZMove) {
+        let ids = self.selection_ids_ordered();
+        if ids.is_empty() {
+            return;
+        }
+        match mode {
+            ZMove::Front => {
+                let max_z = self
+                    .scene
+                    .entities
+                    .iter()
+                    .map(|entity| entity.z)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                for (index, id) in ids.iter().enumerate() {
+                    if let Some(entity) = self.scene.entity_mut(*id) {
+                        entity.z = max_z + 1.0 + index as f32;
+                    }
+                }
+                self.status = "Brought selection to front".to_string();
+            }
+            ZMove::Back => {
+                let min_z = self
+                    .scene
+                    .entities
+                    .iter()
+                    .map(|entity| entity.z)
+                    .fold(f32::INFINITY, f32::min);
+                for (index, id) in ids.iter().enumerate() {
+                    if let Some(entity) = self.scene.entity_mut(*id) {
+                        entity.z = min_z - 1.0 - index as f32;
+                    }
+                }
+                self.status = "Sent selection to back".to_string();
+            }
+            ZMove::Forward => {
+                for id in ids {
+                    if let Some(entity) = self.scene.entity_mut(id) {
+                        entity.z += 1.0;
+                    }
+                }
+                self.status = "Brought selection forward".to_string();
+            }
+            ZMove::Backward => {
+                for id in ids {
+                    if let Some(entity) = self.scene.entity_mut(id) {
+                        entity.z -= 1.0;
+                    }
+                }
+                self.status = "Sent selection backward".to_string();
+            }
+        }
+        self.mark_dirty();
+    }
+
+    fn nudge_selection_z(&mut self, delta: f32) {
+        for id in self.selection_ids_ordered() {
+            if let Some(entity) = self.scene.entity_mut(id) {
+                entity.z += delta;
+            }
+        }
+        self.mark_dirty();
+        self.status = format!("Nudged selection Z by {}", format_num(delta));
+    }
+
+    fn refresh_project_browser(&mut self) {
+        self.image_cache.borrow_mut().clear();
+        self.script_schema_cache.clear();
+        self.bin_scroll = 0.0;
+        self.status = "Refreshed project browser and editor caches".to_string();
+    }
+
     fn frame_all(&mut self) {
         let previous = self.selection_ids_ordered();
         let visible = self
@@ -1388,7 +2075,10 @@ impl EditorApp {
 
         let body_top = TOOLBAR_H;
         let body_total = (h - TOOLBAR_H - STATUS_H).max(0.0);
-        let bin_h = if self.maximize_view || !self.config.layout.show_project {
+        let bin_h = if self.maximize_view
+            || !self.config.layout.show_project
+            || self.config.layout.undock_project
+        {
             0.0
         } else {
             self.config
@@ -1462,15 +2152,23 @@ impl EditorApp {
         self.handle_popup(ui, w, h, popup_interactive);
 
         self.commit_undo_if_settled(ui);
-        ui.draw_tooltip();
+        if self.config.settings.show_tooltips {
+            ui.draw_tooltip();
+        }
     }
 
     fn panels_on(&self, side: Side) -> Vec<Panel> {
         let mut panels = Vec::new();
-        if self.config.layout.hierarchy_side == side {
+        if self.config.layout.show_hierarchy
+            && !self.config.layout.undock_hierarchy
+            && self.config.layout.hierarchy_side == side
+        {
             panels.push(Panel::Hierarchy);
         }
-        if self.config.layout.inspector_side == side {
+        if self.config.layout.show_inspector
+            && !self.config.layout.undock_inspector
+            && self.config.layout.inspector_side == side
+        {
             panels.push(Panel::Inspector);
         }
         panels
@@ -1511,12 +2209,38 @@ impl EditorApp {
         if act(ui, icon::PLAY, "Run", &mut x) {
             self.run_scene();
         }
+        if act(ui, icon::PHONE_ANDROID, "Mobile", &mut x) {
+            self.open_mobile_emulator();
+        }
+        if act(ui, icon::DATA_OBJECT, "Build", &mut x) {
+            self.open_build_target();
+        }
         x += 6.0;
         if act(ui, icon::ADD_CIRCLE, "Entity", &mut x) {
             self.add_entity(None);
         }
 
         x += 10.0;
+        for (tool, glyph, tip) in [
+            (ViewTool::Move, icon::OPEN_WITH, "Move tool"),
+            (ViewTool::Scale, icon::ASPECT_RATIO, "Scale tool"),
+            (ViewTool::Rotate, icon::ROTATE_RIGHT, "Rotate tool"),
+            (ViewTool::Transform, icon::TRANSFORM, "Transform tool"),
+        ] {
+            let rect = Rect::new(x, y, 30.0, bh);
+            if ui.icon_toggle(
+                rect,
+                glyph,
+                self.config.layout.view_tool == tool,
+                self.config.theme.text,
+            ) {
+                self.config.layout.view_tool = tool;
+                self.dirty = true;
+            }
+            ui.tooltip(rect, tip);
+            x += 32.0;
+        }
+        x += 8.0;
         // Snap + grid toggles.
         let snap = self.config.layout.snap;
         let snap_glyph = if snap { icon::GRID_ON } else { icon::GRID_OFF };
@@ -1563,6 +2287,20 @@ impl EditorApp {
             self.open_tools_menu(tools_rect.x, tools_rect.bottom() + 2.0);
         }
         ui.tooltip(tools_rect, "Editor tools and layout");
+        x += 35.0;
+
+        let window_rect = Rect::new(x, y, 30.0, bh);
+        if ui.icon_toggle(window_rect, icon::VIEW_QUILT, false, self.config.theme.text) {
+            self.open_window_menu(window_rect.x, window_rect.bottom() + 2.0);
+        }
+        ui.tooltip(window_rect, "Window panels and project window settings");
+        x += 35.0;
+
+        let settings_rect = Rect::new(x, y, 30.0, bh);
+        if ui.icon_toggle(settings_rect, icon::TUNE, false, self.config.theme.text) {
+            self.open_editor_settings();
+        }
+        ui.tooltip(settings_rect, "Editor settings");
         x += 35.0;
 
         // Scene name (read-only display; rename via the dialog button).
@@ -1642,16 +2380,60 @@ impl EditorApp {
             Panel::Hierarchy => (icon::ACCOUNT_TREE, "Hierarchy", self.config.layout.hierarchy_side),
             Panel::Inspector => (icon::TUNE, "Inspector", self.config.layout.inspector_side),
         };
+        let is_undocked = match panel {
+            Panel::Hierarchy => self.config.layout.undock_hierarchy,
+            Panel::Inspector => self.config.layout.undock_inspector,
+        };
         ui.icon(area.x + 16.0, area.y + HEADER_H / 2.0, glyph, 16.0, self.config.theme.text);
         ui.label(area.x + 30.0, area.y + (HEADER_H - 14.0) / 2.0, title, self.config.theme.text);
-        let swap = Rect::new(area.right() - 26.0, area.y + 3.0, 20.0, HEADER_H - 6.0);
-        ui.tooltip(swap, "Dock to other side");
-        if ui.icon_toggle(swap, icon::SWAP, false, self.config.theme.text_dim) {
+        let close = Rect::new(area.right() - 26.0, area.y + 3.0, 20.0, HEADER_H - 6.0);
+        ui.tooltip(close, "Close panel");
+        if ui.icon_toggle(close, icon::DELETE, false, self.config.theme.text_dim) {
             match panel {
-                Panel::Hierarchy => self.config.layout.hierarchy_side = side.toggled(),
-                Panel::Inspector => self.config.layout.inspector_side = side.toggled(),
+                Panel::Hierarchy => {
+                    self.config.layout.show_hierarchy = false;
+                    self.config.layout.undock_hierarchy = false;
+                }
+                Panel::Inspector => {
+                    self.config.layout.show_inspector = false;
+                    self.config.layout.undock_inspector = false;
+                }
             }
             self.dirty = true;
+        }
+        let swap = Rect::new(area.right() - 50.0, area.y + 3.0, 20.0, HEADER_H - 6.0);
+        if !is_undocked {
+            ui.tooltip(swap, "Dock to other side");
+            if ui.icon_toggle(swap, icon::SWAP, false, self.config.theme.text_dim) {
+                match panel {
+                    Panel::Hierarchy => self.config.layout.hierarchy_side = side.toggled(),
+                    Panel::Inspector => self.config.layout.inspector_side = side.toggled(),
+                }
+                self.dirty = true;
+            }
+        }
+        let undock = Rect::new(area.right() - 74.0, area.y + 3.0, 20.0, HEADER_H - 6.0);
+        ui.tooltip(
+            undock,
+            if is_undocked {
+                "Dock back into main window"
+            } else {
+                "Undock to separate window"
+            },
+        );
+        if ui.icon_toggle(undock, icon::OPEN_IN_NEW, false, self.config.theme.text_dim) {
+            if is_undocked {
+                match panel {
+                    Panel::Hierarchy => self.dock_widget(EditorWidget::Hierarchy),
+                    Panel::Inspector => self.dock_widget(EditorWidget::Inspector),
+                }
+            } else {
+                match panel {
+                    Panel::Hierarchy => self.config.layout.undock_hierarchy = true,
+                    Panel::Inspector => self.config.layout.undock_inspector = true,
+                }
+                self.dirty = true;
+            }
         }
         ui.painter.stroke_rect(area, self.config.theme.border);
 
@@ -1935,6 +2717,9 @@ impl EditorApp {
         if self.config.layout.show_grid {
             self.draw_grid(ui, bg_frame);
         }
+        if self.config.settings.show_window_bounds {
+            self.draw_window_bounds(ui, bg_frame);
+        }
 
         let z = self.cam_zoom;
 
@@ -1970,72 +2755,86 @@ impl EditorApp {
                     continue;
                 }
 
-                // Corner handles sit at the rotated corner positions but stay
-                // screen-aligned so they're easy to grab.
                 let (mx, my) = (ui.input.mouse_x, ui.input.mouse_y);
-                for (cx, cy) in [
-                    (rect.x, rect.y),
-                    (rect.right(), rect.y),
-                    (rect.x, rect.bottom()),
-                    (rect.right(), rect.bottom()),
-                ] {
-                    let (hx, hy) = rotate_point_about(cx, cy, rect.x, rect.y, angle);
-                    // Larger, white-filled handles that brighten under the
-                    // cursor so it's clear they can be grabbed.
-                    let hot = (mx - hx).abs() <= 7.0 && (my - hy).abs() <= 7.0;
-                    let s = if hot { 5.0 } else { 4.0 };
-                    ui.painter.fill_rect(Rect::new(hx - s, hy - s, s * 2.0, s * 2.0), self.config.theme.selection);
-                    ui.painter.fill_rect(
-                        Rect::new(hx - s + 1.5, hy - s + 1.5, s * 2.0 - 3.0, s * 2.0 - 3.0),
-                        if hot { [255, 255, 255, 255] } else { [40, 40, 40, 255] },
-                    );
+                match self.config.layout.view_tool {
+                    ViewTool::Move => {
+                        self.draw_move_handle(ui, rect, angle, mx, my);
+                    }
+                    ViewTool::Scale => {
+                        self.draw_scale_handles(ui, rect, angle, mx, my);
+                    }
+                    ViewTool::Rotate => {
+                        let (kx, ky) = self.rotate_handle_knob(rect, angle);
+                        let rot_hot = self.rotating.map(|r| r.id) == Some(entity.id)
+                            || ((mx - kx).abs() <= 8.0 && (my - ky).abs() <= 8.0);
+                        self.draw_rotate_handle(ui, rect, angle, rot_hot);
+                    }
+                    ViewTool::Transform => {
+                        // Combined gizmo: scale corners plus the rotate knob. No
+                        // move handle — the body itself stays draggable.
+                        self.draw_scale_handles(ui, rect, angle, mx, my);
+                        let (kx, ky) = self.rotate_handle_knob(rect, angle);
+                        let rot_hot = self.rotating.map(|r| r.id) == Some(entity.id)
+                            || ((mx - kx).abs() <= 8.0 && (my - ky).abs() <= 8.0);
+                        self.draw_rotate_handle(ui, rect, angle, rot_hot);
+                    }
                 }
-                // Rotation knob on a stalk above the top edge.
-                let (kx, ky) = self.rotate_handle_knob(rect, angle);
-                let rot_hot = self.rotating == Some(entity.id)
-                    || ((mx - kx).abs() <= 8.0 && (my - ky).abs() <= 8.0);
-                self.draw_rotate_handle(ui, rect, angle, rot_hot);
             }
         }
 
         if self.script_drag.is_some() {
             self.handle_script_drop(ui, area);
+        } else if self.handle_tilemap_paint(ui, area) {
+            // Tile painting owns the pointer while active over its grid.
         } else {
             self.handle_viewport_input(ui, area);
         }
         self.handle_prefab_drop(ui, area, z);
 
         // Transform/zoom HUD overlay (Unity-style), bottom-left of the viewport.
-        let scene_flags = if self.hidden_ids.is_empty() && self.locked_ids.is_empty() {
-            String::new()
-        } else {
-            format!("   hidden {} locked {}", self.hidden_ids.len(), self.locked_ids.len())
-        };
-        let hud = if self.selection_count() > 1 {
-            format!(
-                "{} selected   zoom {}%{}",
-                self.selection_count(),
-                (self.cam_zoom * 100.0).round() as i32,
-                scene_flags,
-            )
-        } else if let Some(e) = self.selected.and_then(|id| self.scene.entity(id)) {
-            format!(
-                "{}   x {} y {}   w {} h {}   zoom {}%{}",
-                e.name,
-                format_num(e.x),
-                format_num(e.y),
-                format_num(e.size_x),
-                format_num(e.size_y),
-                (self.cam_zoom * 100.0).round() as i32,
-                scene_flags,
-            )
-        } else {
-            format!("zoom {}%{}   (scroll to zoom, middle-drag to pan, F to frame)", (self.cam_zoom * 100.0).round() as i32, scene_flags)
-        };
-        let hud_w = ui.painter.text_width(&hud, 13.0) + 16.0;
-        let hud_rect = Rect::new(area.x + 6.0, area.bottom() - 26.0, hud_w.min(area.w - 12.0), 20.0);
-        ui.painter.fill_round_rect(hud_rect, 4.0, [0, 0, 0, 150]);
-        ui.painter.text_clipped(hud_rect.x + 8.0, hud_rect.y + 3.0, &hud, 13.0, self.config.theme.text, hud_rect.w - 12.0);
+        if self.config.settings.show_transform_hud {
+            let scene_flags = if self.hidden_ids.is_empty() && self.locked_ids.is_empty() {
+                String::new()
+            } else {
+                format!("   hidden {} locked {}", self.hidden_ids.len(), self.locked_ids.len())
+            };
+            let hud = if self.selection_count() > 1 {
+                format!(
+                    "{} selected   zoom {}%{}",
+                    self.selection_count(),
+                    (self.cam_zoom * 100.0).round() as i32,
+                    scene_flags,
+                )
+            } else if let Some(e) = self.selected.and_then(|id| self.scene.entity(id)) {
+                format!(
+                    "{}   x {} y {}   w {} h {}   zoom {}%{}",
+                    e.name,
+                    format_num(e.x),
+                    format_num(e.y),
+                    format_num(e.size_x),
+                    format_num(e.size_y),
+                    (self.cam_zoom * 100.0).round() as i32,
+                    scene_flags,
+                )
+            } else {
+                format!(
+                    "zoom {}%{}   (scroll to zoom, middle-drag to pan, F to frame)",
+                    (self.cam_zoom * 100.0).round() as i32,
+                    scene_flags
+                )
+            };
+            let hud_w = ui.painter.text_width(&hud, 13.0) + 16.0;
+            let hud_rect = Rect::new(area.x + 6.0, area.bottom() - 26.0, hud_w.min(area.w - 12.0), 20.0);
+            ui.painter.fill_round_rect(hud_rect, 4.0, [0, 0, 0, 150]);
+            ui.painter.text_clipped(
+                hud_rect.x + 8.0,
+                hud_rect.y + 3.0,
+                &hud,
+                13.0,
+                self.config.theme.text,
+                hud_rect.w - 12.0,
+            );
+        }
 
         ui.reset_input_clip();
         ui.painter.set_clip_raw(prev);
@@ -2060,6 +2859,53 @@ impl EditorApp {
                 ui.painter.fill_rect(Rect::new(area.x, y, area.w, 1.0), line);
             }
             y += step;
+        }
+    }
+
+    fn draw_window_bounds(&self, ui: &mut Ui, area: Rect) {
+        let (root_w, root_h) = self.preview_root_size();
+        let z = self.cam_zoom;
+        let rect = Rect::new(
+            area.x + self.cam_x,
+            area.y + self.cam_y,
+            root_w * z,
+            root_h * z,
+        );
+        ui.painter.stroke_rect(rect, self.config.theme.selection);
+        ui.painter.stroke_rect(rect.shrink(-1.0), [0, 0, 0, 120]);
+        let label = if self.config.settings.mobile_emulator {
+            format!(
+                "Mobile {} x {}",
+                root_w.round() as i32,
+                root_h.round() as i32
+            )
+        } else {
+            let mut suffix = String::new();
+            if self.project_window.fullscreen {
+                suffix.push_str(" fullscreen");
+            }
+            if !self.project_window.resizable {
+                suffix.push_str(" fixed");
+            }
+            format!(
+                "{} x {}{}",
+                root_w.round() as i32,
+                root_h.round() as i32,
+                suffix
+            )
+        };
+        let w = ui.painter.text_width(&label, 12.0) + 10.0;
+        let tag = Rect::new(rect.x + 6.0, rect.y + 6.0, w.min((area.w - 12.0).max(20.0)), 18.0);
+        if rects_intersect(tag, area) {
+            ui.painter.fill_round_rect(tag, 3.0, [0, 0, 0, 150]);
+            ui.painter.text_clipped(
+                tag.x + 5.0,
+                tag.y + 2.0,
+                &label,
+                12.0,
+                self.config.theme.text,
+                tag.w - 8.0,
+            );
         }
     }
 
@@ -2138,7 +2984,40 @@ impl EditorApp {
     }
 
     fn preview_root_size(&self) -> (f32, f32) {
-        (PREVIEW_ROOT_WIDTH, PREVIEW_ROOT_HEIGHT)
+        if self.config.settings.mobile_emulator {
+            let portrait = self.config.settings.mobile_orientation != "landscape";
+            return if portrait {
+                (
+                    crate::mobile_emulation::DEFAULT_WIDTH as f32,
+                    crate::mobile_emulation::DEFAULT_HEIGHT as f32,
+                )
+            } else {
+                (
+                    crate::mobile_emulation::DEFAULT_HEIGHT as f32,
+                    crate::mobile_emulation::DEFAULT_WIDTH as f32,
+                )
+            };
+        }
+        (
+            self.project_window.width.max(1.0),
+            self.project_window.height.max(1.0),
+        )
+    }
+
+    fn mobile_emulation_profile(&self) -> crate::mobile_emulation::MobileEmulation {
+        crate::mobile_emulation::MobileEmulation {
+            enabled: self.config.settings.mobile_emulator,
+            width: crate::mobile_emulation::DEFAULT_WIDTH,
+            height: crate::mobile_emulation::DEFAULT_HEIGHT,
+            orientation: if self.config.settings.mobile_orientation == "landscape" {
+                crate::mobile_emulation::MobileOrientation::Landscape
+            } else {
+                crate::mobile_emulation::MobileOrientation::Portrait
+            },
+            wifi: self.config.settings.mobile_wifi,
+            cellular: self.config.settings.mobile_cellular,
+            low_power: self.config.settings.mobile_low_power,
+        }
     }
 
     fn draw_entity(&self, ui: &mut Ui, entity: &Entity, rect: Rect, zoom: f32) {
@@ -2272,6 +3151,7 @@ impl EditorApp {
                         let emitter_radius = prop_num("radius", 32.0).max(0.0) * world_scale * zoom;
                         let gravity_x = prop_num("gravity_x", 0.0);
                         let gravity_y = prop_num("gravity_y", 60.0);
+                        let particle_image = prop_img("image").and_then(|path| self.load_image(&path));
                         let max_particles = props
                             .iter()
                             .find(|prop| prop.name == "max_particles")
@@ -2314,7 +3194,16 @@ impl EditorApp {
                                     .clamp(0.0, 1.0))
                                 * 255.0)
                                 .round() as u8;
-                            ui.painter.fill_circle(px, py, size * 0.5, particle_color);
+                            if let Some(image) = &particle_image {
+                                ui.painter.draw_image(
+                                    image,
+                                    Rect::new(px - size * 0.5, py - size * 0.5, size, size),
+                                    None,
+                                    particle_color,
+                                );
+                            } else {
+                                ui.painter.fill_circle(px, py, size * 0.5, particle_color);
+                            }
                         }
                         drew = true;
                     }
@@ -2568,6 +3457,95 @@ impl EditorApp {
         rotate_point_about(cx, knob_y, rect.x, rect.y, angle)
     }
 
+    fn move_handle_rect(&self, rect: Rect) -> Rect {
+        let size = 18.0;
+        Rect::new(
+            rect.x + rect.w * 0.5 - size * 0.5,
+            rect.y + rect.h * 0.5 - size * 0.5,
+            size,
+            size,
+        )
+    }
+
+    /// If the cursor is over the move gizmo's X (right) or Y (up) arrow, return
+    /// that axis as a world-space unit vector to constrain the drag along. The
+    /// arms rotate with the entity, so the axes are the entity's local X/Y.
+    fn move_axis_hit(&self, rect: Rect, angle: f32, mx: f32, my: f32) -> Option<(f32, f32)> {
+        let center_x = rect.x + rect.w * 0.5;
+        let center_y = rect.y + rect.h * 0.5;
+        // Express the cursor in the gizmo's unrotated, centre-origin frame.
+        let (dx, dy) = (mx - center_x, my - center_y);
+        let (sin, cos) = (angle.sin(), angle.cos());
+        let lx = dx * cos + dy * sin;
+        let ly = -dx * sin + dy * cos;
+        // X arm points right (+local X); Y arm points up (-local Y). The centre
+        // square (|.| < 9) belongs to the free-move handle.
+        if ly.abs() <= 6.0 && (9.0..=36.0).contains(&lx) {
+            Some((cos, sin))
+        } else if lx.abs() <= 6.0 && (-36.0..=-9.0).contains(&ly) {
+            Some((-sin, cos))
+        } else {
+            None
+        }
+    }
+
+    /// Draw the four screen-aligned scale corner handles at the (possibly
+    /// rotated) corners of `rect`, highlighting whichever the cursor is over.
+    fn draw_scale_handles(&self, ui: &mut Ui, rect: Rect, angle: f32, mx: f32, my: f32) {
+        for (cx, cy) in [
+            (rect.x, rect.y),
+            (rect.right(), rect.y),
+            (rect.x, rect.bottom()),
+            (rect.right(), rect.bottom()),
+        ] {
+            let (hx, hy) = rotate_point_about(cx, cy, rect.x, rect.y, angle);
+            let hot = (mx - hx).abs() <= 7.0 && (my - hy).abs() <= 7.0;
+            let s = if hot { 5.0 } else { 4.0 };
+            ui.painter.fill_rect(Rect::new(hx - s, hy - s, s * 2.0, s * 2.0), SCALE_HANDLE_COLOR);
+            ui.painter.fill_rect(
+                Rect::new(hx - s + 1.5, hy - s + 1.5, s * 2.0 - 3.0, s * 2.0 - 3.0),
+                if hot { [255, 255, 255, 255] } else { [40, 40, 40, 255] },
+            );
+        }
+    }
+
+    fn draw_move_handle(&self, ui: &mut Ui, rect: Rect, angle: f32, mx: f32, my: f32) {
+        let center_x = rect.x + rect.w * 0.5;
+        let center_y = rect.y + rect.h * 0.5;
+        // Which part of the gizmo the cursor is over, so it highlights.
+        let axis = self.move_axis_hit(rect, angle, mx, my);
+        let center_hot = self.move_handle_rect(rect).contains(mx, my);
+        let (sin, cos) = (angle.sin(), angle.cos());
+        let x_hot = axis == Some((cos, sin));
+        let y_hot = axis == Some((-sin, cos));
+        let x_color = if x_hot { [255, 255, 255, 255] } else { MOVE_X_COLOR };
+        let y_color = if y_hot { [255, 255, 255, 255] } else { MOVE_Y_COLOR };
+        let prev = ui.painter.push_rotation(center_x, center_y, angle);
+        // Y axis (vertical) green, X axis (horizontal) red.
+        ui.painter.fill_rect(Rect::new(center_x - 1.0, center_y - 24.0, 2.0, 48.0), y_color);
+        ui.painter.fill_rect(Rect::new(center_x - 24.0, center_y - 1.0, 48.0, 2.0), x_color);
+        ui.painter.fill_triangle(
+            (center_x, center_y - 31.0),
+            (center_x - 5.0, center_y - 22.0),
+            (center_x + 5.0, center_y - 22.0),
+            y_color,
+        );
+        ui.painter.fill_triangle(
+            (center_x + 31.0, center_y),
+            (center_x + 22.0, center_y - 5.0),
+            (center_x + 22.0, center_y + 5.0),
+            x_color,
+        );
+        ui.painter.set_rotation_raw(prev);
+        let handle = self.move_handle_rect(rect);
+        ui.painter.fill_round_rect(handle, 4.0, self.config.theme.selection);
+        ui.painter.fill_round_rect(
+            handle.shrink(3.0),
+            2.0,
+            if center_hot { [255, 255, 255, 255] } else { self.config.theme.selection },
+        );
+    }
+
     /// Draw the rotation gizmo (stalk + knob) for the selected entity. The
     /// stalk rotates with the entity; the knob is a rotation-invariant circle.
     fn draw_rotate_handle(&self, ui: &mut Ui, rect: Rect, angle: f32, hot: bool) {
@@ -2643,6 +3621,90 @@ impl EditorApp {
         }
     }
 
+    fn handle_tilemap_paint(&mut self, ui: &mut Ui, area: Rect) -> bool {
+        let Some((entity_id, component_index)) = self.tile_paint else {
+            return false;
+        };
+        let Some(entity) = self.scene.entity(entity_id).cloned() else {
+            self.tile_paint = None;
+            return false;
+        };
+        let Some(Component::Core { name, props }) = entity.components.get(component_index) else {
+            self.tile_paint = None;
+            return false;
+        };
+        if name != "Tilemap2D" {
+            self.tile_paint = None;
+            return false;
+        }
+        let Some(rect) = self.entity_screen_rect(&entity, area) else {
+            return false;
+        };
+        let columns = prop_number(props, &["map_width"]).unwrap_or(1.0).round().max(1.0) as usize;
+        let rows = prop_number(props, &["map_height"]).unwrap_or(1.0).round().max(1.0) as usize;
+        if columns == 0 || rows == 0 || rect.w <= 0.0 || rect.h <= 0.0 {
+            return false;
+        }
+
+        let angle = self.entity_world_rotation(&entity);
+        let prev = ui.painter.push_rotation(rect.x, rect.y, angle);
+        let cell_w = rect.w / columns as f32;
+        let cell_h = rect.h / rows as f32;
+        for column in 0..=columns {
+            let x = rect.x + column as f32 * cell_w;
+            ui.painter.fill_rect(Rect::new(x, rect.y, 1.0, rect.h), [255, 255, 255, 36]);
+        }
+        for row in 0..=rows {
+            let y = rect.y + row as f32 * cell_h;
+            ui.painter.fill_rect(Rect::new(rect.x, y, rect.w, 1.0), [255, 255, 255, 36]);
+        }
+        ui.painter.set_rotation_raw(prev);
+
+        let (mx, my) = (ui.input.mouse_x, ui.input.mouse_y);
+        let (lx, ly) = rotate_point_about(mx, my, rect.x, rect.y, -angle);
+        if !rect.contains(lx, ly) {
+            return false;
+        }
+        let column = (((lx - rect.x) / cell_w).floor() as isize).clamp(0, columns as isize - 1) as usize;
+        let row = (((ly - rect.y) / cell_h).floor() as isize).clamp(0, rows as isize - 1) as usize;
+        let highlight = Rect::new(
+            rect.x + column as f32 * cell_w,
+            rect.y + row as f32 * cell_h,
+            cell_w,
+            cell_h,
+        );
+        let prev = ui.painter.push_rotation(rect.x, rect.y, angle);
+        ui.painter.stroke_rect(highlight.shrink(1.0), self.config.theme.selection);
+        ui.painter.set_rotation_raw(prev);
+
+        if ui.input.mouse_down {
+            let mut changed = false;
+            if let Some(entity) = self.scene.entity_mut(entity_id) {
+                if let Some(Component::Core { props, .. }) = entity.components.get_mut(component_index) {
+                    if let Some(prop) = props.iter_mut().find(|prop| prop.name == "tiles") {
+                        let mut tiles = match &prop.value {
+                            PropValue::Text(value) => parse_tile_ids(value, columns * rows),
+                            _ => vec![-1; columns * rows],
+                        };
+                        let index = row * columns + column;
+                        if let Some(tile) = tiles.get_mut(index) {
+                            if *tile != self.tile_paint_tile {
+                                *tile = self.tile_paint_tile;
+                                prop.value = PropValue::Text(format_tile_ids(&tiles, columns));
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if changed {
+                self.mark_dirty();
+            }
+            ui.wants_redraw = true;
+        }
+        true
+    }
+
     /// While a `.neoprefab` is dragged from the bin, show a ghost in the
     /// viewport and instantiate it at the drop position on release.
     fn handle_prefab_drop(&mut self, ui: &mut Ui, area: Rect, z: f32) {
@@ -2667,6 +3729,61 @@ impl EditorApp {
             }
             self.prefab_drag = None;
         }
+    }
+
+    fn start_viewport_drag(
+        &mut self,
+        primary: u64,
+        rect: Rect,
+        mx: f32,
+        my: f32,
+        axis: Option<(f32, f32)>,
+    ) {
+        let selected = self.selection_ids_ordered();
+        let selected_set: HashSet<u64> = selected.iter().copied().collect();
+        let mut start_world = Vec::new();
+        for selected_id in selected {
+            if self.locked_ids.contains(&selected_id) {
+                continue;
+            }
+            if let Some(transform) = self.entity_world_transform(selected_id) {
+                start_world.push((selected_id, transform.x, transform.y));
+            }
+        }
+        if !start_world.iter().any(|(selected_id, _, _)| *selected_id == primary) {
+            return;
+        }
+        let mut descendant_start_world = Vec::new();
+        for (id, _, _) in &start_world {
+            for descendant in self.descendants_of(*id) {
+                if selected_set.contains(&descendant) || self.locked_ids.contains(&descendant) {
+                    continue;
+                }
+                if let Some(transform) = self.entity_world_transform(descendant) {
+                    descendant_start_world.push((descendant, transform.x, transform.y));
+                }
+            }
+        }
+        descendant_start_world.sort_by_key(|(id, _, _)| *id);
+        descendant_start_world.dedup_by_key(|(id, _, _)| *id);
+        self.dragging = Some(ViewportDrag {
+            primary,
+            grab_x: mx - rect.x,
+            grab_y: my - rect.y,
+            start_world,
+            descendant_start_world,
+            axis,
+        });
+    }
+
+    fn descendants_of(&self, id: u64) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut stack = self.scene.children_of(Some(id));
+        while let Some(child) = stack.pop() {
+            out.push(child);
+            stack.extend(self.scene.children_of(Some(child)));
+        }
+        out
     }
 
     fn instantiate_prefab(&mut self, path: &Path, wx: f32, wy: f32) {
@@ -2773,14 +3890,16 @@ impl EditorApp {
         }
 
         // Rotation gizmo drag takes priority over resize/move.
-        if let Some(id) = self.rotating {
+        if let Some(rot) = self.rotating {
             if ui.input.mouse_down {
-                if let Some(e) = self.scene.entity(id) {
+                if let Some(e) = self.scene.entity(rot.id) {
                     if let Some(rect) = self.entity_screen_rect(e, area) {
-                        let (pivot_x, pivot_y) = (rect.x, rect.y);
-                        // The knob points straight up from the top-centre in the
-                        // entity's local frame; aim that direction at the cursor.
-                        let base_angle = (-ROT_HANDLE_DIST).atan2(rect.w / 2.0);
+                        // Pivot about the entity's fixed world centre so it spins
+                        // in place. The knob sits straight up from the centre, so
+                        // at world rotation 0 its direction is -90°.
+                        let pivot_x = area.x + self.cam_x + rot.center_x * z;
+                        let pivot_y = area.y + self.cam_y + rot.center_y * z;
+                        let base_angle = -std::f32::consts::FRAC_PI_2;
                         let mouse_angle = (my - pivot_y).atan2(mx - pivot_x);
                         let mut world = mouse_angle - base_angle;
                         if self.config.layout.snap {
@@ -2789,9 +3908,24 @@ impl EditorApp {
                         }
                         let parent_rot = self.entity_world_rotation(e) - e.rotation;
                         let local = world - parent_rot;
-                        if let Some(em) = self.scene.entity_mut(id) {
-                            if (em.rotation - local).abs() > 1e-5 {
+                        // Keep the world centre fixed: solve the world top-left
+                        // (the entity origin) for the new rotation, then convert
+                        // back to a local position.
+                        let (hx, hy) = (rect.w / (2.0 * z), rect.h / (2.0 * z));
+                        let (sin, cos) = (world.sin(), world.cos());
+                        let new_wx = rot.center_x - (hx * cos - hy * sin);
+                        let new_wy = rot.center_y - (hx * sin + hy * cos);
+                        let (local_x, local_y) = self
+                            .world_origin_to_local_position(rot.id, new_wx, new_wy)
+                            .unwrap_or((new_wx, new_wy));
+                        if let Some(em) = self.scene.entity_mut(rot.id) {
+                            if (em.rotation - local).abs() > 1e-5
+                                || (em.x - local_x).abs() > 1e-4
+                                || (em.y - local_y).abs() > 1e-4
+                            {
                                 em.rotation = local;
+                                em.x = local_x;
+                                em.y = local_y;
                                 self.scene_dirty = true;
                             }
                         }
@@ -2803,12 +3937,39 @@ impl EditorApp {
             self.rotating = None;
         }
 
-        // Start a rotation drag when the gizmo knob is pressed.
+        // Start a move drag when the move gizmo is pressed: an axis arm
+        // constrains to that axis, the centre square moves freely in 2D.
         if self.rotating.is_none()
             && self.resizing.is_none()
             && self.dragging.is_none()
             && inside
             && ui.input.mouse_pressed
+            && self.config.layout.view_tool == ViewTool::Move
+        {
+            if let Some(id) = self.selected {
+                if let Some(e) = self.scene.entity(id) {
+                    if let Some(rect) = self.entity_screen_rect(e, area) {
+                        let angle = self.entity_world_rotation(e);
+                        if let Some(axis) = self.move_axis_hit(rect, angle, mx, my) {
+                            self.start_viewport_drag(id, rect, mx, my, Some(axis));
+                            return;
+                        }
+                        if self.move_handle_rect(rect).contains(mx, my) {
+                            self.start_viewport_drag(id, rect, mx, my, None);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Start a rotation drag when the rotate tool's gizmo knob is pressed.
+        if self.rotating.is_none()
+            && self.resizing.is_none()
+            && self.dragging.is_none()
+            && inside
+            && ui.input.mouse_pressed
+            && matches!(self.config.layout.view_tool, ViewTool::Rotate | ViewTool::Transform)
         {
             if let Some(id) = self.selected {
                 if let Some(e) = self.scene.entity(id) {
@@ -2816,7 +3977,19 @@ impl EditorApp {
                         let angle = self.entity_world_rotation(e);
                         let (kx, ky) = self.rotate_handle_knob(rect, angle);
                         if (mx - kx).abs() <= 8.0 && (my - ky).abs() <= 8.0 {
-                            self.rotating = Some(id);
+                            // Capture the world centre as the fixed pivot.
+                            let (csx, csy) = rotate_point_about(
+                                rect.x + rect.w / 2.0,
+                                rect.y + rect.h / 2.0,
+                                rect.x,
+                                rect.y,
+                                angle,
+                            );
+                            self.rotating = Some(RotateDrag {
+                                id,
+                                center_x: (csx - (area.x + self.cam_x)) / z,
+                                center_y: (csy - (area.y + self.cam_y)) / z,
+                            });
                             return;
                         }
                     }
@@ -2830,6 +4003,7 @@ impl EditorApp {
             && self.dragging.is_none()
             && inside
             && ui.input.mouse_pressed
+            && matches!(self.config.layout.view_tool, ViewTool::Scale | ViewTool::Transform)
         {
             if let Some(id) = self.selected {
                 if let Some(e) = self.scene.entity(id) {
@@ -3053,22 +4227,8 @@ impl EditorApp {
                     if self.is_selected(id) {
                         if let Some(e) = e {
                         if let Some(rect) = self.entity_screen_rect(e, area) {
-                                let mut start_world = Vec::new();
-                                for selected_id in self.selection_ids_ordered() {
-                                    if self.locked_ids.contains(&selected_id) {
-                                        continue;
-                                    }
-                                    if let Some(transform) = self.entity_world_transform(selected_id) {
-                                        start_world.push((selected_id, transform.x, transform.y));
-                                    }
-                                }
-                                if start_world.iter().any(|(selected_id, _, _)| *selected_id == id) {
-                                    self.dragging = Some(ViewportDrag {
-                                        primary: id,
-                                        grab_x: mx - rect.x,
-                                        grab_y: my - rect.y,
-                                        start_world,
-                                    });
+                                if matches!(self.config.layout.view_tool, ViewTool::Move | ViewTool::Transform) {
+                                    self.start_viewport_drag(id, rect, mx, my, None);
                                 }
                             }
                         }
@@ -3090,22 +4250,33 @@ impl EditorApp {
                 let grid = self.config.layout.grid.max(1.0);
                 let world_x = (mx - drag.grab_x - (area.x + self.cam_x)) / z;
                 let world_y = (my - drag.grab_y - (area.y + self.cam_y)) / z;
-                let (mut nx, mut ny) = (world_x, world_y);
-                if snap {
-                    nx = (nx / grid).round() * grid;
-                    ny = (ny / grid).round() * grid;
-                } else {
-                    nx = nx.round();
-                    ny = ny.round();
-                }
                 let Some((_, primary_start_x, primary_start_y)) =
                     drag.start_world.iter().find(|(id, _, _)| *id == drag.primary).copied()
                 else {
                     self.dragging = None;
                     return;
                 };
-                let dx = nx - primary_start_x;
-                let dy = ny - primary_start_y;
+                let (dx, dy) = if let Some((ux, uy)) = drag.axis {
+                    // Constrained to one axis: project the raw movement onto the
+                    // axis and snap the distance along it.
+                    let mut t = (world_x - primary_start_x) * ux + (world_y - primary_start_y) * uy;
+                    if snap {
+                        t = (t / grid).round() * grid;
+                    } else {
+                        t = t.round();
+                    }
+                    (t * ux, t * uy)
+                } else {
+                    let (mut nx, mut ny) = (world_x, world_y);
+                    if snap {
+                        nx = (nx / grid).round() * grid;
+                        ny = (ny / grid).round() * grid;
+                    } else {
+                        nx = nx.round();
+                        ny = ny.round();
+                    }
+                    (nx - primary_start_x, ny - primary_start_y)
+                };
                 let mut updates = Vec::new();
                 for (id, start_x, start_y) in &drag.start_world {
                     let target_x = start_x + dx;
@@ -3157,6 +4328,25 @@ impl EditorApp {
                         };
                         if changed {
                             self.scene_dirty = true;
+                        }
+                    }
+                }
+                if ui.input.ctrl {
+                    let descendant_updates: Vec<(u64, f32, f32)> = drag
+                        .descendant_start_world
+                        .iter()
+                        .filter_map(|(id, world_x, world_y)| {
+                            self.world_origin_to_local_position(*id, *world_x, *world_y)
+                                .map(|(x, y)| (*id, x, y))
+                        })
+                        .collect();
+                    for (id, x, y) in descendant_updates {
+                        if let Some(e) = self.scene.entity_mut(id) {
+                            if e.x != x || e.y != y {
+                                e.x = x;
+                                e.y = y;
+                                self.scene_dirty = true;
+                            }
                         }
                     }
                 }
@@ -3316,16 +4506,11 @@ impl EditorApp {
             y += FIELD_H + 6.0;
             self.inspector_label(ui, x, y + 4.0, "Anti-aliasing", LABEL_W - 6.0);
             let aa_button = Rect::new(x + LABEL_W, y, (width - LABEL_W).max(40.0), FIELD_H);
-            if ui.button(aa_button, &self.scene.antialiasing) {
-                self.scene.antialiasing = match self.scene.antialiasing.as_str() {
-                    "off" => "standard",
-                    "standard" => "high",
-                    _ => "off",
-                }
-                .to_string();
-                self.mark_dirty();
+            let antialiasing = self.scene.antialiasing.clone();
+            if ui.dropdown_button(aa_button, &antialiasing) {
+                self.open_scene_antialiasing_menu(aa_button.x, aa_button.bottom() + 2.0);
             }
-            ui.tooltip(aa_button, "Cycles off, standard (2x), and high (4x / supersampled text)");
+            ui.tooltip(aa_button, "Choose off, standard (2x), or high (4x / supersampled text)");
             y += FIELD_H + 6.0;
             return y + 10.0;
         };
@@ -3454,7 +4639,7 @@ impl EditorApp {
     fn component_body(&mut self, ui: &mut Ui, entity: u64, comp: usize, component: &mut Component, x: f32, width: f32, y: &mut f32) -> bool {
         let mut dirty = false;
         match component {
-            Component::Core { props, .. } => {
+            Component::Core { name, props } => {
                 // Basic props.
                 let mut advanced_present = false;
                 for pi in 0..props.len() {
@@ -3478,6 +4663,29 @@ impl EditorApp {
                             }
                         }
                     }
+                }
+                if name == "Tilemap2D" {
+                    *y += 4.0;
+                    ui.painter.fill_rect(Rect::new(x, *y, width, 1.0), self.config.theme.border);
+                    *y += 6.0;
+                    self.inspector_label(ui, x, *y + 4.0, "Paint Tile", LABEL_W - 6.0);
+                    let tile_field = ui.text_field(
+                        &format!("tile_paint_{entity}_{comp}"),
+                        Rect::new(x + LABEL_W, *y, (width - LABEL_W - 84.0).max(42.0), FIELD_H),
+                        &self.tile_paint_tile.to_string(),
+                    );
+                    if tile_field.changed {
+                        if let Ok(value) = tile_field.text.trim().parse::<i32>() {
+                            self.tile_paint_tile = value.max(-1);
+                        }
+                    }
+                    let paint_active = self.tile_paint == Some((entity, comp));
+                    let paint_button = Rect::new(x + width - 76.0, *y, 76.0, FIELD_H);
+                    if ui.button(paint_button, if paint_active { "Painting" } else { "Paint" }) {
+                        self.tile_paint = if paint_active { None } else { Some((entity, comp)) };
+                    }
+                    ui.tooltip(paint_button, "Paint tiles in the Scene view; use tile -1 to erase");
+                    *y += FIELD_H + 6.0;
                 }
             }
             Component::Script { path, variables } => {
@@ -3535,12 +4743,20 @@ impl EditorApp {
                 *y += FIELD_H + 6.0;
             }
             PropValue::Enum { value, options } => {
-                // A button cycling through options (compact).
                 let btn = Rect::new(fx, *y, fw, FIELD_H);
-                if ui.button(btn, value) {
-                    let idx = options.iter().position(|o| o == value).unwrap_or(0);
-                    *value = options[(idx + 1) % options.len().max(1)].clone();
-                    dirty = true;
+                let current = value.clone();
+                if ui.dropdown_button(btn, &current) {
+                    self.open_prop_enum_menu(
+                        btn.x,
+                        btn.bottom() + 2.0,
+                        EnumPropMenuTarget {
+                            entity,
+                            component: comp,
+                            prop: pi,
+                            options: options.clone(),
+                            current,
+                        },
+                    );
                 }
                 *y += FIELD_H + 6.0;
             }
@@ -3559,7 +4775,7 @@ impl EditorApp {
                     &id,
                     s,
                     AssetKind::Image,
-                    AssetTarget { entity, component: comp, prop: pi },
+                    AssetTarget::Prop { entity, component: comp, prop: pi },
                     fx,
                     fw,
                     *y,
@@ -3572,7 +4788,7 @@ impl EditorApp {
                     &id,
                     s,
                     AssetKind::Font,
-                    AssetTarget { entity, component: comp, prop: pi },
+                    AssetTarget::Prop { entity, component: comp, prop: pi },
                     fx,
                     fw,
                     *y,
@@ -3585,7 +4801,7 @@ impl EditorApp {
                     &id,
                     s,
                     AssetKind::Sound,
-                    AssetTarget { entity, component: comp, prop: pi },
+                    AssetTarget::Prop { entity, component: comp, prop: pi },
                     fx,
                     fw,
                     *y,
@@ -3598,7 +4814,20 @@ impl EditorApp {
                     &id,
                     s,
                     AssetKind::Shader,
-                    AssetTarget { entity, component: comp, prop: pi },
+                    AssetTarget::Prop { entity, component: comp, prop: pi },
+                    fx,
+                    fw,
+                    *y,
+                );
+                *y += FIELD_H + 6.0;
+            }
+            PropValue::Animation(s) => {
+                dirty |= self.asset_path_row(
+                    ui,
+                    &id,
+                    s,
+                    AssetKind::Animation,
+                    AssetTarget::Prop { entity, component: comp, prop: pi },
                     fx,
                     fw,
                     *y,
@@ -3608,7 +4837,7 @@ impl EditorApp {
             PropValue::ColorSequence(keypoints) => {
                 self.sequence_row(
                     ui,
-                    AssetTarget { entity, component: comp, prop: pi },
+                    AssetTarget::Prop { entity, component: comp, prop: pi },
                     SequenceKind::Color,
                     SequenceValue::Colors(keypoints.clone()),
                     fx,
@@ -3620,7 +4849,7 @@ impl EditorApp {
             PropValue::NumberSequence(keypoints) => {
                 self.sequence_row(
                     ui,
-                    AssetTarget { entity, component: comp, prop: pi },
+                    AssetTarget::Prop { entity, component: comp, prop: pi },
                     SequenceKind::Transparency,
                     SequenceValue::Numbers(keypoints.clone()),
                     fx,
@@ -3839,6 +5068,90 @@ impl EditorApp {
                 if self.text_row(ui, base, label, text, x, width, y) {
                     *dirty = true;
                 }
+            }
+            VarValue::Image(asset_path) => {
+                self.inspector_label(ui, x, *y + 4.0, label, LABEL_W - 6.0);
+                if self.asset_path_row(
+                    ui,
+                    base,
+                    asset_path,
+                    AssetKind::Image,
+                    AssetTarget::ScriptVar {
+                        entity,
+                        component: comp,
+                        var,
+                        path: path.clone(),
+                    },
+                    x + LABEL_W,
+                    (width - LABEL_W).max(30.0),
+                    *y,
+                ) {
+                    *dirty = true;
+                }
+                *y += FIELD_H + 6.0;
+            }
+            VarValue::Audio(asset_path) => {
+                self.inspector_label(ui, x, *y + 4.0, label, LABEL_W - 6.0);
+                if self.asset_path_row(
+                    ui,
+                    base,
+                    asset_path,
+                    AssetKind::Sound,
+                    AssetTarget::ScriptVar {
+                        entity,
+                        component: comp,
+                        var,
+                        path: path.clone(),
+                    },
+                    x + LABEL_W,
+                    (width - LABEL_W).max(30.0),
+                    *y,
+                ) {
+                    *dirty = true;
+                }
+                *y += FIELD_H + 6.0;
+            }
+            VarValue::Shader(asset_path) => {
+                self.inspector_label(ui, x, *y + 4.0, label, LABEL_W - 6.0);
+                if self.asset_path_row(
+                    ui,
+                    base,
+                    asset_path,
+                    AssetKind::Shader,
+                    AssetTarget::ScriptVar {
+                        entity,
+                        component: comp,
+                        var,
+                        path: path.clone(),
+                    },
+                    x + LABEL_W,
+                    (width - LABEL_W).max(30.0),
+                    *y,
+                ) {
+                    *dirty = true;
+                }
+                *y += FIELD_H + 6.0;
+            }
+            VarValue::Animation(asset_path) => {
+                self.inspector_label(ui, x, *y + 4.0, label, LABEL_W - 6.0);
+                if self.asset_path_row(
+                    ui,
+                    base,
+                    asset_path,
+                    AssetKind::Animation,
+                    AssetTarget::ScriptVar {
+                        entity,
+                        component: comp,
+                        var,
+                        path: path.clone(),
+                    },
+                    x + LABEL_W,
+                    (width - LABEL_W).max(30.0),
+                    *y,
+                ) {
+                    *dirty = true;
+                }
+                *y += FIELD_H + 6.0;
             }
             VarValue::Color(color) => {
                 self.inspector_label(ui, x, *y + 4.0, label, LABEL_W - 6.0);
@@ -4254,6 +5567,21 @@ impl EditorApp {
             ui.tooltip(r, tip);
             c
         };
+        if btn(ui, bx, icon::DELETE, "Close Project panel") {
+            self.config.layout.show_project = false;
+            self.config.layout.undock_project = false;
+            self.dirty = true;
+        }
+        bx -= 28.0;
+        if self.config.layout.undock_project {
+            if btn(ui, bx, icon::OPEN_IN_NEW, "Dock Project panel") {
+                self.dock_widget(EditorWidget::Project);
+            }
+        } else if btn(ui, bx, icon::OPEN_IN_NEW, "Undock Project panel") {
+            self.config.layout.undock_project = true;
+            self.dirty = true;
+        }
+        bx -= 28.0;
         let at_root = self.bin_dir == self.project_root;
         if !at_root && btn(ui, bx, icon::ARROW_UPWARD, "Up one folder") {
             if let Some(parent) = self.bin_dir.parent().map(|p| p.to_path_buf()) {
@@ -4355,6 +5683,8 @@ impl EditorApp {
                     self.open_scene_path(path.clone());
                 } else if path.extension().is_some_and(|e| e == "neoprefab") {
                     self.open_prefab_path(path.clone());
+                } else if path.extension().is_some_and(|e| e == "neoanim") {
+                    self.open_animation_path(path.clone());
                 } else {
                     open = Some(path.clone());
                 }
@@ -4542,6 +5872,9 @@ impl EditorApp {
 
     fn open_tools_menu(&mut self, x: f32, y: f32) {
         let items = vec![
+            MenuItem { action: Action::OpenEditorSettings, glyph: icon::TUNE, label: "Editor Settings".into(), danger: false },
+            MenuItem { action: Action::OpenMobileEmulator, glyph: icon::PHONE_ANDROID, label: "Mobile Emulator".into(), danger: false },
+            MenuItem { action: Action::BuildProject, glyph: icon::DATA_OBJECT, label: "Build Project".into(), danger: false },
             MenuItem { action: Action::OpenSelectionTools(x, y), glyph: icon::SELECT_ALL, label: "Selection".into(), danger: false },
             MenuItem { action: Action::OpenHierarchyTools(x, y), glyph: icon::ACCOUNT_TREE, label: "Hierarchy".into(), danger: false },
             MenuItem { action: Action::OpenArrangeTools(x, y), glyph: icon::VIEW_QUILT, label: "Align & Snap".into(), danger: false },
@@ -4556,12 +5889,28 @@ impl EditorApp {
             MenuItem { action: Action::InvertSelection, glyph: icon::SWAP, label: "Invert Selection".into(), danger: false },
             MenuItem { action: Action::SelectChildren, glyph: icon::ACCOUNT_TREE, label: "Select Descendants".into(), danger: false },
             MenuItem { action: Action::SelectParent, glyph: icon::CHEVRON_LEFT, label: "Select Parent".into(), danger: false },
+            MenuItem { action: Action::SelectRoots, glyph: icon::ACCOUNT_TREE, label: "Select Root Entities".into(), danger: false },
+            MenuItem { action: Action::SelectLeaves, glyph: icon::ACCOUNT_TREE, label: "Select Leaf Entities".into(), danger: false },
+            MenuItem { action: Action::SelectSiblings, glyph: icon::SWAP, label: "Select Siblings".into(), danger: false },
+            MenuItem { action: Action::SelectNext, glyph: icon::CHEVRON_RIGHT, label: "Select Next".into(), danger: false },
+            MenuItem { action: Action::SelectPrevious, glyph: icon::CHEVRON_LEFT, label: "Select Previous".into(), danger: false },
+            MenuItem { action: Action::SelectActive, glyph: icon::VISIBILITY, label: "Select Active".into(), danger: false },
+            MenuItem { action: Action::SelectInactive, glyph: icon::VISIBILITY_OFF, label: "Select Inactive".into(), danger: false },
+            MenuItem { action: Action::SelectVisible, glyph: icon::VISIBILITY, label: "Select Scene Visible".into(), danger: false },
+            MenuItem { action: Action::SelectHidden, glyph: icon::VISIBILITY_OFF, label: "Select Scene Hidden".into(), danger: false },
+            MenuItem { action: Action::SelectLocked, glyph: icon::LOCK, label: "Select Locked".into(), danger: false },
             MenuItem { action: Action::DuplicateSelection, glyph: icon::CONTENT_COPY, label: "Duplicate Selection".into(), danger: false },
             MenuItem { action: Action::GroupSelected, glyph: icon::VIEW_IN_AR, label: "Group     Ctrl+G".into(), danger: false },
             MenuItem { action: Action::UnparentSelected, glyph: icon::CHEVRON_LEFT, label: "Unparent     Ctrl+Shift+G".into(), danger: false },
+            MenuItem { action: Action::ToggleActiveSelection, glyph: icon::VISIBILITY, label: "Toggle Active".into(), danger: false },
             MenuItem { action: Action::HideSelected, glyph: icon::VISIBILITY_OFF, label: "Hide in Scene View     H".into(), danger: false },
+            MenuItem { action: Action::HideUnselected, glyph: icon::VISIBILITY_OFF, label: "Hide Unselected".into(), danger: false },
+            MenuItem { action: Action::IsolateSelection, glyph: icon::CENTER_FOCUS, label: "Isolate Selection".into(), danger: false },
+            MenuItem { action: Action::ShowSelected, glyph: icon::VISIBILITY, label: "Show Selected".into(), danger: false },
             MenuItem { action: Action::ShowAllHidden, glyph: icon::VISIBILITY, label: "Show All     Shift+H".into(), danger: false },
             MenuItem { action: Action::LockSelected, glyph: icon::LOCK, label: "Lock Picking     L".into(), danger: false },
+            MenuItem { action: Action::LockUnselected, glyph: icon::LOCK, label: "Lock Unselected".into(), danger: false },
+            MenuItem { action: Action::UnlockSelection, glyph: icon::LOCK_OPEN, label: "Unlock Selection".into(), danger: false },
             MenuItem { action: Action::UnlockAll, glyph: icon::LOCK_OPEN, label: "Unlock All     Shift+L".into(), danger: false },
         ];
         self.popup = Some(Popup::Menu { x, y, items });
@@ -4580,13 +5929,26 @@ impl EditorApp {
     fn open_arrange_tools(&mut self, x: f32, y: f32) {
         let items = vec![
             MenuItem { action: Action::SnapSelected, glyph: icon::GRID_ON, label: "Snap Selection to Grid".into(), danger: false },
+            MenuItem { action: Action::SnapSelectedSize, glyph: icon::ASPECT_RATIO, label: "Snap Selection Size".into(), danger: false },
             MenuItem { action: Action::ResetSelected, glyph: icon::RESTART_ALT, label: "Reset Selected Transforms".into(), danger: false },
+            MenuItem { action: Action::ResetSelectedRotation, glyph: icon::ROTATE_RIGHT, label: "Reset Selected Rotation".into(), danger: false },
+            MenuItem { action: Action::ResetSelectedScale, glyph: icon::ASPECT_RATIO, label: "Reset Selected Scale".into(), danger: false },
+            MenuItem { action: Action::ResetSelectedAnchors, glyph: icon::CENTER_FOCUS, label: "Reset Selected Anchors".into(), danger: false },
+            MenuItem { action: Action::NormalizeSelectedSizes, glyph: icon::ASPECT_RATIO, label: "Normalize Negative Sizes".into(), danger: false },
+            MenuItem { action: Action::FitSelectionToWindow, glyph: icon::FULLSCREEN, label: "Fit Selection to Window".into(), danger: false },
+            MenuItem { action: Action::CenterSelectionInWindow, glyph: icon::CENTER_FOCUS, label: "Center Selection in Window".into(), danger: false },
             MenuItem { action: Action::Align(AlignKind::Left), glyph: icon::CHEVRON_LEFT, label: "Align Left".into(), danger: false },
             MenuItem { action: Action::Align(AlignKind::CenterX), glyph: icon::CROP_SQUARE, label: "Align Horizontal Centers".into(), danger: false },
             MenuItem { action: Action::Align(AlignKind::Right), glyph: icon::CHEVRON_RIGHT, label: "Align Right".into(), danger: false },
             MenuItem { action: Action::Align(AlignKind::Top), glyph: icon::ARROW_UPWARD, label: "Align Top".into(), danger: false },
             MenuItem { action: Action::Align(AlignKind::CenterY), glyph: icon::CROP_SQUARE, label: "Align Vertical Centers".into(), danger: false },
             MenuItem { action: Action::Align(AlignKind::Bottom), glyph: icon::EXPAND_MORE, label: "Align Bottom".into(), danger: false },
+            MenuItem { action: Action::BringToFront, glyph: icon::UNFOLD_MORE, label: "Bring to Front".into(), danger: false },
+            MenuItem { action: Action::SendToBack, glyph: icon::UNFOLD_LESS, label: "Send to Back".into(), danger: false },
+            MenuItem { action: Action::BringForward, glyph: icon::CHEVRON_RIGHT, label: "Bring Forward".into(), danger: false },
+            MenuItem { action: Action::SendBackward, glyph: icon::CHEVRON_LEFT, label: "Send Backward".into(), danger: false },
+            MenuItem { action: Action::NudgeZ(1.0), glyph: icon::ARROW_UPWARD, label: "Nudge Z +1".into(), danger: false },
+            MenuItem { action: Action::NudgeZ(-1.0), glyph: icon::EXPAND_MORE, label: "Nudge Z -1".into(), danger: false },
         ];
         self.popup = Some(Popup::Menu { x, y, items });
     }
@@ -4595,6 +5957,9 @@ impl EditorApp {
         let items = vec![
             MenuItem { action: Action::FrameAll, glyph: icon::ZOOM_OUT_MAP, label: "Frame All     Home".into(), danger: false },
             MenuItem { action: Action::Zoom100, glyph: icon::CENTER_FOCUS, label: "Zoom to 100%".into(), danger: false },
+            MenuItem { action: Action::OpenProjectRoot, glyph: icon::FOLDER_OPEN, label: "Open Project Root".into(), danger: false },
+            MenuItem { action: Action::RevealSceneFile, glyph: icon::ARTICLE, label: "Reveal Scene File".into(), danger: false },
+            MenuItem { action: Action::RefreshProject, glyph: icon::RESTART_ALT, label: "Refresh Project Browser".into(), danger: false },
             MenuItem {
                 action: Action::ToggleMaximize,
                 glyph: if self.maximize_view { icon::FULLSCREEN_EXIT } else { icon::FULLSCREEN },
@@ -4608,6 +5973,124 @@ impl EditorApp {
                 danger: false,
             },
         ];
+        self.popup = Some(Popup::Menu { x, y, items });
+    }
+
+    fn open_window_menu(&mut self, x: f32, y: f32) {
+        let items = vec![
+            MenuItem {
+                action: Action::OpenProjectWindowSettings,
+                glyph: icon::FULLSCREEN,
+                label: "Project Window Settings".into(),
+                danger: false,
+            },
+            MenuItem {
+                action: Action::ToggleProject,
+                glyph: icon::FOLDER_OPEN,
+                label: if self.config.layout.show_project {
+                    "Close Project".into()
+                } else {
+                    "Show Project".into()
+                },
+                danger: false,
+            },
+            MenuItem {
+                action: Action::ToggleProjectUndocked,
+                glyph: icon::OPEN_IN_NEW,
+                label: if self.config.layout.undock_project {
+                    "Dock Project".into()
+                } else {
+                    "Undock Project".into()
+                },
+                danger: false,
+            },
+            MenuItem {
+                action: Action::ToggleHierarchy,
+                glyph: icon::ACCOUNT_TREE,
+                label: if self.config.layout.show_hierarchy {
+                    "Close Hierarchy".into()
+                } else {
+                    "Show Hierarchy".into()
+                },
+                danger: false,
+            },
+            MenuItem {
+                action: Action::ToggleHierarchyUndocked,
+                glyph: icon::OPEN_IN_NEW,
+                label: if self.config.layout.undock_hierarchy {
+                    "Dock Hierarchy".into()
+                } else {
+                    "Undock Hierarchy".into()
+                },
+                danger: false,
+            },
+            MenuItem {
+                action: Action::ToggleInspector,
+                glyph: icon::TUNE,
+                label: if self.config.layout.show_inspector {
+                    "Close Inspector".into()
+                } else {
+                    "Show Inspector".into()
+                },
+                danger: false,
+            },
+            MenuItem {
+                action: Action::ToggleInspectorUndocked,
+                glyph: icon::OPEN_IN_NEW,
+                label: if self.config.layout.undock_inspector {
+                    "Dock Inspector".into()
+                } else {
+                    "Undock Inspector".into()
+                },
+                danger: false,
+            },
+        ];
+        self.popup = Some(Popup::Menu { x, y, items });
+    }
+
+    fn open_scene_antialiasing_menu(&mut self, x: f32, y: f32) {
+        let current = self.scene.antialiasing.clone();
+        let items = ["off", "standard", "high"]
+            .into_iter()
+            .map(|value| MenuItem {
+                action: Action::SetSceneAntialiasing(value.to_string()),
+                glyph: if current == value { icon::CHECK } else { '\0' },
+                label: value.to_string(),
+                danger: false,
+            })
+            .collect();
+        self.popup = Some(Popup::Menu { x, y, items });
+    }
+
+    fn open_prop_enum_menu(&mut self, x: f32, y: f32, target: EnumPropMenuTarget) {
+        let EnumPropMenuTarget {
+            entity,
+            component,
+            prop,
+            options,
+            current,
+        } = target;
+        if options.is_empty() {
+            return;
+        }
+        let items = options
+            .into_iter()
+            .map(|value| MenuItem {
+                glyph: if value == current {
+                    icon::CHECK
+                } else {
+                    '\0'
+                },
+                label: value.clone(),
+                action: Action::SetPropEnum {
+                    entity,
+                    component,
+                    prop,
+                    value,
+                },
+                danger: false,
+            })
+            .collect();
         self.popup = Some(Popup::Menu { x, y, items });
     }
 
@@ -4631,6 +6114,8 @@ impl EditorApp {
         let items = vec![
             MenuItem { action: Action::NewFolder, glyph: icon::CREATE_NEW_FOLDER, label: "New Folder".into(), danger: false },
             MenuItem { action: Action::NewScript, glyph: icon::NOTE_ADD, label: "New Script".into(), danger: false },
+            MenuItem { action: Action::NewShader, glyph: icon::DATA_OBJECT, label: "New Shader".into(), danger: false },
+            MenuItem { action: Action::NewAnimation, glyph: icon::PLAY, label: "New Animation".into(), danger: false },
             MenuItem { action: Action::OpenProjectInVscode, glyph: icon::CODE, label: "Open in VS Code".into(), danger: false },
             MenuItem { action: Action::RevealInExplorer, glyph: icon::OPEN_IN_NEW, label: "Reveal in File Manager".into(), danger: false },
         ];
@@ -4644,6 +6129,8 @@ impl EditorApp {
             items.push(MenuItem { action: Action::EnterFolder(path.clone()), glyph: icon::FOLDER_OPEN, label: "Open Folder".into(), danger: false });
         } else if path.extension().is_some_and(|e| e == "neoscene") {
             items.push(MenuItem { action: Action::OpenScene(path.clone()), glyph: icon::ARTICLE, label: "Open Scene".into(), danger: false });
+        } else if path.extension().is_some_and(|e| e == "neoanim") {
+            items.push(MenuItem { action: Action::OpenAnimation(path.clone()), glyph: icon::PLAY, label: "Open Animation".into(), danger: false });
         } else {
             items.push(MenuItem { action: Action::OpenPath(path.clone()), glyph: icon::OPEN_IN_NEW, label: "Open".into(), danger: false });
         }
@@ -4659,6 +6146,34 @@ impl EditorApp {
         self.focus = Some("prompt_field".to_string());
         self.edit_buffer = initial.to_string();
         self.popup = Some(Popup::Prompt { title: title.to_string(), action });
+    }
+
+    fn open_editor_settings(&mut self) {
+        self.focus = Some("editor_font_path".to_string());
+        self.edit_buffer = self.config.settings.font_path.clone();
+        self.popup = Some(Popup::EditorSettings {
+            theme_name: self.config.settings.theme_name.clone(),
+            font_path: self.config.settings.font_path.clone(),
+            show_tooltips: self.config.settings.show_tooltips,
+            show_window_bounds: self.config.settings.show_window_bounds,
+            show_transform_hud: self.config.settings.show_transform_hud,
+            autosave_before_run: self.config.settings.autosave_before_run,
+            autosave_before_build: self.config.settings.autosave_before_build,
+        });
+    }
+
+    fn open_build_target(&mut self) {
+        self.popup = Some(Popup::BuildTarget);
+    }
+
+    fn open_mobile_emulator(&mut self) {
+        self.popup = Some(Popup::MobileEmulator {
+            enabled: self.config.settings.mobile_emulator,
+            orientation: self.config.settings.mobile_orientation.clone(),
+            wifi: self.config.settings.mobile_wifi,
+            cellular: self.config.settings.mobile_cellular,
+            low_power: self.config.settings.mobile_low_power,
+        });
     }
 
     fn handle_popup(&mut self, ui: &mut Ui, w: f32, h: f32, interactive: bool) {
@@ -4691,6 +6206,65 @@ impl EditorApp {
                 self.draw_sequence_editor(ui, target, kind, value, selected, dragging, color_picker, w, h, interactive)
             }
             Popup::Error { message, copied } => self.draw_error(ui, message, copied, w, h, interactive),
+            Popup::BuildTarget => self.draw_build_target_picker(ui, w, h, interactive),
+            Popup::ProjectWindow {
+                width,
+                height,
+                fullscreen,
+                resizable,
+            } => self.draw_project_window_settings(
+                ui,
+                width,
+                height,
+                fullscreen,
+                resizable,
+                w,
+                h,
+                interactive,
+            ),
+            Popup::MobileEmulator {
+                enabled,
+                orientation,
+                wifi,
+                cellular,
+                low_power,
+            } => self.draw_mobile_emulator(ui, enabled, orientation, wifi, cellular, low_power, w, h, interactive),
+            Popup::EditorSettings {
+                theme_name,
+                font_path,
+                show_tooltips,
+                show_window_bounds,
+                show_transform_hud,
+                autosave_before_run,
+                autosave_before_build,
+            } => self.draw_editor_settings(
+                ui,
+                theme_name,
+                font_path,
+                show_tooltips,
+                show_window_bounds,
+                show_transform_hud,
+                autosave_before_run,
+                autosave_before_build,
+                w,
+                h,
+                interactive,
+            ),
+            Popup::AnimationEditor {
+                path,
+                clip,
+                selected_track,
+                selected_key,
+            } => self.draw_animation_editor(
+                ui,
+                path,
+                clip,
+                selected_track,
+                selected_key,
+                w,
+                h,
+                interactive,
+            ),
         }
     }
 
@@ -5017,7 +6591,7 @@ impl EditorApp {
             });
         }
         if changed {
-            self.assign_sequence(target, &value);
+            self.assign_sequence(target.clone(), &value);
         }
         if close_clicked {
             ui.clear_focus();
@@ -5034,13 +6608,21 @@ impl EditorApp {
     }
 
     fn assign_sequence(&mut self, target: AssetTarget, value: &SequenceValue) {
-        let Some(entity) = self.scene.entity_mut(target.entity) else {
+        let AssetTarget::Prop {
+            entity,
+            component,
+            prop,
+        } = target
+        else {
             return;
         };
-        let Some(Component::Core { props, .. }) = entity.components.get_mut(target.component) else {
+        let Some(entity) = self.scene.entity_mut(entity) else {
             return;
         };
-        let Some(prop) = props.get_mut(target.prop) else {
+        let Some(Component::Core { props, .. }) = entity.components.get_mut(component) else {
+            return;
+        };
+        let Some(prop) = props.get_mut(prop) else {
             return;
         };
         match (&mut prop.value, value) {
@@ -5204,35 +6786,84 @@ impl EditorApp {
     }
 
     fn assign_asset(&mut self, target: AssetTarget, kind: AssetKind, path: String) {
-        let Some(entity) = self.scene.entity_mut(target.entity) else {
-            return;
-        };
-        let Some(Component::Core { props, .. }) = entity.components.get_mut(target.component) else {
-            return;
-        };
-        let Some(prop) = props.get_mut(target.prop) else {
-            return;
-        };
-        let matches_kind = matches!(
-            (&prop.value, kind),
-            (PropValue::Image(_), AssetKind::Image)
-                | (PropValue::Font(_), AssetKind::Font)
-                | (PropValue::Sound(_), AssetKind::Sound)
-                | (PropValue::Shader(_), AssetKind::Shader)
-        );
-        if !matches_kind {
-            return;
-        }
-        match &mut prop.value {
-            PropValue::Image(value)
-            | PropValue::Font(value)
-            | PropValue::Sound(value)
-            | PropValue::Shader(value) => {
-                *value = path.clone();
+        let label = match target {
+            AssetTarget::Prop {
+                entity,
+                component,
+                prop,
+            } => {
+                let Some(entity) = self.scene.entity_mut(entity) else {
+                    return;
+                };
+                let Some(Component::Core { props, .. }) = entity.components.get_mut(component) else {
+                    return;
+                };
+                let Some(prop) = props.get_mut(prop) else {
+                    return;
+                };
+                let matches_kind = matches!(
+                    (&prop.value, kind),
+                    (PropValue::Image(_), AssetKind::Image)
+                        | (PropValue::Font(_), AssetKind::Font)
+                        | (PropValue::Sound(_), AssetKind::Sound)
+                        | (PropValue::Shader(_), AssetKind::Shader)
+                        | (PropValue::Animation(_), AssetKind::Animation)
+                );
+                if !matches_kind {
+                    return;
+                }
+                match &mut prop.value {
+                    PropValue::Image(value)
+                    | PropValue::Font(value)
+                    | PropValue::Sound(value)
+                    | PropValue::Shader(value)
+                    | PropValue::Animation(value) => {
+                        *value = path.clone();
+                    }
+                    _ => return,
+                }
+                prop.label.clone()
             }
-            _ => return,
-        }
-        let label = prop.label.clone();
+            AssetTarget::ScriptVar {
+                entity,
+                component,
+                var,
+                path: var_path,
+            } => {
+                let Some(entity) = self.scene.entity_mut(entity) else {
+                    return;
+                };
+                let Some(Component::Script { variables, .. }) =
+                    entity.components.get_mut(component)
+                else {
+                    return;
+                };
+                let Some(variable) = variables.get_mut(var) else {
+                    return;
+                };
+                let Some(value) = var_value_at_path_mut(&mut variable.value, &var_path) else {
+                    return;
+                };
+                let matches_kind = matches!(
+                    (&*value, kind),
+                    (VarValue::Image(_), AssetKind::Image)
+                        | (VarValue::Audio(_), AssetKind::Sound)
+                        | (VarValue::Shader(_), AssetKind::Shader)
+                        | (VarValue::Animation(_), AssetKind::Animation)
+                );
+                if !matches_kind {
+                    return;
+                }
+                match value {
+                    VarValue::Image(value)
+                    | VarValue::Audio(value)
+                    | VarValue::Shader(value)
+                    | VarValue::Animation(value) => *value = path.clone(),
+                    _ => return,
+                }
+                humanize_identifier(&variable.name)
+            }
+        };
         self.mark_dirty();
         self.status = if path.is_empty() {
             format!("Cleared {label}")
@@ -5287,6 +6918,133 @@ impl EditorApp {
         }
         if !do_close {
             self.popup = Some(Popup::Error { message, copied });
+        }
+    }
+
+    fn draw_build_target_picker(&mut self, ui: &mut Ui, w: f32, h: f32, interactive: bool) {
+        ui.painter.fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 120]);
+        let width = (w - 32.0).min(430.0).max(340.0);
+        let height = 238.0_f32.min(h - 24.0).max(210.0);
+        let px = (w - width) * 0.5;
+        let py = (h - height) * 0.5;
+        let panel = Rect::new(px, py, width, height);
+        ui.painter.fill_round_rect(panel, 6.0, self.config.theme.panel);
+        ui.painter.stroke_round_rect(panel, 6.0, self.config.theme.accent);
+        ui.icon(px + 18.0, py + 19.0, icon::DATA_OBJECT, 17.0, self.config.theme.accent);
+        ui.painter.text(px + 38.0, py + 12.0, "Build Target", 16.0, self.config.theme.text);
+
+        let mut y = py + 46.0;
+        let mut chosen = None;
+        for (target, glyph) in [
+            (BuildTarget::Desktop, icon::VIEW_IN_AR),
+            (BuildTarget::Webasm, icon::CODE),
+            (BuildTarget::Android, icon::PHONE_ANDROID),
+            (BuildTarget::Ios, icon::PHONE_ANDROID),
+        ] {
+            let row = Rect::new(px + 16.0, y, width - 32.0, 28.0);
+            if interactive && ui.icon_button(row, glyph, target.label()) {
+                chosen = Some(target);
+            }
+            y += 34.0;
+        }
+
+        let cancel = Rect::new(panel.right() - 106.0, panel.bottom() - 36.0, 90.0, 26.0);
+        let cancel_clicked = interactive && (ui.button(cancel, "Cancel") || ui.input.escape);
+        if let Some(target) = chosen {
+            self.build_project(target);
+        } else if !cancel_clicked {
+            self.popup = Some(Popup::BuildTarget);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_mobile_emulator(
+        &mut self,
+        ui: &mut Ui,
+        mut enabled: bool,
+        mut orientation: String,
+        mut wifi: bool,
+        mut cellular: bool,
+        mut low_power: bool,
+        w: f32,
+        h: f32,
+        interactive: bool,
+    ) {
+        ui.painter.fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 120]);
+        let width = (w - 32.0).min(460.0).max(360.0);
+        let height = 282.0_f32.min(h - 24.0).max(250.0);
+        let px = (w - width) * 0.5;
+        let py = (h - height) * 0.5;
+        let panel = Rect::new(px, py, width, height);
+        ui.painter.fill_round_rect(panel, 6.0, self.config.theme.panel);
+        ui.painter.stroke_round_rect(panel, 6.0, self.config.theme.accent);
+        ui.icon(px + 18.0, py + 19.0, icon::PHONE_ANDROID, 17.0, self.config.theme.accent);
+        ui.painter.text(px + 38.0, py + 12.0, "Mobile Emulator", 16.0, self.config.theme.text);
+
+        let mut y = py + 48.0;
+        self.inspector_label(ui, px + 18.0, y + 4.0, "Enabled", 170.0);
+        if let Some(next) = ui.checkbox(Rect::new(px + 190.0, y, FIELD_H, FIELD_H), enabled) {
+            enabled = next;
+        }
+        y += FIELD_H + 10.0;
+
+        self.inspector_label(ui, px + 18.0, y + 4.0, "Orientation", 170.0);
+        ui.icon(px + 164.0, y + 4.0, icon::SCREEN_ROTATION, 15.0, self.config.theme.text_dim);
+        let portrait = Rect::new(px + 190.0, y, 88.0, FIELD_H);
+        let landscape = Rect::new(px + 284.0, y, 104.0, FIELD_H);
+        if interactive && ui.button_colored(portrait, "Portrait", if orientation == "portrait" { self.config.theme.button_active } else { self.config.theme.button }, self.config.theme.text) {
+            orientation = "portrait".to_string();
+        }
+        if interactive && ui.button_colored(landscape, "Landscape", if orientation == "landscape" { self.config.theme.button_active } else { self.config.theme.button }, self.config.theme.text) {
+            orientation = "landscape".to_string();
+        }
+        y += FIELD_H + 10.0;
+
+        let (size_w, size_h) = if orientation == "landscape" {
+            (crate::mobile_emulation::DEFAULT_HEIGHT, crate::mobile_emulation::DEFAULT_WIDTH)
+        } else {
+            (crate::mobile_emulation::DEFAULT_WIDTH, crate::mobile_emulation::DEFAULT_HEIGHT)
+        };
+        self.inspector_label(ui, px + 18.0, y + 4.0, "Locked Size", 170.0);
+        ui.painter.text(px + 190.0, y + 4.0, &format!("{size_w} x {size_h}"), 14.0, self.config.theme.text);
+        y += FIELD_H + 10.0;
+
+        for (label, value) in [
+            ("Wi-Fi", &mut wifi),
+            ("Cellular", &mut cellular),
+            ("Low Power Mode", &mut low_power),
+        ] {
+            self.inspector_label(ui, px + 18.0, y + 4.0, label, 170.0);
+            if let Some(next) = ui.checkbox(Rect::new(px + 190.0, y, FIELD_H, FIELD_H), *value) {
+                *value = next;
+            }
+            y += FIELD_H + 8.0;
+        }
+
+        let save = Rect::new(panel.right() - 204.0, panel.bottom() - 36.0, 92.0, 26.0);
+        let cancel = Rect::new(panel.right() - 104.0, panel.bottom() - 36.0, 90.0, 26.0);
+        let save_clicked = interactive && ui.button_colored(save, "Save", self.config.theme.button, self.config.theme.text);
+        let cancel_clicked = interactive && (ui.button(cancel, "Cancel") || ui.input.escape);
+        if save_clicked {
+            self.config.settings.mobile_emulator = enabled;
+            self.config.settings.mobile_orientation = if orientation == "landscape" { "landscape" } else { "portrait" }.to_string();
+            self.config.settings.mobile_wifi = wifi;
+            self.config.settings.mobile_cellular = cellular;
+            self.config.settings.mobile_low_power = low_power;
+            self.dirty = true;
+            self.status = if enabled {
+                format!("Mobile emulator enabled ({} x {})", size_w, size_h)
+            } else {
+                "Mobile emulator disabled".to_string()
+            };
+        } else if !cancel_clicked {
+            self.popup = Some(Popup::MobileEmulator {
+                enabled,
+                orientation,
+                wifi,
+                cellular,
+                low_power,
+            });
         }
     }
 
@@ -5517,6 +7275,441 @@ impl EditorApp {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn draw_editor_settings(
+        &mut self,
+        ui: &mut Ui,
+        mut theme_name: String,
+        mut font_path: String,
+        mut show_tooltips: bool,
+        mut show_window_bounds: bool,
+        mut show_transform_hud: bool,
+        mut autosave_before_run: bool,
+        mut autosave_before_build: bool,
+        w: f32,
+        h: f32,
+        interactive: bool,
+    ) {
+        ui.painter.fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 120]);
+        let width = (w - 32.0).min(560.0).max(360.0);
+        let height = 430.0_f32.min(h - 24.0).max(300.0);
+        let px = (w - width) * 0.5;
+        let py = (h - height) * 0.5;
+        let panel = Rect::new(px, py, width, height);
+        ui.painter.fill_round_rect(panel, 6.0, self.config.theme.panel);
+        ui.painter.stroke_round_rect(panel, 6.0, self.config.theme.accent);
+        ui.icon(px + 18.0, py + 20.0, icon::TUNE, 17.0, self.config.theme.accent);
+        ui.painter.text(px + 34.0, py + 12.0, "Editor Settings", 16.0, self.config.theme.text);
+
+        let mut y = py + 42.0;
+        ui.painter.text(px + 16.0, y, "Theme", 14.0, self.config.theme.text_dim);
+        y += 20.0;
+        let theme_area = Rect::new(px + 16.0, y, width - 32.0, 162.0);
+        ui.painter.fill_rect(theme_area, self.config.theme.field);
+        ui.painter.stroke_rect(theme_area, self.config.theme.border);
+        let mut row_y = theme_area.y + 4.0;
+        for (name, label) in theme_presets() {
+            let row = Rect::new(theme_area.x + 4.0, row_y, theme_area.w - 8.0, 24.0);
+            if interactive && ui.list_row(row, label, theme_name == *name, 0.0) {
+                theme_name = (*name).to_string();
+            }
+            row_y += 25.0;
+        }
+
+        y = theme_area.bottom() + 14.0;
+        self.inspector_label(ui, px + 16.0, y + 4.0, "Font Path", 90.0);
+        let font_result = ui.text_field(
+            "editor_font_path",
+            Rect::new(px + 106.0, y, width - 122.0, FIELD_H),
+            &font_path,
+        );
+        if font_result.changed {
+            font_path = font_result.text;
+        }
+        y += FIELD_H + 10.0;
+
+        for (label, value) in [
+            ("Show tooltips", &mut show_tooltips),
+            ("Show default window bounds", &mut show_window_bounds),
+            ("Show Scene transform HUD", &mut show_transform_hud),
+            ("Autosave before Run", &mut autosave_before_run),
+            ("Autosave before Build", &mut autosave_before_build),
+        ] {
+            self.inspector_label(ui, px + 16.0, y + 4.0, label, 220.0);
+            if let Some(next) = ui.checkbox(Rect::new(px + 240.0, y, FIELD_H, FIELD_H), *value) {
+                *value = next;
+            }
+            y += FIELD_H + 7.0;
+        }
+
+        let save = Rect::new(panel.right() - 204.0, panel.bottom() - 36.0, 92.0, 26.0);
+        let cancel = Rect::new(panel.right() - 104.0, panel.bottom() - 36.0, 90.0, 26.0);
+        let save_clicked = interactive && ui.button_colored(save, "Save", self.config.theme.button, self.config.theme.text);
+        let cancel_clicked = interactive && (ui.button(cancel, "Cancel") || ui.input.escape);
+        if save_clicked {
+            self.config.settings.theme_name = theme_name.clone();
+            self.config.settings.font_path = font_path.trim().to_string();
+            self.config.settings.show_tooltips = show_tooltips;
+            self.config.settings.show_window_bounds = show_window_bounds;
+            self.config.settings.show_transform_hud = show_transform_hud;
+            self.config.settings.autosave_before_run = autosave_before_run;
+            self.config.settings.autosave_before_build = autosave_before_build;
+            if let Some(theme) = theme_preset(&theme_name) {
+                self.config.theme = theme;
+            }
+            self.dirty = true;
+            self.status = format!("Saved global editor settings ({})", theme_label(&theme_name));
+        } else if !cancel_clicked {
+            self.popup = Some(Popup::EditorSettings {
+                theme_name,
+                font_path,
+                show_tooltips,
+                show_window_bounds,
+                show_transform_hud,
+                autosave_before_run,
+                autosave_before_build,
+            });
+        }
+    }
+
+    fn draw_project_window_settings(
+        &mut self,
+        ui: &mut Ui,
+        mut width: String,
+        mut height: String,
+        mut fullscreen: bool,
+        mut resizable: bool,
+        w: f32,
+        h: f32,
+        interactive: bool,
+    ) {
+        ui.painter.fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 120]);
+        let panel_w = 360.0;
+        let panel_h = 204.0;
+        let px = (w - panel_w) * 0.5;
+        let py = (h - panel_h) * 0.5;
+        let panel = Rect::new(px, py, panel_w, panel_h);
+        ui.painter.fill_round_rect(panel, 6.0, self.config.theme.panel);
+        ui.painter.stroke_round_rect(panel, 6.0, self.config.theme.accent);
+        ui.icon(px + 20.0, py + 22.0, icon::FULLSCREEN, 16.0, self.config.theme.accent);
+        ui.painter
+            .text(px + 36.0, py + 14.0, "Project Window", 16.0, self.config.theme.text);
+
+        let mut y = py + 48.0;
+        self.inspector_label(ui, px + 18.0, y + 4.0, "Width", LABEL_W - 6.0);
+        let width_result = ui.text_field(
+            "project_window_width",
+            Rect::new(px + LABEL_W, y, panel_w - LABEL_W - 24.0, FIELD_H),
+            &width,
+        );
+        if width_result.changed {
+            width = width_result.text;
+        }
+        y += FIELD_H + 8.0;
+        self.inspector_label(ui, px + 18.0, y + 4.0, "Height", LABEL_W - 6.0);
+        let height_result = ui.text_field(
+            "project_window_height",
+            Rect::new(px + LABEL_W, y, panel_w - LABEL_W - 24.0, FIELD_H),
+            &height,
+        );
+        if height_result.changed {
+            height = height_result.text;
+        }
+        y += FIELD_H + 8.0;
+        self.inspector_label(ui, px + 18.0, y + 4.0, "Fullscreen", LABEL_W - 6.0);
+        if let Some(next) = ui.checkbox(Rect::new(px + LABEL_W, y, FIELD_H, FIELD_H), fullscreen) {
+            fullscreen = next;
+        }
+        y += FIELD_H + 8.0;
+        self.inspector_label(ui, px + 18.0, y + 4.0, "Resizable", LABEL_W - 6.0);
+        if let Some(next) = ui.checkbox(Rect::new(px + LABEL_W, y, FIELD_H, FIELD_H), resizable) {
+            resizable = next;
+        }
+
+        let save = Rect::new(panel.right() - 204.0, panel.bottom() - 36.0, 92.0, 26.0);
+        let cancel = Rect::new(panel.right() - 104.0, panel.bottom() - 36.0, 90.0, 26.0);
+        let save_clicked = interactive && ui.button_colored(save, "Save", self.config.theme.button, self.config.theme.text);
+        let cancel_clicked = interactive && (ui.button(cancel, "Cancel") || ui.input.escape);
+        if save_clicked {
+            let parsed_w = width.trim().parse::<f32>().ok().filter(|value| value.is_finite());
+            let parsed_h = height.trim().parse::<f32>().ok().filter(|value| value.is_finite());
+            if let (Some(width), Some(height)) = (parsed_w, parsed_h) {
+                self.project_window.width = width.clamp(1.0, 16384.0);
+                self.project_window.height = height.clamp(1.0, 16384.0);
+                self.project_window.fullscreen = fullscreen;
+                self.project_window.resizable = resizable;
+                match save_project_window_settings(&self.project_root, &self.project_window) {
+                    Ok(()) => {
+                        self.status = "Saved project window settings".to_string();
+                        self.dirty = true;
+                    }
+                    Err(error) => self.status = format!("Project settings save failed: {error}"),
+                }
+            } else {
+                self.status = "Window width and height must be numbers".to_string();
+                self.popup = Some(Popup::ProjectWindow {
+                    width,
+                    height,
+                    fullscreen,
+                    resizable,
+                });
+            }
+        } else if !cancel_clicked {
+            self.popup = Some(Popup::ProjectWindow {
+                width,
+                height,
+                fullscreen,
+                resizable,
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_animation_editor(
+        &mut self,
+        ui: &mut Ui,
+        path: PathBuf,
+        mut clip: AnimationClipAsset,
+        mut selected_track: usize,
+        mut selected_key: usize,
+        w: f32,
+        h: f32,
+        interactive: bool,
+    ) {
+        normalize_animation_clip(&mut clip);
+        selected_track = selected_track.min(clip.tracks.len().saturating_sub(1));
+        selected_key = selected_key.min(
+            clip.tracks
+                .get(selected_track)
+                .map(|track| track.keys.len().saturating_sub(1))
+                .unwrap_or(0),
+        );
+
+        ui.painter.fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 120]);
+        let panel_w = (w - 32.0).min(780.0).max(520.0);
+        let panel_h = (h - 32.0).min(500.0).max(360.0);
+        let px = (w - panel_w) * 0.5;
+        let py = (h - panel_h) * 0.5;
+        let panel = Rect::new(px, py, panel_w, panel_h);
+        ui.painter.fill_round_rect(panel, 6.0, self.config.theme.panel);
+        ui.painter.stroke_round_rect(panel, 6.0, self.config.theme.accent);
+        ui.icon(px + 20.0, py + 22.0, icon::PLAY, 16.0, self.config.theme.accent);
+        let title = path
+            .strip_prefix(&self.project_root)
+            .unwrap_or(&path)
+            .to_string_lossy();
+        ui.painter.text_clipped(
+            px + 36.0,
+            py + 14.0,
+            &format!("Animation  /{title}"),
+            16.0,
+            self.config.theme.text,
+            panel_w - 60.0,
+        );
+
+        let top_y = py + 46.0;
+        self.inspector_label(ui, px + 18.0, top_y + 4.0, "Duration", 70.0);
+        let duration = ui.text_field(
+            "anim_duration",
+            Rect::new(px + 88.0, top_y, 72.0, FIELD_H),
+            &format_num(clip.duration),
+        );
+        if duration.changed {
+            if let Ok(value) = duration.text.trim().parse::<f32>() {
+                clip.duration = value.max(0.001);
+            }
+        }
+        self.inspector_label(ui, px + 178.0, top_y + 4.0, "Looping", 60.0);
+        if let Some(next) = ui.checkbox(Rect::new(px + 238.0, top_y, FIELD_H, FIELD_H), clip.looping) {
+            clip.looping = next;
+        }
+
+        let list = Rect::new(px + 16.0, py + 82.0, 210.0, panel_h - 132.0);
+        ui.painter.fill_rect(list, self.config.theme.field);
+        ui.painter.stroke_rect(list, self.config.theme.border);
+        ui.painter.text(list.x + 8.0, list.y + 7.0, "Tracks", 13.0, self.config.theme.text_dim);
+        let mut row_y = list.y + 28.0;
+        for (track_index, track) in clip.tracks.iter().enumerate() {
+            let row = Rect::new(list.x + 4.0, row_y, list.w - 8.0, 22.0);
+            let selected = track_index == selected_track;
+            if ui.list_row(row, &track.property, selected, 6.0) {
+                selected_track = track_index;
+                selected_key = 0;
+            }
+            row_y += 23.0;
+        }
+        let add_track = Rect::new(list.x + 8.0, list.bottom() - 30.0, 92.0, 24.0);
+        if interactive && ui.icon_button(add_track, icon::ADD, "Track") {
+            clip.tracks.push(AnimationTrackAsset::default());
+            selected_track = clip.tracks.len() - 1;
+            selected_key = 0;
+        }
+        let del_track = Rect::new(list.x + 106.0, list.bottom() - 30.0, 92.0, 24.0);
+        if interactive && ui.icon_button(del_track, icon::DELETE, "Track") && clip.tracks.len() > 1 {
+            clip.tracks.remove(selected_track);
+            selected_track = selected_track.min(clip.tracks.len() - 1);
+            selected_key = 0;
+        }
+
+        let edit = Rect::new(list.right() + 14.0, list.y, panel.right() - list.right() - 30.0, list.h);
+        ui.painter.fill_rect(edit, self.config.theme.panel_alt);
+        ui.painter.stroke_rect(edit, self.config.theme.border);
+
+        if let Some(track) = clip.tracks.get_mut(selected_track) {
+            let mut y = edit.y + 12.0;
+            self.inspector_label(ui, edit.x + 12.0, y + 4.0, "Property", 80.0);
+            let property = ui.text_field(
+                "anim_property",
+                Rect::new(edit.x + 92.0, y, edit.w - 104.0, FIELD_H),
+                &track.property,
+            );
+            if property.changed && !property.text.trim().is_empty() {
+                track.property = property.text;
+            }
+            y += FIELD_H + 8.0;
+            self.inspector_label(ui, edit.x + 12.0, y + 4.0, "Interpolation", 80.0);
+            let interp_button = Rect::new(edit.x + 92.0, y, 120.0, FIELD_H);
+            if ui.button(interp_button, &track.interpolation) {
+                track.interpolation = match track.interpolation.as_str() {
+                    "linear" => "bezier",
+                    "bezier" => "step",
+                    _ => "linear",
+                }
+                .to_string();
+            }
+            y += FIELD_H + 12.0;
+
+            let timeline = Rect::new(edit.x + 12.0, y, edit.w - 24.0, 58.0);
+            ui.painter.fill_rect(timeline, self.config.theme.field);
+            ui.painter.stroke_rect(timeline, self.config.theme.border);
+            let duration = clip.duration.max(0.001);
+            let mut clicked_key = None;
+            for (key_index, key) in track.keys.iter().enumerate() {
+                let x = timeline.x + timeline.w * (key.time / duration).clamp(0.0, 1.0);
+                let color = if key_index == selected_key {
+                    self.config.theme.accent
+                } else {
+                    self.config.theme.text
+                };
+                ui.painter.fill_rect(Rect::new(x - 2.0, timeline.y + 8.0, 4.0, timeline.h - 16.0), color);
+                if interactive
+                    && ui.input.mouse_pressed
+                    && (ui.input.mouse_x - x).abs() <= 7.0
+                    && ui.input.mouse_y >= timeline.y
+                    && ui.input.mouse_y <= timeline.bottom()
+                {
+                    clicked_key = Some(key_index);
+                }
+            }
+            if let Some(index) = clicked_key {
+                selected_key = index;
+            }
+            y += timeline.h + 10.0;
+
+            let keys_list = Rect::new(edit.x + 12.0, y, 150.0, edit.bottom() - y - 44.0);
+            ui.painter.fill_rect(keys_list, self.config.theme.field);
+            ui.painter.stroke_rect(keys_list, self.config.theme.border);
+            let mut ky = keys_list.y + 5.0;
+            for (key_index, key) in track.keys.iter().enumerate() {
+                let row = Rect::new(keys_list.x + 4.0, ky, keys_list.w - 8.0, 22.0);
+                if ui.list_row(
+                    row,
+                    &format!("{}  {}", format_num(key.time), format_num(key.value)),
+                    key_index == selected_key,
+                    4.0,
+                ) {
+                    selected_key = key_index;
+                }
+                ky += 23.0;
+            }
+            let add_key = Rect::new(keys_list.x, keys_list.bottom() + 8.0, 70.0, 24.0);
+            if interactive && ui.icon_button(add_key, icon::ADD, "Key") {
+                let time = (clip.duration * 0.5).max(0.0);
+                track.keys.push(AnimationKeyAsset::new(time, 0.0));
+                track.keys.sort_by(|a, b| a.time.total_cmp(&b.time));
+                selected_key = nearest_animation_key(&track.keys, time);
+            }
+            let del_key = Rect::new(keys_list.x + 76.0, keys_list.bottom() + 8.0, 74.0, 24.0);
+            if interactive && ui.icon_button(del_key, icon::DELETE, "Key") && track.keys.len() > 1 {
+                track.keys.remove(selected_key);
+                selected_key = selected_key.min(track.keys.len() - 1);
+            }
+
+            let field_x = keys_list.right() + 16.0;
+            let field_w = edit.right() - field_x - 12.0;
+            if let Some(key) = track.keys.get_mut(selected_key) {
+                let mut fy = y;
+                for (label, id, value, min, max) in [
+                    ("Time", "anim_key_time", &mut key.time, 0.0, clip.duration.max(0.001)),
+                    ("Value", "anim_key_value", &mut key.value, -1.0e9, 1.0e9),
+                ] {
+                    self.inspector_label(ui, field_x, fy + 4.0, label, 70.0);
+                    let result = ui.text_field(
+                        id,
+                        Rect::new(field_x + 72.0, fy, field_w - 72.0, FIELD_H),
+                        &format_num(*value),
+                    );
+                    if result.changed {
+                        if let Ok(next) = result.text.trim().parse::<f32>() {
+                            *value = next.clamp(min, max);
+                        }
+                    }
+                    fy += FIELD_H + 7.0;
+                }
+                if track.interpolation == "bezier" {
+                    for (label, id, value) in [
+                        ("Out X", "anim_out_x", &mut key.out_x),
+                        ("Out Y", "anim_out_y", &mut key.out_y),
+                        ("In X", "anim_in_x", &mut key.in_x),
+                        ("In Y", "anim_in_y", &mut key.in_y),
+                    ] {
+                        self.inspector_label(ui, field_x, fy + 4.0, label, 70.0);
+                        let result = ui.text_field(
+                            id,
+                            Rect::new(field_x + 72.0, fy, field_w - 72.0, FIELD_H),
+                            &format_num(*value),
+                        );
+                        if result.changed {
+                            if let Ok(next) = result.text.trim().parse::<f32>() {
+                                *value = if label.ends_with('X') {
+                                    next.clamp(0.0, 1.0)
+                                } else {
+                                    next
+                                };
+                            }
+                        }
+                        fy += FIELD_H + 7.0;
+                    }
+                }
+            }
+            track.keys.sort_by(|a, b| a.time.total_cmp(&b.time));
+            selected_key = selected_key.min(track.keys.len().saturating_sub(1));
+        }
+
+        let save = Rect::new(panel.right() - 204.0, panel.bottom() - 36.0, 92.0, 26.0);
+        let close = Rect::new(panel.right() - 104.0, panel.bottom() - 36.0, 90.0, 26.0);
+        let save_clicked = interactive && ui.button_colored(save, "Save", self.config.theme.button, self.config.theme.text);
+        let close_clicked = interactive && (ui.button(close, "Close") || ui.input.escape);
+        if save_clicked {
+            normalize_animation_clip(&mut clip);
+            match serde_json::to_string_pretty(&clip)
+                .map_err(|error| error.to_string())
+                .and_then(|json| std::fs::write(&path, json).map_err(|error| error.to_string()))
+            {
+                Ok(()) => self.status = format!("Saved {}", path.display()),
+                Err(error) => self.status = format!("Animation save failed: {error}"),
+            }
+        }
+        if !close_clicked {
+            self.popup = Some(Popup::AnimationEditor {
+                path,
+                clip,
+                selected_track,
+                selected_key,
+            });
+        }
+    }
+
     // ---- Actions -----------------------------------------------------------
 
     fn perform(&mut self, action: Action) {
@@ -5592,32 +7785,153 @@ impl EditorApp {
             }
             Action::NewFolder => self.open_prompt("New folder name", Pending::CreateFolder, "NewFolder"),
             Action::NewScript => self.open_prompt("New script name", Pending::CreateScript, "script.luau"),
+            Action::NewShader => self.open_prompt("New shader name", Pending::CreateShader, "shader.frag"),
+            Action::NewAnimation => {
+                self.open_prompt("New animation name", Pending::CreateAnimation, "animation.neoanim")
+            }
             Action::RevealInExplorer => self.reveal_in_explorer(),
             Action::OpenProjectInVscode => self.open_project_in_vscode(),
             Action::OpenPath(p) => self.open_path(&p),
+            Action::OpenAnimation(p) => self.open_animation_path(p),
             Action::OpenScene(p) => self.open_scene_path(p),
             Action::EnterFolder(p) => self.navigate_bin(p),
             Action::OpenSelectionTools(x, y) => self.open_selection_tools(x, y),
             Action::OpenHierarchyTools(x, y) => self.open_hierarchy_tools(x, y),
             Action::OpenArrangeTools(x, y) => self.open_arrange_tools(x, y),
             Action::OpenViewTools(x, y) => self.open_view_tools(x, y),
+            Action::OpenEditorSettings => self.open_editor_settings(),
+            Action::OpenMobileEmulator => self.open_mobile_emulator(),
+            Action::OpenProjectWindowSettings => {
+                self.popup = Some(Popup::ProjectWindow {
+                    width: format_num(self.project_window.width),
+                    height: format_num(self.project_window.height),
+                    fullscreen: self.project_window.fullscreen,
+                    resizable: self.project_window.resizable,
+                });
+            }
+            Action::BuildProject => self.open_build_target(),
+            Action::ToggleHierarchy => {
+                self.config.layout.show_hierarchy = !self.config.layout.show_hierarchy;
+                if !self.config.layout.show_hierarchy {
+                    self.config.layout.undock_hierarchy = false;
+                }
+                self.dirty = true;
+            }
+            Action::ToggleInspector => {
+                self.config.layout.show_inspector = !self.config.layout.show_inspector;
+                if !self.config.layout.show_inspector {
+                    self.config.layout.undock_inspector = false;
+                }
+                self.dirty = true;
+            }
+            Action::ToggleHierarchyUndocked => {
+                self.config.layout.show_hierarchy = true;
+                self.config.layout.undock_hierarchy = !self.config.layout.undock_hierarchy;
+                self.dirty = true;
+            }
+            Action::ToggleInspectorUndocked => {
+                self.config.layout.show_inspector = true;
+                self.config.layout.undock_inspector = !self.config.layout.undock_inspector;
+                self.dirty = true;
+            }
+            Action::ToggleProjectUndocked => {
+                self.config.layout.show_project = true;
+                self.config.layout.undock_project = !self.config.layout.undock_project;
+                self.dirty = true;
+            }
+            Action::SetSceneAntialiasing(value) => {
+                if matches!(value.as_str(), "off" | "standard" | "high")
+                    && self.scene.antialiasing != value
+                {
+                    self.scene.antialiasing = value;
+                    self.mark_dirty();
+                }
+            }
+            Action::SetPropEnum {
+                entity,
+                component,
+                prop,
+                value,
+            } => {
+                let mut changed = false;
+                if let Some(entity) = self.scene.entity_mut(entity) {
+                    if let Some(Component::Core { props, .. }) = entity.components.get_mut(component) {
+                        if let Some(prop) = props.get_mut(prop) {
+                            if let PropValue::Enum {
+                                value: current,
+                                options,
+                            } = &mut prop.value
+                            {
+                                if options.iter().any(|option| option == &value) && *current != value {
+                                    *current = value;
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if changed {
+                    self.mark_dirty();
+                }
+            }
             Action::SelectAll => self.select_all(),
             Action::InvertSelection => self.invert_selection(),
             Action::SelectChildren => self.select_children(),
             Action::SelectParent => self.select_parent(),
+            Action::SelectRoots => self.select_by_filter("Selected root entities", |app, entity| {
+                entity.parent.is_none() && !app.hidden_ids.contains(&entity.id)
+            }),
+            Action::SelectLeaves => self.select_by_filter("Selected leaf entities", |app, entity| {
+                app.scene.children_of(Some(entity.id)).is_empty() && !app.hidden_ids.contains(&entity.id)
+            }),
+            Action::SelectVisible => self.select_by_filter("Selected Scene-visible entities", |app, entity| {
+                !app.hidden_ids.contains(&entity.id)
+            }),
+            Action::SelectHidden => self.select_by_filter("Selected Scene-hidden entities", |app, entity| {
+                app.hidden_ids.contains(&entity.id)
+            }),
+            Action::SelectLocked => self.select_by_filter("Selected locked entities", |app, entity| {
+                app.locked_ids.contains(&entity.id)
+            }),
+            Action::SelectActive => self.select_by_filter("Selected active entities", |_app, entity| entity.enabled),
+            Action::SelectInactive => {
+                self.select_by_filter("Selected inactive entities", |_app, entity| !entity.enabled)
+            }
+            Action::SelectSiblings => self.select_siblings(),
+            Action::SelectNext => self.select_relative(1),
+            Action::SelectPrevious => self.select_relative(-1),
             Action::DuplicateSelection => self.duplicate_selection(),
             Action::GroupSelected => self.group_selected(),
             Action::UnparentSelected => self.unparent_selected(),
             Action::HideSelected => self.hide_selected(),
+            Action::HideUnselected => self.hide_unselected(),
+            Action::IsolateSelection => {
+                self.hide_unselected();
+                self.frame_selected();
+            }
             Action::ShowAllHidden => {
                 self.hidden_ids.clear();
                 self.status = "Revealed all Scene-view objects".to_string();
             }
+            Action::ShowSelected => {
+                for id in self.selection_ids_ordered() {
+                    self.hidden_ids.remove(&id);
+                }
+                self.status = "Revealed selected Scene-view objects".to_string();
+            }
             Action::LockSelected => self.lock_selected(),
+            Action::LockUnselected => self.lock_unselected(),
+            Action::UnlockSelection => {
+                for id in self.selection_ids_ordered() {
+                    self.locked_ids.remove(&id);
+                }
+                self.status = "Unlocked selection".to_string();
+            }
             Action::UnlockAll => {
                 self.locked_ids.clear();
                 self.status = "Unlocked all Scene-view objects".to_string();
             }
+            Action::ToggleActiveSelection => self.toggle_active_selection(),
             Action::CollapseSelected => {
                 self.hierarchy_collapsed.extend(self.selection_ids_ordered());
                 self.status = "Collapsed selected branches".to_string();
@@ -5643,13 +7957,37 @@ impl EditorApp {
                 self.status = "Expanded hierarchy".to_string();
             }
             Action::SnapSelected => self.snap_selected(),
+            Action::SnapSelectedSize => self.snap_selected_size(),
             Action::ResetSelected => self.reset_selected(),
+            Action::ResetSelectedRotation => self.reset_selected_rotation(),
+            Action::ResetSelectedScale => self.reset_selected_scale(),
+            Action::ResetSelectedAnchors => self.reset_selected_anchors(),
+            Action::FitSelectionToWindow => self.fit_selection_to_window(),
+            Action::CenterSelectionInWindow => self.center_selection_in_window(),
+            Action::NormalizeSelectedSizes => self.normalize_selected_sizes(),
             Action::Align(kind) => self.align_selected(kind),
+            Action::BringToFront => self.move_selection_z(ZMove::Front),
+            Action::SendToBack => self.move_selection_z(ZMove::Back),
+            Action::BringForward => self.move_selection_z(ZMove::Forward),
+            Action::SendBackward => self.move_selection_z(ZMove::Backward),
+            Action::NudgeZ(delta) => self.nudge_selection_z(delta),
+            Action::RefreshProject => self.refresh_project_browser(),
+            Action::RevealSceneFile => {
+                let path = self.scene_path.clone();
+                self.open_path(&path);
+            }
+            Action::OpenProjectRoot => {
+                let path = self.project_root.clone();
+                self.open_path(&path);
+            }
             Action::FrameAll => self.frame_all(),
             Action::Zoom100 => self.zoom_100(),
             Action::ToggleMaximize => self.maximize_view = !self.maximize_view,
             Action::ToggleProject => {
                 self.config.layout.show_project = !self.config.layout.show_project;
+                if !self.config.layout.show_project {
+                    self.config.layout.undock_project = false;
+                }
                 self.dirty = true;
             }
         }
@@ -5669,6 +8007,8 @@ impl EditorApp {
             Pending::RenameScene => self.rename_scene(value),
             Pending::CreateFolder => self.create_folder(&value),
             Pending::CreateScript => self.create_script(&value),
+            Pending::CreateShader => self.create_shader(&value),
+            Pending::CreateAnimation => self.create_animation(&value),
             Pending::RenameEntity(id) => {
                 if let Some(e) = self.scene.entity_mut(id) {
                     e.name = value;
@@ -5976,6 +8316,70 @@ impl EditorApp {
         }
     }
 
+    fn create_shader(&mut self, name: &str) {
+        let mut name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if !name.ends_with(".frag") && !name.ends_with(".glsl") && !name.ends_with(".shader") {
+            name.push_str(".frag");
+        }
+        let path = self.bin_dir.join(&name);
+        let template = "#version 450\n\nuniform sampler2D Texture;\n\nvoid main() {\n    gl_FragColor = texture2D(Texture, uv) * color;\n}\n";
+        match std::fs::write(&path, template) {
+            Ok(()) => {
+                self.status = format!("Created shader {name}");
+                self.open_path(&path);
+            }
+            Err(e) => self.status = format!("Create shader failed: {e}"),
+        }
+    }
+
+    fn create_animation(&mut self, name: &str) {
+        let mut name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if !name.ends_with(".neoanim") {
+            name.push_str(".neoanim");
+        }
+        let path = self.bin_dir.join(&name);
+        let clip = AnimationClipAsset::default();
+        match serde_json::to_string_pretty(&clip)
+            .map_err(|error| error.to_string())
+            .and_then(|json| std::fs::write(&path, json).map_err(|error| error.to_string()))
+        {
+            Ok(()) => {
+                self.status = format!("Created animation {name}");
+                self.popup = Some(Popup::AnimationEditor {
+                    path,
+                    clip,
+                    selected_track: 0,
+                    selected_key: 0,
+                });
+            }
+            Err(error) => self.status = format!("Create animation failed: {error}"),
+        }
+    }
+
+    fn open_animation_path(&mut self, path: PathBuf) {
+        match std::fs::read_to_string(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|text| serde_json::from_str::<AnimationClipAsset>(&text).map_err(|error| error.to_string()))
+        {
+            Ok(mut clip) => {
+                normalize_animation_clip(&mut clip);
+                self.popup = Some(Popup::AnimationEditor {
+                    path,
+                    clip,
+                    selected_track: 0,
+                    selected_key: 0,
+                });
+            }
+            Err(error) => self.status = format!("Animation open failed: {error}"),
+        }
+    }
+
     fn add_script_component_from_path(&mut self, entity_id: u64, path: &Path) -> bool {
         let source = match std::fs::read_to_string(path) {
             Ok(source) => source,
@@ -6091,11 +8495,49 @@ impl EditorApp {
                 }
             }
         }
-        self.status = "VS Code command not found on PATH".to_string();
+
+        for (app_id, label) in [
+            ("com.visualstudio.code", "VS Code Flatpak"),
+            ("com.visualstudio.code.insiders", "VS Code Insiders Flatpak"),
+            ("com.vscodium.codium", "VSCodium Flatpak"),
+        ] {
+            match flatpak_app_installed(app_id) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => {
+                    self.status = format!("Failed to query Flatpak VS Code apps: {error}");
+                    return;
+                }
+            }
+
+            match std::process::Command::new("flatpak")
+                .arg("run")
+                .arg(app_id)
+                .arg("--reuse-window")
+                .arg(&self.project_root)
+                .spawn()
+            {
+                Ok(_) => {
+                    self.status = format!("Opened project in {label}");
+                    return;
+                }
+                Err(error) => {
+                    self.status = format!("Failed to open {label}: {error}");
+                    return;
+                }
+            }
+        }
+
+        self.status = "VS Code command not found on PATH or Flatpak".to_string();
     }
 
     /// Open a file or folder with the OS default handler.
     fn open_path(&mut self, path: &Path) {
+        if path.extension().is_some_and(|extension| extension == "neoanim") {
+            self.open_animation_path(path.to_path_buf());
+            return;
+        }
         #[cfg(target_os = "macos")]
         let cmd = "open";
         #[cfg(target_os = "windows")]
@@ -6108,11 +8550,11 @@ impl EditorApp {
         }
     }
 
-    fn export_luau(&mut self) {
+    fn export_luau(&mut self) -> bool {
         let path = self.project_root.join("main.luau");
         if let Err(e) = std::fs::write(&path, self.scene.to_luau()) {
             self.status = format!("Export failed: {e}");
-            return;
+            return false;
         }
         // Write (or clean up) the shared image-cache module alongside main.luau.
         let images_path = self.project_root.join("images.luau");
@@ -6120,7 +8562,7 @@ impl EditorApp {
             Some(content) => {
                 if let Err(e) = std::fs::write(&images_path, content) {
                     self.status = format!("Export failed (images.luau): {e}");
-                    return;
+                    return false;
                 }
             }
             None => remove_generated_file(&images_path),
@@ -6129,6 +8571,7 @@ impl EditorApp {
         // assets.luau files are preserved by remove_generated_file.
         remove_generated_file(&self.project_root.join("assets.luau"));
         self.status = format!("Exported {}", path.display());
+        true
     }
 
     /// Save an entity (and its descendants) as a `.neoprefab` in the current
@@ -6161,7 +8604,15 @@ impl EditorApp {
     }
 
     fn run_scene(&mut self) {
-        self.export_luau();
+        if self.config.settings.autosave_before_run && self.scene_dirty {
+            self.save();
+            if self.scene_dirty {
+                return;
+            }
+        }
+        if !self.export_luau() {
+            return;
+        }
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
             Err(e) => {
@@ -6170,6 +8621,7 @@ impl EditorApp {
             }
         };
         let root = self.project_root.clone();
+        let mobile_profile = self.mobile_emulation_profile();
         // Open a loopback IPC session for the live logger window before
         // launching, so the game can connect back and stream logs + snapshots.
         let ipc_addr = match crate::editor_ipc::LoggerSession::start() {
@@ -6189,6 +8641,7 @@ impl EditorApp {
         std::thread::spawn(move || {
             let mut command = std::process::Command::new(exe);
             command.arg("run").arg(&root).env("RUST_BACKTRACE", "1");
+            crate::mobile_emulation::apply_env(&mut command, &mobile_profile);
             if let Some(addr) = &ipc_addr {
                 command.env("NEOLOVE_EDITOR_IPC", addr);
             }
@@ -6212,9 +8665,70 @@ impl EditorApp {
         self.status = "Running preview…".to_string();
     }
 
+    fn build_project(&mut self, target: BuildTarget) {
+        if self.build_rx.is_some() {
+            self.status = "Build already running".to_string();
+            return;
+        }
+        if self.config.settings.autosave_before_build && self.scene_dirty {
+            self.save();
+            if self.scene_dirty {
+                return;
+            }
+        }
+        if !self.export_luau() {
+            return;
+        }
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                self.status = format!("Build failed: {e}");
+                return;
+            }
+        };
+        let root = self.project_root.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut command = std::process::Command::new(exe);
+            command.arg("build").arg(&root);
+            if let Some(arg) = target.cli_arg() {
+                command.arg(arg);
+            }
+            let outcome = match command.output() {
+                Ok(out) if out.status.success() => {
+                    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    Ok(if stdout.is_empty() {
+                        "Build complete".to_string()
+                    } else {
+                        stdout
+                    })
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    Err(if !stderr.is_empty() {
+                        stderr
+                    } else if !stdout.is_empty() {
+                        stdout
+                    } else {
+                        format!("Build exited with {}.", out.status)
+                    })
+                }
+                Err(e) => Err(format!("Failed to launch build: {e}")),
+            };
+            let _ = tx.send(outcome);
+        });
+        self.build_rx = Some(rx);
+        self.status = format!("Building {}…", target.label());
+    }
+
     /// True while a launched preview is still running.
     pub fn run_pending(&self) -> bool {
         self.run_rx.is_some()
+    }
+
+    pub fn build_pending(&self) -> bool {
+        self.build_rx.is_some()
     }
 
     /// Take a pending logger session (set when a run starts) so the windowing
@@ -6246,6 +8760,32 @@ impl EditorApp {
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
                 self.run_rx = None;
+                true
+            }
+        }
+    }
+
+    pub fn poll_build(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let result = match &self.build_rx {
+            Some(rx) => rx.try_recv(),
+            None => return false,
+        };
+        match result {
+            Ok(outcome) => {
+                self.build_rx = None;
+                match outcome {
+                    Ok(message) => self.status = message.lines().last().unwrap_or("Build complete").to_string(),
+                    Err(message) => {
+                        self.status = "Build failed".to_string();
+                        self.popup = Some(Popup::Error { message, copied: false });
+                    }
+                }
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.build_rx = None;
                 true
             }
         }
@@ -6702,7 +9242,8 @@ fn prop_string_like(props: &[Prop], names: &[&str]) -> Option<String> {
         | PropValue::Image(value)
         | PropValue::Font(value)
         | PropValue::Sound(value)
-        | PropValue::Shader(value) => Some(value.clone()),
+        | PropValue::Shader(value)
+        | PropValue::Animation(value) => Some(value.clone()),
         PropValue::Enum { value, .. } => Some(value.clone()),
         PropValue::Number(value) => Some(format_num(*value)),
         PropValue::Int(value) => Some(value.to_string()),
@@ -6932,6 +9473,83 @@ fn draw_tilemap(
             );
         }
     }
+}
+
+fn parse_tile_ids(data: &str, len: usize) -> Vec<i32> {
+    let mut ids: Vec<i32> = data
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    ids.resize(len, -1);
+    ids
+}
+
+fn format_tile_ids(ids: &[i32], columns: usize) -> String {
+    let columns = columns.max(1);
+    let mut out = String::new();
+    for (index, id) in ids.iter().enumerate() {
+        if index > 0 {
+            if index % columns == 0 {
+                out.push('\n');
+            } else {
+                out.push_str(", ");
+            }
+        }
+        out.push_str(&id.to_string());
+    }
+    out
+}
+
+fn normalize_animation_clip(clip: &mut AnimationClipAsset) {
+    if !clip.duration.is_finite() || clip.duration <= 0.0 {
+        clip.duration = 1.0;
+    }
+    if clip.tracks.is_empty() {
+        clip.tracks.push(AnimationTrackAsset::default());
+    }
+    for track in &mut clip.tracks {
+        if track.property.trim().is_empty() {
+            track.property = "x".to_string();
+        }
+        match track.interpolation.as_str() {
+            "linear" | "step" | "hold" | "bezier" => {}
+            _ => track.interpolation = "linear".to_string(),
+        }
+        if track.keys.is_empty() {
+            track.keys.push(AnimationKeyAsset::new(0.0, 0.0));
+        }
+        for key in &mut track.keys {
+            if !key.time.is_finite() {
+                key.time = 0.0;
+            }
+            key.time = key.time.clamp(0.0, clip.duration);
+            if !key.value.is_finite() {
+                key.value = 0.0;
+            }
+            key.out_x = key.out_x.clamp(0.0, 1.0);
+            key.in_x = key.in_x.clamp(0.0, 1.0);
+            if !key.out_y.is_finite() {
+                key.out_y = 0.0;
+            }
+            if !key.in_y.is_finite() {
+                key.in_y = 1.0;
+            }
+        }
+        track.keys.sort_by(|a, b| a.time.total_cmp(&b.time));
+    }
+}
+
+fn nearest_animation_key(keys: &[AnimationKeyAsset], time: f32) -> usize {
+    keys.iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (a.time - time)
+                .abs()
+                .total_cmp(&(b.time - time).abs())
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(0)
 }
 
 fn sample_color_sequence(keypoints: &[ColorKeypoint], time: f32) -> [u8; 4] {
@@ -7286,6 +9904,7 @@ fn file_icon(name: &str) -> char {
         "wav" | "mp3" | "ogg" | "flac" | "aac" | "m4a" | "aiff" => icon::AUDIOTRACK,
         "ttf" | "otf" => icon::FONT_DOWNLOAD,
         "glsl" | "frag" | "vert" | "fs" | "vs" | "shader" => icon::DATA_OBJECT,
+        "neoanim" | "animation" | "anim" => icon::PLAY,
         "luau" | "lua" => icon::DATA_OBJECT,
         "toml" | "json" | "txt" | "md" | "neoscene" => icon::ARTICLE,
         "neoprefab" => icon::VIEW_IN_AR,
@@ -7293,19 +9912,355 @@ fn file_icon(name: &str) -> char {
     }
 }
 
+pub fn global_config_path() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
+            return PathBuf::from(appdata).join("NeoLOVE").join("editor.json");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+            return PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("NeoLOVE")
+                .join("editor.json");
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+            return PathBuf::from(config_home).join("neolove").join("editor.json");
+        }
+        if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+            return PathBuf::from(home)
+                .join(".config")
+                .join("neolove")
+                .join("editor.json");
+        }
+    }
+
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("editor.json")
+}
+
+pub fn load_config_with_fallback(global_path: &Path, legacy_path: &Path) -> EditorConfig {
+    if global_path.exists() {
+        return load_config(global_path);
+    }
+    load_config(legacy_path)
+}
+
 pub fn load_config(path: &Path) -> EditorConfig {
     match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|error| {
-            eprintln!("warning: failed to parse {}: {error}", path.display());
-            EditorConfig::default()
-        }),
-        Err(_) => EditorConfig::default(),
+        Ok(text) => {
+            let has_settings = text.contains("\"settings\"");
+            let mut config = serde_json::from_str::<EditorConfig>(&text).unwrap_or_else(|error| {
+                eprintln!("warning: failed to parse {}: {error}", path.display());
+                EditorConfig::default()
+            });
+            if !has_settings && text.contains("\"theme\"") {
+                config.settings.theme_name = "custom".to_string();
+            }
+            normalize_config(&mut config);
+            config
+        }
+        Err(_) => {
+            let mut config = EditorConfig::default();
+            normalize_config(&mut config);
+            config
+        }
     }
 }
 
 pub fn save_config(path: &Path, config: &EditorConfig) -> Result<(), String> {
     let text = serde_json::to_string_pretty(config).map_err(|e| format!("failed to serialize config: {e}"))?;
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
     std::fs::write(path, text).map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+fn normalize_config(config: &mut EditorConfig) {
+    if config.settings.theme_name.trim().is_empty() {
+        config.settings.theme_name = "dark_plus".to_string();
+    }
+    if let Some(theme) = theme_preset(&config.settings.theme_name) {
+        config.theme = theme;
+    }
+}
+
+fn theme_preset(name: &str) -> Option<Theme> {
+    match name {
+        "dark_plus" => Some(Theme::default()),
+        "gruvbox_dark" => Some(Theme {
+            panel: [40, 40, 40, 255],
+            panel_alt: [50, 48, 47, 255],
+            toolbar: [60, 56, 54, 255],
+            viewport_bg: [29, 32, 33, 255],
+            border: [80, 73, 69, 255],
+            text: [235, 219, 178, 255],
+            text_dim: [168, 153, 132, 255],
+            button: [69, 133, 136, 255],
+            button_hover: [104, 157, 106, 255],
+            button_active: [7, 102, 120, 255],
+            field: [60, 56, 54, 255],
+            field_focus: [50, 48, 47, 255],
+            accent: [250, 189, 47, 255],
+            selection: [250, 189, 47, 255],
+            danger: [251, 73, 52, 255],
+            splitter: [80, 73, 69, 255],
+            splitter_hover: [250, 189, 47, 255],
+            header: [50, 48, 47, 255],
+            grid: [235, 219, 178, 18],
+            corner_radius: 4.0,
+        }),
+        "dracula" => Some(Theme {
+            panel: [40, 42, 54, 255],
+            panel_alt: [48, 50, 65, 255],
+            toolbar: [33, 34, 44, 255],
+            viewport_bg: [30, 31, 40, 255],
+            border: [68, 71, 90, 255],
+            text: [248, 248, 242, 255],
+            text_dim: [191, 194, 205, 255],
+            button: [98, 114, 164, 255],
+            button_hover: [121, 135, 190, 255],
+            button_active: [68, 71, 90, 255],
+            field: [53, 55, 70, 255],
+            field_focus: [68, 71, 90, 255],
+            accent: [255, 184, 108, 255],
+            selection: [139, 233, 253, 255],
+            danger: [255, 85, 85, 255],
+            splitter: [68, 71, 90, 255],
+            splitter_hover: [255, 121, 198, 255],
+            header: [33, 34, 44, 255],
+            grid: [248, 248, 242, 18],
+            corner_radius: 4.0,
+        }),
+        "monokai" => Some(Theme {
+            panel: [39, 40, 34, 255],
+            panel_alt: [48, 49, 43, 255],
+            toolbar: [32, 33, 28, 255],
+            viewport_bg: [28, 29, 25, 255],
+            border: [73, 72, 62, 255],
+            text: [248, 248, 242, 255],
+            text_dim: [187, 181, 150, 255],
+            button: [73, 134, 156, 255],
+            button_hover: [90, 160, 184, 255],
+            button_active: [73, 72, 62, 255],
+            field: [55, 56, 48, 255],
+            field_focus: [65, 66, 57, 255],
+            accent: [253, 151, 31, 255],
+            selection: [253, 151, 31, 255],
+            danger: [249, 38, 114, 255],
+            splitter: [73, 72, 62, 255],
+            splitter_hover: [253, 151, 31, 255],
+            header: [32, 33, 28, 255],
+            grid: [248, 248, 242, 16],
+            corner_radius: 4.0,
+        }),
+        "solarized_dark" => Some(Theme {
+            panel: [0, 43, 54, 255],
+            panel_alt: [7, 54, 66, 255],
+            toolbar: [0, 33, 42, 255],
+            viewport_bg: [0, 27, 34, 255],
+            border: [88, 110, 117, 255],
+            text: [211, 222, 224, 255],
+            text_dim: [147, 166, 170, 255],
+            button: [38, 139, 210, 255],
+            button_hover: [42, 161, 152, 255],
+            button_active: [7, 54, 66, 255],
+            field: [7, 54, 66, 255],
+            field_focus: [0, 43, 54, 255],
+            accent: [203, 153, 0, 255],
+            selection: [42, 161, 152, 255],
+            danger: [220, 50, 47, 255],
+            splitter: [88, 110, 117, 255],
+            splitter_hover: [203, 153, 0, 255],
+            header: [0, 33, 42, 255],
+            grid: [211, 222, 224, 15],
+            corner_radius: 4.0,
+        }),
+        "light_plus" => Some(Theme {
+            panel: [243, 243, 243, 255],
+            panel_alt: [230, 230, 230, 255],
+            toolbar: [221, 221, 221, 255],
+            viewport_bg: [250, 250, 250, 255],
+            border: [198, 198, 198, 255],
+            text: [30, 30, 30, 255],
+            text_dim: [98, 98, 98, 255],
+            button: [0, 122, 204, 255],
+            button_hover: [17, 119, 187, 255],
+            button_active: [204, 232, 255, 255],
+            field: [255, 255, 255, 255],
+            field_focus: [245, 245, 245, 255],
+            accent: [0, 122, 204, 255],
+            selection: [204, 128, 0, 255],
+            danger: [196, 43, 28, 255],
+            splitter: [198, 198, 198, 255],
+            splitter_hover: [0, 122, 204, 255],
+            header: [230, 230, 230, 255],
+            grid: [0, 0, 0, 18],
+            corner_radius: 4.0,
+        }),
+        _ => None,
+    }
+}
+
+fn theme_label(name: &str) -> &'static str {
+    match name {
+        "dark_plus" => "Dark+",
+        "gruvbox_dark" => "Gruvbox Dark",
+        "dracula" => "Dracula",
+        "monokai" => "Monokai",
+        "solarized_dark" => "Solarized Dark",
+        "light_plus" => "Light+",
+        "custom" => "Custom",
+        _ => "Custom",
+    }
+}
+
+fn theme_presets() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("dark_plus", "Dark+"),
+        ("gruvbox_dark", "Gruvbox Dark"),
+        ("dracula", "Dracula"),
+        ("monokai", "Monokai"),
+        ("solarized_dark", "Solarized Dark"),
+        ("light_plus", "Light+"),
+        ("custom", "Custom"),
+    ]
+}
+
+fn parse_toml_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn flatpak_app_installed(app_id: &str) -> std::io::Result<bool> {
+    std::process::Command::new("flatpak")
+        .arg("info")
+        .arg(app_id)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+}
+
+fn load_project_window_settings(root: &Path) -> ProjectWindowSettings {
+    let mut settings = ProjectWindowSettings::default();
+    let Ok(text) = std::fs::read_to_string(root.join("neolove.toml")) else {
+        return settings;
+    };
+    let mut section = String::new();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim().to_ascii_lowercase();
+            continue;
+        }
+        if section != "window" {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim().to_ascii_lowercase().as_str() {
+            "width" => {
+                if let Ok(value) = value.trim().parse::<f32>() && value.is_finite() {
+                    settings.width = value.clamp(1.0, 16384.0);
+                }
+            }
+            "height" => {
+                if let Ok(value) = value.trim().parse::<f32>() && value.is_finite() {
+                    settings.height = value.clamp(1.0, 16384.0);
+                }
+            }
+            "fullscreen" => {
+                if let Some(value) = parse_toml_bool(value) {
+                    settings.fullscreen = value;
+                }
+            }
+            "resizable" => {
+                if let Some(value) = parse_toml_bool(value) {
+                    settings.resizable = value;
+                }
+            }
+            _ => {}
+        }
+    }
+    settings
+}
+
+fn save_project_window_settings(root: &Path, settings: &ProjectWindowSettings) -> Result<(), String> {
+    let path = root.join("neolove.toml");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut lines: Vec<String> = if existing.is_empty() {
+        Vec::new()
+    } else {
+        existing.lines().map(ToString::to_string).collect()
+    };
+
+    if !lines
+        .iter()
+        .any(|line| line.trim().eq_ignore_ascii_case("[window]"))
+    {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("[window]".to_string());
+    }
+
+    for (key, value) in [
+        ("width", format!("{}", settings.width.round() as i32)),
+        ("height", format!("{}", settings.height.round() as i32)),
+        ("fullscreen", settings.fullscreen.to_string()),
+        ("resizable", settings.resizable.to_string()),
+    ] {
+        upsert_toml_window_key(&mut lines, key, &value);
+    }
+
+    let mut out = lines.join("\n");
+    out.push('\n');
+    std::fs::write(&path, out).map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+fn upsert_toml_window_key(lines: &mut Vec<String>, key: &str, value: &str) {
+    let mut in_window = false;
+    let mut insert_at = lines.len();
+    for (index, line) in lines.iter_mut().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_window {
+                insert_at = index;
+                break;
+            }
+            in_window = trimmed.eq_ignore_ascii_case("[window]");
+            continue;
+        }
+        if in_window {
+            insert_at = index + 1;
+            if let Some((line_key, _)) = trimmed.split_once('=')
+                && line_key.trim().eq_ignore_ascii_case(key)
+            {
+                *line = format!("{key} = {value}");
+                return;
+            }
+        }
+    }
+    lines.insert(insert_at, format!("{key} = {value}"));
 }
 
 fn format_num(value: f32) -> String {
@@ -7400,10 +10355,157 @@ mod tests {
         }
     }
 
+    fn unique_test_path(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!(
+            "neolove_editor_{label}_{}_{}",
+            std::process::id(),
+            nanos
+        ))
+    }
+
     #[test]
     fn default_scene_has_no_components() {
         let h = Harness::new(Scene::default());
         assert!(h.app.scene.entities[0].components.is_empty());
+    }
+
+    #[test]
+    fn config_loading_prefers_global_and_preserves_legacy_custom_theme() {
+        let dir = unique_test_path("config");
+        let global = dir.join("global").join("editor.json");
+        let legacy = dir.join("legacy").join("editor.json");
+        std::fs::create_dir_all(legacy.parent().expect("legacy parent")).expect("legacy dir");
+        std::fs::write(
+            &legacy,
+            r#"{"theme":{"panel":[1,2,3,255],"button":[4,5,6,255]},"layout":{"grid":24}}"#,
+        )
+        .expect("write legacy config");
+
+        let config = load_config_with_fallback(&global, &legacy);
+        assert_eq!(config.settings.theme_name, "custom");
+        assert_eq!(config.theme.panel, [1, 2, 3, 255]);
+        assert_eq!(config.theme.button, [4, 5, 6, 255]);
+        assert_eq!(config.layout.grid, 24.0);
+
+        std::fs::create_dir_all(global.parent().expect("global parent")).expect("global dir");
+        std::fs::write(&global, r#"{"settings":{"theme_name":"gruvbox_dark"}}"#)
+            .expect("write global config");
+        let config = load_config_with_fallback(&global, &legacy);
+        assert_eq!(config.settings.theme_name, "gruvbox_dark");
+        assert_eq!(config.theme.panel, [40, 40, 40, 255]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn project_window_settings_preserve_resizable() {
+        let dir = unique_test_path("project_window");
+        std::fs::create_dir_all(&dir).expect("create project dir");
+        std::fs::write(
+            dir.join("neolove.toml"),
+            "[window]\nwidth = 900\nheight = 500\nfullscreen = false\nresizable = false\n",
+        )
+        .expect("write project settings");
+
+        let loaded = load_project_window_settings(&dir);
+        assert_eq!(loaded.width, 900.0);
+        assert_eq!(loaded.height, 500.0);
+        assert!(!loaded.fullscreen);
+        assert!(!loaded.resizable);
+
+        let updated = ProjectWindowSettings {
+            width: 1024.0,
+            height: 768.0,
+            fullscreen: true,
+            resizable: true,
+        };
+        save_project_window_settings(&dir, &updated).expect("save project settings");
+        let saved = std::fs::read_to_string(dir.join("neolove.toml")).expect("read saved settings");
+        assert!(saved.contains("resizable = true"));
+        assert!(load_project_window_settings(&dir).resizable);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_config_accepts_plain_relative_file_paths() {
+        let name = format!(
+            ".neolove_editor_config_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        );
+        let path = PathBuf::from(&name);
+        save_config(&path, &EditorConfig::default()).expect("save config");
+        assert!(path.exists());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn docking_actions_can_redock_detached_widgets() {
+        let mut h = Harness::new(Scene::default());
+        h.app.config.layout.show_inspector = true;
+        h.app.config.layout.undock_inspector = true;
+        h.app.dirty = false;
+        h.app.dock_widget(EditorWidget::Inspector);
+        assert!(h.app.config.layout.show_inspector);
+        assert!(!h.app.config.layout.undock_inspector);
+        assert!(h.app.dirty);
+
+        h.app.config.layout.show_project = true;
+        h.app.config.layout.undock_project = true;
+        h.app.perform(Action::ToggleProject);
+        assert!(!h.app.config.layout.show_project);
+        assert!(!h.app.config.layout.undock_project);
+    }
+
+    #[test]
+    fn enum_dropdown_actions_update_scene_and_component_values() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        scene
+            .entity_mut(id)
+            .expect("entity")
+            .components
+            .push(Component::core("Shape2D"));
+        let mut h = Harness::new(scene);
+
+        h.app.perform(Action::SetSceneAntialiasing("standard".to_string()));
+        assert_eq!(h.app.scene.antialiasing, "standard");
+        assert!(h.app.scene_dirty);
+        h.app.scene_dirty = false;
+
+        h.app.perform(Action::SetSceneAntialiasing("invalid".to_string()));
+        assert_eq!(h.app.scene.antialiasing, "standard");
+        assert!(!h.app.scene_dirty);
+
+        let shape_prop = match &h.app.scene.entity(id).expect("entity").components[0] {
+            Component::Core { props, .. } => props
+                .iter()
+                .position(|prop| prop.name == "shape")
+                .expect("shape prop"),
+            _ => panic!("core component"),
+        };
+        h.app.perform(Action::SetPropEnum {
+            entity: id,
+            component: 0,
+            prop: shape_prop,
+            value: "circle".to_string(),
+        });
+        let Component::Core { props, .. } = &h.app.scene.entity(id).expect("entity").components[0]
+        else {
+            panic!("core component");
+        };
+        assert!(matches!(
+            &props[shape_prop].value,
+            PropValue::Enum { value, .. } if value == "circle"
+        ));
     }
 
     #[test]
@@ -7430,7 +10532,7 @@ mod tests {
             .push(Component::core("SpatialSound2D"));
         let mut harness = Harness::new(scene);
         harness.app.assign_asset(
-            AssetTarget {
+            AssetTarget::Prop {
                 entity: id,
                 component: 0,
                 prop: 0,
@@ -7732,6 +10834,87 @@ mod tests {
         assert!((second_entity.x - 380.0).abs() < 1.0, "second x was {}", second_entity.x);
     }
 
+    /// World-space centre of an entity (its origin plus the rotated half-size).
+    fn world_center(app: &EditorApp, id: u64) -> (f32, f32) {
+        let t = app.entity_world_transform(id).expect("transform");
+        let e = app.scene.entity(id).expect("entity");
+        let (sx, sy) = editor_entity_size(&app.scene, e, app.preview_root_size());
+        let (hw, hh) = (sx * t.scale / 2.0, sy * t.scale / 2.0);
+        let (sin, cos) = (t.rotation.sin(), t.rotation.cos());
+        (t.x + hw * cos - hh * sin, t.y + hw * sin + hh * cos)
+    }
+
+    #[test]
+    fn rotate_gizmo_pivots_about_entity_center() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        {
+            let e = scene.entity_mut(id).expect("entity");
+            e.x = 200.0;
+            e.y = 150.0;
+            e.size_x = 120.0;
+            e.size_y = 80.0;
+            e.rotation = 0.0;
+        }
+        let mut h = Harness::new(scene);
+        h.app.config.layout.snap = false;
+        h.app.config.layout.view_tool = ViewTool::Rotate;
+        h.app.select_only(id);
+
+        // Render once so the viewport rect and camera are populated.
+        h.frame(FrameInput::default());
+        let area = h.app.last_viewport;
+        let e = h.app.scene.entity(id).expect("entity");
+        let rect = h.app.entity_screen_rect(e, area).expect("rect");
+        let (kx, ky) = h.app.rotate_handle_knob(rect, 0.0);
+        let (cx, cy) = (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
+        let center_before = world_center(&h.app, id);
+
+        // Grab the knob, then swing the cursor out to the entity's right side.
+        h.frame(FrameInput { mouse_x: kx, mouse_y: ky, mouse_pressed: true, mouse_down: true, ..Default::default() });
+        h.frame(FrameInput { mouse_x: cx + 80.0, mouse_y: cy, mouse_down: true, ..Default::default() });
+        h.frame(FrameInput { mouse_x: cx + 80.0, mouse_y: cy, ..Default::default() });
+
+        let after = h.app.scene.entity(id).expect("entity");
+        assert!(after.rotation.abs() > 0.1, "entity did not rotate: {}", after.rotation);
+        let center_after = world_center(&h.app, id);
+        assert!((center_after.0 - center_before.0).abs() < 1.0, "center x drifted {} -> {}", center_before.0, center_after.0);
+        assert!((center_after.1 - center_before.1).abs() < 1.0, "center y drifted {} -> {}", center_before.1, center_after.1);
+    }
+
+    #[test]
+    fn move_gizmo_x_arrow_constrains_to_x_axis() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        {
+            let e = scene.entity_mut(id).expect("entity");
+            e.x = 200.0;
+            e.y = 150.0;
+            e.size_x = 100.0;
+            e.size_y = 100.0;
+            e.rotation = 0.0;
+        }
+        let mut h = Harness::new(scene);
+        h.app.config.layout.snap = false;
+        h.app.config.layout.view_tool = ViewTool::Move;
+        h.app.select_only(id);
+
+        h.frame(FrameInput::default());
+        let area = h.app.last_viewport;
+        let e = h.app.scene.entity(id).expect("entity");
+        let rect = h.app.entity_screen_rect(e, area).expect("rect");
+        let (cx, cy) = (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
+
+        // Grab the +X (right) arrow arm, then drag diagonally: only x moves.
+        h.frame(FrameInput { mouse_x: cx + 22.0, mouse_y: cy, mouse_pressed: true, mouse_down: true, ..Default::default() });
+        h.frame(FrameInput { mouse_x: cx + 62.0, mouse_y: cy + 40.0, mouse_down: true, ..Default::default() });
+        h.frame(FrameInput { mouse_x: cx + 62.0, mouse_y: cy + 40.0, ..Default::default() });
+
+        let after = h.app.scene.entity(id).expect("entity");
+        assert!((after.x - 240.0).abs() < 1.0, "x should move +40, was {}", after.x);
+        assert!((after.y - 150.0).abs() < 0.01, "y should stay put, was {}", after.y);
+    }
+
     #[test]
     fn entity_scaler_drag_defaults_to_percent_position() {
         let mut scene = Scene::default();
@@ -7743,6 +10926,7 @@ mod tests {
             .push(Component::core("EntityScaler"));
         let mut h = Harness::new(scene);
         h.app.config.layout.snap = false;
+        h.app.config.layout.view_tool = ViewTool::Move;
         h.app.select_only(id);
 
         // The scaler starts at viewport (240,40), sized 100x100. Moving by
@@ -7770,6 +10954,7 @@ mod tests {
             .push(Component::core("EntityScaler"));
         let mut h = Harness::new(scene);
         h.app.config.layout.snap = false;
+        h.app.config.layout.view_tool = ViewTool::Scale;
         h.app.select_only(id);
 
         // Resize 100x100 to 128x144: 10% and 20% of the preview root.
@@ -7807,6 +10992,7 @@ mod tests {
         h.frame(FrameInput { mouse_x: 330.0, mouse_y: 90.0, ..Default::default() });
 
         // The move puts the rect at x=280, so its bottom-right handle is 380,140.
+        h.app.config.layout.view_tool = ViewTool::Scale;
         h.frame(FrameInput { mouse_x: 380.0, mouse_y: 140.0, mouse_pressed: true, mouse_down: true, ..Default::default() });
         h.frame(FrameInput { mouse_x: 420.0, mouse_y: 180.0, mouse_down: true, ..Default::default() });
         h.frame(FrameInput { mouse_x: 420.0, mouse_y: 180.0, ..Default::default() });
@@ -7904,6 +11090,7 @@ mod tests {
         // (440,190)-(540,290); the bottom-right handle is at (540,290).
         let mut h = Harness::new(Scene::default());
         h.app.config.layout.snap = false;
+        h.app.config.layout.view_tool = ViewTool::Scale;
         let id = h.app.scene.entities[0].id;
         h.app.selected = Some(id);
         // Press the bottom-right handle, drag +40,+40, release.
@@ -7922,6 +11109,7 @@ mod tests {
         scene.entities[0].size_y = 50.0;
         let mut h = Harness::new(scene);
         h.app.config.layout.snap = false;
+        h.app.config.layout.view_tool = ViewTool::Scale;
         let id = h.app.scene.entities[0].id;
         h.app.select_only(id);
 
@@ -8110,7 +11298,7 @@ mod tests {
         scene.entity_mut(id).expect("entity").components.push(Component::core("ParticleSystem2D"));
         let mut h = Harness::new(scene);
         h.app.popup = Some(Popup::Sequence {
-            target: AssetTarget { entity: id, component: 0, prop: 12 },
+            target: AssetTarget::Prop { entity: id, component: 0, prop: 13 },
             kind: SequenceKind::Color,
             value: SequenceValue::Colors(vec![
                 ColorKeypoint { time: 0.0, color: [255, 0, 0, 255] },
@@ -8136,7 +11324,7 @@ mod tests {
         ]);
         let mut h = Harness::new(scene);
         h.app.popup = Some(Popup::Sequence {
-            target: AssetTarget { entity: id, component: 0, prop: 12 },
+            target: AssetTarget::Prop { entity: id, component: 0, prop: 13 },
             kind: SequenceKind::Color,
             value,
             selected: 1,
@@ -8163,7 +11351,7 @@ mod tests {
         let Component::Core { props, .. } = &h.app.scene.entity(id).expect("entity").components[0] else {
             panic!("particle component");
         };
-        let PropValue::ColorSequence(saved) = &props[12].value else {
+        let PropValue::ColorSequence(saved) = &props[13].value else {
             panic!("color sequence property");
         };
         assert!((saved[1].time - 0.75).abs() < 0.002);
@@ -8176,7 +11364,7 @@ mod tests {
         scene.entity_mut(id).expect("entity").components.push(Component::core("ParticleSystem2D"));
         let mut h = Harness::new(scene);
         h.app.popup = Some(Popup::Sequence {
-            target: AssetTarget { entity: id, component: 0, prop: 12 },
+            target: AssetTarget::Prop { entity: id, component: 0, prop: 13 },
             kind: SequenceKind::Color,
             value: SequenceValue::Colors(vec![
                 ColorKeypoint { time: 0.0, color: [255, 0, 0, 255] },
@@ -8209,7 +11397,7 @@ mod tests {
         let Component::Core { props, .. } = &h.app.scene.entity(id).expect("entity").components[0] else {
             panic!("particle component");
         };
-        let PropValue::ColorSequence(saved) = &props[12].value else {
+        let PropValue::ColorSequence(saved) = &props[13].value else {
             panic!("color sequence property");
         };
         assert_eq!(saved[0].color, keypoints[0].color);
@@ -8698,6 +11886,114 @@ mod tests {
         harness.app.select_only(first);
         harness.app.invert_selection();
         assert_eq!(harness.app.selection_ids_ordered(), vec![second, third]);
+    }
+
+    #[test]
+    fn expanded_quality_of_life_actions_mutate_selection_state() {
+        let mut scene = Scene::default();
+        let first = scene.entities[0].id;
+        {
+            let entity = scene.entity_mut(first).expect("first");
+            entity.x = 10.0;
+            entity.y = 20.0;
+            entity.size_x = 13.0;
+            entity.size_y = 17.0;
+            entity.rotation = 0.75;
+            entity.scale = 2.0;
+            entity.anchor_x = 0.5;
+            entity.anchor_y = 0.5;
+            entity.z = 0.0;
+        }
+        let second = scene.add_entity("Second", 100.0, 100.0).id;
+        scene.entity_mut(second).expect("second").z = 2.0;
+        let child = scene.add_entity("Child", 5.0, 6.0).id;
+        {
+            let entity = scene.entity_mut(child).expect("child");
+            entity.parent = Some(second);
+            entity.z = 3.0;
+        }
+        let disabled = scene.add_entity("Disabled", 0.0, 0.0).id;
+        {
+            let entity = scene.entity_mut(disabled).expect("disabled");
+            entity.enabled = false;
+            entity.z = -2.0;
+        }
+
+        let mut harness = Harness::new(scene);
+        harness.app.hidden_ids.insert(second);
+        harness.app.locked_ids.insert(child);
+        harness.app.perform(Action::SelectHidden);
+        assert_eq!(harness.app.selection_ids_ordered(), vec![second]);
+        harness.app.perform(Action::SelectLocked);
+        assert_eq!(harness.app.selection_ids_ordered(), vec![child]);
+        harness.app.perform(Action::SelectInactive);
+        assert_eq!(harness.app.selection_ids_ordered(), vec![disabled]);
+        harness.app.select_only(first);
+        harness.app.perform(Action::SelectNext);
+        assert_eq!(harness.app.selected, Some(second));
+        harness.app.perform(Action::SelectPrevious);
+        assert_eq!(harness.app.selected, Some(first));
+
+        harness.app.select_only(first);
+        harness.app.perform(Action::HideUnselected);
+        assert!(!harness.app.hidden_ids.contains(&first));
+        assert!(harness.app.hidden_ids.contains(&second));
+        assert!(harness.app.hidden_ids.contains(&child));
+        assert!(harness.app.hidden_ids.contains(&disabled));
+        harness.app.perform(Action::LockUnselected);
+        assert!(!harness.app.locked_ids.contains(&first));
+        assert!(harness.app.locked_ids.contains(&second));
+        assert!(harness.app.locked_ids.contains(&child));
+        assert!(harness.app.locked_ids.contains(&disabled));
+        harness.app.perform(Action::ToggleActiveSelection);
+        assert!(!harness.app.scene.entity(first).expect("first").enabled);
+        harness.app.perform(Action::ToggleActiveSelection);
+        assert!(harness.app.scene.entity(first).expect("first").enabled);
+
+        harness.app.config.layout.grid = 16.0;
+        harness.app.perform(Action::SnapSelectedSize);
+        let first_entity = harness.app.scene.entity(first).expect("first");
+        assert_eq!((first_entity.size_x, first_entity.size_y), (16.0, 16.0));
+        harness.app.perform(Action::ResetSelectedRotation);
+        harness.app.perform(Action::ResetSelectedScale);
+        harness.app.perform(Action::ResetSelectedAnchors);
+        let first_entity = harness.app.scene.entity(first).expect("first");
+        assert_eq!(first_entity.rotation, 0.0);
+        assert_eq!(first_entity.scale, 1.0);
+        assert_eq!((first_entity.anchor_x, first_entity.anchor_y), (0.0, 0.0));
+
+        {
+            let entity = harness.app.scene.entity_mut(first).expect("first");
+            entity.x = 10.0;
+            entity.y = 20.0;
+            entity.size_x = -20.0;
+            entity.size_y = -30.0;
+        }
+        harness.app.perform(Action::NormalizeSelectedSizes);
+        let first_entity = harness.app.scene.entity(first).expect("first");
+        assert_eq!((first_entity.x, first_entity.y), (-10.0, -10.0));
+        assert_eq!((first_entity.size_x, first_entity.size_y), (20.0, 30.0));
+
+        harness.app.perform(Action::FitSelectionToWindow);
+        let first_entity = harness.app.scene.entity(first).expect("first");
+        assert_eq!((first_entity.x, first_entity.y), (0.0, 0.0));
+        assert_eq!((first_entity.size_x, first_entity.size_y), (1280.0, 720.0));
+        {
+            let entity = harness.app.scene.entity_mut(first).expect("first");
+            entity.size_x = 100.0;
+            entity.size_y = 50.0;
+        }
+        harness.app.perform(Action::CenterSelectionInWindow);
+        let first_entity = harness.app.scene.entity(first).expect("first");
+        assert_eq!((first_entity.x, first_entity.y), (590.0, 335.0));
+
+        harness.app.perform(Action::BringToFront);
+        let front_z = harness.app.scene.entity(first).expect("first").z;
+        assert!(front_z > 3.0);
+        harness.app.perform(Action::SendBackward);
+        assert_eq!(harness.app.scene.entity(first).expect("first").z, front_z - 1.0);
+        harness.app.perform(Action::NudgeZ(0.5));
+        assert_eq!(harness.app.scene.entity(first).expect("first").z, front_z - 0.5);
     }
 
     #[test]

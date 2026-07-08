@@ -1,6 +1,8 @@
 #[cfg(not(target_os = "emscripten"))]
 mod native {
-    use mlua::{Buffer, Compiler, Function, Lua, MultiValue, RegistryKey, Table, TextRequirer, Value};
+    use mlua::{
+        Buffer, Compiler, Function, Lua, MultiValue, RegistryKey, Table, TextRequirer, Value,
+    };
     use ring::digest;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
     use rustls::{
@@ -110,7 +112,9 @@ mod native {
 
     #[derive(Clone)]
     enum ClientTransport {
-        Local { shared: Arc<HostedServerShared> },
+        Local {
+            shared: Arc<HostedServerShared>,
+        },
         Remote {
             base_url: String,
             outbound_sender: Sender<Vec<u8>>,
@@ -421,7 +425,10 @@ mod native {
             PackedValue::Map(entries) => {
                 let table = lua.create_table()?;
                 for (key, value) in entries {
-                    table.set(unpack_packed_value(lua, key)?, unpack_packed_value(lua, value)?)?;
+                    table.set(
+                        unpack_packed_value(lua, key)?,
+                        unpack_packed_value(lua, value)?,
+                    )?;
                 }
                 Ok(Value::Table(table))
             }
@@ -439,9 +446,7 @@ mod native {
             rmp_serde::from_slice(&buffer.to_vec()).map_err(mlua::Error::external)?;
         match unpack_packed_value(lua, packed)? {
             Value::Table(table) => Ok(table),
-            _ => Err(mlua::Error::external(
-                "deserialized value was not a table",
-            )),
+            _ => Err(mlua::Error::external("deserialized value was not a table")),
         }
     }
 
@@ -876,7 +881,8 @@ mod native {
         reason: &'static str,
         value: &T,
     ) -> Result<HttpResponse, String> {
-        let body = serde_json::to_vec(value).map_err(|error| format!("failed to encode json: {error}"))?;
+        let body =
+            serde_json::to_vec(value).map_err(|error| format!("failed to encode json: {error}"))?;
         Ok(HttpResponse {
             status,
             reason,
@@ -1132,9 +1138,9 @@ mod native {
             Ok(function) => function,
             Err(_) => return,
         };
-        if let Err(error) = protect_lua_call("polling server-side HTTP callbacks", || {
-            poll.call::<()>(())
-        }) {
+        if let Err(error) =
+            protect_lua_call("polling server-side HTTP callbacks", || poll.call::<()>(()))
+        {
             eprintln!(
                 "\x1b[31mLua Error:\x1b[0m Failed to poll server-side HTTP callbacks\n{}",
                 describe_lua_error(&error)
@@ -1172,9 +1178,11 @@ mod native {
         let kick_shared = shared.clone();
         module.set(
             "kick",
-            lua.create_function(move |_lua, (client_key, reason): (String, Option<String>)| {
-                kick_client(&kick_shared, &client_key, reason).map_err(mlua::Error::external)
-            })?,
+            lua.create_function(
+                move |_lua, (client_key, reason): (String, Option<String>)| {
+                    kick_client(&kick_shared, &client_key, reason).map_err(mlua::Error::external)
+                },
+            )?,
         )?;
 
         let host_shared = shared.clone();
@@ -1260,10 +1268,9 @@ mod native {
                         };
                         let payload = lua.create_buffer(event.payload)?;
                         for callback in functions {
-                            if let Err(error) = protect_lua_call(
-                                "running server callback",
-                                || callback.call::<()>((event.client_key.clone(), payload.clone())),
-                            ) {
+                            if let Err(error) = protect_lua_call("running server callback", || {
+                                callback.call::<()>((event.client_key.clone(), payload.clone()))
+                            }) {
                                 eprintln!(
                                     "\x1b[31mLua Error in server callback:\x1b[0m\n{}",
                                     describe_lua_error(&error)
@@ -1309,7 +1316,10 @@ mod native {
         headers.get("x-neolove-client-key").cloned()
     }
 
-    fn handle_http_request(shared: Arc<HostedServerShared>, request: HttpRequest) -> Result<HttpResponse, String> {
+    fn handle_http_request(
+        shared: Arc<HostedServerShared>,
+        request: HttpRequest,
+    ) -> Result<HttpResponse, String> {
         if request.method.eq_ignore_ascii_case("OPTIONS") {
             return Ok(empty_response(204, "No Content"));
         }
@@ -1323,11 +1333,16 @@ mod native {
                 };
                 json_response(200, "OK", &response)
             }
-            "/connect" if request.method.eq_ignore_ascii_case("POST")
-                || request.method.eq_ignore_ascii_case("GET") =>
+            "/connect"
+                if request.method.eq_ignore_ascii_case("POST")
+                    || request.method.eq_ignore_ascii_case("GET") =>
             {
                 if shared.stop_flag.load(Ordering::SeqCst) {
-                    return Ok(plain_response(503, "Service Unavailable", "server is stopping"));
+                    return Ok(plain_response(
+                        503,
+                        "Service Unavailable",
+                        "server is stopping",
+                    ));
                 }
                 json_response(200, "OK", &register_remote_client(&shared))
             }
@@ -1354,27 +1369,22 @@ mod native {
                 let Some(client_key) = client_key_from_headers(&request.headers) else {
                     return Ok(plain_response(400, "Bad Request", "missing client key"));
                 };
-                let timeout =
-                    Duration::from_millis(parse_timeout_ms(request.query.as_deref()));
+                let timeout = Duration::from_millis(parse_timeout_ms(request.query.as_deref()));
                 match wait_for_client_event(&shared, &client_key, timeout) {
                     PollResult::Message(payload) => Ok(HttpResponse {
                         status: 200,
                         reason: "OK",
                         content_type: "application/octet-stream",
-                        headers: vec![(
-                            "X-NeoLOVE-Event".to_string(),
-                            "data".to_string(),
-                        )],
+                        headers: vec![("X-NeoLOVE-Event".to_string(), "data".to_string())],
                         body: payload,
                     }),
                     PollResult::Empty => Ok(empty_response(204, "No Content")),
                     PollResult::Kicked(reason) => {
                         let mut response = plain_response(410, "Gone", "client was kicked");
                         if let Some(reason) = reason {
-                            response.headers.push((
-                                "X-NeoLOVE-Kick-Reason".to_string(),
-                                reason,
-                            ));
+                            response
+                                .headers
+                                .push(("X-NeoLOVE-Kick-Reason".to_string(), reason));
                         }
                         Ok(response)
                     }
@@ -1387,7 +1397,11 @@ mod native {
                 let Some(client_key) = client_key_from_headers(&request.headers) else {
                     return Ok(plain_response(400, "Bad Request", "missing client key"));
                 };
-                disconnect_client(&shared, &client_key, Some("client disconnected".to_string()));
+                disconnect_client(
+                    &shared,
+                    &client_key,
+                    Some("client disconnected".to_string()),
+                );
                 Ok(empty_response(204, "No Content"))
             }
             _ => Ok(plain_response(404, "Not Found", "unknown route")),
@@ -1427,8 +1441,9 @@ mod native {
             return Ok(PrivateKeyDer::Pkcs8(key.into()));
         }
 
-        let file = File::open(path)
-            .map_err(|error| format!("failed to reopen private key '{}': {error}", path.display()))?;
+        let file = File::open(path).map_err(|error| {
+            format!("failed to reopen private key '{}': {error}", path.display())
+        })?;
         let mut reader = BufReader::new(file);
         if let Some(key) = rustls_pemfile::rsa_private_keys(&mut reader)
             .map_err(|error| format!("failed to read private key '{}': {error}", path.display()))?
@@ -1438,8 +1453,9 @@ mod native {
             return Ok(PrivateKeyDer::Pkcs1(key.into()));
         }
 
-        let file = File::open(path)
-            .map_err(|error| format!("failed to reopen private key '{}': {error}", path.display()))?;
+        let file = File::open(path).map_err(|error| {
+            format!("failed to reopen private key '{}': {error}", path.display())
+        })?;
         let mut reader = BufReader::new(file);
         if let Some(key) = rustls_pemfile::ec_private_keys(&mut reader)
             .map_err(|error| format!("failed to read private key '{}': {error}", path.display()))?
@@ -1449,7 +1465,10 @@ mod native {
             return Ok(PrivateKeyDer::Sec1(key.into()));
         }
 
-        Err(format!("no supported private key found in '{}'", path.display()))
+        Err(format!(
+            "no supported private key found in '{}'",
+            path.display()
+        ))
     }
 
     fn build_server_tls_config(
@@ -1480,8 +1499,10 @@ mod native {
                             configure_stream(&stream)?;
                             match tls_config {
                                 Some(config) => {
-                                    let connection = ServerConnection::new(config)
-                                        .map_err(|error| format!("failed to start TLS session: {error}"))?;
+                                    let connection =
+                                        ServerConnection::new(config).map_err(|error| {
+                                            format!("failed to start TLS session: {error}")
+                                        })?;
                                     let mut stream = StreamOwned::new(connection, stream);
                                     handle_connection(&mut stream, shared)
                                 }
@@ -1509,7 +1530,8 @@ mod native {
     }
 
     fn connect_remote_client(base_url: &str) -> Result<ConnectResponse, String> {
-        let response = perform_binary_http_request(&join_url(base_url, "/connect"), "POST", &[], &[])?;
+        let response =
+            perform_binary_http_request(&join_url(base_url, "/connect"), "POST", &[], &[])?;
         if response.status != 200 {
             let body = String::from_utf8_lossy(&response.body);
             return Err(format!(
@@ -1517,19 +1539,18 @@ mod native {
                 response.status, body
             ));
         }
-        let payload: ConnectResponse =
-            serde_json::from_slice(&response.body).map_err(|error| format!("invalid connect response: {error}"))?;
+        let payload: ConnectResponse = serde_json::from_slice(&response.body)
+            .map_err(|error| format!("invalid connect response: {error}"))?;
         if !payload.ok {
-            return Err(payload.error.unwrap_or_else(|| "server rejected connect request".to_string()));
+            return Err(payload
+                .error
+                .unwrap_or_else(|| "server rejected connect request".to_string()));
         }
         Ok(payload)
     }
 
     fn send_remote_payload(base_url: &str, client_key: &str, payload: &[u8]) -> Result<(), String> {
-        let headers = vec![(
-            "X-NeoLOVE-Client-Key".to_string(),
-            client_key.to_string(),
-        )];
+        let headers = vec![("X-NeoLOVE-Client-Key".to_string(), client_key.to_string())];
         let response =
             perform_binary_http_request(&join_url(base_url, "/send"), "POST", &headers, payload)?;
         if response.status != 202 {
@@ -1543,10 +1564,7 @@ mod native {
     }
 
     fn disconnect_remote_client(base_url: &str, client_key: &str) -> Result<(), String> {
-        let headers = vec![(
-            "X-NeoLOVE-Client-Key".to_string(),
-            client_key.to_string(),
-        )];
+        let headers = vec![("X-NeoLOVE-Client-Key".to_string(), client_key.to_string())];
         let response =
             perform_binary_http_request(&join_url(base_url, "/disconnect"), "POST", &headers, &[])?;
         if response.status != 204 {
@@ -1564,14 +1582,8 @@ mod native {
         client_key: &str,
         timeout_ms: u64,
     ) -> Result<RemotePollResult, String> {
-        let headers = vec![(
-            "X-NeoLOVE-Client-Key".to_string(),
-            client_key.to_string(),
-        )];
-        let url = format!(
-            "{}?timeout_ms={timeout_ms}",
-            join_url(base_url, "/poll")
-        );
+        let headers = vec![("X-NeoLOVE-Client-Key".to_string(), client_key.to_string())];
+        let url = format!("{}?timeout_ms={timeout_ms}", join_url(base_url, "/poll"));
         let response = perform_binary_http_request(&url, "GET", &headers, &[])?;
         match response.status {
             200 => Ok(RemotePollResult::Payload(response.body)),
@@ -1676,7 +1688,11 @@ mod native {
                         .clients
                         .get(&client_id)
                         .ok_or_else(|| mlua::Error::external("client handle disappeared"))?;
-                    (client.transport.clone(), client.key.clone(), client.connected)
+                    (
+                        client.transport.clone(),
+                        client.key.clone(),
+                        client.connected,
+                    )
                 };
 
                 if !connected {
@@ -1750,7 +1766,11 @@ mod native {
 
                 match transport {
                     ClientTransport::Local { shared } => {
-                        disconnect_client(&shared, &client_key, Some("client disconnected".to_string()));
+                        disconnect_client(
+                            &shared,
+                            &client_key,
+                            Some("client disconnected".to_string()),
+                        );
                     }
                     ClientTransport::Remote {
                         base_url,
@@ -1876,146 +1896,152 @@ mod native {
         let host_state = state.clone();
         module.set(
             "host",
-            lua.create_function(move |lua, (script_path, port, options): (String, u16, Option<Table>)| {
-                let script_path =
-                    canonicalize_project_path(&host_root, &script_path).map_err(mlua::Error::external)?;
-                let bind_host = match &options {
-                    Some(options) => get_option_string(options, &["host"])?
-                        .unwrap_or_else(|| "127.0.0.1".to_string()),
-                    None => "127.0.0.1".to_string(),
-                };
+            lua.create_function(
+                move |lua, (script_path, port, options): (String, u16, Option<Table>)| {
+                    let script_path = canonicalize_project_path(&host_root, &script_path)
+                        .map_err(mlua::Error::external)?;
+                    let bind_host = match &options {
+                        Some(options) => get_option_string(options, &["host"])?
+                            .unwrap_or_else(|| "127.0.0.1".to_string()),
+                        None => "127.0.0.1".to_string(),
+                    };
 
-                let cert_path = match &options {
-                    Some(options) => get_option_string(options, &["certPath", "cert_path"])?,
-                    None => None,
-                };
-                let key_path = match &options {
-                    Some(options) => get_option_string(options, &["keyPath", "key_path"])?,
-                    None => None,
-                };
+                    let cert_path = match &options {
+                        Some(options) => get_option_string(options, &["certPath", "cert_path"])?,
+                        None => None,
+                    };
+                    let key_path = match &options {
+                        Some(options) => get_option_string(options, &["keyPath", "key_path"])?,
+                        None => None,
+                    };
 
-                let tls_config = match (cert_path, key_path) {
-                    (Some(cert_path), Some(key_path)) => {
-                        let cert_path = canonicalize_project_path(&host_root, &cert_path)
-                            .map_err(mlua::Error::external)?;
-                        let key_path = canonicalize_project_path(&host_root, &key_path)
-                            .map_err(mlua::Error::external)?;
-                        Some(
-                            build_server_tls_config(&cert_path, &key_path)
-                                .map_err(mlua::Error::external)?,
-                        )
-                    }
-                    (None, None) => None,
-                    _ => {
-                        return Err(mlua::Error::external(
-                            "certPath and keyPath must either both be set or both be omitted",
-                        ))
-                    }
-                };
+                    let tls_config = match (cert_path, key_path) {
+                        (Some(cert_path), Some(key_path)) => {
+                            let cert_path = canonicalize_project_path(&host_root, &cert_path)
+                                .map_err(mlua::Error::external)?;
+                            let key_path = canonicalize_project_path(&host_root, &key_path)
+                                .map_err(mlua::Error::external)?;
+                            Some(
+                                build_server_tls_config(&cert_path, &key_path)
+                                    .map_err(mlua::Error::external)?,
+                            )
+                        }
+                        (None, None) => None,
+                        _ => {
+                            return Err(mlua::Error::external(
+                                "certPath and keyPath must either both be set or both be omitted",
+                            ));
+                        }
+                    };
 
-                let listener = TcpListener::bind(format_socket_addr(&bind_host, port))
-                    .map_err(mlua::Error::external)?;
-                listener
-                    .set_nonblocking(true)
-                    .map_err(mlua::Error::external)?;
-                let actual_port = listener.local_addr().map_err(mlua::Error::external)?.port();
-                let url = format_public_url(
-                    if tls_config.is_some() {
-                        HttpScheme::Https
-                    } else {
-                        HttpScheme::Http
-                    },
-                    &bind_host,
-                    actual_port,
-                );
-
-                let (inbound_sender, inbound_receiver) = mpsc::channel::<ServerInboundEvent>();
-                let host_client_key = generate_client_key();
-                let (host_event_sender, host_event_receiver) = mpsc::channel::<ClientEvent>();
-                let mut clients = HashMap::new();
-                clients.insert(
-                    host_client_key.clone(),
-                    new_runtime_client_state(true, Some(host_event_sender)),
-                );
-
-                let shared = Arc::new(HostedServerShared {
-                    clients: Mutex::new(clients),
-                    condvar: Condvar::new(),
-                    stop_flag: AtomicBool::new(false),
-                    host_client_key: host_client_key.clone(),
-                    inbound_sender: inbound_sender.clone(),
-                });
-
-                let (startup_sender, startup_receiver) = mpsc::channel::<Result<(), String>>();
-                let runtime_shared = shared.clone();
-                let runtime_root = host_root.clone();
-                let runtime_script_path = script_path.clone();
-                thread::spawn(move || {
-                    run_server_runtime(
-                        runtime_shared,
-                        runtime_root,
-                        runtime_script_path,
-                        inbound_receiver,
-                        startup_sender,
+                    let listener = TcpListener::bind(format_socket_addr(&bind_host, port))
+                        .map_err(mlua::Error::external)?;
+                    listener
+                        .set_nonblocking(true)
+                        .map_err(mlua::Error::external)?;
+                    let actual_port = listener.local_addr().map_err(mlua::Error::external)?.port();
+                    let url = format_public_url(
+                        if tls_config.is_some() {
+                            HttpScheme::Https
+                        } else {
+                            HttpScheme::Http
+                        },
+                        &bind_host,
+                        actual_port,
                     );
-                });
 
-                match startup_receiver.recv_timeout(Duration::from_secs(5)) {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        stop_hosted_server(&shared, "server failed to start");
-                        return Err(mlua::Error::external(error));
-                    }
-                    Err(RecvTimeoutError::Timeout) => {
-                        stop_hosted_server(&shared, "server failed to start");
-                        return Err(mlua::Error::external(
-                            "timed out waiting for hosted server startup",
-                        ));
-                    }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        stop_hosted_server(&shared, "server failed to start");
-                        return Err(mlua::Error::external(
-                            "hosted server shut down before confirming startup",
-                        ));
-                    }
-                }
+                    let (inbound_sender, inbound_receiver) = mpsc::channel::<ServerInboundEvent>();
+                    let host_client_key = generate_client_key();
+                    let (host_event_sender, host_event_receiver) = mpsc::channel::<ClientEvent>();
+                    let mut clients = HashMap::new();
+                    clients.insert(
+                        host_client_key.clone(),
+                        new_runtime_client_state(true, Some(host_event_sender)),
+                    );
 
-                let accept_shared = shared.clone();
-                thread::spawn(move || accept_server_connections(listener, tls_config, accept_shared));
+                    let shared = Arc::new(HostedServerShared {
+                        clients: Mutex::new(clients),
+                        condvar: Condvar::new(),
+                        stop_flag: AtomicBool::new(false),
+                        host_client_key: host_client_key.clone(),
+                        inbound_sender: inbound_sender.clone(),
+                    });
 
-                let (client_id, hosted_id) = {
-                    let mut state = host_state.borrow_mut();
-                    let client_id = state.next_client_id;
-                    state.next_client_id = state.next_client_id.saturating_add(1);
-                    state.clients.insert(
-                        client_id,
-                        ClientHandleState {
-                            key: host_client_key,
-                            is_host: true,
-                            connected: true,
-                            kick_reason: None,
-                            callbacks: Vec::new(),
-                            receiver: host_event_receiver,
-                            transport: ClientTransport::Local {
-                                shared: shared.clone(),
+                    let (startup_sender, startup_receiver) = mpsc::channel::<Result<(), String>>();
+                    let runtime_shared = shared.clone();
+                    let runtime_root = host_root.clone();
+                    let runtime_script_path = script_path.clone();
+                    thread::spawn(move || {
+                        run_server_runtime(
+                            runtime_shared,
+                            runtime_root,
+                            runtime_script_path,
+                            inbound_receiver,
+                            startup_sender,
+                        );
+                    });
+
+                    match startup_receiver.recv_timeout(Duration::from_secs(5)) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            stop_hosted_server(&shared, "server failed to start");
+                            return Err(mlua::Error::external(error));
+                        }
+                        Err(RecvTimeoutError::Timeout) => {
+                            stop_hosted_server(&shared, "server failed to start");
+                            return Err(mlua::Error::external(
+                                "timed out waiting for hosted server startup",
+                            ));
+                        }
+                        Err(RecvTimeoutError::Disconnected) => {
+                            stop_hosted_server(&shared, "server failed to start");
+                            return Err(mlua::Error::external(
+                                "hosted server shut down before confirming startup",
+                            ));
+                        }
+                    }
+
+                    let accept_shared = shared.clone();
+                    thread::spawn(move || {
+                        accept_server_connections(listener, tls_config, accept_shared)
+                    });
+
+                    let (client_id, hosted_id) = {
+                        let mut state = host_state.borrow_mut();
+                        let client_id = state.next_client_id;
+                        state.next_client_id = state.next_client_id.saturating_add(1);
+                        state.clients.insert(
+                            client_id,
+                            ClientHandleState {
+                                key: host_client_key,
+                                is_host: true,
+                                connected: true,
+                                kick_reason: None,
+                                callbacks: Vec::new(),
+                                receiver: host_event_receiver,
+                                transport: ClientTransport::Local {
+                                    shared: shared.clone(),
+                                },
                             },
-                        },
-                    );
+                        );
 
-                    let hosted_id = state.next_hosted_id;
-                    state.next_hosted_id = state.next_hosted_id.saturating_add(1);
-                    state.hosted.insert(
+                        let hosted_id = state.next_hosted_id;
+                        state.next_hosted_id = state.next_hosted_id.saturating_add(1);
+                        state.hosted.insert(hosted_id, HostedHandleState { shared });
+                        (client_id, hosted_id)
+                    };
+
+                    let client = create_client_handle(lua, host_state.clone(), client_id)?;
+                    create_hosted_handle(
+                        lua,
+                        host_state.clone(),
                         hosted_id,
-                        HostedHandleState {
-                            shared,
-                        },
-                    );
-                    (client_id, hosted_id)
-                };
-
-                let client = create_client_handle(lua, host_state.clone(), client_id)?;
-                create_hosted_handle(lua, host_state.clone(), hosted_id, client, actual_port, url)
-            })?,
+                        client,
+                        actual_port,
+                        url,
+                    )
+                },
+            )?,
         )?;
 
         let connect_state = state.clone();
@@ -2023,8 +2049,7 @@ mod native {
             "connect",
             lua.create_function(move |lua, url: String| {
                 let base_url = normalize_base_url(&url);
-                let response =
-                    connect_remote_client(&base_url).map_err(mlua::Error::external)?;
+                let response = connect_remote_client(&base_url).map_err(mlua::Error::external)?;
 
                 let (event_sender, event_receiver) = mpsc::channel::<ClientEvent>();
                 let (outbound_sender, outbound_receiver) = mpsc::channel::<Vec<u8>>();
@@ -2081,7 +2106,8 @@ mod native {
                             match client.receiver.try_recv() {
                                 Ok(event) => {
                                     match &event {
-                                        ClientEvent::Kicked(reason) | ClientEvent::Closed(reason) => {
+                                        ClientEvent::Kicked(reason)
+                                        | ClientEvent::Closed(reason) => {
                                             client.connected = false;
                                             if client.kick_reason.is_none() {
                                                 client.kick_reason = reason.clone();
@@ -2090,7 +2116,10 @@ mod native {
                                         ClientEvent::Payload(_) => {}
                                     }
 
-                                    let callbacks = collect_registry_functions(lua, client.callbacks.as_slice())?;
+                                    let callbacks = collect_registry_functions(
+                                        lua,
+                                        client.callbacks.as_slice(),
+                                    )?;
                                     Some((event, callbacks))
                                 }
                                 Err(TryRecvError::Empty) => None,
@@ -2108,10 +2137,11 @@ mod native {
                         if let ClientEvent::Payload(payload) = event {
                             let payload = lua.create_buffer(payload)?;
                             for callback in callbacks {
-                                if let Err(error) = protect_lua_call(
-                                    "running server client callback",
-                                    || callback.call::<()>(payload.clone()),
-                                ) {
+                                if let Err(error) =
+                                    protect_lua_call("running server client callback", || {
+                                        callback.call::<()>(payload.clone())
+                                    })
+                                {
                                     eprintln!(
                                         "\x1b[31mLua Error in server client callback:\x1b[0m\n{}",
                                         describe_lua_error(&error)
@@ -2156,7 +2186,7 @@ mod native {
             assert_eq!(bytes.to_vec(), vec![1, 2, 3, 4]);
 
             let nested: Table = decoded.get("nested")?;
-            assert_eq!(nested.get::<bool>("ok")?, true);
+            assert!(nested.get::<bool>("ok")?);
             assert_eq!(nested.get::<String>(1)?, "a");
             assert_eq!(nested.get::<String>(2)?, "b");
             Ok(())

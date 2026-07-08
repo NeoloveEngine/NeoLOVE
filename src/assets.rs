@@ -981,7 +981,7 @@ pub(crate) fn add_assets_module_with_data_root(
                     })?;
                 let mut renderer = SoftwareRenderer::new(screen_width, screen_height);
                 renderer
-                    .render_commands(&platform, commands)
+                    .render_commands(&platform, commands.as_ref())
                     .map_err(|error| {
                         mlua::Error::external(format!("snapPhoto failed to render frame: {error}"))
                     })?;

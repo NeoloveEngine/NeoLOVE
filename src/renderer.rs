@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::assets::ImageHandle;
-use crate::platform::{Antialiasing, Color, SharedPlatformState, lock_platform_state};
+use crate::platform::{lock_platform_state, Antialiasing, Color, SharedPlatformState};
 use fontdue::Font;
 use image::{ImageBuffer, Rgba, RgbaImage};
 use std::collections::hash_map::DefaultHasher;
@@ -166,7 +166,7 @@ pub(crate) enum DrawCommand {
 pub(crate) struct RenderState {
     commands: Vec<DrawCommand>,
     overlay_commands: Vec<DrawCommand>,
-    last_frame_commands: Option<Vec<DrawCommand>>,
+    last_frame_commands: Option<Arc<[DrawCommand]>>,
 }
 
 pub(crate) type SharedRenderState = Arc<Mutex<RenderState>>;
@@ -230,10 +230,27 @@ impl RenderState {
     }
 
     pub(crate) fn drain(&mut self) -> Vec<DrawCommand> {
-        let mut out = self.commands.drain(..).collect::<Vec<_>>();
-        out.extend(self.overlay_commands.drain(..));
-        self.last_frame_commands = Some(out.clone());
+        let out = self.drain_without_remembering();
+        self.last_frame_commands = Some(Arc::from(out.clone().into_boxed_slice()));
         out
+    }
+
+    fn drain_and_remember_shared(&mut self) -> Arc<[DrawCommand]> {
+        let out = self.drain_without_remembering();
+        let out = Arc::from(out.into_boxed_slice());
+        self.last_frame_commands = Some(Arc::clone(&out));
+        out
+    }
+
+    fn drain_without_remembering(&mut self) -> Vec<DrawCommand> {
+        let mut out = Vec::with_capacity(self.commands.len() + self.overlay_commands.len());
+        out.append(&mut self.commands);
+        out.append(&mut self.overlay_commands);
+        out
+    }
+
+    fn remember_last_frame(&mut self, commands: Vec<DrawCommand>) {
+        self.last_frame_commands = Some(Arc::from(commands.into_boxed_slice()));
     }
 }
 
@@ -416,9 +433,37 @@ pub(crate) fn drain_commands(render_state: &SharedRenderState) -> Result<Vec<Dra
         .map(|mut state| state.drain())
 }
 
+pub(crate) fn drain_commands_without_remembering(
+    render_state: &SharedRenderState,
+) -> Result<Vec<DrawCommand>, String> {
+    render_state
+        .lock()
+        .map_err(|_| "render state lock poisoned".to_string())
+        .map(|mut state| state.drain_without_remembering())
+}
+
+pub(crate) fn drain_commands_and_remember(
+    render_state: &SharedRenderState,
+) -> Result<Arc<[DrawCommand]>, String> {
+    render_state
+        .lock()
+        .map_err(|_| "render state lock poisoned".to_string())
+        .map(|mut state| state.drain_and_remember_shared())
+}
+
+pub(crate) fn remember_last_frame_commands(
+    render_state: &SharedRenderState,
+    commands: Vec<DrawCommand>,
+) -> Result<(), String> {
+    render_state
+        .lock()
+        .map_err(|_| "render state lock poisoned".to_string())
+        .map(|mut state| state.remember_last_frame(commands))
+}
+
 pub(crate) fn last_frame_commands(
     render_state: &SharedRenderState,
-) -> Result<Option<Vec<DrawCommand>>, String> {
+) -> Result<Option<Arc<[DrawCommand]>>, String> {
     render_state
         .lock()
         .map_err(|_| "render state lock poisoned".to_string())
@@ -503,13 +548,7 @@ fn horizontal_kern(font: &Font, previous: char, ch: char, px: f32) -> f32 {
     }
 }
 
-fn measure_line_width(
-    font: &Font,
-    text: &str,
-    px: f32,
-    letter_spacing: f32,
-    tab_size: f32,
-) -> f32 {
+fn measure_line_width(font: &Font, text: &str, px: f32, letter_spacing: f32, tab_size: f32) -> f32 {
     let mut width = 0.0f32;
     let mut previous = None;
     let spacing = letter_spacing;
@@ -641,8 +680,7 @@ fn wrap_paragraph_word(
         let token_width = measure_line_width(font, token, px, letter_spacing, tab_size);
         let token_is_word = token.chars().any(|ch| !ch.is_whitespace());
         if current.is_empty() && token_is_word && token_width > limit {
-            let mut wrapped =
-                wrap_paragraph_char(font, token, px, limit, letter_spacing, tab_size);
+            let mut wrapped = wrap_paragraph_char(font, token, px, limit, letter_spacing, tab_size);
             current = wrapped.pop().unwrap_or_default();
             lines.extend(wrapped);
         } else {
@@ -832,8 +870,7 @@ fn prepare_text_layout_uncached(request: &TextRenderRequest) -> Option<PreparedT
         measured = best_measured;
     }
 
-    let (lines, block_width, block_height, line_metrics, base_line_height, line_advance) =
-        measured;
+    let (lines, block_width, block_height, line_metrics, base_line_height, line_advance) = measured;
     let padded_origin_x = request.bounds.x + request.padding_x.max(0.0);
     let padded_origin_y = request.bounds.y + request.padding_y.max(0.0);
     let content_box_width = available_width.unwrap_or(block_width);
@@ -1110,16 +1147,12 @@ pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<Raste
     for glyph in layout.glyphs {
         let glyph_font = load_font(&glyph.style.font).unwrap_or_else(|| font.clone());
         let layout_metrics = glyph_font.metrics(glyph.ch, glyph.style.scale.max(1.0));
-        let (metrics, bitmap) = glyph_font.rasterize(
-            glyph.ch,
-            glyph.style.scale.max(1.0) * supersample as f32,
-        );
+        let (metrics, bitmap) =
+            glyph_font.rasterize(glyph.ch, glyph.style.scale.max(1.0) * supersample as f32);
         let glyph_origin_x = glyph.x - layout_metrics.xmin as f32;
-        let glyph_baseline_y =
-            glyph.y + layout_metrics.height as f32 + layout_metrics.ymin as f32;
-        let base_x = ((glyph_origin_x - min_x) * supersample as f32
-            + metrics.xmin as f32)
-            .round() as i32
+        let glyph_baseline_y = glyph.y + layout_metrics.height as f32 + layout_metrics.ymin as f32;
+        let base_x = ((glyph_origin_x - min_x) * supersample as f32 + metrics.xmin as f32).round()
+            as i32
             + (border * supersample) as i32;
         let top_y = ((glyph_baseline_y - min_y) * supersample as f32
             - metrics.height as f32
@@ -1145,10 +1178,7 @@ pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<Raste
                     } else {
                         0
                     };
-                    let tx = base_x
-                        + gx as i32
-                        + pass as i32 * supersample as i32
-                        + slant;
+                    let tx = base_x + gx as i32 + pass as i32 * supersample as i32 + slant;
                     let ty = top_y + gy as i32;
                     if tx < 0
                         || ty < 0
@@ -1200,9 +1230,9 @@ pub(crate) fn rasterize_text_sprite(request: &TextRenderRequest) -> Option<Raste
         text_image
     };
 
-    let filter = if request.stretch_width > 0.0 && request.stretch_height > 0.0 {
-        TextureFilter::Nearest
-    } else if request.rotation.abs() > 0.0001 && matches!(request.font, FontHandle::Default) {
+    let filter = if (request.stretch_width > 0.0 && request.stretch_height > 0.0)
+        || (request.rotation.abs() > 0.0001 && matches!(request.font, FontHandle::Default))
+    {
         TextureFilter::Nearest
     } else {
         TextureFilter::Linear
@@ -1405,8 +1435,8 @@ fn command_bounds(command: &DrawCommand) -> Option<Rect> {
     }
 }
 
-pub(crate) fn commands_dirty_bounds(
-    commands: &[DrawCommand],
+pub(crate) fn commands_dirty_bounds<'a>(
+    commands: impl IntoIterator<Item = &'a DrawCommand>,
     viewport: (u32, u32),
 ) -> Option<DirtyBounds> {
     let (width, height) = viewport;
@@ -1456,7 +1486,7 @@ pub(crate) fn translate_commands(commands: Vec<DrawCommand>, dx: f32, dy: f32) -
         .collect()
 }
 
-fn translate_command(command: DrawCommand, dx: f32, dy: f32) -> DrawCommand {
+pub(crate) fn translate_command(command: DrawCommand, dx: f32, dy: f32) -> DrawCommand {
     match command {
         DrawCommand::Rect {
             x,
@@ -1607,14 +1637,27 @@ impl SoftwareRenderer {
         let commands = render_state
             .lock()
             .map_err(|_| "render state lock poisoned".to_string())?
-            .drain();
-        self.render_commands(platform, commands)
+            .drain_without_remembering();
+        self.render_command_slice(platform, &commands)?;
+        render_state
+            .lock()
+            .map_err(|_| "render state lock poisoned".to_string())?
+            .remember_last_frame(commands);
+        Ok(())
     }
 
     pub(crate) fn render_commands(
         &mut self,
         platform: &SharedPlatformState,
-        commands: Vec<DrawCommand>,
+        commands: &[DrawCommand],
+    ) -> Result<(), String> {
+        self.render_command_slice(platform, commands)
+    }
+
+    fn render_command_slice(
+        &mut self,
+        platform: &SharedPlatformState,
+        commands: &[DrawCommand],
     ) -> Result<(), String> {
         if commands.iter().any(command_uses_custom_shader) {
             #[cfg(target_os = "emscripten")]
@@ -1652,7 +1695,7 @@ impl SoftwareRenderer {
 
     pub(crate) fn draw_unshaded_commands(
         &mut self,
-        commands: Vec<DrawCommand>,
+        commands: &[DrawCommand],
     ) -> Result<(), String> {
         if commands.iter().any(command_uses_custom_shader) {
             return Err("draw_unshaded_commands received a shader command".to_string());
@@ -1666,7 +1709,7 @@ impl SoftwareRenderer {
         Ok(())
     }
 
-    fn draw_command(&mut self, command: DrawCommand) -> Result<(), String> {
+    fn draw_command(&mut self, command: &DrawCommand) -> Result<(), String> {
         match command {
             DrawCommand::Rect {
                 x,
@@ -1678,6 +1721,8 @@ impl SoftwareRenderer {
                 color,
                 ..
             } => {
+                let (x, y, w, h, rotation, offset, color) =
+                    (*x, *y, *w, *h, *rotation, *offset, *color);
                 if rotation.abs() <= 0.0001 {
                     self.fill_axis_aligned_rect(x, y, w, h, color);
                     return Ok(());
@@ -1691,13 +1736,13 @@ impl SoftwareRenderer {
                 self.fill_triangle(p0, p1, p2, color);
                 self.fill_triangle(p0, p2, p3, color);
             }
-            DrawCommand::Triangle { a, b, c, color, .. } => self.fill_triangle(a, b, c, color),
+            DrawCommand::Triangle { a, b, c, color, .. } => self.fill_triangle(*a, *b, *c, *color),
             DrawCommand::Circle {
                 center,
                 radius,
                 color,
                 ..
-            } => self.fill_circle(center, radius, color),
+            } => self.fill_circle(*center, *radius, *color),
             DrawCommand::Image {
                 image,
                 dest,
@@ -1707,7 +1752,15 @@ impl SoftwareRenderer {
                 tint,
                 filter,
                 ..
-            } => self.draw_image(image, dest, source, rotation, pivot, tint, filter)?,
+            } => self.draw_image(
+                image.clone(),
+                *dest,
+                *source,
+                *rotation,
+                *pivot,
+                *tint,
+                *filter,
+            )?,
             DrawCommand::Text(request) => self.draw_text(&request)?,
         }
         Ok(())
@@ -1727,6 +1780,34 @@ impl SoftwareRenderer {
         if w <= 0.0 || h <= 0.0 {
             return;
         }
+
+        if color.a == 255
+            && x.fract() == 0.0
+            && y.fract() == 0.0
+            && w.fract() == 0.0
+            && h.fract() == 0.0
+        {
+            let min_x = x.max(0.0) as i32;
+            let max_x = (x + w).min(self.width as f32) as i32;
+            let min_y = y.max(0.0) as i32;
+            let max_y = (y + h).min(self.height as f32) as i32;
+            if max_x <= min_x || max_y <= min_y {
+                return;
+            }
+            for py in min_y..max_y {
+                let row_start = py as usize * self.width as usize * 4;
+                let row = &mut self.pixels
+                    [row_start + min_x as usize * 4..row_start + max_x as usize * 4];
+                for pixel in row.chunks_exact_mut(4) {
+                    pixel[0] = color.r;
+                    pixel[1] = color.g;
+                    pixel[2] = color.b;
+                    pixel[3] = 255;
+                }
+            }
+            return;
+        }
+
         let min_x = x.floor().max(0.0) as i32;
         let max_x = (x + w).ceil().min(self.width as f32) as i32;
         let min_y = y.floor().max(0.0) as i32;
@@ -1742,10 +1823,10 @@ impl SoftwareRenderer {
                         0.0
                     }
                 } else {
-                    let overlap_x = ((px as f32 + 1.0).min(x + w) - (px as f32).max(x))
-                        .clamp(0.0, 1.0);
-                    let overlap_y = ((py as f32 + 1.0).min(y + h) - (py as f32).max(y))
-                        .clamp(0.0, 1.0);
+                    let overlap_x =
+                        ((px as f32 + 1.0).min(x + w) - (px as f32).max(x)).clamp(0.0, 1.0);
+                    let overlap_y =
+                        ((py as f32 + 1.0).min(y + h) - (py as f32).max(y)).clamp(0.0, 1.0);
                     overlap_x * overlap_y
                 };
                 if coverage > 0.0 {
@@ -1784,12 +1865,8 @@ impl SoftwareRenderer {
                 let mut covered = 0u32;
                 for sample_y in 0..samples {
                     for sample_x in 0..samples {
-                        let dx = px as f32
-                            + (sample_x as f32 + 0.5) / samples as f32
-                            - center.x;
-                        let dy = py as f32
-                            + (sample_y as f32 + 0.5) / samples as f32
-                            - center.y;
+                        let dx = px as f32 + (sample_x as f32 + 0.5) / samples as f32 - center.x;
+                        let dy = py as f32 + (sample_y as f32 + 0.5) / samples as f32 - center.y;
                         if dx * dx + dy * dy <= rr {
                             covered += 1;
                         }
@@ -1826,10 +1903,22 @@ impl SoftwareRenderer {
         for py in min_y..=max_y {
             for px in min_x..=max_x {
                 let corners = [
-                    Vec2 { x: px as f32, y: py as f32 },
-                    Vec2 { x: px as f32 + 1.0, y: py as f32 },
-                    Vec2 { x: px as f32, y: py as f32 + 1.0 },
-                    Vec2 { x: px as f32 + 1.0, y: py as f32 + 1.0 },
+                    Vec2 {
+                        x: px as f32,
+                        y: py as f32,
+                    },
+                    Vec2 {
+                        x: px as f32 + 1.0,
+                        y: py as f32,
+                    },
+                    Vec2 {
+                        x: px as f32,
+                        y: py as f32 + 1.0,
+                    },
+                    Vec2 {
+                        x: px as f32 + 1.0,
+                        y: py as f32 + 1.0,
+                    },
                 ];
                 let inside = |point: Vec2| {
                     let w0 = Self::edge(b, c, point);
@@ -1853,9 +1942,7 @@ impl SoftwareRenderer {
                             .all(|point| Self::edge(edge_a, edge_b, *point) > 0.0)
                     }
                 };
-                if fully_outside_edge(b, c)
-                    || fully_outside_edge(c, a)
-                    || fully_outside_edge(a, b)
+                if fully_outside_edge(b, c) || fully_outside_edge(c, a) || fully_outside_edge(a, b)
                 {
                     continue;
                 }
@@ -2072,7 +2159,15 @@ impl SoftwareRenderer {
             return;
         }
         let index = ((y * self.width + x) * 4) as usize;
-        blend(&mut self.pixels[index..index + 4], color);
+        let dest = &mut self.pixels[index..index + 4];
+        if color.a == 255 {
+            dest[0] = color.r;
+            dest[1] = color.g;
+            dest[2] = color.b;
+            dest[3] = 255;
+        } else {
+            blend(dest, color);
+        }
     }
 }
 
@@ -2435,17 +2530,20 @@ mod tests {
             antialiasing: TextAntialiasing::Off,
         };
         let hard = rasterize_text_sprite(&request).expect("hard text");
-        assert!(hard
-            .image
-            .pixels()
-            .all(|pixel| matches!(pixel.0[3], 0 | 255)));
+        assert!(
+            hard.image
+                .pixels()
+                .all(|pixel| matches!(pixel.0[3], 0 | 255))
+        );
 
         request.antialiasing = TextAntialiasing::High;
         let smooth = rasterize_text_sprite(&request).expect("smooth text");
-        assert!(smooth
-            .image
-            .pixels()
-            .any(|pixel| pixel.0[3] > 0 && pixel.0[3] < 255));
+        assert!(
+            smooth
+                .image
+                .pixels()
+                .any(|pixel| pixel.0[3] > 0 && pixel.0[3] < 255)
+        );
     }
 
     #[test]
@@ -2510,20 +2608,24 @@ mod tests {
         };
         let mut renderer = SoftwareRenderer::new(18, 18);
         renderer
-            .render_commands(&platform, vec![command.clone()])
+            .render_commands(&platform, std::slice::from_ref(&command))
             .expect("hard circle");
-        assert!(renderer
-            .pixels()
-            .chunks_exact(4)
-            .all(|pixel| matches!(pixel[3], 0 | 255)));
+        assert!(
+            renderer
+                .pixels()
+                .chunks_exact(4)
+                .all(|pixel| matches!(pixel[3], 0 | 255))
+        );
 
         lock_platform_state(&platform).set_antialiasing(Antialiasing::High);
         renderer
-            .render_commands(&platform, vec![command])
+            .render_commands(&platform, &[command])
             .expect("smooth circle");
-        assert!(renderer
-            .pixels()
-            .chunks_exact(4)
-            .any(|pixel| pixel[3] > 0 && pixel[3] < 255));
+        assert!(
+            renderer
+                .pixels()
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] > 0 && pixel[3] < 255)
+        );
     }
 }

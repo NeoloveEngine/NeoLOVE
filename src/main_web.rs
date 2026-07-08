@@ -1,4 +1,5 @@
 mod assets;
+mod android_module;
 mod animation;
 mod audio_system;
 mod commands;
@@ -7,6 +8,8 @@ mod fs_module;
 pub mod hierarchy;
 mod http;
 mod lua_error;
+mod mobile_emulation;
+mod mobile_module;
 mod platform;
 mod prefabs;
 mod renderer;
@@ -339,9 +342,9 @@ impl WebApp {
                 clear.a
             ));
         }
-        let commands = crate::renderer::drain_commands(&self.render_state)
+        let commands = crate::renderer::drain_commands_and_remember(&self.render_state)
             .map_err(|error| format!("failed to drain render commands: {error}"))?;
-        let (pixel_commands, text_commands) = split_text_commands(commands);
+        let (pixel_commands, text_commands) = split_text_commands(commands.as_ref());
         if tick_index <= WEB_DEBUG_TICK_LIMIT {
             let (rects, triangles, circles, images) = summarize_pixel_commands(&pixel_commands);
             debug_log(&format!(
@@ -354,7 +357,7 @@ impl WebApp {
                 images
             ));
         }
-        render_web_commands_in_order(&mut self.renderer, &self.platform_state, pixel_commands)
+        render_web_commands_in_order(&mut self.renderer, &self.platform_state, &pixel_commands)
             .map_err(|error| format!("web renderer failed: {error}"))?;
         if tick_index <= WEB_DEBUG_TICK_LIMIT {
             let clear = lock_platform_state(&self.platform_state).clear_color();
@@ -457,45 +460,6 @@ impl WebApp {
     }
 
     fn sync_input(&self) -> Result<(), String> {
-        let mut keys_down = Vec::new();
-        let mut keys_pressed = Vec::new();
-        let mut keys_released = Vec::new();
-
-        for key in WEB_KEYS {
-            let name = key.name.to_string();
-            let c_name = key.c_name.as_ptr() as *const c_char;
-
-            if unsafe { neolove_web_key_state(c_name, 0) } != 0 {
-                keys_down.push(name.clone());
-            }
-
-            if unsafe { neolove_web_key_state(c_name, 1) } != 0 {
-                keys_pressed.push(name.clone());
-            }
-
-            if unsafe { neolove_web_key_state(c_name, 2) } != 0 {
-                keys_released.push(name);
-            }
-        }
-
-        let mut mouse_down = Vec::new();
-        let mut mouse_pressed = Vec::new();
-        let mut mouse_released = Vec::new();
-        for (name, index) in WEB_MOUSE_BUTTONS {
-            let button_name = (*name).to_string();
-            if unsafe { neolove_web_mouse_button_state(*index, 0) } != 0 {
-                mouse_down.push(button_name.clone());
-            }
-
-            if unsafe { neolove_web_mouse_button_state(*index, 1) } != 0 {
-                mouse_pressed.push(button_name.clone());
-            }
-
-            if unsafe { neolove_web_mouse_button_state(*index, 2) } != 0 {
-                mouse_released.push(button_name);
-            }
-        }
-
         let wheel_x = unsafe { neolove_web_wheel_x() } as f32;
         let wheel_y = unsafe { neolove_web_wheel_y() } as f32;
         let last_key = take_bridge_string(neolove_web_take_last_key)?;
@@ -504,13 +468,42 @@ impl WebApp {
         let mut platform = lock_platform_state(&self.platform_state);
         let input = platform.input_mut();
         input.keys_down.clear();
-        input.keys_down.extend(keys_down);
-        input.keys_pressed.extend(keys_pressed);
-        input.keys_released.extend(keys_released);
+        input.keys_pressed.clear();
+        input.keys_released.clear();
+
+        for key in WEB_KEYS {
+            let c_name = key.c_name.as_ptr() as *const c_char;
+
+            if unsafe { neolove_web_key_state(c_name, 0) } != 0 {
+                input.keys_down.insert(key.name.to_string());
+            }
+
+            if unsafe { neolove_web_key_state(c_name, 1) } != 0 {
+                input.keys_pressed.insert(key.name.to_string());
+            }
+
+            if unsafe { neolove_web_key_state(c_name, 2) } != 0 {
+                input.keys_released.insert(key.name.to_string());
+            }
+        }
+
         input.mouse_down.clear();
-        input.mouse_down.extend(mouse_down);
-        input.mouse_pressed.extend(mouse_pressed);
-        input.mouse_released.extend(mouse_released);
+        input.mouse_pressed.clear();
+        input.mouse_released.clear();
+        for (name, index) in WEB_MOUSE_BUTTONS {
+            if unsafe { neolove_web_mouse_button_state(*index, 0) } != 0 {
+                input.mouse_down.insert((*name).to_string());
+            }
+
+            if unsafe { neolove_web_mouse_button_state(*index, 1) } != 0 {
+                input.mouse_pressed.insert((*name).to_string());
+            }
+
+            if unsafe { neolove_web_mouse_button_state(*index, 2) } != 0 {
+                input.mouse_released.insert((*name).to_string());
+            }
+        }
+
         input.wheel_x += wheel_x;
         input.wheel_y += wheel_y;
         if let Some(last_key) = last_key {
@@ -524,11 +517,10 @@ impl WebApp {
     }
 }
 
-
 fn render_web_commands_in_order(
     renderer: &mut SoftwareRenderer,
     platform: &SharedPlatformState,
-    commands: Vec<DrawCommand>,
+    commands: &[&DrawCommand],
 ) -> Result<(), String> {
     let clear = lock_platform_state(platform).clear_color();
     unsafe {
@@ -537,21 +529,23 @@ fn render_web_commands_in_order(
 
     let viewport = renderer.dimensions();
     let mut pending = Vec::new();
-    for command in commands {
-        if !crate::renderer::command_intersects_viewport(&command, viewport.0, viewport.1) {
+    for &command in commands {
+        if !crate::renderer::command_intersects_viewport(command, viewport.0, viewport.1) {
             continue;
         }
-        if is_web_native_image(&command) {
-            flush_software_chunk(renderer, viewport, std::mem::take(&mut pending))?;
+        if is_web_native_image(command) {
+            flush_software_chunk(renderer, viewport, &pending)?;
+            pending.clear();
             draw_web_image(command)?;
-        } else if command_has_shader(&command) {
-            flush_software_chunk(renderer, viewport, std::mem::take(&mut pending))?;
+        } else if command_has_shader(command) {
+            flush_software_chunk(renderer, viewport, &pending)?;
+            pending.clear();
             draw_web_shader_command(command)?;
         } else {
             pending.push(command);
         }
     }
-    let result = flush_software_chunk(renderer, viewport, pending);
+    let result = flush_software_chunk(renderer, viewport, &pending);
     renderer.resize(viewport.0, viewport.1);
     result
 }
@@ -567,7 +561,7 @@ fn is_web_native_image(command: &DrawCommand) -> bool {
     )
 }
 
-fn draw_web_image(command: DrawCommand) -> Result<(), String> {
+fn draw_web_image(command: &DrawCommand) -> Result<(), String> {
     let DrawCommand::Image {
         image,
         dest,
@@ -607,7 +601,7 @@ fn draw_web_image(command: DrawCommand) -> Result<(), String> {
                     dest.y,
                     dest.w,
                     dest.h,
-                    rotation,
+                    *rotation,
                     pivot.x,
                     pivot.y,
                     tint.a as f32 / 255.0,
@@ -621,21 +615,28 @@ fn draw_web_image(command: DrawCommand) -> Result<(), String> {
 fn flush_software_chunk(
     renderer: &mut SoftwareRenderer,
     viewport: (u32, u32),
-    commands: Vec<DrawCommand>,
+    commands: &[&DrawCommand],
 ) -> Result<(), String> {
     if commands.is_empty() {
         return Ok(());
     }
-    let Some(bounds) = crate::renderer::commands_dirty_bounds(&commands, viewport) else {
+    let Some(bounds) = crate::renderer::commands_dirty_bounds(commands.iter().copied(), viewport)
+    else {
         return Ok(());
     };
     renderer.resize(bounds.w, bounds.h);
     renderer.clear_transparent();
-    renderer.draw_unshaded_commands(crate::renderer::translate_commands(
-        commands,
-        -(bounds.x as f32),
-        -(bounds.y as f32),
-    ))?;
+    let translated: Vec<_> = commands
+        .iter()
+        .map(|&command| {
+            crate::renderer::translate_command(
+                command.clone(),
+                -(bounds.x as f32),
+                -(bounds.y as f32),
+            )
+        })
+        .collect();
+    renderer.draw_unshaded_commands(&translated)?;
     unsafe {
         neolove_web_composite_rgba(
             renderer.pixels().as_ptr(),
@@ -658,7 +659,7 @@ fn command_has_shader(command: &DrawCommand) -> bool {
     }
 }
 
-fn draw_web_shader_command(command: DrawCommand) -> Result<(), String> {
+fn draw_web_shader_command(command: &DrawCommand) -> Result<(), String> {
     let (shader, vertices, texture) = match command {
         DrawCommand::Rect {
             x,
@@ -670,19 +671,19 @@ fn draw_web_shader_command(command: DrawCommand) -> Result<(), String> {
             color,
             shader: Some(shader),
         } => {
-            let pivot = (x + w * offset.x, y + h * offset.y);
+            let pivot = (*x + *w * offset.x, *y + *h * offset.y);
             let corners = [
-                rotate_web_point(x, y, pivot.0, pivot.1, rotation),
-                rotate_web_point(x + w, y, pivot.0, pivot.1, rotation),
-                rotate_web_point(x + w, y + h, pivot.0, pivot.1, rotation),
-                rotate_web_point(x, y + h, pivot.0, pivot.1, rotation),
+                rotate_web_point(*x, *y, pivot.0, pivot.1, *rotation),
+                rotate_web_point(*x + *w, *y, pivot.0, pivot.1, *rotation),
+                rotate_web_point(*x + *w, *y + *h, pivot.0, pivot.1, *rotation),
+                rotate_web_point(*x, *y + *h, pivot.0, pivot.1, *rotation),
             ];
             (
                 shader,
                 web_quad_vertices(
                     corners,
                     [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
-                    color,
+                    *color,
                 ),
                 None,
             )
@@ -695,7 +696,10 @@ fn draw_web_shader_command(command: DrawCommand) -> Result<(), String> {
             shader: Some(shader),
         } => (
             shader,
-            web_vertices(&[(a, [0.0, 0.0]), (b, [1.0, 0.0]), (c, [0.5, 1.0])], color),
+            web_vertices(
+                &[(*a, [0.0, 0.0]), (*b, [1.0, 0.0]), (*c, [0.5, 1.0])],
+                *color,
+            ),
             None,
         ),
         DrawCommand::Circle {
@@ -704,28 +708,29 @@ fn draw_web_shader_command(command: DrawCommand) -> Result<(), String> {
             color,
             shader: Some(shader),
         } => {
-            let segments = ((radius * std::f32::consts::TAU / 4.0).ceil() as usize).clamp(24, 128);
+            let segments =
+                ((*radius * std::f32::consts::TAU / 4.0).ceil() as usize).clamp(24, 128);
             let mut points = Vec::with_capacity(segments * 3);
             for index in 0..segments {
                 let a0 = index as f32 / segments as f32 * std::f32::consts::TAU;
                 let a1 = (index + 1) as f32 / segments as f32 * std::f32::consts::TAU;
-                points.push((center, [0.5, 0.5]));
+                points.push((*center, [0.5, 0.5]));
                 points.push((
                     crate::renderer::Vec2 {
-                        x: center.x + a0.cos() * radius,
-                        y: center.y + a0.sin() * radius,
+                        x: center.x + a0.cos() * *radius,
+                        y: center.y + a0.sin() * *radius,
                     },
                     [1.0, 0.0],
                 ));
                 points.push((
                     crate::renderer::Vec2 {
-                        x: center.x + a1.cos() * radius,
-                        y: center.y + a1.sin() * radius,
+                        x: center.x + a1.cos() * *radius,
+                        y: center.y + a1.sin() * *radius,
                     },
                     [0.0, 1.0],
                 ));
             }
-            (shader, web_vertices(&points, color), None)
+            (shader, web_vertices(&points, *color), None)
         }
         DrawCommand::Image {
             image,
@@ -750,15 +755,21 @@ fn draw_web_shader_command(command: DrawCommand) -> Result<(), String> {
             let u1 = (source.x + source.w) / image_width.max(1) as f32;
             let v1 = (source.y + source.h) / image_height.max(1) as f32;
             let corners = [
-                rotate_web_point(dest.x, dest.y, pivot.x, pivot.y, rotation),
-                rotate_web_point(dest.x + dest.w, dest.y, pivot.x, pivot.y, rotation),
-                rotate_web_point(dest.x + dest.w, dest.y + dest.h, pivot.x, pivot.y, rotation),
-                rotate_web_point(dest.x, dest.y + dest.h, pivot.x, pivot.y, rotation),
+                rotate_web_point(dest.x, dest.y, pivot.x, pivot.y, *rotation),
+                rotate_web_point(dest.x + dest.w, dest.y, pivot.x, pivot.y, *rotation),
+                rotate_web_point(
+                    dest.x + dest.w,
+                    dest.y + dest.h,
+                    pivot.x,
+                    pivot.y,
+                    *rotation,
+                ),
+                rotate_web_point(dest.x, dest.y + dest.h, pivot.x, pivot.y, *rotation),
             ];
             (
                 shader,
-                web_quad_vertices(corners, [[u0, v0], [u1, v0], [u1, v1], [u0, v1]], tint),
-                Some((image, filter)),
+                web_quad_vertices(corners, [[u0, v0], [u1, v0], [u1, v1], [u0, v1]], *tint),
+                Some((image, *filter)),
             )
         }
         other => return flush_unexpected_unshaded(other),
@@ -862,11 +873,13 @@ fn web_vertices(
     vertices
 }
 
-fn flush_unexpected_unshaded(_command: DrawCommand) -> Result<(), String> {
+fn flush_unexpected_unshaded(_command: &DrawCommand) -> Result<(), String> {
     Err("internal web renderer error: expected a shader command".to_string())
 }
 
-fn split_text_commands(commands: Vec<DrawCommand>) -> (Vec<DrawCommand>, Vec<TextRenderRequest>) {
+fn split_text_commands(
+    commands: &[DrawCommand],
+) -> (Vec<&DrawCommand>, Vec<&TextRenderRequest>) {
     let mut pixel_commands = Vec::with_capacity(commands.len());
     let mut text_commands = Vec::new();
     for command in commands {
@@ -878,7 +891,7 @@ fn split_text_commands(commands: Vec<DrawCommand>) -> (Vec<DrawCommand>, Vec<Tex
     (pixel_commands, text_commands)
 }
 
-fn summarize_pixel_commands(commands: &[DrawCommand]) -> (usize, usize, usize, usize) {
+fn summarize_pixel_commands(commands: &[&DrawCommand]) -> (usize, usize, usize, usize) {
     let mut rects = 0usize;
     let mut triangles = 0usize;
     let mut circles = 0usize;
@@ -942,8 +955,8 @@ fn font_path_cstring(value: &FontHandle) -> Option<CString> {
     }
 }
 
-fn draw_web_text_commands(commands: &[TextRenderRequest]) {
-    for request in commands {
+fn draw_web_text_commands(commands: &[&TextRenderRequest]) {
+    for &request in commands {
         if request.text.is_empty() || request.color.a == 0 {
             continue;
         }

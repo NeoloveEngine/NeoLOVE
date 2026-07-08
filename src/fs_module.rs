@@ -46,10 +46,7 @@ fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
 }
 
 fn io_error(action: &str, path: &Path, error: &std::io::Error) -> mlua::Error {
-    mlua::Error::external(format!(
-        "failed to {action} '{}': {error}",
-        path.display()
-    ))
+    mlua::Error::external(format!("failed to {action} '{}': {error}", path.display()))
 }
 
 fn io_pair_error(action: &str, from: &Path, to: &Path, error: &std::io::Error) -> mlua::Error {
@@ -93,6 +90,7 @@ fn path_to_project_string(root: &Path, path: &Path) -> String {
     }
 }
 
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 fn picked_path_to_string(path: PathBuf) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -104,24 +102,34 @@ fn is_webasm_target() -> bool {
     cfg!(target_arch = "wasm32") || cfg!(target_os = "windows")
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn pick_file() -> Option<String> {
-    rfd::FileDialog::new().pick_file().map(picked_path_to_string)
+fn is_mobile_target() -> bool {
+    crate::mobile_module::is_mobile()
 }
 
-#[cfg(target_arch = "wasm32")]
+fn is_android_target() -> bool {
+    cfg!(target_os = "android")
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn pick_file() -> Option<String> {
+    rfd::FileDialog::new()
+        .pick_file()
+        .map(picked_path_to_string)
+}
+
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
 fn pick_file() -> Option<String> {
     None
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 fn pick_folder() -> Option<String> {
     rfd::FileDialog::new()
         .pick_folder()
         .map(picked_path_to_string)
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
 fn pick_folder() -> Option<String> {
     None
 }
@@ -131,11 +139,7 @@ fn create_walk_entry(lua: &Lua, root: &Path, path: &Path) -> mlua::Result<Table>
     let entry = lua.create_table()?;
     let is_file = metadata.is_file();
     let is_dir = metadata.is_dir();
-    let kind = if is_dir {
-        "directory"
-    } else {
-        "file"
-    };
+    let kind = if is_dir { "directory" } else { "file" };
     entry.set("path", path_to_project_string(root, path))?;
     entry.set(
         "name",
@@ -165,8 +169,11 @@ fn collect_walk_entries(
     }
 
     let mut children = Vec::new();
-    for entry in fs::read_dir(path).map_err(|error| contextual_io_error("read directory", path, error))? {
-        let entry = entry.map_err(|error| contextual_io_error("read directory entry", path, error))?;
+    for entry in
+        fs::read_dir(path).map_err(|error| contextual_io_error("read directory", path, error))?
+    {
+        let entry =
+            entry.map_err(|error| contextual_io_error("read directory entry", path, error))?;
         children.push(entry.path());
     }
     children.sort();
@@ -189,12 +196,13 @@ fn copy_path(source: &Path, destination: &Path) -> std::io::Result<()> {
         if destination.starts_with(source) {
             return Err(std::io::Error::other("cannot copy a directory into itself"));
         }
-        fs::create_dir_all(destination)
-            .map_err(|error| contextual_io_pair_error("create directory", source, destination, error))?;
+        fs::create_dir_all(destination).map_err(|error| {
+            contextual_io_pair_error("create directory", source, destination, error)
+        })?;
         let mut children = Vec::new();
-        for entry in fs::read_dir(source)
-            .map_err(|error| contextual_io_pair_error("read directory", source, destination, error))?
-        {
+        for entry in fs::read_dir(source).map_err(|error| {
+            contextual_io_pair_error("read directory", source, destination, error)
+        })? {
             let entry = entry.map_err(|error| {
                 contextual_io_pair_error("read directory entry", source, destination, error)
             })?;
@@ -236,6 +244,14 @@ pub(crate) fn add_fs_module_with_data_root(
     module.set(
         "isWebAssembly",
         lua.create_function(|_lua, ()| Ok(is_webasm_target()))?,
+    )?;
+    module.set(
+        "isMobile",
+        lua.create_function(|_lua, ()| Ok(is_mobile_target()))?,
+    )?;
+    module.set(
+        "isAndroid",
+        lua.create_function(|_lua, ()| Ok(is_android_target()))?,
     )?;
     module.set(
         "openFilePicker",
@@ -322,8 +338,7 @@ pub(crate) fn add_fs_module_with_data_root(
     module.set(
         "isFile",
         lua.create_function(move |_lua, path: String| {
-            let path =
-                resolve_read_path(&is_file_resource_root, &is_file_data_root, &path)?;
+            let path = resolve_read_path(&is_file_resource_root, &is_file_data_root, &path)?;
             Ok(path.is_file())
         })?,
     )?;
@@ -354,9 +369,7 @@ pub(crate) fn add_fs_module_with_data_root(
         lua.create_function(
             move |lua, (path, recursive): (Option<String>, Option<bool>)| {
                 let start = match path {
-                    Some(path) => {
-                        resolve_read_path(&walk_resource_root, &walk_data_root, &path)?
-                    }
+                    Some(path) => resolve_read_path(&walk_resource_root, &walk_data_root, &path)?,
                     None => walk_data_root.clone(),
                 };
                 let mut entries = Vec::new();
@@ -384,7 +397,8 @@ pub(crate) fn add_fs_module_with_data_root(
         lua.create_function(move |_lua, (from, to): (String, String)| {
             let from = resolve_path(&rename_data_root, &from)?;
             let to = resolve_path(&rename_data_root, &to)?;
-            ensure_parent_dir(&to).map_err(|error| io_error("create parent directory", &to, &error))?;
+            ensure_parent_dir(&to)
+                .map_err(|error| io_error("create parent directory", &to, &error))?;
             fs::rename(&from, &to).map_err(|error| io_pair_error("rename", &from, &to, &error))
         })?,
     )?;
@@ -484,15 +498,13 @@ mod tests {
         let absolute_file = root.join("absolute.txt");
         fs::create_dir_all(&resource_root).map_err(mlua::Error::external)?;
         fs::create_dir_all(&data_root).map_err(mlua::Error::external)?;
-        fs::write(resource_root.join("bundled.txt"), "bundled")
-            .map_err(mlua::Error::external)?;
+        fs::write(resource_root.join("bundled.txt"), "bundled").map_err(mlua::Error::external)?;
 
         let lua = Lua::new();
         add_fs_module_with_data_root(&lua, resource_root.clone(), data_root.clone())?;
         lua.globals()
             .set("absoluteFile", absolute_file.to_string_lossy().into_owned())?;
-        lua.globals()
-            .set("expectedWebasm", is_webasm_target())?;
+        lua.globals().set("expectedWebasm", is_webasm_target())?;
         lua.load(
             r#"
             assert(fs.isWebasm() == expectedWebasm)
@@ -509,8 +521,7 @@ mod tests {
         .exec()?;
 
         assert_eq!(
-            fs::read_to_string(data_root.join("save/state.txt"))
-                .map_err(mlua::Error::external)?,
+            fs::read_to_string(data_root.join("save/state.txt")).map_err(mlua::Error::external)?,
             "saved"
         );
         assert_eq!(

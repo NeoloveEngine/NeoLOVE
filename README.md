@@ -5,8 +5,8 @@
 </p>
 
 NeoLOVE combines a Luau scripting runtime with an entity-component-system,
-2D rendering, physics, audio, input, networking, and native or WebAssembly
-packaging. A game is a directory containing a `main.luau` entry point and an
+2D rendering, physics, audio, input, networking, and native, Android, iOS
+simulator, or WebAssembly packaging. A game is a directory containing a `main.luau` entry point and an
 optional `neolove.toml` configuration file.
 
 > [!NOTE]
@@ -16,13 +16,16 @@ optional `neolove.toml` configuration file.
 ## Features
 
 - Luau scripting with generated type definitions
-- Entities, hierarchy, components, systems, linked prefabs, tweening, and keyframe animation
-- Shapes, text, sprites, nine-slice sprites, tile textures, and custom shaders
+- Entities, hierarchy, components, systems, linked prefabs, tweening, and keyframe animation controllers
+- Shapes, text, sprites, nine-slice sprites, particle images, tilemaps, tile textures, and custom shaders
 - Rigidbody, collider, rope, raycasting, and pixel-shaped sprite queries
 - Keyboard, mouse, audio, image, file system, HTTP, and server APIs
 - A built-in visual scene editor inspired by Unity and Godot
 - Standalone desktop executables with embedded game assets
+- Signed Android APK builds with embedded game assets
+- iOS simulator app builds for macOS/Xcode users
 - Itch.io-ready WebAssembly bundles
+- Mobile emulator mode for desktop testing of locked phone/tablet layouts
 - External writable data directories for packaged desktop games
 - Project-root restrictions for command working-directory paths
 
@@ -129,28 +132,35 @@ neolove editor          # edit the project in the current directory
 neolove editor my-game  # edit a specific project
 ```
 
-The editor opens a window with a dockable **Hierarchy**, a 2D **Viewport**, an
-**Inspector**, and a bottom **Project** file browser:
+The editor opens a window with a dockable or detachable **Hierarchy**, a 2D
+**Viewport**, an **Inspector**, and a bottom **Project** file browser:
 
 - Build scenes from entities and the real engine components — `Rect2D`,
-  `Shape2D`, `ParticleSystem2D`, `SpatialSound2D`, `TextBox`, `Sprite2D`, `NineSliceSprite2D`, `Tilemap2D`, `TileTexture2D`,
-  `Collider2D`, `Rigidbody2D`, `Bolt2D`, `Rope2D` — added from a dropdown, each
-  with its inspector-editable properties (advanced fields collapse away).
+  `Shape2D`, `ParticleSystem2D`, `AnimationController`, `SpatialSound2D`,
+  `TextBox`, `Sprite2D`, `NineSliceSprite2D`, `Tilemap2D`, `TileTexture2D`,
+  `Collider2D`, `Rigidbody2D`, `Bolt2D`, `Rope2D` — added from a dropdown,
+  each with its inspector-editable properties (advanced fields collapse away).
 - Nest entities into a hierarchy by dragging rows; set per-entity `z` order and
   `scale`; reorder, duplicate, copy/paste and rename via right-click menus.
 - Attach a `Script` component to expose **public variables** edited in the
-  inspector — the editor's take on Unity's serialized fields.
+  inspector — including `IImage`, `IAudio`, `IShader`, and `IAnimation` asset
+  handles for custom scripts.
 - Edit the scene background (`app.bg`) with a color picker; it previews live in
-  the viewport. Pan the viewport with the middle mouse button.
-- Dock the side panels left or right and resize every panel (and the project
-  bin) with draggable splitters; the layout adapts to any window size.
+  the viewport. The viewport shows the configured default game-window bounds.
+- Use move, scale, and rotate scene tools with explicit handles. Holding `Ctrl`
+  while moving a parent keeps descendants in their world positions.
+- Dock, undock, close, and restore the Hierarchy, Inspector, and Project
+  browser from the Window menu; resize panels with draggable splitters.
 - Browse, create, and open project files from the bottom Project panel; reveal
-  folders in your OS file manager. Toggle the grid overlay and grid snapping.
+  folders in your OS file manager. Create shader and animation assets from the
+  editor, open `.neoanim` clips in the Bezier animation editor, and toggle the
+  grid overlay and grid snapping.
 - Image components (`Sprite2D`, `Image2D`, `NineSliceSprite2D`, `TileTexture2D`)
-  load and preview their real assets in the viewport (with true 9-slice and
-  tiling). Copy/paste components between entities. Save a prefab by dragging an
-  entity onto the Project panel, and drag a `.neoprefab` back into the viewport
-  to instantiate it.
+  and `ParticleSystem2D` emitters load and preview their real assets in the
+  viewport (with true 9-slice, tiling, and particle sprites). Paint `Tilemap2D`
+  tiles directly inside selected tilemap entities. Copy/paste components
+  between entities. Save a prefab by dragging an entity onto the Project panel,
+  and drag a `.neoprefab` back into the viewport to instantiate it.
 - Right-click almost anything for a context menu; hover any control for a
   tooltip; unsaved changes prompt before New/Load/Quit.
 - Unity-style quality-of-life: undo/redo (Ctrl+Z / Ctrl+Y), duplicate (Ctrl+D),
@@ -166,11 +176,29 @@ ecs.loadScene("scene.neoscene")
 ```
 
 Scenes are saved as `scene.neoscene` (JSON). **Export main.luau** generates a
-runnable entry point from the scene, and **Run** launches a live preview.
+runnable entry point from the scene, **Run** launches a live preview, and
+**Build** exports then asks whether to package for desktop, WebAssembly,
+Android, or iOS. The **Mobile** control runs previews in a locked phone-sized
+viewport with portrait/landscape rotation and Wi-Fi/cellular/low-power toggles.
 
-The editor's appearance and dock layout are stored in `editor.json`, created on
-first launch with a Visual Studio Code "Dark+" theme. Edit the `theme` section
-to recolor the editor.
+Project window defaults live in `neolove.toml` under `[window]`:
+
+```toml
+[window]
+title = "My Game"
+width = 1280
+height = 720
+fullscreen = false
+resizable = true
+```
+
+Global editor preferences are stored in your user config directory
+(`%APPDATA%\NeoLOVE\editor.json` on Windows,
+`~/Library/Application Support/NeoLOVE/editor.json` on macOS, or
+`$XDG_CONFIG_HOME/neolove/editor.json` / `~/.config/neolove/editor.json` on
+Linux). The Settings button opens editor-wide theme, font, tooltip, overlay,
+and autosave options. Older project-local `editor.json` files are still read as
+a fallback.
 
 ## CLI
 
@@ -178,9 +206,12 @@ to recolor the editor.
 | --- | --- |
 | `neolove new <project-name>` | Create a new project |
 | `neolove run [project-dir]` | Run a project |
+| `neolove run [project-dir] --mobile` | Run with the locked mobile emulator |
 | `neolove editor [project-dir]` | Open the visual scene editor |
 | `neolove build [project-dir]` | Build a standalone desktop executable |
 | `neolove build [project-dir] --webasm` | Build an HTML5 bundle and upload zip |
+| `neolove build [project-dir] --android` | Build a signed Android APK |
+| `neolove build [project-dir] --ios` | Build an iOS simulator app on macOS |
 | `neolove api [project-dir]` | Refresh the Luau API type definitions |
 | `neolove update` | Pull, rebuild, and install the latest engine revision |
 | `neolove setup-path` | Add NeoLOVE to the user PATH |
@@ -201,7 +232,7 @@ NeoLOVE exposes its APIs as Luau globals:
 | Application and input | `app`, `input`, `userInput`, `mouse`, `window` |
 | Entities and transforms | `ecs`, `core`, `transform`, `transforms` |
 | Assets and audio | `assets`, `audio` |
-| Files and processes | `fs`, `commands`, `command` |
+| Files, platform, and processes | `fs`, `android`, `mobile`, `commands`, `command` |
 | Networking | `http`, `servers` |
 | Gameplay helpers | `prefabs`, `prefab`, `tweening`, `tween`, `animation`, `animations` |
 | Rendering | `shaders` |
@@ -251,6 +282,26 @@ Then open `http://localhost:8000`. Browsers will not reliably run the bundle
 from a `file://` URL. The first web build may install the Emscripten Rust target
 and a local toolchain under `~/.neolove/toolchains/emsdk`.
 
+Build an Android APK:
+
+```bash
+neolove build --android
+```
+
+This creates `dist/<project-name>-android-arm64.apk`. The first Android build
+may install the Android Rust target plus a local JDK, SDK, build-tools, and NDK
+under `~/.neolove/toolchains/`. `--apk` is accepted as an alias for `--android`.
+
+Build an iOS simulator app on macOS:
+
+```bash
+neolove build --ios
+```
+
+This creates `dist/<project-name>-ios-simulator.app` using Xcode's
+`iphonesimulator` SDK. The command is only available on macOS with Xcode
+installed.
+
 ## Asset Support
 
 - Images: PNG, JPEG, GIF, BMP, TGA, TIFF, PNM, WebP, HDR, and DDS
@@ -283,9 +334,11 @@ cargo test --all-targets --all-features
 cargo check --target wasm32-unknown-unknown
 ```
 
-Release builds use size optimization, fat LTO, a single codegen unit, stripped
-symbols, and a deflated embedded project payload so image and audio assets are
-compressed in standalone builds. Web upload ZIPs use deflate compression as well.
+Release builds use size-oriented optimization, fat LTO, a single codegen unit,
+stripped symbols, and a deflated embedded project payload so image and audio
+assets are compressed in standalone builds. Desktop game exports rebuild a
+compact packaged runtime before appending the payload. Web upload ZIPs use
+deflate compression as well.
 
 ## License
 

@@ -12,6 +12,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PATH");
     println!("cargo:rerun-if-env-changed=HOME");
     println!("cargo:rerun-if-env-changed=USERPROFILE");
+    println!("cargo:rerun-if-env-changed=NEOLOVE_PACKAGED_RUNTIME");
+    println!("cargo:rustc-check-cfg=cfg(neolove_packaged)");
+
+    if std::env::var_os("NEOLOVE_PACKAGED_RUNTIME").is_some_and(|value| !value.is_empty()) {
+        println!("cargo:rustc-cfg=neolove_packaged");
+    }
 
     emit_git_revision();
 
@@ -37,6 +43,15 @@ fn main() {
             .archiver(archiver)
             .file("src/web_bridge.c")
             .compile("neolove_web_bridge");
+
+        let out_dir = std::path::PathBuf::from(
+            std::env::var_os("OUT_DIR").expect("Cargo should set OUT_DIR for build scripts"),
+        );
+        println!(
+            "cargo:rustc-link-arg-bin=neolove={}",
+            out_dir.join("libneolove_web_bridge.a").display()
+        );
+        println!("cargo:rustc-link-lib=static=neolove_web_bridge");
     }
 }
 

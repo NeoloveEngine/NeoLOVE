@@ -1,9 +1,12 @@
 mod assets;
+mod android_module;
 mod animation;
 mod audio_system;
 mod commands;
 mod core;
+#[cfg(not(neolove_packaged))]
 mod editor;
+#[cfg(not(neolove_packaged))]
 mod editor_ipc;
 mod fs_module;
 #[cfg(feature = "vulkan")]
@@ -11,6 +14,8 @@ mod gpu_renderer;
 pub mod hierarchy;
 mod http;
 mod lua_error;
+mod mobile_emulation;
+mod mobile_module;
 mod platform;
 mod prefabs;
 mod renderer;
@@ -19,6 +24,7 @@ mod scene;
 mod servers;
 mod shader;
 mod tweening;
+#[cfg(not(neolove_packaged))]
 mod update;
 mod user_input;
 pub mod window;
@@ -45,7 +51,7 @@ use winit::event::{
     ElementState, Event, KeyboardInput, MouseButton, MouseScrollDelta, VirtualKeyCode, WindowEvent,
 };
 use winit::event_loop::{ControlFlow, EventLoop};
-use winit::window::{CursorGrabMode, Icon, WindowBuilder};
+use winit::window::{CursorGrabMode, Fullscreen, Icon, WindowBuilder};
 use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
 
@@ -185,6 +191,10 @@ struct ProjectSettings {
     package_name: Option<String>,
     window_title: Option<String>,
     window_icon: Option<String>,
+    window_width: Option<f32>,
+    window_height: Option<f32>,
+    window_fullscreen: Option<bool>,
+    window_resizable: Option<bool>,
 }
 
 fn resolve_from_cwd(user_path: &str) -> std::io::Result<PathBuf> {
@@ -360,6 +370,18 @@ fn parse_quoted(input: &str) -> Option<String> {
     Some(value[1..value.len() - 1].to_string())
 }
 
+fn parse_number(input: &str) -> Option<f32> {
+    input.trim().parse::<f32>().ok().filter(|value| value.is_finite())
+}
+
+fn parse_bool(input: &str) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 fn parse_project_settings(project_root: &Path) -> ProjectSettings {
     let mut settings = ProjectSettings::default();
     let file_path = project_root.join("neolove.toml");
@@ -382,14 +404,35 @@ fn parse_project_settings(project_root: &Path) -> ProjectSettings {
             continue;
         };
         let key = key_raw.trim().to_ascii_lowercase();
-        let Some(value) = parse_quoted(value_raw) else {
-            continue;
-        };
-
         match section.as_str() {
-            "package" if key == "name" => settings.package_name = Some(value),
-            "window" if key == "title" => settings.window_title = Some(value),
-            "window" if key == "icon" => settings.window_icon = Some(value),
+            "package" if key == "name" => {
+                if let Some(value) = parse_quoted(value_raw) {
+                    settings.package_name = Some(value);
+                }
+            }
+            "window" if key == "title" => {
+                if let Some(value) = parse_quoted(value_raw) {
+                    settings.window_title = Some(value);
+                }
+            }
+            "window" if key == "icon" => {
+                if let Some(value) = parse_quoted(value_raw) {
+                    settings.window_icon = Some(value);
+                }
+            }
+            "window" if key == "width" => {
+                settings.window_width = parse_number(value_raw).map(|value| value.clamp(1.0, 16384.0));
+            }
+            "window" if key == "height" => {
+                settings.window_height =
+                    parse_number(value_raw).map(|value| value.clamp(1.0, 16384.0));
+            }
+            "window" if key == "fullscreen" => {
+                settings.window_fullscreen = parse_bool(value_raw);
+            }
+            "window" if key == "resizable" => {
+                settings.window_resizable = parse_bool(value_raw);
+            }
             _ => {}
         }
     }
@@ -405,19 +448,24 @@ fn try_load_window_icon(project_root: &Path, icon_path: &str) -> Option<Icon> {
     Icon::from_rgba(resized.into_raw(), 64, 64).ok()
 }
 
-fn window_options_for_project(project_root: &Path) -> (String, Option<Icon>) {
+fn window_options_for_project(project_root: &Path) -> (String, Option<Icon>, f32, f32, bool, bool) {
     let settings = parse_project_settings(project_root);
     let title = settings
         .window_title
-        .or(settings.package_name)
+        .clone()
+        .or(settings.package_name.clone())
         .unwrap_or_else(|| "NeoLOVE".to_string());
+    let width = settings.window_width.unwrap_or(DEFAULT_WINDOW_WIDTH);
+    let height = settings.window_height.unwrap_or(DEFAULT_WINDOW_HEIGHT);
+    let fullscreen = settings.window_fullscreen.unwrap_or(false);
+    let resizable = settings.window_resizable.unwrap_or(true);
 
     let icon = settings
         .window_icon
         .as_ref()
         .and_then(|path| try_load_window_icon(project_root, path));
 
-    (title, icon)
+    (title, icon, width, height, fullscreen, resizable)
 }
 
 fn should_skip_in_build(path: &Path) -> bool {
@@ -819,29 +867,69 @@ fn patch_subsystem_to_gui(image: &mut [u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn build_executable(project_root: &Path) -> Result<PathBuf, String> {
-    let output_stem = project_output_stem(project_root);
-
+fn executable_file_name(output_stem: &str) -> String {
     #[cfg(windows)]
-    let output_name = {
-        let mut output_name = output_stem;
+    {
+        let mut output_name = output_stem.to_string();
         if !output_name.to_ascii_lowercase().ends_with(".exe") {
             output_name.push_str(".exe");
         }
         output_name
-    };
+    }
     #[cfg(not(windows))]
-    let output_name = output_stem;
+    {
+        output_stem.to_string()
+    }
+}
+
+fn runtime_executable_file_name() -> String {
+    executable_file_name(env!("CARGO_PKG_NAME"))
+}
+
+fn build_packaged_runtime() -> Result<PathBuf, String> {
+    let engine_root = engine_source_root()?;
+    let cargo_target_dir = engine_root.join("target").join("neolove-packaged-runtime");
+
+    println!("Building compact packaged runtime...");
+    let mut cargo = std::process::Command::new("cargo");
+    apply_size_optimized_release_env(&mut cargo);
+    cargo
+        .env("NEOLOVE_PACKAGED_RUNTIME", "1")
+        .env("CARGO_TARGET_DIR", &cargo_target_dir)
+        .arg("build")
+        .arg("--release")
+        .arg("--bin")
+        .arg(env!("CARGO_PKG_NAME"));
+    if cfg!(feature = "vulkan") {
+        cargo.args(["--features", "vulkan"]);
+    }
+    cargo.current_dir(&engine_root);
+    run_checked_command_quiet(&mut cargo, "building compact packaged runtime")?;
+
+    let artifact = cargo_target_dir
+        .join("release")
+        .join(runtime_executable_file_name());
+    if !artifact.is_file() {
+        return Err(format!(
+            "packaged runtime build succeeded but output was not found: {}",
+            artifact.display()
+        ));
+    }
+    Ok(artifact)
+}
+
+fn build_executable(project_root: &Path) -> Result<PathBuf, String> {
+    let output_stem = project_output_stem(project_root);
+    let output_name = executable_file_name(&output_stem);
 
     let payload = build_payload(project_root)?;
 
-    let current_exe = env::current_exe()
-        .map_err(|e| format!("failed to resolve current executable path: {e}"))?;
+    let packaged_runtime = build_packaged_runtime()?;
     #[allow(unused_mut)]
-    let mut engine_bytes = fs::read(&current_exe).map_err(|e| {
+    let mut engine_bytes = fs::read(&packaged_runtime).map_err(|e| {
         format!(
-            "failed to read engine executable {}: {e}",
-            current_exe.display()
+            "failed to read packaged runtime {}: {e}",
+            packaged_runtime.display()
         )
     })?;
 
@@ -909,7 +997,7 @@ fn engine_source_root() -> Result<PathBuf, String> {
         Ok(root)
     } else {
         Err(format!(
-            "webasm build requires engine source files; expected Cargo.toml at {}",
+            "build requires engine source files; expected Cargo.toml at {}",
             root.display()
         ))
     }
@@ -963,6 +1051,16 @@ fn run_checked_command_quiet(
             output.status
         ))
     }
+}
+
+fn apply_size_optimized_release_env(command: &mut std::process::Command) {
+    command
+        .env("CARGO_PROFILE_RELEASE_OPT_LEVEL", "z")
+        .env("CARGO_PROFILE_RELEASE_LTO", "fat")
+        .env("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1")
+        .env("CARGO_PROFILE_RELEASE_STRIP", "symbols")
+        .env("CARGO_PROFILE_RELEASE_DEBUG", "false")
+        .env("CARGO_PROFILE_RELEASE_INCREMENTAL", "false");
 }
 
 fn emsdk_root() -> Result<PathBuf, String> {
@@ -1110,6 +1208,34 @@ fn recreate_dir(path: &Path) -> Result<(), String> {
     }
     fs::create_dir_all(path)
         .map_err(|e| format!("failed to create directory {}: {e}", path.display()))
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
+    if !source.is_dir() {
+        return Err(format!("source directory does not exist: {}", source.display()));
+    }
+    fs::create_dir_all(destination)
+        .map_err(|e| format!("failed to create directory {}: {e}", destination.display()))?;
+    for entry in fs::read_dir(source).map_err(|e| format!("failed to read {}: {e}", source.display()))? {
+        let entry = entry.map_err(|e| format!("failed to read entry in {}: {e}", source.display()))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let kind = entry
+            .file_type()
+            .map_err(|e| format!("failed to inspect {}: {e}", source_path.display()))?;
+        if kind.is_dir() {
+            copy_dir_recursive(&source_path, &destination_path)?;
+        } else if kind.is_file() {
+            fs::copy(&source_path, &destination_path).map_err(|e| {
+                format!(
+                    "failed to copy {} -> {}: {e}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn stage_web_project(project_root: &Path, stage_dir: &Path) -> Result<(), String> {
@@ -1605,7 +1731,8 @@ fn build_webasm(project_root: &Path) -> Result<(PathBuf, PathBuf), String> {
     println!("Building NeoLOVE webasm runtime...");
     let mut cargo = std::process::Command::new("cargo");
     apply_emsdk_env(&mut cargo, &emsdk)?;
-    cargo.env("CXXFLAGS", "-fwasm-exceptions");
+    apply_size_optimized_release_env(&mut cargo);
+    cargo.env("CXXFLAGS", "-Oz -fwasm-exceptions");
     cargo.env("CARGO_TARGET_DIR", &cargo_target_dir);
     cargo
         .arg("rustc")
@@ -1622,6 +1749,14 @@ fn build_webasm(project_root: &Path) -> Result<(PathBuf, PathBuf), String> {
             "link-arg={}@/project",
             staged_project.to_string_lossy()
         ))
+        .arg("-C")
+        .arg("link-arg=-Oz")
+        .arg("-C")
+        .arg("link-arg=--strip-debug")
+        .arg("-C")
+        .arg("link-arg=-sASSERTIONS=0")
+        .arg("-C")
+        .arg("link-arg=-sMALLOC=emmalloc")
         .arg("-C")
         .arg("link-arg=-sFORCE_FILESYSTEM=1")
         .arg("-C")
@@ -1685,6 +1820,1019 @@ fn build_webasm(project_root: &Path) -> Result<(PathBuf, PathBuf), String> {
     create_webasm_zip(&bundle_dir, &zip_output)?;
 
     Ok((bundle_dir, zip_output))
+}
+
+const ANDROID_API_LEVEL: &str = "35";
+const ANDROID_BUILD_TOOLS_VERSION: &str = "35.0.0";
+const ANDROID_NDK_VERSION: &str = "27.2.12479018";
+const ANDROID_MIN_SDK: &str = "24";
+const ANDROID_RUST_TARGET: &str = "aarch64-linux-android";
+const ANDROID_ABI: &str = "arm64-v8a";
+const ANDROID_PAYLOAD_ASSET: &str = "neolove_project.payload";
+const ANDROID_CMDLINE_TOOLS_URL: &str =
+    "https://dl.google.com/android/repository/commandlinetools-linux-14742923_latest.zip";
+const JDK_LINUX_X64_URL: &str =
+    "https://api.adoptium.net/v3/binary/latest/21/ga/linux/x64/jdk/hotspot/normal/eclipse";
+
+struct AndroidToolchain {
+    java_home: PathBuf,
+    aapt2: PathBuf,
+    zipalign: PathBuf,
+    apksigner: PathBuf,
+    android_jar: PathBuf,
+    clang: PathBuf,
+    clangxx: PathBuf,
+    llvm_ar: PathBuf,
+    llvm_strip: PathBuf,
+    keytool: PathBuf,
+}
+
+fn executable_name(name: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("{name}.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        name.to_string()
+    }
+}
+
+fn script_name(name: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("{name}.bat")
+    }
+    #[cfg(not(windows))]
+    {
+        name.to_string()
+    }
+}
+
+fn find_program_on_path(name: &str) -> Option<PathBuf> {
+    let name = executable_name(name);
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|dir| dir.join(&name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn java_home_from_executable(java: &Path) -> Option<PathBuf> {
+    java.parent()?.parent().map(Path::to_path_buf)
+}
+
+fn find_java_home() -> Option<PathBuf> {
+    env::var_os("JAVA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|home| home.join("bin").join(executable_name("java")).is_file())
+        .or_else(|| find_program_on_path("java").and_then(|java| java_home_from_executable(&java)))
+}
+
+fn find_java_home_under(root: &Path) -> Option<PathBuf> {
+    if root.join("bin").join(executable_name("java")).is_file() {
+        return Some(root.to_path_buf());
+    }
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.join("bin").join(executable_name("java")).is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn toolchains_root() -> Result<PathBuf, String> {
+    let home = user_home_dir().ok_or_else(|| "could not resolve home directory".to_string())?;
+    Ok(home.join(".neolove").join("toolchains"))
+}
+
+fn download_file(url: &str, output: &Path) -> Result<(), String> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+
+    if let Some(curl) = find_program_on_path("curl") {
+        let mut command = std::process::Command::new(curl);
+        command
+            .arg("--fail")
+            .arg("--location")
+            .arg("--show-error")
+            .arg("--output")
+            .arg(output)
+            .arg(url);
+        return run_checked_command(&mut command, "downloading toolchain file");
+    }
+
+    if let Some(wget) = find_program_on_path("wget") {
+        let mut command = std::process::Command::new(wget);
+        command.arg("-O").arg(output).arg(url);
+        return run_checked_command(&mut command, "downloading toolchain file");
+    }
+
+    Err("Android build bootstrap requires curl or wget on PATH".to_string())
+}
+
+fn prepend_path(command: &mut std::process::Command, extra: &Path) -> Result<(), String> {
+    let mut paths = vec![extra.to_path_buf()];
+    if let Some(existing) = env::var_os("PATH") {
+        paths.extend(env::split_paths(&existing));
+    }
+    let joined =
+        env::join_paths(paths).map_err(|error| format!("failed to construct PATH: {error}"))?;
+    command.env("PATH", joined);
+    Ok(())
+}
+
+fn apply_java_env(command: &mut std::process::Command, java_home: &Path) -> Result<(), String> {
+    command.env("JAVA_HOME", java_home);
+    prepend_path(command, &java_home.join("bin"))
+}
+
+fn ensure_jdk() -> Result<PathBuf, String> {
+    if let Some(java_home) = find_java_home() {
+        return Ok(java_home);
+    }
+
+    let root = toolchains_root()?.join("jdk");
+    if let Some(java_home) = find_java_home_under(&root) {
+        return Ok(java_home);
+    }
+
+    if cfg!(not(all(target_os = "linux", target_arch = "x86_64"))) {
+        return Err(
+            "Java was not found. Set JAVA_HOME to a JDK 17+ installation before building Android APKs."
+                .to_string(),
+        );
+    }
+
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("failed to create JDK directory {}: {error}", root.display()))?;
+    let archive = std::env::temp_dir().join("neolove-jdk-linux-x64.tar.gz");
+    println!("Installing user-local JDK for Android APK signing...");
+    download_file(JDK_LINUX_X64_URL, &archive)?;
+    let mut tar = std::process::Command::new("tar");
+    tar.arg("-xzf").arg(&archive).arg("-C").arg(&root);
+    run_checked_command(&mut tar, "extracting JDK")?;
+
+    find_java_home_under(&root).ok_or_else(|| {
+        format!(
+            "JDK archive was extracted, but no bin/java was found under {}",
+            root.display()
+        )
+    })
+}
+
+fn configured_android_sdk_root() -> Result<PathBuf, String> {
+    if let Some(root) = env::var_os("ANDROID_HOME")
+        .or_else(|| env::var_os("ANDROID_SDK_ROOT"))
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(PathBuf::from(root));
+    }
+    Ok(toolchains_root()?.join("android-sdk"))
+}
+
+fn sdkmanager_path(sdk_root: &Path) -> PathBuf {
+    sdk_root
+        .join("cmdline-tools")
+        .join("latest")
+        .join("bin")
+        .join(script_name("sdkmanager"))
+}
+
+fn ensure_android_cmdline_tools(sdk_root: &Path) -> Result<PathBuf, String> {
+    let sdkmanager = sdkmanager_path(sdk_root);
+    if sdkmanager.is_file() {
+        return Ok(sdkmanager);
+    }
+
+    if cfg!(not(all(target_os = "linux", target_arch = "x86_64"))) {
+        return Err(format!(
+            "Android command-line tools were not found at {}. Install them or set ANDROID_HOME.",
+            sdkmanager.display()
+        ));
+    }
+
+    println!("Installing Android command-line tools...");
+    let tools_root = sdk_root.join("cmdline-tools");
+    let latest = tools_root.join("latest");
+    let staging = tools_root.join(".latest-staging");
+    recreate_dir(&staging)?;
+    fs::create_dir_all(&tools_root).map_err(|error| {
+        format!(
+            "failed to create Android cmdline-tools directory {}: {error}",
+            tools_root.display()
+        )
+    })?;
+
+    let archive = std::env::temp_dir().join("neolove-android-cmdline-tools.zip");
+    download_file(ANDROID_CMDLINE_TOOLS_URL, &archive)?;
+    let unzip = find_program_on_path("unzip")
+        .ok_or_else(|| "Android build bootstrap requires unzip on PATH".to_string())?;
+    let mut command = std::process::Command::new(unzip);
+    command.arg("-q").arg("-o").arg(&archive).arg("-d").arg(&staging);
+    run_checked_command(&mut command, "extracting Android command-line tools")?;
+
+    if latest.exists() {
+        fs::remove_dir_all(&latest)
+            .map_err(|error| format!("failed to clean {}: {error}", latest.display()))?;
+    }
+    let extracted = staging.join("cmdline-tools");
+    fs::rename(&extracted, &latest).map_err(|error| {
+        format!(
+            "failed to move Android command-line tools {} -> {}: {error}",
+            extracted.display(),
+            latest.display()
+        )
+    })?;
+    fs::remove_dir_all(&staging)
+        .map_err(|error| format!("failed to clean {}: {error}", staging.display()))?;
+
+    if !sdkmanager.is_file() {
+        return Err(format!(
+            "Android command-line tools install completed, but sdkmanager was not found at {}",
+            sdkmanager.display()
+        ));
+    }
+    Ok(sdkmanager)
+}
+
+fn accept_android_licenses(
+    sdkmanager: &Path,
+    sdk_root: &Path,
+    java_home: &Path,
+) -> Result<(), String> {
+    let mut command = std::process::Command::new(sdkmanager);
+    apply_java_env(&mut command, java_home)?;
+    command
+        .arg(format!("--sdk_root={}", sdk_root.display()))
+        .arg("--licenses")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null());
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to launch sdkmanager --licenses: {error}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all("y\n".repeat(64).as_bytes())
+            .map_err(|error| format!("failed to accept Android SDK licenses: {error}"))?;
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("failed while accepting Android SDK licenses: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("sdkmanager --licenses failed with status {status}"))
+    }
+}
+
+fn run_sdkmanager_install(
+    sdkmanager: &Path,
+    sdk_root: &Path,
+    java_home: &Path,
+    packages: &[&str],
+) -> Result<(), String> {
+    let mut command = std::process::Command::new(sdkmanager);
+    apply_java_env(&mut command, java_home)?;
+    command
+        .arg(format!("--sdk_root={}", sdk_root.display()))
+        .arg("--install");
+    command.args(packages);
+    run_checked_command(&mut command, "installing Android SDK packages")
+}
+
+fn android_host_tag() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows-x86_64"
+    } else if cfg!(target_os = "macos") {
+        "darwin-x86_64"
+    } else {
+        "linux-x86_64"
+    }
+}
+
+fn android_build_tools_tool(sdk_root: &Path, tool: &str, script: bool) -> PathBuf {
+    sdk_root
+        .join("build-tools")
+        .join(ANDROID_BUILD_TOOLS_VERSION)
+        .join(if script { script_name(tool) } else { executable_name(tool) })
+}
+
+fn ensure_android_toolchain() -> Result<AndroidToolchain, String> {
+    let java_home = ensure_jdk()?;
+    let sdk_root = configured_android_sdk_root()?;
+    let sdkmanager = ensure_android_cmdline_tools(&sdk_root)?;
+    accept_android_licenses(&sdkmanager, &sdk_root, &java_home)?;
+    run_sdkmanager_install(
+        &sdkmanager,
+        &sdk_root,
+        &java_home,
+        &[
+            "platform-tools",
+            &format!("platforms;android-{ANDROID_API_LEVEL}"),
+            &format!("build-tools;{ANDROID_BUILD_TOOLS_VERSION}"),
+            &format!("ndk;{ANDROID_NDK_VERSION}"),
+        ],
+    )?;
+
+    let ndk_root = sdk_root.join("ndk").join(ANDROID_NDK_VERSION);
+    let llvm_bin = ndk_root
+        .join("toolchains")
+        .join("llvm")
+        .join("prebuilt")
+        .join(android_host_tag())
+        .join("bin");
+    let clang = llvm_bin.join(if cfg!(windows) {
+        format!("{ANDROID_RUST_TARGET}{ANDROID_MIN_SDK}-clang.cmd")
+    } else {
+        format!("{ANDROID_RUST_TARGET}{ANDROID_MIN_SDK}-clang")
+    });
+    let clangxx = llvm_bin.join(if cfg!(windows) {
+        format!("{ANDROID_RUST_TARGET}{ANDROID_MIN_SDK}-clang++.cmd")
+    } else {
+        format!("{ANDROID_RUST_TARGET}{ANDROID_MIN_SDK}-clang++")
+    });
+    let llvm_ar = llvm_bin.join(executable_name("llvm-ar"));
+    let llvm_strip = llvm_bin.join(executable_name("llvm-strip"));
+
+    let toolchain = AndroidToolchain {
+        java_home: java_home.clone(),
+        aapt2: android_build_tools_tool(&sdk_root, "aapt2", false),
+        zipalign: android_build_tools_tool(&sdk_root, "zipalign", false),
+        apksigner: android_build_tools_tool(&sdk_root, "apksigner", true),
+        android_jar: sdk_root
+            .join("platforms")
+            .join(format!("android-{ANDROID_API_LEVEL}"))
+            .join("android.jar"),
+        clang,
+        clangxx,
+        llvm_ar,
+        llvm_strip,
+        keytool: java_home.join("bin").join(executable_name("keytool")),
+    };
+
+    for path in [
+        &toolchain.aapt2,
+        &toolchain.zipalign,
+        &toolchain.apksigner,
+        &toolchain.android_jar,
+        &toolchain.clang,
+        &toolchain.clangxx,
+        &toolchain.llvm_ar,
+        &toolchain.llvm_strip,
+        &toolchain.keytool,
+    ] {
+        if !path.is_file() {
+            return Err(format!(
+                "Android toolchain setup completed, but required tool is missing: {}",
+                path.display()
+            ));
+        }
+    }
+
+    Ok(toolchain)
+}
+
+fn valid_android_package_name(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('.').collect();
+    parts.len() >= 2
+        && parts.iter().all(|part| {
+            let mut chars = part.chars();
+            matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
+                && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+}
+
+fn android_identifier_segment(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if ch == '_' || ch == '-' || ch.is_whitespace() {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push_str("game");
+    }
+    if out
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_digit())
+    {
+        out.insert(0, 'g');
+    }
+    while out.contains("__") {
+        out = out.replace("__", "_");
+    }
+    out.trim_matches('_').to_string().if_empty("game")
+}
+
+trait IfEmpty {
+    fn if_empty(self, fallback: &str) -> String;
+}
+
+impl IfEmpty for String {
+    fn if_empty(self, fallback: &str) -> String {
+        if self.is_empty() {
+            fallback.to_string()
+        } else {
+            self
+        }
+    }
+}
+
+fn android_package_name(project_root: &Path) -> String {
+    let settings = parse_project_settings(project_root);
+    if let Some(name) = settings.package_name.as_deref() {
+        let lower = name.to_ascii_lowercase();
+        if valid_android_package_name(&lower) {
+            return lower;
+        }
+    }
+    format!(
+        "com.neolove.{}",
+        android_identifier_segment(&project_output_stem(project_root))
+    )
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn android_manifest(project_root: &Path) -> String {
+    let settings = parse_project_settings(project_root);
+    let package_name = android_package_name(project_root);
+    let label = settings
+        .window_title
+        .or(settings.package_name)
+        .unwrap_or_else(|| project_output_stem(project_root));
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="{package_name}"
+    android:versionCode="1"
+    android:versionName="0.1.0">
+    <uses-sdk android:minSdkVersion="{ANDROID_MIN_SDK}" android:targetSdkVersion="{ANDROID_API_LEVEL}" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application
+        android:label="{label}"
+        android:allowBackup="false"
+        android:hasCode="false"
+        android:extractNativeLibs="true"
+        android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="true"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+            android:screenOrientation="sensorLandscape">
+            <meta-data android:name="android.app.lib_name" android:value="neolove" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+"#,
+        package_name = xml_escape(&package_name),
+        label = xml_escape(&label),
+    )
+}
+
+fn ensure_android_debug_keystore(toolchain: &AndroidToolchain) -> Result<PathBuf, String> {
+    let keystore = toolchains_root()?.join("android").join("debug.keystore");
+    if keystore.is_file() {
+        return Ok(keystore);
+    }
+    if let Some(parent) = keystore.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    let mut command = std::process::Command::new(&toolchain.keytool);
+    apply_java_env(&mut command, &toolchain.java_home)?;
+    command
+        .arg("-genkeypair")
+        .arg("-keystore")
+        .arg(&keystore)
+        .arg("-storepass")
+        .arg("android")
+        .arg("-keypass")
+        .arg("android")
+        .arg("-alias")
+        .arg("androiddebugkey")
+        .arg("-keyalg")
+        .arg("RSA")
+        .arg("-keysize")
+        .arg("2048")
+        .arg("-validity")
+        .arg("10000")
+        .arg("-dname")
+        .arg("CN=Android Debug,O=NeoLOVE,C=US");
+    run_checked_command(&mut command, "creating Android debug keystore")?;
+    Ok(keystore)
+}
+
+fn build_android(project_root: &Path) -> Result<PathBuf, String> {
+    let output_stem = project_output_stem(project_root);
+    let output_dir = project_root.join("dist");
+    fs::create_dir_all(&output_dir).map_err(|error| {
+        format!(
+            "failed to create dist directory {}: {error}",
+            output_dir.display()
+        )
+    })?;
+
+    let toolchain = ensure_android_toolchain()?;
+    println!("Ensuring Rust Android target is installed...");
+    let mut rustup = std::process::Command::new("rustup");
+    rustup.args(["target", "add", ANDROID_RUST_TARGET]);
+    run_checked_command(&mut rustup, "installing Android Rust target")?;
+
+    let payload = build_payload(project_root)?;
+    let engine_root = engine_source_root()?;
+    let cargo_target_dir = engine_root.join("target").join("android-aarch64");
+
+    println!("Building NeoLOVE Android runtime...");
+    let mut cargo = std::process::Command::new("cargo");
+    apply_size_optimized_release_env(&mut cargo);
+    cargo
+        .env("CARGO_TARGET_DIR", &cargo_target_dir)
+        .env(
+            "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER",
+            &toolchain.clang,
+        )
+        .env("CC_aarch64_linux_android", &toolchain.clang)
+        .env("CXX_aarch64_linux_android", &toolchain.clangxx)
+        .env("AR_aarch64_linux_android", &toolchain.llvm_ar)
+        .arg("build")
+        .arg("--release")
+        .arg("--lib")
+        .arg("--target")
+        .arg(ANDROID_RUST_TARGET)
+        .current_dir(&engine_root);
+    run_checked_command_quiet(&mut cargo, "building Android runtime")?;
+
+    let built_library = cargo_target_dir
+        .join(ANDROID_RUST_TARGET)
+        .join("release")
+        .join(format!("lib{}.so", env!("CARGO_PKG_NAME")));
+    if !built_library.is_file() {
+        return Err(format!(
+            "Android runtime build succeeded but output was not found: {}",
+            built_library.display()
+        ));
+    }
+
+    let stage_dir = output_dir.join(".android-stage");
+    recreate_dir(&stage_dir)?;
+    let lib_dir = stage_dir.join("lib").join(ANDROID_ABI);
+    let assets_dir = stage_dir.join("assets");
+    fs::create_dir_all(&lib_dir)
+        .map_err(|error| format!("failed to create {}: {error}", lib_dir.display()))?;
+    fs::create_dir_all(&assets_dir)
+        .map_err(|error| format!("failed to create {}: {error}", assets_dir.display()))?;
+
+    let staged_library = lib_dir.join("libneolove.so");
+    fs::copy(&built_library, &staged_library).map_err(|error| {
+        format!(
+            "failed to stage Android runtime {} -> {}: {error}",
+            built_library.display(),
+            staged_library.display()
+        )
+    })?;
+    let mut strip = std::process::Command::new(&toolchain.llvm_strip);
+    strip.arg("--strip-unneeded").arg(&staged_library);
+    run_checked_command(&mut strip, "stripping Android runtime")?;
+
+    fs::write(assets_dir.join(ANDROID_PAYLOAD_ASSET), payload)
+        .map_err(|error| format!("failed to stage Android project payload: {error}"))?;
+    let manifest_path = stage_dir.join("AndroidManifest.xml");
+    fs::write(&manifest_path, android_manifest(project_root))
+        .map_err(|error| format!("failed to write Android manifest: {error}"))?;
+
+    let linked_apk = stage_dir.join("linked.apk");
+    let mut aapt2 = std::process::Command::new(&toolchain.aapt2);
+    aapt2
+        .arg("link")
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("-I")
+        .arg(&toolchain.android_jar)
+        .arg("--min-sdk-version")
+        .arg(ANDROID_MIN_SDK)
+        .arg("--target-sdk-version")
+        .arg(ANDROID_API_LEVEL)
+        .arg("-o")
+        .arg(&linked_apk);
+    run_checked_command_quiet(&mut aapt2, "linking Android APK manifest")?;
+
+    let zip = find_program_on_path("zip")
+        .ok_or_else(|| "Android APK packaging requires zip on PATH".to_string())?;
+    let mut zip_command = std::process::Command::new(zip);
+    zip_command
+        .current_dir(&stage_dir)
+        .arg("-q")
+        .arg("-0")
+        .arg(&linked_apk)
+        .arg(format!("assets/{ANDROID_PAYLOAD_ASSET}"))
+        .arg(format!("lib/{ANDROID_ABI}/libneolove.so"));
+    run_checked_command(&mut zip_command, "adding Android assets to APK")?;
+
+    let aligned_apk = stage_dir.join("aligned.apk");
+    let mut zipalign = std::process::Command::new(&toolchain.zipalign);
+    zipalign
+        .arg("-f")
+        .arg("-p")
+        .arg("4")
+        .arg(&linked_apk)
+        .arg(&aligned_apk);
+    run_checked_command(&mut zipalign, "aligning Android APK")?;
+
+    let final_apk = output_dir.join(format!("{output_stem}-android-arm64.apk"));
+    let keystore = ensure_android_debug_keystore(&toolchain)?;
+    let mut apksigner = std::process::Command::new(&toolchain.apksigner);
+    apply_java_env(&mut apksigner, &toolchain.java_home)?;
+    apksigner
+        .arg("sign")
+        .arg("--ks")
+        .arg(&keystore)
+        .arg("--ks-pass")
+        .arg("pass:android")
+        .arg("--key-pass")
+        .arg("pass:android")
+        .arg("--out")
+        .arg(&final_apk)
+        .arg(&aligned_apk);
+    run_checked_command_quiet(&mut apksigner, "signing Android APK")?;
+
+    let _ = fs::remove_dir_all(&stage_dir);
+    Ok(final_apk)
+}
+
+fn ios_product_name(project_root: &Path) -> String {
+    let stem = project_output_stem(project_root);
+    let mut out = String::new();
+    for ch in stem.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else if ch == '_' || ch == '-' || ch.is_whitespace() {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push_str("NeoLOVEGame");
+    }
+    if out.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+        out.insert_str(0, "NeoLOVE");
+    }
+    out
+}
+
+fn ios_info_plist(project_root: &Path, product_name: &str, bundle_id: &str) -> String {
+    let settings = parse_project_settings(project_root);
+    let label = settings
+        .window_title
+        .or(settings.package_name)
+        .unwrap_or_else(|| project_output_stem(project_root));
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>$(DEVELOPMENT_LANGUAGE)</string>
+    <key>CFBundleDisplayName</key>
+    <string>{}</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key>
+    <string>{}</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>{}</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+    <key>UIRequiresFullScreen</key>
+    <true/>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+</dict>
+</plist>
+"#,
+        xml_escape(&label),
+        xml_escape(bundle_id),
+        xml_escape(product_name)
+    )
+}
+
+fn ios_app_delegate_source() -> &'static str {
+    r#"import UIKit
+
+@main
+final class AppDelegate: UIResponder, UIApplicationDelegate {
+    var window: UIWindow?
+
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+    ) -> Bool {
+        let window = UIWindow(frame: UIScreen.main.bounds)
+        window.rootViewController = ViewController()
+        window.makeKeyAndVisible()
+        self.window = window
+        return true
+    }
+}
+"#
+}
+
+fn ios_view_controller_source() -> &'static str {
+    r#"import UIKit
+import WebKit
+
+final class ViewController: UIViewController {
+    private var webView: WKWebView!
+    private var server: LocalWebServer?
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+
+        let configuration = WKWebViewConfiguration()
+        configuration.allowsInlineMediaPlayback = true
+        if #available(iOS 10.0, *) {
+            configuration.mediaTypesRequiringUserActionForPlayback = []
+        }
+
+        let webView = WKWebView(frame: view.bounds, configuration: configuration)
+        webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        webView.isOpaque = false
+        webView.backgroundColor = .black
+        view.addSubview(webView)
+        self.webView = webView
+
+        do {
+            guard let root = Bundle.main.resourceURL?.appendingPathComponent("webasm", isDirectory: true) else {
+                throw LocalWebServer.Error.missingBundle
+            }
+            let server = try LocalWebServer(root: root)
+            self.server = server
+            let url = try server.start()
+            webView.load(URLRequest(url: url.appendingPathComponent("index.html")))
+        } catch {
+            let escaped = String(describing: error)
+                .replacingOccurrences(of: "&", with: "&amp;")
+                .replacingOccurrences(of: "<", with: "&lt;")
+                .replacingOccurrences(of: ">", with: "&gt;")
+            let message = "<html><body style='font: -apple-system-body; padding: 24px'><h1>NeoLOVE failed to start</h1><p>\(escaped)</p></body></html>"
+            webView.loadHTMLString(message, baseURL: nil)
+        }
+    }
+}
+"#
+}
+
+fn ios_local_web_server_source() -> &'static str {
+    r#"import Foundation
+import Network
+
+final class LocalWebServer {
+    enum Error: Swift.Error {
+        case missingBundle
+        case missingPort
+    }
+
+    private let root: URL
+    private let queue = DispatchQueue(label: "NeoLOVE.LocalWebServer")
+    private var listener: NWListener?
+
+    init(root: URL) throws {
+        self.root = root
+        self.listener = try NWListener(using: .tcp, on: .any)
+    }
+
+    func start() throws -> URL {
+        guard let listener = listener else { throw Error.missingPort }
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.handle(connection)
+        }
+        listener.start(queue: queue)
+        guard let port = listener.port else { throw Error.missingPort }
+        return URL(string: "http://127.0.0.1:\(port.rawValue)")!
+    }
+
+    private func handle(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, _ in
+            guard let self = self else { return }
+            let response = self.response(for: data ?? Data())
+            connection.send(content: response, completion: .contentProcessed { _ in
+                connection.cancel()
+            })
+        }
+    }
+
+    private func response(for requestData: Data) -> Data {
+        let request = String(decoding: requestData, as: UTF8.self)
+        let firstLine = request.split(separator: "\r\n", maxSplits: 1).first ?? ""
+        let parts = firstLine.split(separator: " ")
+        let rawPath = parts.count >= 2 ? String(parts[1]) : "/index.html"
+        let cleanPath = sanitize(rawPath)
+        let fileURL = root.appendingPathComponent(cleanPath)
+        guard fileURL.path.hasPrefix(root.path), let body = try? Data(contentsOf: fileURL) else {
+            return http(status: "404 Not Found", mime: "text/plain; charset=utf-8", body: Data("Not Found".utf8))
+        }
+        return http(status: "200 OK", mime: mime(for: fileURL), body: body)
+    }
+
+    private func sanitize(_ rawPath: String) -> String {
+        let path = rawPath.split(separator: "?", maxSplits: 1).first.map(String.init) ?? rawPath
+        let decoded = path.removingPercentEncoding ?? path
+        let trimmed = decoded.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let parts = trimmed.split(separator: "/").filter { $0 != "." && $0 != ".." }
+        return parts.isEmpty ? "index.html" : parts.joined(separator: "/")
+    }
+
+    private func http(status: String, mime: String, body: Data) -> Data {
+        var header = "HTTP/1.1 \(status)\r\n"
+        header += "Content-Type: \(mime)\r\n"
+        header += "Content-Length: \(body.count)\r\n"
+        header += "Cache-Control: no-store\r\n"
+        header += "Connection: close\r\n\r\n"
+        var data = Data(header.utf8)
+        data.append(body)
+        return data
+    }
+
+    private func mime(for url: URL) -> String {
+        switch url.pathExtension.lowercased() {
+        case "html": return "text/html; charset=utf-8"
+        case "js": return "application/javascript; charset=utf-8"
+        case "wasm": return "application/wasm"
+        case "data": return "application/octet-stream"
+        case "png": return "image/png"
+        case "jpg", "jpeg": return "image/jpeg"
+        case "gif": return "image/gif"
+        case "svg": return "image/svg+xml"
+        case "css": return "text/css; charset=utf-8"
+        default: return "application/octet-stream"
+        }
+    }
+}
+"#
+}
+
+fn ios_pbxproj(product_name: &str, bundle_id: &str) -> String {
+    r#"// !$*UTF8*$!
+{
+    archiveVersion = 1;
+    classes = {};
+    objectVersion = 56;
+    objects = {
+        A00000000000000000000001 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000011 /* AppDelegate.swift */; };
+        A00000000000000000000002 /* ViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000012 /* ViewController.swift */; };
+        A00000000000000000000003 /* LocalWebServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000013 /* LocalWebServer.swift */; };
+        A00000000000000000000004 /* webasm in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000015 /* webasm */; };
+        A00000000000000000000010 /* __PRODUCT_NAME__.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "__PRODUCT_NAME__.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+        A00000000000000000000011 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+        A00000000000000000000012 /* ViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewController.swift; sourceTree = "<group>"; };
+        A00000000000000000000013 /* LocalWebServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalWebServer.swift; sourceTree = "<group>"; };
+        A00000000000000000000014 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+        A00000000000000000000015 /* webasm */ = {isa = PBXFileReference; lastKnownFileType = folder; path = webasm; sourceTree = "<group>"; };
+        A00000000000000000000020 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+        A00000000000000000000030 = {isa = PBXGroup; children = (A00000000000000000000031 /* __PRODUCT_NAME__ */, A00000000000000000000032 /* Products */); sourceTree = "<group>"; };
+        A00000000000000000000031 /* __PRODUCT_NAME__ */ = {isa = PBXGroup; children = (A00000000000000000000011, A00000000000000000000012, A00000000000000000000013, A00000000000000000000014, A00000000000000000000015); path = __PRODUCT_NAME__; sourceTree = "<group>"; };
+        A00000000000000000000032 /* Products */ = {isa = PBXGroup; children = (A00000000000000000000010); name = Products; sourceTree = "<group>"; };
+        A00000000000000000000040 /* __PRODUCT_NAME__ */ = {isa = PBXNativeTarget; buildConfigurationList = A00000000000000000000070; buildPhases = (A00000000000000000000050, A00000000000000000000060, A00000000000000000000020); buildRules = (); dependencies = (); name = __PRODUCT_NAME__; productName = __PRODUCT_NAME__; productReference = A00000000000000000000010 /* __PRODUCT_NAME__.app */; productType = "com.apple.product-type.application"; };
+        A00000000000000000000041 /* Project object */ = {isa = PBXProject; attributes = {BuildIndependentTargetsInParallel = 1; LastSwiftUpdateCheck = 1600; LastUpgradeCheck = 1600; TargetAttributes = {A00000000000000000000040 = {CreatedOnToolsVersion = 16.0; }; }; }; buildConfigurationList = A00000000000000000000080; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = A00000000000000000000030; productRefGroup = A00000000000000000000032; projectDirPath = ""; projectRoot = ""; targets = (A00000000000000000000040); };
+        A00000000000000000000050 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000001, A00000000000000000000002, A00000000000000000000003); runOnlyForDeploymentPostprocessing = 0; };
+        A00000000000000000000060 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000004); runOnlyForDeploymentPostprocessing = 0; };
+        A00000000000000000000070 = {isa = XCConfigurationList; buildConfigurations = (A00000000000000000000071, A00000000000000000000072); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+        A00000000000000000000071 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {INFOPLIST_FILE = "__PRODUCT_NAME__/Info.plist"; PRODUCT_BUNDLE_IDENTIFIER = __BUNDLE_ID__; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; IPHONEOS_DEPLOYMENT_TARGET = 14.0; TARGETED_DEVICE_FAMILY = "1,2"; CODE_SIGN_STYLE = Automatic; }; name = Debug; };
+        A00000000000000000000072 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {INFOPLIST_FILE = "__PRODUCT_NAME__/Info.plist"; PRODUCT_BUNDLE_IDENTIFIER = __BUNDLE_ID__; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; IPHONEOS_DEPLOYMENT_TARGET = 14.0; TARGETED_DEVICE_FAMILY = "1,2"; CODE_SIGN_STYLE = Automatic; }; name = Release; };
+        A00000000000000000000080 = {isa = XCConfigurationList; buildConfigurations = (A00000000000000000000081, A00000000000000000000082); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+        A00000000000000000000081 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; DEBUG_INFORMATION_FORMAT = dwarf; GCC_C_LANGUAGE_STANDARD = gnu17; GCC_OPTIMIZATION_LEVEL = 0; SDKROOT = iphoneos; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
+        A00000000000000000000082 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; ENABLE_NS_ASSERTIONS = NO; GCC_C_LANGUAGE_STANDARD = gnu17; SDKROOT = iphoneos; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; VALIDATE_PRODUCT = YES; }; name = Release; };
+    };
+    rootObject = A00000000000000000000041 /* Project object */;
+}
+"#
+    .replace("__PRODUCT_NAME__", product_name)
+    .replace("__BUNDLE_ID__", bundle_id)
+}
+
+fn build_ios(project_root: &Path) -> Result<PathBuf, String> {
+    if !cfg!(target_os = "macos") {
+        return Err(
+            "iOS builds require macOS with Xcode installed. Use `neolove build --ios` on a Mac."
+                .to_string(),
+        );
+    }
+
+    let output_stem = project_output_stem(project_root);
+    let output_dir = project_root.join("dist");
+    fs::create_dir_all(&output_dir).map_err(|error| {
+        format!(
+            "failed to create dist directory {}: {error}",
+            output_dir.display()
+        )
+    })?;
+
+    let (web_bundle, _) = build_webasm(project_root)?;
+    let product_name = ios_product_name(project_root);
+    let bundle_id = android_package_name(project_root);
+    let ios_dir = output_dir.join("ios");
+    recreate_dir(&ios_dir)?;
+    let source_dir = ios_dir.join(&product_name);
+    fs::create_dir_all(&source_dir)
+        .map_err(|error| format!("failed to create iOS source directory: {error}"))?;
+    copy_dir_recursive(&web_bundle, &source_dir.join("webasm"))?;
+    fs::write(source_dir.join("AppDelegate.swift"), ios_app_delegate_source())
+        .map_err(|error| format!("failed to write iOS AppDelegate.swift: {error}"))?;
+    fs::write(source_dir.join("ViewController.swift"), ios_view_controller_source())
+        .map_err(|error| format!("failed to write iOS ViewController.swift: {error}"))?;
+    fs::write(source_dir.join("LocalWebServer.swift"), ios_local_web_server_source())
+        .map_err(|error| format!("failed to write iOS LocalWebServer.swift: {error}"))?;
+    fs::write(
+        source_dir.join("Info.plist"),
+        ios_info_plist(project_root, &product_name, &bundle_id),
+    )
+    .map_err(|error| format!("failed to write iOS Info.plist: {error}"))?;
+
+    let xcodeproj = ios_dir.join(format!("{product_name}.xcodeproj"));
+    fs::create_dir_all(&xcodeproj)
+        .map_err(|error| format!("failed to create {}: {error}", xcodeproj.display()))?;
+    fs::write(
+        xcodeproj.join("project.pbxproj"),
+        ios_pbxproj(&product_name, &bundle_id),
+    )
+    .map_err(|error| format!("failed to write iOS Xcode project: {error}"))?;
+
+    let xcodebuild =
+        find_program_on_path("xcodebuild").ok_or_else(|| "iOS builds require xcodebuild on PATH".to_string())?;
+    let derived_data = ios_dir.join("DerivedData");
+    let mut command = std::process::Command::new(xcodebuild);
+    command
+        .arg("-project")
+        .arg(&xcodeproj)
+        .arg("-target")
+        .arg(&product_name)
+        .arg("-configuration")
+        .arg("Release")
+        .arg("-sdk")
+        .arg("iphonesimulator")
+        .arg("-derivedDataPath")
+        .arg(&derived_data)
+        .arg("CODE_SIGNING_ALLOWED=NO")
+        .arg("build");
+    run_checked_command_quiet(&mut command, "building iOS simulator app with Xcode")?;
+
+    let built_app = derived_data
+        .join("Build")
+        .join("Products")
+        .join("Release-iphonesimulator")
+        .join(format!("{product_name}.app"));
+    if !built_app.is_dir() {
+        return Err(format!(
+            "iOS build succeeded but app bundle was not found: {}",
+            built_app.display()
+        ));
+    }
+
+    let output_app = output_dir.join(format!("{output_stem}-ios-simulator.app"));
+    if output_app.exists() {
+        fs::remove_dir_all(&output_app)
+            .map_err(|error| format!("failed to replace {}: {error}", output_app.display()))?;
+    }
+    copy_dir_recursive(&built_app, &output_app)?;
+    Ok(output_app)
 }
 
 fn virtual_key_name(key: VirtualKeyCode) -> Option<&'static str> {
@@ -1939,19 +3087,30 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
             project_root.display()
         )
     })?;
-    let (title, icon) = window_options_for_project(&project_root);
+    let (title, icon, window_width, window_height, fullscreen, resizable) =
+        window_options_for_project(&project_root);
+    let mobile_profile = mobile_emulation::MobileEmulation::from_env();
+    let (window_width, window_height, fullscreen, resizable) = if mobile_profile.enabled {
+        let (mobile_width, mobile_height) = mobile_profile.oriented_size();
+        (mobile_width as f32, mobile_height as f32, false, false)
+    } else {
+        (window_width, window_height, fullscreen, resizable)
+    };
     let mut runtime = match data_root {
         Some(data_root) => window::Runtime::with_data_root(project_root, data_root),
         None => window::Runtime::new(project_root),
     };
-    runtime.set_platform_window_state(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
+    runtime.set_platform_window_state(window_width, window_height);
 
     // When launched by the editor, stream logs and live scene snapshots back to
     // its logger window over loopback IPC. Absent the env var this is a no-op.
+    #[cfg(not(neolove_packaged))]
     let ipc_client = env::var("NEOLOVE_EDITOR_IPC")
         .ok()
         .and_then(|addr| editor_ipc::IpcClient::connect(&addr));
+    #[cfg(not(neolove_packaged))]
     let (log_tx, log_rx) = std::sync::mpsc::channel();
+    #[cfg(not(neolove_packaged))]
     if ipc_client.is_some() {
         runtime.set_log_sink(log_tx);
     }
@@ -1974,12 +3133,18 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
 
     let event_loop =
         catch_desktop_panic("failed to initialize the window event loop", EventLoop::new)?;
+    let title = if mobile_profile.enabled {
+        format!("{} - Mobile Emulator ({})", title, mobile_profile.orientation.as_str())
+    } else {
+        title
+    };
     let mut builder = WindowBuilder::new()
         .with_title(title)
-        .with_inner_size(LogicalSize::new(
-            DEFAULT_WINDOW_WIDTH as f64,
-            DEFAULT_WINDOW_HEIGHT as f64,
-        ));
+        .with_inner_size(LogicalSize::new(window_width as f64, window_height as f64))
+        .with_resizable(resizable);
+    if fullscreen {
+        builder = builder.with_fullscreen(Some(Fullscreen::Borderless(None)));
+    }
     if let Some(icon) = icon {
         builder = builder.with_window_icon(Some(icon));
     }
@@ -2005,7 +3170,14 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
                 Event::WindowEvent { event, .. } => match event {
                     WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
                     WindowEvent::Resized(size) => {
-                        runtime.set_platform_window_state(size.width as f32, size.height as f32);
+                        if mobile_profile.enabled {
+                            let (mobile_width, mobile_height) = mobile_profile.oriented_size();
+                            let requested = LogicalSize::new(mobile_width as f64, mobile_height as f64);
+                            window.set_inner_size(requested);
+                            runtime.set_platform_window_state(mobile_width as f32, mobile_height as f32);
+                        } else {
+                            runtime.set_platform_window_state(size.width as f32, size.height as f32);
+                        }
                         presenter.request_resize();
                     }
                     WindowEvent::CursorMoved { position, .. } => {
@@ -2047,7 +3219,7 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
                         }
                     }
                     WindowEvent::ReceivedCharacter(ch) => {
-                        if !ch.is_control() {
+                        if !mobile_profile.enabled && !ch.is_control() {
                             if let Err(error) = with_platform_state(
                                 &platform_state,
                                 "recording text input",
@@ -2068,6 +3240,9 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
                             },
                         ..
                     } => {
+                        if mobile_profile.enabled {
+                            return;
+                        }
                         if let Some(name) = virtual_key_name(key) {
                             if let Err(error) = with_platform_state(
                                 &platform_state,
@@ -2118,6 +3293,7 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
                     }
 
                     // Stream output and a throttled live snapshot to the editor.
+                    #[cfg(not(neolove_packaged))]
                     if let Some(ipc) = ipc_client.as_ref() {
                         while let Ok(line) = log_rx.try_recv() {
                             ipc.send(&editor_ipc::IpcMessage::Log(line));
@@ -2215,6 +3391,10 @@ version = \"0.1.0\"
 [window]
 title = \"{}\"
 icon = \"assets/icon.png\"
+width = 1280
+height = 720
+fullscreen = false
+resizable = true
 
 [dependencies]
 ",
@@ -2283,9 +3463,9 @@ fn print_usage() {
     println!("NeoLOVE CLI");
     println!("Usage:");
     println!("  neolove new <project-name>");
-    println!("  neolove run [project-dir]");
+    println!("  neolove run [project-dir] [--mobile] [--portrait|--landscape] [--wifi|--cellular|--offline]");
     println!("  neolove editor [project-dir]");
-    println!("  neolove build [project-dir] [--webasm]");
+    println!("  neolove build [project-dir] [--webasm|--android|--apk|--ios]");
     println!("  neolove api [project-dir]");
     println!("  neolove update");
     println!("  neolove setup-path");
@@ -2343,6 +3523,69 @@ fn embedded_data_root(executable: &Path) -> Result<PathBuf, String> {
     Ok(parent.join(format!("{stem}_data")))
 }
 
+fn parse_run_options<'a>(
+    args: &'a [String],
+) -> Result<(Option<&'a str>, mobile_emulation::MobileEmulation), String> {
+    let mut project_arg: Option<&str> = None;
+    let mut mobile = mobile_emulation::MobileEmulation::from_env();
+    for arg in args {
+        match arg.as_str() {
+            "--mobile" | "--emulate-mobile" => mobile.enabled = true,
+            "--portrait" => {
+                mobile.enabled = true;
+                mobile.orientation = mobile_emulation::MobileOrientation::Portrait;
+            }
+            "--landscape" => {
+                mobile.enabled = true;
+                mobile.orientation = mobile_emulation::MobileOrientation::Landscape;
+            }
+            "--wifi" => {
+                mobile.enabled = true;
+                mobile.wifi = true;
+                mobile.cellular = false;
+            }
+            "--cellular" => {
+                mobile.enabled = true;
+                mobile.wifi = false;
+                mobile.cellular = true;
+            }
+            "--offline" | "--no-wifi" => {
+                mobile.enabled = true;
+                mobile.wifi = false;
+                mobile.cellular = false;
+            }
+            "--low-power" => {
+                mobile.enabled = true;
+                mobile.low_power = true;
+            }
+            "--no-low-power" => mobile.low_power = false,
+            _ if arg.starts_with("--mobile-size=") => {
+                mobile.enabled = true;
+                let value = arg.trim_start_matches("--mobile-size=");
+                let Some((width, height)) = value.split_once('x') else {
+                    return Err("run failed: --mobile-size expects WIDTHxHEIGHT".to_string());
+                };
+                mobile.width = width
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| "run failed: invalid --mobile-size width".to_string())?;
+                mobile.height = height
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| "run failed: invalid --mobile-size height".to_string())?;
+            }
+            _ if arg.starts_with('-') => {
+                return Err(format!("run failed: unrecognized option: {arg}"));
+            }
+            _ if project_arg.is_none() => project_arg = Some(arg),
+            _ => return Err("run failed: expected at most one project directory".to_string()),
+        }
+    }
+    Ok((project_arg, mobile))
+}
+
 fn run_cli() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
 
@@ -2364,138 +3607,176 @@ fn run_cli() -> Result<(), String> {
         }
     }
 
-    match setup_path_for_neolove() {
-        Ok(true) => {
-            eprintln!("Added Neolove to PATH. Open a new terminal to use `neolove` globally.");
-        }
-        Ok(false) => {}
-        Err(e) => {
-            eprintln!("PATH setup warning: {}", e);
-        }
+    #[cfg(neolove_packaged)]
+    {
+        Err("packaged NeoLOVE runtime can only launch its embedded game payload".to_string())
     }
 
-    if args.len() <= 1 {
-        print_usage();
-        return Ok(());
-    }
+    #[cfg(not(neolove_packaged))]
+    {
+        match setup_path_for_neolove() {
+            Ok(true) => {
+                eprintln!("Added Neolove to PATH. Open a new terminal to use `neolove` globally.");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("PATH setup warning: {}", e);
+            }
+        }
 
-    match args[1].as_str() {
-        "--help" | "-h" | "help" => {
+        if args.len() <= 1 {
             print_usage();
+            return Ok(());
         }
-        "--version" | "-V" | "version" => {
-            println!("{}", env!("CARGO_PKG_VERSION"));
-        }
-        "setup-path" => match setup_path_for_neolove() {
-            Ok(true) => println!("PATH updated. Restart your terminal."),
-            Ok(false) => println!("PATH already contains Neolove."),
-            Err(error) => return Err(format!("failed to set PATH: {error}")),
-        },
-        "update" => {
-            if args.len() != 2 {
-                return Err(format!(
-                    "update failed: expected no arguments, got {}",
-                    args.len().saturating_sub(2)
-                ));
+
+        match args[1].as_str() {
+            "--help" | "-h" | "help" => {
+                print_usage();
             }
-            let outcome = update::update_engine()
-                .map_err(|error| format!("update failed: {error}"))?;
-            println!("{outcome}");
-        }
-        "new" => {
-            if args.len() != 3 {
-                return Err(format!(
-                    "new failed: expected 1 project name argument, got {}",
-                    args.len().saturating_sub(2)
-                ));
+            "--version" | "-V" | "version" => {
+                println!("{}", env!("CARGO_PKG_VERSION"));
             }
-            let project_path = handle_new_command(&args[2])?;
-            println!(
-                "Created project \"{}\" at {}.",
-                args[2],
-                project_path.display()
-            );
-            println!("Set [window].title and [window].icon in neolove.toml to customize the game window.");
-            println!("To run, execute in the project directory the command `neolove run`");
-            println!("To build a standalone executable, run `neolove build`");
-            println!("To build the webasm package, run `neolove build --webasm`");
-        }
-        "run" => {
-            let project_root = resolve_target_project_root(args.get(2).map(String::as_str))?;
-            validate_project_root(&project_root).map_err(|error| format!("run failed: {error}"))?;
-            run_project_window(project_root, None).map_err(|error| format!("run failed: {error}"))?;
-        }
-        "editor" => {
-            if args.len() > 3 {
-                return Err(format!(
-                    "editor failed: expected at most one project directory, got {}",
-                    args.len().saturating_sub(2)
-                ));
+            "setup-path" => match setup_path_for_neolove() {
+                Ok(true) => println!("PATH updated. Restart your terminal."),
+                Ok(false) => println!("PATH already contains Neolove."),
+                Err(error) => return Err(format!("failed to set PATH: {error}")),
+            },
+            "update" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "update failed: expected no arguments, got {}",
+                        args.len().saturating_sub(2)
+                    ));
+                }
+                let outcome = update::update_engine()
+                    .map_err(|error| format!("update failed: {error}"))?;
+                println!("{outcome}");
             }
-            let project_root = resolve_target_project_root(args.get(2).map(String::as_str))?;
-            if !project_root.is_dir() {
-                return Err(format!(
-                    "editor failed: project directory does not exist: {}",
-                    project_root.display()
-                ));
+            "new" => {
+                if args.len() != 3 {
+                    return Err(format!(
+                        "new failed: expected 1 project name argument, got {}",
+                        args.len().saturating_sub(2)
+                    ));
+                }
+                let project_path = handle_new_command(&args[2])?;
+                println!(
+                    "Created project \"{}\" at {}.",
+                    args[2],
+                    project_path.display()
+                );
+                println!("Set [window] fields in neolove.toml to customize the game window.");
+                println!("To run, execute in the project directory the command `neolove run`");
+                println!("To build a standalone executable, run `neolove build`");
+                println!("To build the webasm package, run `neolove build --webasm`");
+                println!("To build an Android APK, run `neolove build --android`");
+                println!("To build an iOS simulator app on macOS, run `neolove build --ios`");
             }
-            editor::run_editor(project_root).map_err(|error| format!("editor failed: {error}"))?;
-        }
-        "build" => {
-            let mut project_arg: Option<&str> = None;
-            let mut webasm = false;
-            for arg in &args[2..] {
-                if arg == "--webasm" {
-                    webasm = true;
-                } else if arg.starts_with('-') {
-                    return Err(format!("build failed: unrecognized option: {arg}"));
-                } else if project_arg.is_none() {
-                    project_arg = Some(arg);
+            "run" => {
+                let (project_arg, mobile_profile) = parse_run_options(&args[2..])?;
+                mobile_emulation::set_current_process_env(&mobile_profile);
+                let project_root = resolve_target_project_root(project_arg)?;
+                validate_project_root(&project_root)
+                    .map_err(|error| format!("run failed: {error}"))?;
+                run_project_window(project_root, None)
+                    .map_err(|error| format!("run failed: {error}"))?;
+            }
+            "editor" => {
+                if args.len() > 3 {
+                    return Err(format!(
+                        "editor failed: expected at most one project directory, got {}",
+                        args.len().saturating_sub(2)
+                    ));
+                }
+                let project_root = resolve_target_project_root(args.get(2).map(String::as_str))?;
+                if !project_root.is_dir() {
+                    return Err(format!(
+                        "editor failed: project directory does not exist: {}",
+                        project_root.display()
+                    ));
+                }
+                editor::run_editor(project_root)
+                    .map_err(|error| format!("editor failed: {error}"))?;
+            }
+            "build" => {
+                let mut project_arg: Option<&str> = None;
+                let mut webasm = false;
+                let mut android = false;
+                let mut ios = false;
+                for arg in &args[2..] {
+                    if arg == "--webasm" {
+                        webasm = true;
+                    } else if arg == "--android" || arg == "--apk" {
+                        android = true;
+                    } else if arg == "--ios" {
+                        ios = true;
+                    } else if arg.starts_with('-') {
+                        return Err(format!("build failed: unrecognized option: {arg}"));
+                    } else if project_arg.is_none() {
+                        project_arg = Some(arg);
+                    } else {
+                        return Err("build failed: expected at most one project directory".to_string());
+                    }
+                }
+
+                let project_root = resolve_target_project_root(project_arg)?;
+                validate_project_root(&project_root)
+                    .map_err(|error| format!("build failed: {error}"))?;
+
+                if [webasm, android, ios]
+                    .into_iter()
+                    .filter(|enabled| *enabled)
+                    .count()
+                    > 1
+                {
+                    return Err("build failed: choose only one target option".to_string());
+                }
+
+                if webasm {
+                    let (bundle_output, zip_output) = build_webasm(&project_root)
+                        .map_err(|error| format!("build failed: {error}"))?;
+                    println!("Built webasm bundle: {}", bundle_output.display());
+                    println!("Built itch.io package: {}", zip_output.display());
+                } else if android {
+                    let output = build_android(&project_root)
+                        .map_err(|error| format!("build failed: {error}"))?;
+                    println!("Built Android APK: {}", output.display());
+                } else if ios {
+                    let output =
+                        build_ios(&project_root).map_err(|error| format!("build failed: {error}"))?;
+                    println!("Built iOS simulator app: {}", output.display());
                 } else {
-                    return Err("build failed: expected at most one project directory".to_string());
+                    let output = build_executable(&project_root)
+                        .map_err(|error| format!("build failed: {error}"))?;
+                    println!("Built executable: {}", output.display());
                 }
             }
+            "api" => {
+                if args.len() > 3 {
+                    return Err(format!(
+                        "api failed: expected at most one project directory, got {}",
+                        args.len().saturating_sub(2)
+                    ));
+                }
+                let paths = handle_api_command(args.get(2).map(String::as_str))?;
+                if paths.len() == 2 {
+                    println!(
+                        "Updated API definitions at {} and {}.",
+                        paths[0].display(),
+                        paths[1].display()
+                    );
+                } else if let Some(path) = paths.first() {
+                    println!("Updated API definitions at {}.", path.display());
+                }
+            }
+            _ => {
+                print_usage();
+                return Err(format!("unrecognized command: {}", args[1]));
+            }
+        }
 
-            let project_root = resolve_target_project_root(project_arg)?;
-            validate_project_root(&project_root)
-                .map_err(|error| format!("build failed: {error}"))?;
-
-            if webasm {
-                let (bundle_output, zip_output) =
-                    build_webasm(&project_root).map_err(|error| format!("build failed: {error}"))?;
-                println!("Built webasm bundle: {}", bundle_output.display());
-                println!("Built itch.io package: {}", zip_output.display());
-            } else {
-                let output = build_executable(&project_root)
-                    .map_err(|error| format!("build failed: {error}"))?;
-                println!("Built executable: {}", output.display());
-            }
-        }
-        "api" => {
-            if args.len() > 3 {
-                return Err(format!(
-                    "api failed: expected at most one project directory, got {}",
-                    args.len().saturating_sub(2)
-                ));
-            }
-            let paths = handle_api_command(args.get(2).map(String::as_str))?;
-            if paths.len() == 2 {
-                println!(
-                    "Updated API definitions at {} and {}.",
-                    paths[0].display(),
-                    paths[1].display()
-                );
-            } else if let Some(path) = paths.first() {
-                println!("Updated API definitions at {}.", path.display());
-            }
-        }
-        _ => {
-            print_usage();
-            return Err(format!("unrecognized command: {}", args[1]));
-        }
+        Ok(())
     }
-
-    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -2524,6 +3805,32 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod build_compression_tests {
     use super::*;
+
+    #[test]
+    fn project_settings_parse_resizable_window_flag() {
+        let root = std::env::temp_dir().join(format!(
+            "neolove_window_settings_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp project");
+        std::fs::write(
+            root.join("neolove.toml"),
+            "[window]\nwidth = 800\nheight = 600\nfullscreen = false\nresizable = false\n",
+        )
+        .expect("write settings");
+
+        let settings = parse_project_settings(&root);
+        assert_eq!(settings.window_width, Some(800.0));
+        assert_eq!(settings.window_height, Some(600.0));
+        assert_eq!(settings.window_fullscreen, Some(false));
+        assert_eq!(settings.window_resizable, Some(false));
+
+        let (_, _, _, _, _, resizable) = window_options_for_project(&root);
+        assert!(!resizable);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn compressed_payload_round_trips_asset_bytes() {

@@ -339,16 +339,10 @@ EM_JS(void, neolove_js_bootstrap, (), {
 });
 
 EM_JS(int, neolove_js_canvas_width, (), {
-  if (Module.neoloveSyncCanvasSize) {
-    Module.neoloveSyncCanvasSize();
-  }
   return Module.neoloveState ? Module.neoloveState.canvasWidth : 1;
 });
 
 EM_JS(int, neolove_js_canvas_height, (), {
-  if (Module.neoloveSyncCanvasSize) {
-    Module.neoloveSyncCanvasSize();
-  }
   return Module.neoloveState ? Module.neoloveState.canvasHeight : 1;
 });
 
@@ -464,7 +458,7 @@ EM_JS(void, neolove_js_present_rgba, (const uint8_t* pixels, int width, int heig
     return;
   }
   if (!state.ctx) {
-    state.ctx = canvas.getContext("2d", { alpha: false }) || canvas.getContext("2d");
+    state.ctx = canvas.getContext("2d", { alpha: false, desynchronized: true }) || canvas.getContext("2d");
     if (state.ctx) {
       state.ctx.imageSmoothingEnabled = false;
     }
@@ -497,7 +491,7 @@ EM_JS(void, neolove_js_clear_canvas, (int r, int g, int b, int a), {
     return;
   }
   if (!state.ctx) {
-    state.ctx = canvas.getContext("2d", { alpha: false }) || canvas.getContext("2d");
+    state.ctx = canvas.getContext("2d", { alpha: false, desynchronized: true }) || canvas.getContext("2d");
     if (state.ctx) {
       state.ctx.imageSmoothingEnabled = false;
     }
@@ -522,7 +516,7 @@ EM_JS(void, neolove_js_composite_rgba, (const uint8_t* pixels, int width, int he
     return;
   }
   if (!state.ctx) {
-    state.ctx = canvas.getContext("2d", { alpha: false }) || canvas.getContext("2d");
+    state.ctx = canvas.getContext("2d", { alpha: false, desynchronized: true }) || canvas.getContext("2d");
     if (state.ctx) {
       state.ctx.imageSmoothingEnabled = false;
     }
@@ -581,7 +575,7 @@ EM_JS(void, neolove_js_draw_image, (
     return;
   }
   if (!state.ctx) {
-    state.ctx = canvas.getContext("2d", { alpha: false }) || canvas.getContext("2d");
+    state.ctx = canvas.getContext("2d", { alpha: false, desynchronized: true }) || canvas.getContext("2d");
   }
   const ctx = state.ctx;
   if (!ctx) {
@@ -826,7 +820,7 @@ void main() {
   }
 
   gl.drawArrays(gl.TRIANGLES, 0, vertex_count);
-  if (!state.ctx) state.ctx = canvas.getContext("2d", { alpha: false }) || canvas.getContext("2d");
+  if (!state.ctx) state.ctx = canvas.getContext("2d", { alpha: false, desynchronized: true }) || canvas.getContext("2d");
   if (state.ctx) {
     const sx = Math.max(0, Math.floor(minX));
     const sy = Math.max(0, Math.floor(minY));
@@ -873,7 +867,7 @@ EM_JS(void, neolove_js_draw_text, (
     return;
   }
   if (!state.ctx) {
-    state.ctx = Module.canvas.getContext("2d", { alpha: false }) || Module.canvas.getContext("2d");
+    state.ctx = Module.canvas.getContext("2d", { alpha: false, desynchronized: true }) || Module.canvas.getContext("2d");
     if (state.ctx) {
       state.ctx.imageSmoothingEnabled = false;
     }

@@ -9,6 +9,7 @@
 //! another. It has no external GUI dependency, keeping the editor self-contained
 //! within the engine crate.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use fontdue::Font;
@@ -76,6 +77,12 @@ pub mod icon {
     pub const FULLSCREEN_EXIT: char = '\u{e5d1}';
     pub const SELECT_ALL: char = '\u{e162}';
     pub const ZOOM_OUT_MAP: char = '\u{e56b}';
+    pub const OPEN_WITH: char = '\u{e89f}';
+    pub const ASPECT_RATIO: char = '\u{e85b}';
+    pub const ROTATE_RIGHT: char = '\u{e419}';
+    pub const TRANSFORM: char = '\u{e428}';
+    pub const PHONE_ANDROID: char = '\u{e324}';
+    pub const SCREEN_ROTATION: char = '\u{e1c1}';
 }
 
 /// An RGBA color in `[r, g, b, a]` byte order.
@@ -953,7 +960,7 @@ impl<'a> Ui<'a> {
     /// Draw a clickable button. Returns true on the frame it is pressed.
     pub fn button(&mut self, rect: Rect, label: &str) -> bool {
         let base = self.theme.button;
-        let text = self.theme.text;
+        let text = readable_text_color(base, self.theme.text);
         self.button_colored(rect, label, base, text)
     }
 
@@ -964,6 +971,7 @@ impl<'a> Ui<'a> {
         } else {
             base
         };
+        let text_color = readable_text_color(bg, text_color);
         let radius = self.theme.corner_radius;
         self.painter.fill_round_rect(rect, radius, bg);
         let size = 14.0;
@@ -975,13 +983,42 @@ impl<'a> Ui<'a> {
         hovered && self.input.mouse_pressed
     }
 
+    /// A field-like button with a dropdown chevron.
+    pub fn dropdown_button(&mut self, rect: Rect, label: &str) -> bool {
+        let hovered = self.hovered(rect);
+        let bg = if hovered {
+            lighten(self.theme.button, 0.12)
+        } else {
+            self.theme.button
+        };
+        let text_color = readable_text_color(bg, self.theme.text);
+        self.painter.fill_round_rect(rect, self.theme.corner_radius, bg);
+        let icon_w = 22.0_f32.min(rect.w.max(0.0));
+        self.painter.text_clipped(
+            rect.x + 8.0,
+            rect.y + (rect.h - 14.0) / 2.0,
+            label,
+            14.0,
+            text_color,
+            (rect.w - icon_w - 12.0).max(0.0),
+        );
+        self.painter.icon_centered(
+            rect.right() - icon_w * 0.5,
+            rect.y + rect.h * 0.5,
+            icon::EXPAND_MORE,
+            16.0,
+            text_color,
+        );
+        hovered && self.input.mouse_pressed
+    }
+
     /// A button with a leading Material icon and a text label.
     pub fn icon_button(&mut self, rect: Rect, glyph: char, label: &str) -> bool {
         let hovered = self.hovered(rect);
         let base = self.theme.button;
         let bg = if hovered { lighten(base, 0.12) } else { base };
         self.painter.fill_round_rect(rect, self.theme.corner_radius, bg);
-        let text_color = self.theme.text;
+        let text_color = readable_text_color(bg, self.theme.text);
         let icon_size = 16.0;
         let cy = rect.y + rect.h / 2.0;
         let label_w = self.painter.text_width(label, 14.0);
@@ -1002,7 +1039,10 @@ impl<'a> Ui<'a> {
         let base = if active { self.theme.accent } else { self.theme.button };
         let bg = if hovered { lighten(base, 0.12) } else { base };
         self.painter.fill_round_rect(rect, self.theme.corner_radius, bg);
-        let color = if active { [255, 255, 255, 255] } else { tooltip_color };
+        let color = readable_text_color(
+            bg,
+            if active { [255, 255, 255, 255] } else { tooltip_color },
+        );
         self.painter.icon_centered(
             rect.x + rect.w / 2.0,
             rect.y + rect.h / 2.0,
@@ -1153,7 +1193,10 @@ impl<'a> Ui<'a> {
             self.painter
                 .fill_rect(Rect::new(rect.x, rect.y, 2.0, rect.h), self.theme.accent);
         }
-        let text_color = if selected { [255, 255, 255, 255] } else { self.theme.text };
+        let text_color = readable_text_color(
+            bg,
+            if selected { [255, 255, 255, 255] } else { self.theme.text },
+        );
         self.painter.text_clipped(
             rect.x + 8.0 + indent,
             rect.y + (rect.h - 14.0) / 2.0,
@@ -1284,12 +1327,60 @@ fn lighten(color: Rgba, t: f32) -> Rgba {
     [mix(color[0]), mix(color[1]), mix(color[2]), color[3]]
 }
 
+fn linear_channel(channel: u8) -> f32 {
+    let value = channel as f32 / 255.0;
+    if value <= 0.03928 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn relative_luminance(color: Rgba) -> f32 {
+    0.2126 * linear_channel(color[0])
+        + 0.7152 * linear_channel(color[1])
+        + 0.0722 * linear_channel(color[2])
+}
+
+fn contrast_ratio(a: Rgba, b: Rgba) -> f32 {
+    let a = relative_luminance(a);
+    let b = relative_luminance(b);
+    let (lighter, darker) = if a >= b { (a, b) } else { (b, a) };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+fn readable_text_color(background: Rgba, preferred: Rgba) -> Rgba {
+    if contrast_ratio(background, preferred) >= 4.5 {
+        return preferred;
+    }
+    let dark = [22, 24, 28, preferred[3]];
+    let light = [255, 255, 255, preferred[3]];
+    if contrast_ratio(background, dark) >= contrast_ratio(background, light) {
+        dark
+    } else {
+        light
+    }
+}
+
 /// Load the editor's text and icon fonts once. Returns shareable handles so the
 /// painter can be rebuilt cheaply each frame.
 pub fn load_fonts() -> Result<Fonts, String> {
-    let text = Font::from_bytes(EDITOR_FONT_BYTES, fontdue::FontSettings::default())
-        .map(Arc::new)
-        .map_err(|e| format!("failed to load editor font: {e}"))?;
+    load_fonts_from_path(None)
+}
+
+pub fn load_fonts_from_path(text_font_path: Option<&Path>) -> Result<Fonts, String> {
+    let text = match text_font_path.filter(|path| !path.as_os_str().is_empty()) {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| format!("failed to read editor font {}: {e}", path.display()))?;
+            Font::from_bytes(bytes, fontdue::FontSettings::default())
+                .map(Arc::new)
+                .map_err(|e| format!("failed to load editor font {}: {e}", path.display()))?
+        }
+        None => Font::from_bytes(EDITOR_FONT_BYTES, fontdue::FontSettings::default())
+            .map(Arc::new)
+            .map_err(|e| format!("failed to load editor font: {e}"))?,
+    };
     let icons = Font::from_bytes(ICON_FONT_BYTES, fontdue::FontSettings::default())
         .map(Arc::new)
         .map_err(|e| format!("failed to load icon font: {e}"))?;

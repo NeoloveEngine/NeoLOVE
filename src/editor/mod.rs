@@ -8,8 +8,9 @@
 //!
 //! The editor reuses the project's existing dependencies (winit, softbuffer and
 //! fontdue) but renders its own immediate-mode UI, so it shares no state with
-//! the Lua-driven game runtime. Its appearance is themeable via `editor.json`,
-//! which defaults to a Visual Studio Code "Dark+" palette.
+//! the Lua-driven game runtime. Its global `editor.json` stores theme, layout,
+//! font, tooltip, overlay, and autosave preferences, and defaults to a Visual
+//! Studio Code "Dark+" palette.
 
 mod app;
 mod inspector;
@@ -27,7 +28,7 @@ use winit::event::{
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 
-use app::EditorApp;
+use app::{EditorApp, EditorWidget};
 use logger::LoggerWindow;
 use crate::scene::Scene;
 use ui::{FrameInput, Fonts, Painter, Theme, Ui};
@@ -36,23 +37,21 @@ const DEFAULT_SCENE_FILE: &str = "scene.neoscene";
 const CONFIG_FILE: &str = "editor.json";
 const WINDOW_W: f64 = 1280.0;
 const WINDOW_H: f64 = 760.0;
-/// Baseline editor refresh used to recover from code paths that mutate visible
-/// state without explicitly requesting a redraw. Input and animations may
-/// still request frames immediately between these ticks.
-const IDLE_FRAME_INTERVAL: Duration = Duration::from_millis(50);
+const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Launch the visual editor for the project rooted at `project_root`.
 ///
 /// A `scene.neoscene` file in the project is loaded if present; otherwise a
-/// starter scene is created. Editor appearance and dock layout are read from
-/// `editor.json`, which is created with defaults on first launch so it can be
-/// customized. Saving and exporting write back into the project directory.
+/// starter scene is created. Editor appearance and dock layout are read from a
+/// user-wide `editor.json`, with older project-local files used as a migration
+/// fallback. Saving and exporting write back into the project directory.
 pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
     let scene_path = project_root.join(DEFAULT_SCENE_FILE);
-    let config_path = project_root.join(CONFIG_FILE);
+    let legacy_config_path = project_root.join(CONFIG_FILE);
+    let config_path = app::global_config_path();
 
     let scene = load_or_default(&scene_path);
-    let config = app::load_config(&config_path);
+    let config = app::load_config_with_fallback(&config_path, &legacy_config_path);
     // Write the config on first launch so users have a file to customize.
     if !config_path.exists() {
         if let Err(error) = app::save_config(&config_path, &config) {
@@ -60,8 +59,20 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
         }
     }
 
-    let mut editor = EditorApp::new(project_root, scene_path, scene, config);
-    let fonts = ui::load_fonts()?;
+    let configured_font = config.settings.font_path.trim();
+    let font_path = if configured_font.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(configured_font))
+    };
+    let fonts = match font_path.as_deref() {
+        Some(path) => ui::load_fonts_from_path(Some(path)).or_else(|error| {
+            eprintln!("warning: {error}; falling back to bundled editor font");
+            ui::load_fonts()
+        })?,
+        None => ui::load_fonts()?,
+    };
+    let mut editor = EditorApp::new_with_config_path(project_root, scene_path, scene, config, config_path);
 
     // When set, render a single frame and exit. Used for headless smoke testing.
     // If the value names a `.png` path, the frame is also written there.
@@ -105,17 +116,22 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
     let mut logger_input = PendingInput::default();
     let mut logger_visible = false;
 
+    let mut detached_widgets = Vec::new();
+    for widget in [
+        EditorWidget::Hierarchy,
+        EditorWidget::Inspector,
+        EditorWidget::Project,
+    ] {
+        detached_widgets.push(create_detached_widget(&event_loop, widget)?);
+    }
+
     let mut input = PendingInput::default();
     let mut last_title = editor.title();
-    let mut next_idle_redraw = Instant::now() + IDLE_FRAME_INTERVAL;
     window.request_redraw();
 
     event_loop.run(move |event, _target, control_flow| {
-        *control_flow = ControlFlow::WaitUntil(next_idle_redraw);
+        *control_flow = ControlFlow::Wait;
 
-        // Maintain a 20 FPS baseline even when no code path explicitly asks
-        // for a frame. This also polls preview state often enough for startup
-        // errors to surface promptly.
         if let Event::NewEvents(_) = event {
             // A run just started: open/refresh the live logger window.
             if let Some(session) = editor.take_logger_session() {
@@ -125,15 +141,10 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                 logger_window.focus_window();
                 logger_window.request_redraw();
             }
-            let now = Instant::now();
-            if now >= next_idle_redraw {
-                window.request_redraw();
-                if logger_visible {
-                    logger_window.request_redraw();
-                }
-                next_idle_redraw = now + IDLE_FRAME_INTERVAL;
-            }
             if editor.poll_run() {
+                window.request_redraw();
+            }
+            if editor.poll_build() {
                 window.request_redraw();
             }
             if editor.poll_update_check() {
@@ -145,6 +156,16 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
             // Logger window: a small, self-contained input + close handler.
             Event::WindowEvent { window_id, event } if window_id == logger_id => {
                 handle_logger_event(event, &logger_window, &mut logger_input, &mut logger_visible);
+            }
+            Event::WindowEvent { window_id, event }
+                if detached_widgets.iter().any(|widget| widget.window.id() == window_id) =>
+            {
+                if let Some(widget) = detached_widgets
+                    .iter_mut()
+                    .find(|widget| widget.window.id() == window_id)
+                {
+                    handle_detached_widget_event(event, widget, &mut editor);
+                }
             }
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => {
@@ -282,6 +303,25 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                         ) {
                             eprintln!("logger render error: {error}");
                         }
+                        if logger_visible {
+                            logger_window.request_redraw();
+                        }
+                    }
+                }
+            }
+            Event::RedrawRequested(id)
+                if detached_widgets.iter().any(|widget| widget.window.id() == id) =>
+            {
+                if let Some(widget) = detached_widgets
+                    .iter_mut()
+                    .find(|widget| widget.window.id() == id)
+                    && widget.visible
+                {
+                    if let Err(error) = redraw_detached_widget(widget, &mut editor, &fonts) {
+                        eprintln!("detached widget render error: {error}");
+                    }
+                    if widget.visible {
+                        widget.window.request_redraw();
                     }
                 }
             }
@@ -294,7 +334,6 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                     *control_flow = ControlFlow::Exit;
                     return;
                 }
-                next_idle_redraw = Instant::now() + IDLE_FRAME_INTERVAL;
                 editor.flush_config();
                 if editor.should_quit() {
                     editor.flush_config();
@@ -308,19 +347,22 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                 }
                 if smoke_test {
                     *control_flow = ControlFlow::Exit;
+                } else {
+                    window.request_redraw();
                 }
             }
             _ => {}
         }
 
+        sync_detached_widgets(&mut detached_widgets, &editor);
+
         if *control_flow != ControlFlow::Exit {
-            let mut deadline = next_idle_redraw;
-            // Preserve the explicit preview polling bound if the baseline FPS
-            // is changed to a slower cadence in the future.
-            if editor.run_pending() {
-                deadline = deadline.min(Instant::now() + Duration::from_millis(250));
+            if editor.run_pending() || editor.build_pending() {
+                *control_flow =
+                    ControlFlow::WaitUntil(Instant::now() + BACKGROUND_POLL_INTERVAL);
+            } else {
+                *control_flow = ControlFlow::Wait;
             }
-            *control_flow = ControlFlow::WaitUntil(deadline);
         }
     });
 }
@@ -503,6 +545,169 @@ impl PendingInput {
         self.nudge_y = 0.0;
         frame
     }
+}
+
+struct DetachedWidgetWindow {
+    widget: EditorWidget,
+    window: Window,
+    _context: softbuffer::Context,
+    surface: softbuffer::Surface,
+    input: PendingInput,
+    visible: bool,
+}
+
+fn create_detached_widget(
+    event_loop: &EventLoop<()>,
+    widget: EditorWidget,
+) -> Result<DetachedWidgetWindow, String> {
+    let window = WindowBuilder::new()
+        .with_title(EditorApp::widget_title(widget))
+        .with_inner_size(LogicalSize::new(420.0, 620.0))
+        .with_visible(false)
+        .build(event_loop)
+        .map_err(|e| format!("failed to create detached widget window: {e}"))?;
+    let context = unsafe { softbuffer::Context::new(&window) }
+        .map_err(|e| format!("failed to create detached widget context: {e}"))?;
+    let surface = unsafe { softbuffer::Surface::new(&context, &window) }
+        .map_err(|e| format!("failed to create detached widget surface: {e}"))?;
+    Ok(DetachedWidgetWindow {
+        widget,
+        window,
+        _context: context,
+        surface,
+        input: PendingInput::default(),
+        visible: false,
+    })
+}
+
+fn sync_detached_widgets(widgets: &mut [DetachedWidgetWindow], editor: &EditorApp) {
+    for widget in widgets {
+        let should_show = editor.widget_undocked(widget.widget);
+        if should_show != widget.visible {
+            widget.visible = should_show;
+            widget.window.set_visible(should_show);
+            if should_show {
+                widget.window.focus_window();
+                widget.window.request_redraw();
+            }
+        }
+    }
+}
+
+fn handle_detached_widget_event(
+    event: WindowEvent,
+    widget: &mut DetachedWidgetWindow,
+    editor: &mut EditorApp,
+) {
+    match event {
+        WindowEvent::CloseRequested => {
+            editor.close_detached_widget(widget.widget);
+            widget.visible = false;
+            widget.window.set_visible(false);
+        }
+        WindowEvent::ModifiersChanged(state) => {
+            widget.input.ctrl = state.ctrl() || state.logo();
+            widget.input.shift = state.shift();
+        }
+        WindowEvent::CursorMoved { position, .. } => {
+            widget.input.mouse_x = position.x as f32;
+            widget.input.mouse_y = position.y as f32;
+            widget.window.request_redraw();
+        }
+        WindowEvent::MouseInput { state, button, .. } => {
+            let pressed = state == ElementState::Pressed;
+            match button {
+                MouseButton::Left => {
+                    widget.input.mouse_down = pressed;
+                    if pressed {
+                        widget.input.mouse_pressed = true;
+                    }
+                }
+                MouseButton::Right => {
+                    if pressed {
+                        widget.input.right_pressed = true;
+                    }
+                }
+                MouseButton::Middle => widget.input.middle_down = pressed,
+                _ => {}
+            }
+            widget.window.request_redraw();
+        }
+        WindowEvent::MouseWheel { delta, .. } => {
+            widget.input.scroll += match delta {
+                MouseScrollDelta::LineDelta(_, y) => y,
+                MouseScrollDelta::PixelDelta(pos) => (pos.y as f32) / 32.0,
+            };
+            widget.window.request_redraw();
+        }
+        WindowEvent::ReceivedCharacter(ch) => {
+            if !ch.is_control() {
+                widget.input.typed.push(ch);
+                widget.window.request_redraw();
+            }
+        }
+        WindowEvent::KeyboardInput {
+            input:
+                KeyboardInput {
+                    virtual_keycode: Some(key),
+                    state: ElementState::Pressed,
+                    ..
+                },
+            ..
+        } => {
+            match key {
+                VirtualKeyCode::Back => widget.input.backspace = true,
+                VirtualKeyCode::Delete => widget.input.delete = true,
+                VirtualKeyCode::Return | VirtualKeyCode::NumpadEnter => widget.input.enter = true,
+                VirtualKeyCode::Escape => widget.input.escape = true,
+                _ => {}
+            }
+            widget.window.request_redraw();
+        }
+        WindowEvent::Resized(_) => widget.window.request_redraw(),
+        _ => {}
+    }
+}
+
+fn redraw_detached_widget(
+    widget: &mut DetachedWidgetWindow,
+    editor: &mut EditorApp,
+    fonts: &Fonts,
+) -> Result<(), String> {
+    let size = widget.window.inner_size();
+    let width = size.width.max(1);
+    let height = size.height.max(1);
+    widget
+        .surface
+        .resize(
+            NonZeroU32::new(width).expect("width clamped to >= 1"),
+            NonZeroU32::new(height).expect("height clamped to >= 1"),
+        )
+        .map_err(|e| format!("failed to resize detached widget surface: {e}"))?;
+    let mut buffer = widget
+        .surface
+        .buffer_mut()
+        .map_err(|e| format!("failed to acquire detached widget buffer: {e}"))?;
+    let painter = Painter::new(&mut buffer, width as usize, height as usize, fonts.clone());
+    let frame_input = widget.input.take_frame();
+    let mut ctx = Ui::new(
+        painter,
+        frame_input,
+        editor.theme(),
+        editor.take_focus(),
+        editor.take_edit_buffer(),
+    );
+    editor.frame_detached_widget(&mut ctx, widget.widget);
+    let wants_redraw = ctx.wants_redraw;
+    let (focus, edit_buffer) = ctx.into_focus_state();
+    editor.set_focus(focus, edit_buffer);
+    buffer
+        .present()
+        .map_err(|e| format!("failed to present detached widget surface: {e}"))?;
+    if wants_redraw {
+        widget.window.request_redraw();
+    }
+    Ok(())
 }
 
 /// Feed input to the logger window. It needs only pointer interaction plus

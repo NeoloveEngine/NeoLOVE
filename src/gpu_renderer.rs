@@ -7,8 +7,6 @@ use naga::back::spv;
 use naga::front::glsl;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
@@ -748,9 +746,10 @@ impl VulkanPresenter {
             self.recreate(width, height)?;
         }
 
-        let commands = renderer::drain_commands(render_state)?;
+        let commands = renderer::drain_commands_without_remembering(render_state)?;
         let clear_color = lock_platform_state(platform).clear_color();
-        let batches = self.build_batches(commands, width.max(1), height.max(1))?;
+        let batches = self.build_batches(&commands, width.max(1), height.max(1))?;
+        renderer::remember_last_frame_commands(render_state, commands)?;
 
         let (image_index, suboptimal, acquire_future) =
             match swapchain::acquire_next_image(self.swapchain.clone(), None)
@@ -996,11 +995,11 @@ impl VulkanPresenter {
 
     fn build_batches(
         &mut self,
-        commands: Vec<DrawCommand>,
+        commands: &[DrawCommand],
         width: u32,
         height: u32,
     ) -> Result<Vec<TextureBatch>, String> {
-        let mut batches = Vec::new();
+        let mut batches = Vec::with_capacity(commands.len().min(64));
         let mut current: Option<TextureBatch> = None;
 
         for command in commands {
@@ -1018,6 +1017,8 @@ impl VulkanPresenter {
                     color,
                     shader,
                 } => {
+                    let (x, y, w, h, rotation, offset, color) =
+                        (*x, *y, *w, *h, *rotation, *offset, *color);
                     let pivot_x = x + w * offset.x;
                     let pivot_y = y + h * offset.y;
                     let verts = quad_vertices(
@@ -1032,7 +1033,7 @@ impl VulkanPresenter {
                         [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
                         color,
                     );
-                    let shader = self.batch_shader_for_command(shader)?;
+                    let shader = self.batch_shader_for_command(shader.as_ref())?;
                     push_vertices(
                         &mut current,
                         &mut batches,
@@ -1049,17 +1050,17 @@ impl VulkanPresenter {
                     color,
                     shader,
                 } => {
-                    let shader = self.batch_shader_for_command(shader)?;
+                    let shader = self.batch_shader_for_command(shader.as_ref())?;
                     push_vertices(
                         &mut current,
                         &mut batches,
                         self.white_texture,
                         TextureFilter::Nearest,
                         shader,
-                        vec![
-                            vertex_from_point(width, height, a, color, [0.0, 0.0]),
-                            vertex_from_point(width, height, b, color, [1.0, 0.0]),
-                            vertex_from_point(width, height, c, color, [0.5, 1.0]),
+                        [
+                            vertex_from_point(width, height, *a, *color, [0.0, 0.0]),
+                            vertex_from_point(width, height, *b, *color, [1.0, 0.0]),
+                            vertex_from_point(width, height, *c, *color, [0.5, 1.0]),
                         ],
                     );
                 }
@@ -1069,6 +1070,7 @@ impl VulkanPresenter {
                     color,
                     shader,
                 } => {
+                    let (center, radius, color) = (*center, *radius, *color);
                     let segments =
                         ((radius * std::f32::consts::TAU / 4.0).ceil() as usize).clamp(24, 128);
                     let mut verts = Vec::with_capacity(segments * 3);
@@ -1088,7 +1090,7 @@ impl VulkanPresenter {
                         verts.push(vertex_from_point(width, height, p1, color, [1.0, 0.0]));
                         verts.push(vertex_from_point(width, height, p2, color, [0.0, 1.0]));
                     }
-                    let shader = self.batch_shader_for_command(shader)?;
+                    let shader = self.batch_shader_for_command(shader.as_ref())?;
                     push_vertices(
                         &mut current,
                         &mut batches,
@@ -1108,18 +1110,18 @@ impl VulkanPresenter {
                     filter,
                     shader,
                 } => {
-                    let texture = self.texture_for_image(&image)?;
-                    let uv = image_uvs(&image, source)?;
-                    let corners = image_corners(dest, rotation, pivot);
-                    let verts = quad_vertices(width, height, corners, uv, tint);
-                    let shader = self.batch_shader_for_command(shader)?;
-                    push_vertices(&mut current, &mut batches, texture, filter, shader, verts);
+                    let texture = self.texture_for_image(image)?;
+                    let uv = image_uvs(image, *source)?;
+                    let corners = image_corners(*dest, *rotation, *pivot);
+                    let verts = quad_vertices(width, height, corners, uv, *tint);
+                    let shader = self.batch_shader_for_command(shader.as_ref())?;
+                    push_vertices(&mut current, &mut batches, texture, *filter, shader, verts);
                 }
                 DrawCommand::Text(request) => {
-                    let Some(sprite) = renderer::rasterize_text_sprite(&request) else {
+                    let Some(sprite) = renderer::rasterize_text_sprite(request) else {
                         continue;
                     };
-                    let texture = self.texture_for_text(&request, sprite.image.as_ref())?;
+                    let texture = self.texture_for_text(request, sprite.image.as_ref())?;
                     let corners = image_corners(sprite.dest, sprite.rotation, sprite.pivot);
                     let verts = quad_vertices(
                         width,
@@ -1148,7 +1150,7 @@ impl VulkanPresenter {
 
     fn batch_shader_for_command(
         &mut self,
-        shader: Option<crate::shader::ShaderHandle>,
+        shader: Option<&crate::shader::ShaderHandle>,
     ) -> Result<BatchShaderState, String> {
         let Some(shader) = shader else {
             return Ok(BatchShaderState::default_pipeline());
@@ -1196,57 +1198,7 @@ impl VulkanPresenter {
         request: &renderer::TextRenderRequest,
         rgba: &RgbaImage,
     ) -> Result<TextureKey, String> {
-        let mut hasher = DefaultHasher::new();
-        request.text.hash(&mut hasher);
-        match &request.font {
-            renderer::FontHandle::Default => "__neolove_default_font__".hash(&mut hasher),
-            renderer::FontHandle::Path(path) => path.hash(&mut hasher),
-        }
-        request.scale.to_bits().hash(&mut hasher);
-        request.min_scale.to_bits().hash(&mut hasher);
-        match request.text_scale {
-            renderer::TextScaleMode::None => 0u8,
-            renderer::TextScaleMode::Fit => 1u8,
-            renderer::TextScaleMode::FitWidth => 2u8,
-            renderer::TextScaleMode::FitHeight => 3u8,
-        }
-        .hash(&mut hasher);
-        match request.align_x {
-            renderer::TextAlignX::Left => 0u8,
-            renderer::TextAlignX::Center => 1u8,
-            renderer::TextAlignX::Right => 2u8,
-        }
-        .hash(&mut hasher);
-        match request.align_y {
-            renderer::TextAlignY::Top => 0u8,
-            renderer::TextAlignY::Center => 1u8,
-            renderer::TextAlignY::Bottom => 2u8,
-        }
-        .hash(&mut hasher);
-        match request.wrap {
-            renderer::TextWrapMode::None => 0u8,
-            renderer::TextWrapMode::Word => 1u8,
-            renderer::TextWrapMode::Char => 2u8,
-        }
-        .hash(&mut hasher);
-        request.bounds.x.to_bits().hash(&mut hasher);
-        request.bounds.y.to_bits().hash(&mut hasher);
-        request.bounds.w.to_bits().hash(&mut hasher);
-        request.bounds.h.to_bits().hash(&mut hasher);
-        request.padding_x.to_bits().hash(&mut hasher);
-        request.padding_y.to_bits().hash(&mut hasher);
-        request.line_spacing.to_bits().hash(&mut hasher);
-        request.letter_spacing.to_bits().hash(&mut hasher);
-        request.stretch_width.to_bits().hash(&mut hasher);
-        request.stretch_height.to_bits().hash(&mut hasher);
-        [
-            request.color.r,
-            request.color.g,
-            request.color.b,
-            request.color.a,
-        ]
-        .hash(&mut hasher);
-        let hash = hasher.finish();
+        let hash = renderer::text_render_request_cache_id(request);
         if let Some(key) = self.text_cache.get(&hash).copied() {
             return Ok(key);
         }
@@ -1364,7 +1316,7 @@ fn push_vertices(
     texture: TextureKey,
     filter: TextureFilter,
     shader: BatchShaderState,
-    vertices: Vec<GpuVertex>,
+    vertices: impl IntoIterator<Item = GpuVertex>,
 ) {
     match current {
         Some(batch)
@@ -1380,7 +1332,7 @@ fn push_vertices(
             *current = Some(TextureBatch {
                 texture,
                 filter,
-                vertices,
+                vertices: vertices.into_iter().collect(),
                 shader,
             });
         }
@@ -1388,7 +1340,7 @@ fn push_vertices(
             *current = Some(TextureBatch {
                 texture,
                 filter,
-                vertices,
+                vertices: vertices.into_iter().collect(),
                 shader,
             });
         }
@@ -1421,8 +1373,8 @@ fn quad_vertices(
     corners: [Vec2; 4],
     uv: [[f32; 2]; 4],
     color: Color,
-) -> Vec<GpuVertex> {
-    vec![
+) -> [GpuVertex; 6] {
+    [
         vertex_from_point(width, height, corners[0], color, uv[0]),
         vertex_from_point(width, height, corners[1], color, uv[1]),
         vertex_from_point(width, height, corners[2], color, uv[2]),

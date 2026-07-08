@@ -37,7 +37,10 @@ pub enum PropValue {
     Text(String),
     Color(Color),
     /// A one-of-many string value with its allowed options for the dropdown.
-    Enum { value: String, options: Vec<String> },
+    Enum {
+        value: String,
+        options: Vec<String>,
+    },
     /// An image asset path. Exported as `assets.loadImage("...")` so the
     /// runtime receives an ImageHandle rather than a bare string.
     Image(String),
@@ -49,6 +52,8 @@ pub enum PropValue {
     Sound(String),
     /// A fragment shader asset path, exported as a runtime ShaderHandle.
     Shader(String),
+    /// An animation clip asset path, exported as a runtime AnimationClip table.
+    Animation(String),
     /// Colour keypoints sampled over a particle's normalized lifetime.
     ColorSequence(Vec<ColorKeypoint>),
     /// Numeric keypoints sampled over a particle's normalized lifetime.
@@ -75,6 +80,7 @@ impl PropValue {
             PropValue::Font(s) => format!("\"{}\"", escape_luau(s)),
             PropValue::Sound(s) => format!("assets.loadSound(\"{}\")", escape_luau(s)),
             PropValue::Shader(s) => format!("shaders.loadFragment(\"{}\")", escape_luau(s)),
+            PropValue::Animation(s) => format!("animation.load(\"{}\")", escape_luau(s)),
             PropValue::ColorSequence(keypoints) => format!(
                 "{{{}}}",
                 keypoints
@@ -180,6 +186,15 @@ impl Prop {
             optional: true,
         }
     }
+    fn animation(name: &str, label: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            label: label.to_string(),
+            value: PropValue::Animation(String::new()),
+            advanced: false,
+            optional: true,
+        }
+    }
     fn color_sequence(name: &str, label: &str, keypoints: Vec<ColorKeypoint>) -> Self {
         Self::new(name, label, PropValue::ColorSequence(keypoints), false)
     }
@@ -210,6 +225,11 @@ pub enum VarValue {
     Entity(Option<u64>),
     /// A reference to a component attached to an entity in this scene.
     Component(Option<ComponentReference>),
+    /// Project-relative asset handle fields for custom script Inspector data.
+    Image(String),
+    Audio(String),
+    Shader(String),
+    Animation(String),
     List(Vec<VarValue>),
     Dictionary(Vec<DictionaryEntry>),
 }
@@ -272,9 +292,41 @@ impl VarValue {
             // Scene export resolves references against its generated local
             // variables. Outside that context, an unassigned value is safest.
             VarValue::Entity(_) | VarValue::Component(_) => "nil".to_string(),
+            VarValue::Image(path) => {
+                if path.is_empty() {
+                    "nil".to_string()
+                } else {
+                    format!("assets.loadImage(\"{}\")", escape_luau(path))
+                }
+            }
+            VarValue::Audio(path) => {
+                if path.is_empty() {
+                    "nil".to_string()
+                } else {
+                    format!("assets.loadSound(\"{}\")", escape_luau(path))
+                }
+            }
+            VarValue::Shader(path) => {
+                if path.is_empty() {
+                    "nil".to_string()
+                } else {
+                    format!("shaders.loadFragment(\"{}\")", escape_luau(path))
+                }
+            }
+            VarValue::Animation(path) => {
+                if path.is_empty() {
+                    "nil".to_string()
+                } else {
+                    format!("animation.load(\"{}\")", escape_luau(path))
+                }
+            }
             VarValue::List(values) => format!(
                 "{{{}}}",
-                values.iter().map(Self::to_luau).collect::<Vec<_>>().join(", ")
+                values
+                    .iter()
+                    .map(Self::to_luau)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             VarValue::Dictionary(entries) => format!(
                 "{{{}}}",
@@ -291,9 +343,9 @@ impl VarValue {
         match self {
             Self::Entity(_) | Self::Component(_) => true,
             Self::List(values) => values.iter().any(Self::contains_reference),
-            Self::Dictionary(entries) => entries
-                .iter()
-                .any(|entry| entry.value.contains_reference()),
+            Self::Dictionary(entries) => {
+                entries.iter().any(|entry| entry.value.contains_reference())
+            }
             _ => false,
         }
     }
@@ -331,6 +383,9 @@ impl VarValue {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Self::Image(_) | Self::Audio(_) | Self::Shader(_) | Self::Animation(_) => {
+                self.to_luau()
+            }
             _ => self.to_luau(),
         }
     }
@@ -365,7 +420,9 @@ impl VarValue {
         match self {
             Self::Entity(reference) if *reference == Some(id) => *reference = None,
             Self::Component(reference)
-                if reference.as_ref().is_some_and(|reference| reference.entity == id) =>
+                if reference
+                    .as_ref()
+                    .is_some_and(|reference| reference.entity == id) =>
             {
                 *reference = None;
             }
@@ -457,7 +514,10 @@ fn normalize_core_component(component: &mut Component) {
     };
     // Scenes saved before asset pickers had fonts represented as generic text.
     // Upgrade them in place so existing projects get the picker too.
-    if matches!(name.as_str(), "TextBox" | "TextLabel" | "RudimentaryTextLabel") {
+    if matches!(
+        name.as_str(),
+        "TextBox" | "TextLabel" | "RudimentaryTextLabel"
+    ) {
         for prop in props.iter_mut() {
             if prop.name == "font" {
                 if let PropValue::Text(path) = &prop.value {
@@ -468,6 +528,14 @@ fn normalize_core_component(component: &mut Component) {
     }
 
     if name == "ParticleSystem2D" {
+        if !props.iter().any(|prop| prop.name == "image") {
+            if let Some(image) = core_component_props(name)
+                .into_iter()
+                .find(|prop| prop.name == "image")
+            {
+                props.insert(0, image);
+            }
+        }
         let start = props
             .iter()
             .find(|prop| prop.name == "start_color")
@@ -489,18 +557,33 @@ fn normalize_core_component(component: &mut Component) {
                 "color_sequence",
                 "Color",
                 vec![
-                    ColorKeypoint { time: 0.0, color: [start[0], start[1], start[2], 255] },
-                    ColorKeypoint { time: 1.0, color: [end[0], end[1], end[2], 255] },
+                    ColorKeypoint {
+                        time: 0.0,
+                        color: [start[0], start[1], start[2], 255],
+                    },
+                    ColorKeypoint {
+                        time: 1.0,
+                        color: [end[0], end[1], end[2], 255],
+                    },
                 ],
             ));
         }
-        if !props.iter().any(|prop| prop.name == "transparency_sequence") {
+        if !props
+            .iter()
+            .any(|prop| prop.name == "transparency_sequence")
+        {
             props.push(Prop::number_sequence(
                 "transparency_sequence",
                 "Transparency",
                 vec![
-                    NumberKeypoint { time: 0.0, value: 1.0 - start[3] as f32 / 255.0 },
-                    NumberKeypoint { time: 1.0, value: 1.0 - end[3] as f32 / 255.0 },
+                    NumberKeypoint {
+                        time: 0.0,
+                        value: 1.0 - start[3] as f32 / 255.0,
+                    },
+                    NumberKeypoint {
+                        time: 1.0,
+                        value: 1.0 - end[3] as f32 / 255.0,
+                    },
                 ],
             ));
         }
@@ -547,6 +630,7 @@ pub const CORE_COMPONENTS: &[&str] = &[
     "NineSliceSprite2D",
     "Tilemap2D",
     "TileTexture2D",
+    "AnimationController",
     "EntityScaler",
     "Collider2D",
     "Rigidbody2D",
@@ -598,6 +682,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             p
         }
         "ParticleSystem2D" => vec![
+            Prop::image("image", "Particle Image", ""),
             Prop::boolean("playing", "Playing", true),
             Prop::boolean("looping", "Looping", true),
             Prop::boolean("visible", "Visible", true),
@@ -614,23 +699,48 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
                 "color_sequence",
                 "Color",
                 vec![
-                    ColorKeypoint { time: 0.0, color: [255, 184, 76, 255] },
-                    ColorKeypoint { time: 1.0, color: [255, 92, 40, 255] },
+                    ColorKeypoint {
+                        time: 0.0,
+                        color: [255, 184, 76, 255],
+                    },
+                    ColorKeypoint {
+                        time: 1.0,
+                        color: [255, 92, 40, 255],
+                    },
                 ],
             ),
             Prop::number_sequence(
                 "transparency_sequence",
                 "Transparency",
                 vec![
-                    NumberKeypoint { time: 0.0, value: 0.0 },
-                    NumberKeypoint { time: 1.0, value: 1.0 },
+                    NumberKeypoint {
+                        time: 0.0,
+                        value: 0.0,
+                    },
+                    NumberKeypoint {
+                        time: 1.0,
+                        value: 1.0,
+                    },
                 ],
             ),
-            Prop::enumv("shape", "Emitter", "point", &["point", "box", "circle"], false),
+            Prop::enumv(
+                "shape",
+                "Emitter",
+                "point",
+                &["point", "box", "circle"],
+                false,
+            ),
             Prop::num("radius", "Radius", 32.0),
             Prop::num_adv("gravity_x", "Gravity X", 0.0),
             Prop::num_adv("gravity_y", "Gravity Y", 60.0),
             Prop::shader("shader", "Shader"),
+        ],
+        "AnimationController" => vec![
+            Prop::animation("animation", "Animation"),
+            Prop::boolean("autoplay", "Autoplay", true),
+            Prop::boolean("looping", "Looping", true),
+            Prop::boolean("playing", "Playing", false),
+            Prop::num("speed", "Speed", 1.0),
         ],
         "TextBox" | "TextLabel" | "RudimentaryTextLabel" => {
             let mut p = vec![
@@ -647,8 +757,20 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
                     false,
                 ),
                 Prop::font("font", "Font", ""),
-                Prop::enumv("align_x", "Align X", "left", &["left", "center", "right"], false),
-                Prop::enumv("align_y", "Align Y", "top", &["top", "center", "bottom"], false),
+                Prop::enumv(
+                    "align_x",
+                    "Align X",
+                    "left",
+                    &["left", "center", "right"],
+                    false,
+                ),
+                Prop::enumv(
+                    "align_y",
+                    "Align Y",
+                    "top",
+                    &["top", "center", "bottom"],
+                    false,
+                ),
                 Prop::enumv("wrap", "Wrap", "none", &["none", "word", "char"], false),
             ];
             p.push(Prop::num_adv("min_scale", "Min Scale", 1.0));
@@ -740,7 +862,13 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
         "Collider2D" => vec![
             Prop::boolean("enabled", "Enabled", true),
             Prop::boolean("is_trigger", "Is Trigger", false),
-            Prop::enumv("shape", "Shape", "box", &["box", "circle", "triangle"], false),
+            Prop::enumv(
+                "shape",
+                "Shape",
+                "box",
+                &["box", "circle", "triangle"],
+                false,
+            ),
             Prop::num("size_x", "Size X", 0.0),
             Prop::num("size_y", "Size Y", 0.0),
             Prop::num_adv("offset_x", "Offset X", 0.0),
@@ -796,7 +924,13 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::color("color", "Color", [255, 255, 255, 255]),
             Prop::boolean("visible", "Visible", true),
             Prop::num("scale", "Scale", 18.0),
-            Prop::enumv("align_x", "Align X", "center", &["left", "center", "right"], false),
+            Prop::enumv(
+                "align_x",
+                "Align X",
+                "center",
+                &["left", "center", "right"],
+                false,
+            ),
             Prop::num("corner_radius", "Corner", 8.0),
             Prop::num_adv("padding_x", "Padding X", 12.0),
             Prop::num_adv("padding_y", "Padding Y", 8.0),
@@ -807,7 +941,13 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::color("color", "Color", [255, 255, 255, 255]),
             Prop::boolean("visible", "Visible", true),
             Prop::num("scale", "Scale", 18.0),
-            Prop::enumv("align_x", "Align X", "left", &["left", "center", "right"], false),
+            Prop::enumv(
+                "align_x",
+                "Align X",
+                "left",
+                &["left", "center", "right"],
+                false,
+            ),
             Prop::num("corner_radius", "Corner", 8.0),
             Prop::int("max_length", "Max Length", 0),
             Prop::boolean("password", "Password", false),
@@ -924,6 +1064,8 @@ pub struct Scene {
     next_id: u64,
 }
 
+const DEFAULT_SCENE_BACKGROUND: Color = [20, 20, 20, 255];
+
 fn default_nearest_neighbor() -> bool {
     true
 }
@@ -936,7 +1078,7 @@ impl Default for Scene {
     fn default() -> Self {
         let mut scene = Self {
             name: "Untitled".to_string(),
-            background: [24, 26, 32, 255],
+            background: DEFAULT_SCENE_BACKGROUND,
             nearest_neighbor_scaling: true,
             antialiasing: default_antialiasing(),
             entities: Vec::new(),
@@ -960,7 +1102,7 @@ impl Scene {
         let next_id = entities.iter().map(|entity| entity.id).max().unwrap_or(0) + 1;
         Self {
             name: name.into(),
-            background: [24, 26, 32, 255],
+            background: DEFAULT_SCENE_BACKGROUND,
             nearest_neighbor_scaling: true,
             antialiasing: default_antialiasing(),
             entities,
@@ -1088,7 +1230,11 @@ impl Scene {
     }
 
     /// Instantiate and link the new root to its project-relative prefab file.
-    pub fn instantiate_linked(&mut self, proto: Vec<Entity>, source: impl Into<String>) -> Option<u64> {
+    pub fn instantiate_linked(
+        &mut self,
+        proto: Vec<Entity>,
+        source: impl Into<String>,
+    ) -> Option<u64> {
         let root = self.instantiate(proto)?;
         self.entity_mut(root)?.prefab_source = Some(source.into());
         Some(root)
@@ -1109,9 +1255,14 @@ impl Scene {
             .collect();
         let mut refreshed = 0;
         for root_id in roots {
-            let Some(instance_root) = self.entity(root_id).cloned() else { continue; };
-            let removed: std::collections::HashSet<u64> =
-                self.subtree(root_id).into_iter().map(|entity| entity.id).collect();
+            let Some(instance_root) = self.entity(root_id).cloned() else {
+                continue;
+            };
+            let removed: std::collections::HashSet<u64> = self
+                .subtree(root_id)
+                .into_iter()
+                .map(|entity| entity.id)
+                .collect();
             self.entities.retain(|entity| !removed.contains(&entity.id));
 
             let mut id_map = std::collections::HashMap::new();
@@ -1122,7 +1273,9 @@ impl Scene {
             for mut entity in proto.iter().cloned() {
                 let old_id = entity.id;
                 entity.id = id_map[&old_id];
-                entity.parent = entity.parent.and_then(|parent| id_map.get(&parent).copied());
+                entity.parent = entity
+                    .parent
+                    .and_then(|parent| id_map.get(&parent).copied());
                 entity.prefab_source = None;
                 for component in &mut entity.components {
                     normalize_core_component(component);
@@ -1308,9 +1461,7 @@ impl Scene {
                 let cvar = format!("{var}_c{ci}");
                 match component {
                     Component::Core { name, props } => {
-                        out.push_str(&format!(
-                            "local {cvar} = {var}:AddComponent(core.{name})\n"
-                        ));
+                        out.push_str(&format!("local {cvar} = {var}:AddComponent(core.{name})\n"));
                         for prop in props {
                             // Skip optional asset/text props left empty, and
                             // empty handle paths, so the runtime keeps defaults.
@@ -1322,6 +1473,7 @@ impl Scene {
                                         | PropValue::Image(path)
                                         | PropValue::Sound(path)
                                         | PropValue::Shader(path)
+                                        | PropValue::Animation(path)
                                         if path.is_empty()
                                 )
                             {
@@ -1569,9 +1721,15 @@ mod tests {
     fn linked_prefab_refresh_preserves_root_placement() {
         let mut prototype_scene = Scene::default();
         let prototype_root = prototype_scene.entities[0].id;
-        prototype_scene.entity_mut(prototype_root).expect("prototype root exists").name = "Enemy".into();
+        prototype_scene
+            .entity_mut(prototype_root)
+            .expect("prototype root exists")
+            .name = "Enemy".into();
         let child = prototype_scene.add_entity("Weapon", 4.0, 5.0).id;
-        prototype_scene.entity_mut(child).expect("child exists").parent = Some(prototype_root);
+        prototype_scene
+            .entity_mut(child)
+            .expect("child exists")
+            .parent = Some(prototype_root);
         let prototype = prototype_scene.subtree(prototype_root);
 
         let mut scene = Scene::default();
@@ -1639,8 +1797,16 @@ mod tests {
         };
         assert!(props.iter().any(|prop| prop.name == "emission_rate"));
         assert!(props.iter().any(|prop| prop.name == "color_sequence"));
-        assert!(props.iter().any(|prop| prop.name == "transparency_sequence"));
-        assert!(props.iter().any(|prop| prop.name == "gravity_y" && prop.advanced));
+        assert!(
+            props
+                .iter()
+                .any(|prop| prop.name == "transparency_sequence")
+        );
+        assert!(
+            props
+                .iter()
+                .any(|prop| prop.name == "gravity_y" && prop.advanced)
+        );
         scene
             .entity_mut(id)
             .expect("entity")
@@ -1650,7 +1816,9 @@ mod tests {
         let luau = scene.to_luau();
         assert!(luau.contains("AddComponent(core.ParticleSystem2D)"));
         assert!(luau.contains(".emission_rate = 12"));
-        assert!(luau.contains(".color_sequence = {{ time = 0, color = Color4(255, 184, 76, 255) }"));
+        assert!(
+            luau.contains(".color_sequence = {{ time = 0, color = Color4(255, 184, 76, 255) }")
+        );
         assert!(luau.contains(".transparency_sequence = {{ time = 0, value = 0 }"));
     }
 
@@ -1669,9 +1837,11 @@ mod tests {
             .value = PropValue::Shader("shaders/glow.glsl".into());
         scene.entity_mut(id).expect("entity").components.push(rect);
 
-        assert!(scene
-            .to_luau()
-            .contains(".shader = shaders.loadFragment(\"shaders/glow.glsl\")"));
+        assert!(
+            scene
+                .to_luau()
+                .contains(".shader = shaders.loadFragment(\"shaders/glow.glsl\")")
+        );
     }
 
     #[test]
@@ -1736,7 +1906,11 @@ mod tests {
         });
         props.push(Prop::color("start_color", "Start Color", [10, 20, 30, 204]));
         props.push(Prop::color("end_color", "End Color", [40, 50, 60, 51]));
-        scene.entity_mut(id).expect("entity").components.push(particle);
+        scene
+            .entity_mut(id)
+            .expect("entity")
+            .components
+            .push(particle);
 
         let restored = Scene::from_json(&scene.to_json().expect("serialize")).expect("restore");
         let Component::Core { props, .. } = &restored.entities[0].components[0] else {
@@ -1754,14 +1928,24 @@ mod tests {
                 if (keypoints[0].value - 0.2).abs() < 0.001
                     && (keypoints[1].value - 0.8).abs() < 0.001
         )));
-        assert!(props.iter().any(|prop| matches!(prop.value, PropValue::Shader(_))));
-        assert!(!props.iter().any(|prop| prop.name == "start_color" || prop.name == "end_color"));
+        assert!(
+            props
+                .iter()
+                .any(|prop| matches!(prop.value, PropValue::Shader(_)))
+        );
+        assert!(
+            !props
+                .iter()
+                .any(|prop| prop.name == "start_color" || prop.name == "end_color")
+        );
     }
 
     #[test]
     fn tilemap_has_editor_schema_and_exports_runtime_component() {
         let component = Component::core("Tilemap2D");
-        let Component::Core { props, .. } = &component else { unreachable!() };
+        let Component::Core { props, .. } = &component else {
+            unreachable!()
+        };
         assert!(props.iter().any(|prop| prop.name == "tiles"));
         assert!(props.iter().any(|prop| prop.name == "map_width"));
         let mut scene = Scene::default();
@@ -1835,7 +2019,11 @@ mod tests {
         assert!(luau.contains("AddComponent(ScriptModule_0)"));
         assert!(luau.contains(".speed = 200"));
         assert!(scene.to_images_luau().is_none());
-        assert!(luau.find("require(\"./scripts/Player\")").expect("require in output") < luau.find("app.bg").expect("app.bg in output"));
+        assert!(
+            luau.find("require(\"./scripts/Player\")")
+                .expect("require in output")
+                < luau.find("app.bg").expect("app.bg in output")
+        );
     }
 
     #[test]
@@ -1892,7 +2080,10 @@ mod tests {
     fn removing_component_clears_or_shifts_component_references() {
         let mut scene = Scene::default();
         let target_id = scene.entities[0].id;
-        scene.entity_mut(target_id).expect("target exists").components = vec![
+        scene
+            .entity_mut(target_id)
+            .expect("target exists")
+            .components = vec![
             Component::core("Rect2D"),
             Component::core("Shape2D"),
             Component::Script {
@@ -1917,10 +2108,15 @@ mod tests {
                 ],
             },
         ];
-        scene.entity_mut(target_id).expect("target exists").components.remove(0);
+        scene
+            .entity_mut(target_id)
+            .expect("target exists")
+            .components
+            .remove(0);
         scene.adjust_component_references(target_id, 0);
 
-        let Component::Script { variables, .. } = &scene.entity(target_id).expect("target exists").components[1]
+        let Component::Script { variables, .. } =
+            &scene.entity(target_id).expect("target exists").components[1]
         else {
             unreachable!()
         };
@@ -1940,14 +2136,22 @@ mod tests {
         ] {
             let mut scene = Scene::default();
             let id = scene.entities[0].id;
-            scene.entity_mut(id).expect("entity").components.push(Component::Script {
-                path: path.into(),
-                variables: Vec::new(),
-            });
+            scene
+                .entity_mut(id)
+                .expect("entity")
+                .components
+                .push(Component::Script {
+                    path: path.into(),
+                    variables: Vec::new(),
+                });
             let luau = scene.to_luau();
             assert!(luau.contains(&format!("local ScriptModule_0 = require(\"{required}\")")));
             assert!(luau.contains("AddComponent(ScriptModule_0)"));
-            assert!(luau.find(&format!("require(\"{required}\")")).expect("require in output") < luau.find("app.bg").expect("app.bg in output"));
+            assert!(
+                luau.find(&format!("require(\"{required}\")"))
+                    .expect("require in output")
+                    < luau.find("app.bg").expect("app.bg in output")
+            );
         }
     }
 
@@ -1972,7 +2176,11 @@ mod tests {
 
         let images = scene.to_images_luau().expect("images emitted");
         assert_eq!(images.matches("assets.loadImage(").count(), 1);
-        assert!(images.contains("Images[\"assets/shared.png\"] = assets.loadImage(\"assets/shared.png\")"));
+        assert!(
+            images.contains(
+                "Images[\"assets/shared.png\"] = assets.loadImage(\"assets/shared.png\")"
+            )
+        );
 
         let luau = scene.to_luau();
         // Both entities reference the cached handle, none call loadImage inline.
@@ -1985,7 +2193,11 @@ mod tests {
     fn scene_without_images_emits_no_images_module() {
         let mut scene = Scene::default();
         let id = scene.entities[0].id;
-        scene.entity_mut(id).expect("entity").components.push(Component::core("TextBox"));
+        scene
+            .entity_mut(id)
+            .expect("entity")
+            .components
+            .push(Component::core("TextBox"));
         assert!(scene.to_images_luau().is_none());
         assert!(!scene.to_luau().contains("require(\"./images\")"));
     }
@@ -1994,29 +2206,36 @@ mod tests {
     fn script_component_exports_color_list_and_dictionary_variables() {
         let mut scene = Scene::default();
         let id = scene.entities[0].id;
-        scene.entity_mut(id).expect("entity").components.push(Component::Script {
-            path: "scripts/Inventory.luau".into(),
-            variables: vec![
-                ScriptVar {
-                    name: "tint".into(),
-                    value: VarValue::Color([1, 2, 3, 4]),
-                    control: VarControl::Field,
-                },
-                ScriptVar {
-                    name: "items".into(),
-                    value: VarValue::List(vec![VarValue::Text("key".into()), VarValue::Number(2.0)]),
-                    control: VarControl::Field,
-                },
-                ScriptVar {
-                    name: "stats".into(),
-                    value: VarValue::Dictionary(vec![DictionaryEntry {
-                        key: VarKey::Text("health".into()),
-                        value: VarValue::Number(100.0),
-                    }]),
-                    control: VarControl::Field,
-                },
-            ],
-        });
+        scene
+            .entity_mut(id)
+            .expect("entity")
+            .components
+            .push(Component::Script {
+                path: "scripts/Inventory.luau".into(),
+                variables: vec![
+                    ScriptVar {
+                        name: "tint".into(),
+                        value: VarValue::Color([1, 2, 3, 4]),
+                        control: VarControl::Field,
+                    },
+                    ScriptVar {
+                        name: "items".into(),
+                        value: VarValue::List(vec![
+                            VarValue::Text("key".into()),
+                            VarValue::Number(2.0),
+                        ]),
+                        control: VarControl::Field,
+                    },
+                    ScriptVar {
+                        name: "stats".into(),
+                        value: VarValue::Dictionary(vec![DictionaryEntry {
+                            key: VarKey::Text("health".into()),
+                            value: VarValue::Number(100.0),
+                        }]),
+                        control: VarControl::Field,
+                    },
+                ],
+            });
 
         let luau = scene.to_luau();
         assert!(luau.contains(".tint = Color4(1, 2, 3, 4)"));
@@ -2104,14 +2323,21 @@ mod tests {
                 "edit_with_percent" | "size_x_percent" | "size_y_percent"
             )
         });
-        scene.entity_mut(id).expect("entity").components.push(scaler);
+        scene
+            .entity_mut(id)
+            .expect("entity")
+            .components
+            .push(scaler);
 
         let restored = Scene::from_json(&scene.to_json().expect("serialize")).expect("load");
         let Component::Core { props, .. } = &restored.entities[0].components[0] else {
             panic!("expected core component");
         };
         assert!(matches!(
-            props.iter().find(|prop| prop.name == "edit_with_percent").map(|prop| &prop.value),
+            props
+                .iter()
+                .find(|prop| prop.name == "edit_with_percent")
+                .map(|prop| &prop.value),
             Some(PropValue::Bool(true))
         ));
         for name in ["size_x_percent", "size_y_percent"] {
@@ -2124,12 +2350,27 @@ mod tests {
 
     #[test]
     fn ui_and_legacy_components_export() {
-        for name in ["Frame", "Button", "TextInput", "Dropdown", "ScrollList", "LegacyBolt2D", "String2D"] {
+        for name in [
+            "Frame",
+            "Button",
+            "TextInput",
+            "Dropdown",
+            "ScrollList",
+            "LegacyBolt2D",
+            "String2D",
+        ] {
             let mut scene = Scene::default();
             let id = scene.entities[0].id;
-            scene.entity_mut(id).expect("e").components.push(Component::core(name));
+            scene
+                .entity_mut(id)
+                .expect("e")
+                .components
+                .push(Component::core(name));
             let luau = scene.to_luau();
-            assert!(luau.contains(&format!("AddComponent(core.{name})")), "missing {name}");
+            assert!(
+                luau.contains(&format!("AddComponent(core.{name})")),
+                "missing {name}"
+            );
         }
     }
 

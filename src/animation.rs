@@ -4,18 +4,26 @@
 //! editor, loaded from modules, or assembled at runtime.
 
 use mlua::{Lua, RegistryKey, Table, Value};
+use serde::Deserialize;
 use std::cell::RefCell;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 #[derive(Clone, Copy)]
 enum Interpolation {
     Linear,
     Step,
+    Bezier,
 }
 
 struct Keyframe {
     time: f64,
     value: f64,
+    out_x: f64,
+    out_y: f64,
+    in_x: f64,
+    in_y: f64,
 }
 
 struct Track {
@@ -45,7 +53,16 @@ fn number(value: Value, field: &str) -> mlua::Result<f64> {
     match value {
         Value::Integer(value) => Ok(value as f64),
         Value::Number(value) if value.is_finite() => Ok(value),
-        _ => Err(mlua::Error::external(format!("{field} must be a finite number"))),
+        _ => Err(mlua::Error::external(format!(
+            "{field} must be a finite number"
+        ))),
+    }
+}
+
+fn optional_number(table: &Table, field: &str, default: f64) -> mlua::Result<f64> {
+    match table.get::<Option<Value>>(field)? {
+        Some(value) => number(value, field),
+        None => Ok(default),
     }
 }
 
@@ -57,7 +74,9 @@ fn parse_clip(clip: &Table) -> mlua::Result<(Vec<Track>, f64, bool)> {
         let track = track?;
         let property: String = track.get("property")?;
         if property.trim().is_empty() {
-            return Err(mlua::Error::external("animation track property cannot be empty"));
+            return Err(mlua::Error::external(
+                "animation track property cannot be empty",
+            ));
         }
         let interpolation = match track
             .get::<Option<String>>("interpolation")?
@@ -67,10 +86,11 @@ fn parse_clip(clip: &Table) -> mlua::Result<(Vec<Track>, f64, bool)> {
         {
             "linear" => Interpolation::Linear,
             "step" | "hold" => Interpolation::Step,
+            "bezier" | "cubic" | "ease" => Interpolation::Bezier,
             other => {
                 return Err(mlua::Error::external(format!(
                     "unknown animation interpolation '{other}'"
-                )))
+                )));
             }
         };
         let key_table: Table = track.get("keys")?;
@@ -82,8 +102,19 @@ fn parse_clip(clip: &Table) -> mlua::Result<(Vec<Track>, f64, bool)> {
                 return Err(mlua::Error::external("keyframe time must be >= 0"));
             }
             let value = number(key.get("value")?, "keyframe value")?;
+            let out_x = optional_number(&key, "out_x", 0.333)?.clamp(0.0, 1.0);
+            let out_y = optional_number(&key, "out_y", 0.0)?;
+            let in_x = optional_number(&key, "in_x", 0.667)?.clamp(0.0, 1.0);
+            let in_y = optional_number(&key, "in_y", 1.0)?;
             inferred_duration = inferred_duration.max(time);
-            keys.push(Keyframe { time, value });
+            keys.push(Keyframe {
+                time,
+                value,
+                out_x,
+                out_y,
+                in_x,
+                in_y,
+            });
         }
         keys.sort_by(|a, b| a.time.total_cmp(&b.time));
         if !keys.is_empty() {
@@ -108,6 +139,30 @@ fn parse_clip(clip: &Table) -> mlua::Result<(Vec<Track>, f64, bool)> {
     Ok((tracks, duration, looping))
 }
 
+fn cubic_bezier(a: f64, b: f64, c: f64, d: f64, t: f64) -> f64 {
+    let mt = 1.0 - t;
+    mt * mt * mt * a + 3.0 * mt * mt * t * b + 3.0 * mt * t * t * c + t * t * t * d
+}
+
+fn sample_bezier(from: &Keyframe, to: &Keyframe, alpha: f64) -> f64 {
+    // Handles are stored in normalized segment space. Invert x(t) with a short
+    // binary search so non-linear time handles work predictably.
+    let mut lo = 0.0;
+    let mut hi = 1.0;
+    for _ in 0..20 {
+        let mid = (lo + hi) * 0.5;
+        let x = cubic_bezier(0.0, from.out_x, to.in_x, 1.0, mid);
+        if x < alpha {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let t = (lo + hi) * 0.5;
+    let y = cubic_bezier(0.0, from.out_y, to.in_y, 1.0, t);
+    from.value + (to.value - from.value) * y
+}
+
 fn sample(track: &Track, time: f64) -> f64 {
     let first = &track.keys[0];
     if time <= first.time {
@@ -121,17 +176,92 @@ fn sample(track: &Track, time: f64) -> f64 {
         let from = &pair[0];
         let to = &pair[1];
         if time <= to.time {
+            let span = (to.time - from.time).max(f64::EPSILON);
+            let alpha = ((time - from.time) / span).clamp(0.0, 1.0);
             return match track.interpolation {
                 Interpolation::Step => from.value,
-                Interpolation::Linear => {
-                    let span = (to.time - from.time).max(f64::EPSILON);
-                    let alpha = ((time - from.time) / span).clamp(0.0, 1.0);
-                    from.value + (to.value - from.value) * alpha
-                }
+                Interpolation::Bezier => sample_bezier(from, to, alpha),
+                Interpolation::Linear => from.value + (to.value - from.value) * alpha,
             };
         }
     }
     last.value
+}
+
+#[derive(Deserialize)]
+struct JsonClip {
+    duration: Option<f64>,
+    looping: Option<bool>,
+    looped: Option<bool>,
+    tracks: Vec<JsonTrack>,
+}
+
+#[derive(Deserialize)]
+struct JsonTrack {
+    property: String,
+    interpolation: Option<String>,
+    keys: Vec<JsonKeyframe>,
+}
+
+#[derive(Deserialize)]
+struct JsonKeyframe {
+    time: f64,
+    value: f64,
+    out_x: Option<f64>,
+    out_y: Option<f64>,
+    in_x: Option<f64>,
+    in_y: Option<f64>,
+}
+
+fn resolve_path(root: &Path, input: &str) -> PathBuf {
+    let path = PathBuf::from(input);
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
+fn json_clip_to_lua(lua: &Lua, clip: JsonClip) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    if let Some(duration) = clip.duration {
+        table.set("duration", duration)?;
+    }
+    if let Some(looping) = clip.looping.or(clip.looped) {
+        table.set("looping", looping)?;
+    }
+    let tracks = lua.create_table()?;
+    for track in clip.tracks {
+        let track_table = lua.create_table()?;
+        track_table.set("property", track.property)?;
+        track_table.set(
+            "interpolation",
+            track.interpolation.unwrap_or_else(|| "linear".to_string()),
+        )?;
+        let keys = lua.create_table()?;
+        for key in track.keys {
+            let key_table = lua.create_table()?;
+            key_table.set("time", key.time)?;
+            key_table.set("value", key.value)?;
+            if let Some(value) = key.out_x {
+                key_table.set("out_x", value)?;
+            }
+            if let Some(value) = key.out_y {
+                key_table.set("out_y", value)?;
+            }
+            if let Some(value) = key.in_x {
+                key_table.set("in_x", value)?;
+            }
+            if let Some(value) = key.in_y {
+                key_table.set("in_y", value)?;
+            }
+            keys.push(key_table)?;
+        }
+        track_table.set("keys", keys)?;
+        tracks.push(track_table)?;
+    }
+    table.set("tracks", tracks)?;
+    Ok(table)
 }
 
 fn with_player<R>(
@@ -210,7 +340,7 @@ fn create_handle(lua: &Lua, state: Rc<RefCell<AnimationState>>, id: u64) -> mlua
     Ok(handle)
 }
 
-pub(crate) fn add_animation_module(lua: &Lua) -> mlua::Result<()> {
+pub(crate) fn add_animation_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()> {
     let module = lua.create_table()?;
     let state = Rc::new(RefCell::new(AnimationState {
         next_id: 1,
@@ -239,6 +369,16 @@ pub(crate) fn add_animation_module(lua: &Lua) -> mlua::Result<()> {
     })?;
     module.set("new", create.clone())?;
     module.set("create", create)?;
+
+    let load_root = env_root;
+    let load = lua.create_function(move |lua, path: String| {
+        let text =
+            fs::read_to_string(resolve_path(&load_root, &path)).map_err(mlua::Error::external)?;
+        let clip: JsonClip = serde_json::from_str(&text).map_err(mlua::Error::external)?;
+        json_clip_to_lua(lua, clip)
+    })?;
+    module.set("load", load.clone())?;
+    module.set("Load", load)?;
 
     let play_state = state.clone();
     module.set(
@@ -308,8 +448,22 @@ mod tests {
             property: "x".into(),
             interpolation: Interpolation::Linear,
             keys: vec![
-                Keyframe { time: 0.0, value: 2.0 },
-                Keyframe { time: 2.0, value: 10.0 },
+                Keyframe {
+                    time: 0.0,
+                    value: 2.0,
+                    out_x: 0.333,
+                    out_y: 0.0,
+                    in_x: 0.667,
+                    in_y: 1.0,
+                },
+                Keyframe {
+                    time: 2.0,
+                    value: 10.0,
+                    out_x: 0.333,
+                    out_y: 0.0,
+                    in_x: 0.667,
+                    in_y: 1.0,
+                },
             ],
         };
         assert_eq!(sample(&track, 1.0), 6.0);
@@ -318,7 +472,7 @@ mod tests {
     #[test]
     fn module_plays_and_controls_clip() -> mlua::Result<()> {
         let lua = Lua::new();
-        add_animation_module(&lua)?;
+        add_animation_module(&lua, std::env::current_dir().expect("cwd"))?;
         lua.load(
             r#"
             target = { x = 0 }
