@@ -2939,6 +2939,331 @@ pub fn add_core_components(
         core_components.set("Rect2D", rect2d)?;
     }
 
+    // lighting
+    // global module controlling the 2D lighting compositor
+    {
+        use crate::lighting::{LightConfig, LightQuality};
+
+        let lighting = lua.create_table()?;
+
+        macro_rules! edit_config {
+            ($ty:ty, |$cfg:ident, $arg:pat_param| $body:expr) => {{
+                let render_state = render_state.clone();
+                lua.create_function(move |_ctx, $arg: $ty| -> mlua::Result<()> {
+                    let mut state = render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
+                    #[allow(unused_mut)]
+                    let mut $cfg = state.lighting_config();
+                    $body;
+                    state.set_lighting_config($cfg);
+                    Ok(())
+                })?
+            }};
+        }
+
+        lighting.set(
+            "setEnabled",
+            edit_config!(Option<bool>, |config, enabled| {
+                config.enabled = enabled.unwrap_or(true);
+            }),
+        )?;
+        lighting.set(
+            "enable",
+            edit_config!((), |config, _unused| config.enabled = true),
+        )?;
+        lighting.set(
+            "disable",
+            edit_config!((), |config, _unused| config.enabled = false),
+        )?;
+
+        {
+            let render_state = render_state.clone();
+            lighting.set(
+                "isEnabled",
+                lua.create_function(move |_ctx, ()| {
+                    let state = render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
+                    Ok(state.lighting_config().enabled)
+                })?,
+            )?;
+        }
+
+        lighting.set(
+            "setAmbient",
+            edit_config!((Table, Option<f32>), |config, (color, intensity)| {
+                if let Ok(c) = color4_to_color(color) {
+                    config.ambient = c;
+                }
+                if let Some(intensity) = intensity {
+                    config.ambient_intensity = intensity.max(0.0);
+                }
+            }),
+        )?;
+        lighting.set(
+            "setAmbientIntensity",
+            edit_config!(f32, |config, intensity| {
+                config.ambient_intensity = intensity.max(0.0);
+            }),
+        )?;
+
+        {
+            let render_state = render_state.clone();
+            lighting.set(
+                "getAmbient",
+                lua.create_function(move |ctx, ()| {
+                    let config = render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                        .lighting_config();
+                    let color = color4(
+                        ctx,
+                        config.ambient.r,
+                        config.ambient.g,
+                        config.ambient.b,
+                        config.ambient.a,
+                    )?;
+                    Ok((color, config.ambient_intensity))
+                })?,
+            )?;
+        }
+
+        lighting.set(
+            "setAmbientOcclusion",
+            edit_config!(
+                (Option<bool>, Option<f32>, Option<f32>, Option<u32>),
+                |config, (enabled, radius, intensity, samples)| {
+                    config.ao_enabled = enabled.unwrap_or(true);
+                    if let Some(radius) = radius {
+                        config.ao_radius = radius.max(0.0);
+                    }
+                    if let Some(intensity) = intensity {
+                        config.ao_intensity = intensity.clamp(0.0, 1.0);
+                    }
+                    if let Some(samples) = samples {
+                        config.ao_samples = samples.clamp(1, 64);
+                    }
+                }
+            ),
+        )?;
+        lighting.set(
+            "setShadows",
+            edit_config!((Option<bool>, Option<f32>), |config, (enabled, softness)| {
+                config.shadows_enabled = enabled.unwrap_or(true);
+                if let Some(softness) = softness {
+                    config.soft_shadows = softness.max(0.0);
+                }
+            }),
+        )?;
+        lighting.set(
+            "setBloom",
+            edit_config!(f32, |config, amount| config.bloom = amount.max(0.0)),
+        )?;
+        lighting.set(
+            "setExposure",
+            edit_config!(f32, |config, value| config.exposure = value.max(0.0)),
+        )?;
+        lighting.set(
+            "setQuality",
+            edit_config!(String, |config, quality| {
+                config.quality = LightQuality::parse(&quality);
+            }),
+        )?;
+
+        {
+            let render_state = render_state.clone();
+            lighting.set(
+                "getQuality",
+                lua.create_function(move |_ctx, ()| {
+                    let config = render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                        .lighting_config();
+                    Ok(config.quality.as_str().to_string())
+                })?,
+            )?;
+        }
+
+        {
+            let render_state = render_state.clone();
+            lighting.set(
+                "reset",
+                lua.create_function(move |_ctx, ()| {
+                    render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                        .set_lighting_config(LightConfig::default());
+                    Ok(())
+                })?,
+            )?;
+        }
+
+        // sample(x, y) -> Color4?  The light reaching a world/screen position,
+        // as a color, or nil when the point is off-screen. Uses the last
+        // completed frame's lights/occluders so it is safe to call from update
+        // (this frame's lights are still being queued). Returns opaque white
+        // when lighting is disabled (everything is effectively fully lit).
+        {
+            let render_state = render_state.clone();
+            let sample = lua.create_function(move |lua, (x, y): (f32, f32)| {
+                // Reject points outside the logical window when its size is known.
+                if let Ok(Some(window)) = lua.globals().get::<Option<Table>>("window") {
+                    let w: f32 = window.get("x").unwrap_or(0.0);
+                    let h: f32 = window.get("y").unwrap_or(0.0);
+                    if w > 0.0 && h > 0.0 && !(x >= 0.0 && y >= 0.0 && x <= w && y <= h) {
+                        return Ok(Value::Nil);
+                    }
+                }
+                let (config, lights, occluders) = render_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .last_frame_lighting();
+                if !config.enabled {
+                    return Ok(Value::Table(color4(lua, 255, 255, 255, 255)?));
+                }
+                let (r, g, b) =
+                    crate::lighting::sample_light_at(x, y, &config, &lights, &occluders);
+                let to_byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let color = color4(lua, to_byte(r), to_byte(g), to_byte(b), 255)?;
+                Ok(Value::Table(color))
+            })?;
+            lighting.set("sample", sample.clone())?;
+            lighting.set("getAt", sample.clone())?;
+            lighting.set("sampleAt", sample)?;
+        }
+
+        lua.globals().set("lighting", lighting)?;
+    }
+
+    // Rng
+    // seedable random-number generators as first-class objects
+    {
+        lua.globals()
+            .set("Rng", crate::rng::create_module(lua)?)?;
+    }
+
+    // Light2D
+    // emits a point, spot, or directional light into the lighting compositor
+    {
+        use crate::lighting::{Light, LightKind};
+
+        let light2d = lua.create_table()?;
+        light2d.set("__neolove_component", "Light2D")?;
+        light2d.set("NEOLOVE_RENDERING", true)?;
+        light2d.set(
+            "awake",
+            lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
+                component.set("kind", "point")?;
+                component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
+                component.set("intensity", 1.0)?;
+                component.set("radius", 256.0)?;
+                component.set("falloff", 2.0)?;
+                component.set("angleOffset", 0.0)?;
+                component.set("coneAngle", 60.0)?;
+                component.set("coneSoftness", 0.35)?;
+                component.set("castsShadows", true)?;
+                // Negative means "use the global lighting.setShadows softness".
+                component.set("shadowSoftness", -1.0)?;
+                component.set("visible", true)?;
+                Ok(())
+            })?,
+        )?;
+
+        let render_state = render_state.clone();
+        light2d.set(
+            "update",
+            lua.create_function(move |_ctx, (entity, component, _dt): (Table, Table, f32)| {
+                if !component.get::<bool>("visible").unwrap_or(true) {
+                    return Ok(());
+                }
+                let (x, y, rotation) = crate::window::get_global_transform(&entity)?;
+                let kind = LightKind::parse(
+                    &component
+                        .get::<String>("kind")
+                        .unwrap_or_else(|_| "point".to_string()),
+                );
+                let color = match component.get::<Table>("color") {
+                    Ok(table) => color4_to_color(table)?,
+                    Err(_) => Color::WHITE,
+                };
+                let angle_offset = component.get::<f32>("angleOffset").unwrap_or(0.0).to_radians();
+                let cone_deg = component.get::<f32>("coneAngle").unwrap_or(60.0).max(0.0);
+                let light = Light {
+                    kind,
+                    x,
+                    y,
+                    radius: component.get::<f32>("radius").unwrap_or(256.0).max(0.0),
+                    color,
+                    intensity: component.get::<f32>("intensity").unwrap_or(1.0).max(0.0),
+                    falloff: component.get::<f32>("falloff").unwrap_or(2.0).max(0.1),
+                    angle: rotation + angle_offset,
+                    cone: (cone_deg * 0.5).to_radians(),
+                    cone_softness: component.get::<f32>("coneSoftness").unwrap_or(0.35),
+                    casts_shadows: component.get::<bool>("castsShadows").unwrap_or(true),
+                    shadow_softness: component.get::<f32>("shadowSoftness").unwrap_or(-1.0),
+                };
+                render_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .queue_light(light);
+                Ok(())
+            })?,
+        )?;
+        core_components.set("Light2D", light2d)?;
+    }
+
+    // LightOccluder2D
+    // blocks light and contributes ambient occlusion using its bounds
+    {
+        use crate::lighting::Occluder;
+
+        let occluder2d = lua.create_table()?;
+        occluder2d.set("__neolove_component", "LightOccluder2D")?;
+        occluder2d.set("NEOLOVE_RENDERING", true)?;
+        occluder2d.set(
+            "awake",
+            lua.create_function(move |_ctx, (_entity, component): (Table, Table)| {
+                component.set("visible", true)?;
+                component.set("shape", "box")?;
+                Ok(())
+            })?,
+        )?;
+
+        let render_state = render_state.clone();
+        occluder2d.set(
+            "update",
+            lua.create_function(move |_ctx, (entity, component, _dt): (Table, Table, f32)| {
+                if !component.get::<bool>("visible").unwrap_or(true) {
+                    return Ok(());
+                }
+                let (_, _, rotation) = crate::window::get_global_transform(&entity)?;
+                let (cx, cy) = crate::window::get_global_rotation_pivot(&entity)?;
+                let (w, h) = crate::window::get_global_size(&entity)?;
+                if w <= 0.0 || h <= 0.0 {
+                    return Ok(());
+                }
+                render_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .queue_occluder(Occluder {
+                        cx,
+                        cy,
+                        half_w: w * 0.5,
+                        half_h: h * 0.5,
+                        rotation,
+                        shape: crate::lighting::OccluderShape::parse(
+                            &component
+                                .get::<String>("shape")
+                                .unwrap_or_else(|_| "box".to_string()),
+                        ),
+                    });
+                Ok(())
+            })?,
+        )?;
+        core_components.set("LightOccluder2D", occluder2d)?;
+    }
+
     // Shape2D
     // renderer for box, circle, and right-triangle primitives
     {
@@ -7000,6 +7325,123 @@ mod tests {
             10,
         )
         .is_none());
+    }
+
+    fn lua_with_core_components() -> (Lua, SharedRenderState) {
+        let lua = Lua::new();
+        let platform = crate::platform::new_shared_platform_state();
+        let render_state = crate::renderer::new_shared_render_state();
+        add_core_components(
+            &lua,
+            platform,
+            render_state.clone(),
+            std::env::temp_dir(),
+        )
+        .expect("core components install");
+        (lua, render_state)
+    }
+
+    #[test]
+    fn lighting_global_is_installed_and_updates_config() {
+        let (lua, render_state) = lua_with_core_components();
+        lua.load(
+            r#"
+                assert(type(lighting) == "table", "lighting global missing")
+                assert(lighting.isEnabled() == false, "lighting should start disabled")
+                lighting.setEnabled(true)
+                lighting.setAmbient(Color4(10, 20, 30), 0.5)
+                lighting.setAmbientOcclusion(true, 24, 0.7, 8)
+                lighting.setShadows(true, 4)
+                lighting.setBloom(0.25)
+                lighting.setExposure(1.5)
+                lighting.setQuality("high")
+                assert(lighting.isEnabled() == true, "enable failed")
+                assert(lighting.getQuality() == "high", "quality not applied")
+                local color, intensity = lighting.getAmbient()
+                assert(color.r == 10 and color.g == 20 and color.b == 30, "ambient color wrong")
+                assert(math.abs(intensity - 0.5) < 1e-4, "ambient intensity wrong")
+            "#,
+        )
+        .exec()
+        .expect("lighting api script runs");
+
+        let config = render_state.lock().unwrap().lighting_config();
+        assert!(config.enabled);
+        assert_eq!(config.ambient, Color::rgba(10, 20, 30, 255));
+        assert!(config.ao_enabled);
+        assert_eq!(config.quality, crate::lighting::LightQuality::High);
+        assert!((config.exposure - 1.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn lighting_sample_reports_light_at_a_position() {
+        let (lua, _render_state) = lua_with_core_components();
+        lua.load(
+            r#"
+                window = { x = 800, y = 600 }
+                -- Disabled lighting reports fully lit (white).
+                local off = lighting.sample(400, 300)
+                assert(off ~= nil and off.r == 255 and off.g == 255 and off.b == 255,
+                    "disabled lighting should read as white")
+                -- Off-screen returns nil.
+                assert(lighting.sample(-10, 300) == nil, "off-screen should be nil")
+                assert(lighting.sample(400, 9000) == nil, "off-screen should be nil")
+                -- Enabled with dark ambient reads dark (no lights queued yet).
+                lighting.setEnabled(true)
+                lighting.setAmbient(Color4(0, 0, 0), 0.0)
+                local dark = lighting.sample(400, 300)
+                assert(dark ~= nil and dark.r == 0 and dark.g == 0 and dark.b == 0,
+                    "dark ambient with no lights should read black")
+                assert(type(lighting.getAt) == "function", "getAt alias missing")
+            "#,
+        )
+        .exec()
+        .expect("lighting.sample script runs");
+    }
+
+    #[test]
+    fn rng_global_is_seedable_and_reproducible() {
+        let (lua, _render_state) = lua_with_core_components();
+        lua.load(
+            r#"
+                assert(type(Rng) == "table", "Rng global missing")
+                local a = Rng.new(1234)
+                local b = Rng.new(1234)
+                for i = 1, 50 do
+                    assert(a:number() == b:number(), "same seed must reproduce")
+                end
+                local r = Rng.new(7)
+                for i = 1, 200 do
+                    local n = r:integer(1, 6)
+                    assert(n >= 1 and n <= 6, "integer out of range: " .. tostring(n))
+                end
+                assert(type(Rng(99)) == "userdata", "callable Rng() form failed")
+                local named = Rng.fromString("world-seed")
+                assert(type(named:number()) == "number", "fromString failed")
+                local deck = { 1, 2, 3, 4, 5 }
+                r:shuffle(deck)
+                assert(#deck == 5, "shuffle must preserve length")
+                assert(r:pick(deck) ~= nil, "pick must return an element")
+            "#,
+        )
+        .exec()
+        .expect("rng api script runs");
+    }
+
+    #[test]
+    fn light_components_are_registered() {
+        let (lua, _render_state) = lua_with_core_components();
+        lua.load(
+            r#"
+                assert(type(core.Light2D) == "table", "Light2D missing")
+                assert(type(core.Light2D.update) == "function", "Light2D.update missing")
+                assert(type(core.Light2D.awake) == "function", "Light2D.awake missing")
+                assert(type(core.LightOccluder2D) == "table", "LightOccluder2D missing")
+                assert(type(core.LightOccluder2D.update) == "function", "LightOccluder2D.update missing")
+            "#,
+        )
+        .exec()
+        .expect("component registration script runs");
     }
 
     fn component_with_letter_bounds(lua: &Lua) -> mlua::Result<Table> {

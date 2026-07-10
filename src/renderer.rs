@@ -167,6 +167,15 @@ pub(crate) struct RenderState {
     commands: Vec<DrawCommand>,
     overlay_commands: Vec<DrawCommand>,
     last_frame_commands: Option<Arc<[DrawCommand]>>,
+    // Lighting: `config` persists across frames; lights and occluders are
+    // re-queued every frame by their components and drained with the commands.
+    lighting: crate::lighting::LightConfig,
+    lights: Vec<crate::lighting::Light>,
+    occluders: Vec<crate::lighting::Occluder>,
+    // The last frame's lights/occluders, kept so `snapPhoto` can reproduce the
+    // lit image (it re-renders from `last_frame_commands`).
+    last_frame_lights: Vec<crate::lighting::Light>,
+    last_frame_occluders: Vec<crate::lighting::Occluder>,
 }
 
 pub(crate) type SharedRenderState = Arc<Mutex<RenderState>>;
@@ -251,6 +260,61 @@ impl RenderState {
 
     fn remember_last_frame(&mut self, commands: Vec<DrawCommand>) {
         self.last_frame_commands = Some(Arc::from(commands.into_boxed_slice()));
+    }
+
+    pub(crate) fn queue_light(&mut self, light: crate::lighting::Light) {
+        self.lights.push(light);
+    }
+
+    pub(crate) fn queue_occluder(&mut self, occluder: crate::lighting::Occluder) {
+        self.occluders.push(occluder);
+    }
+
+    pub(crate) fn lighting_config(&self) -> crate::lighting::LightConfig {
+        self.lighting
+    }
+
+    pub(crate) fn set_lighting_config(&mut self, config: crate::lighting::LightConfig) {
+        self.lighting = config;
+    }
+
+    pub(crate) fn update_lighting_config(
+        &mut self,
+        edit: impl FnOnce(&mut crate::lighting::LightConfig),
+    ) {
+        edit(&mut self.lighting);
+    }
+
+    /// Take the persistent config plus this frame's queued lights/occluders,
+    /// clearing the per-frame lists for the next frame.
+    pub(crate) fn take_lighting(
+        &mut self,
+    ) -> (
+        crate::lighting::LightConfig,
+        Vec<crate::lighting::Light>,
+        Vec<crate::lighting::Occluder>,
+    ) {
+        let lights = std::mem::take(&mut self.lights);
+        let occluders = std::mem::take(&mut self.occluders);
+        self.last_frame_lights = lights.clone();
+        self.last_frame_occluders = occluders.clone();
+        (self.lighting, lights, occluders)
+    }
+
+    /// The persistent config plus the previous frame's lights/occluders, for
+    /// reproducing the lit image outside the main render loop (e.g. snapPhoto).
+    pub(crate) fn last_frame_lighting(
+        &self,
+    ) -> (
+        crate::lighting::LightConfig,
+        Vec<crate::lighting::Light>,
+        Vec<crate::lighting::Occluder>,
+    ) {
+        (
+            self.lighting,
+            self.last_frame_lights.clone(),
+            self.last_frame_occluders.clone(),
+        )
     }
 }
 
@@ -468,6 +532,22 @@ pub(crate) fn last_frame_commands(
         .lock()
         .map_err(|_| "render state lock poisoned".to_string())
         .map(|state| state.last_frame_commands.clone())
+}
+
+pub(crate) fn last_frame_lighting(
+    render_state: &SharedRenderState,
+) -> Result<
+    (
+        crate::lighting::LightConfig,
+        Vec<crate::lighting::Light>,
+        Vec<crate::lighting::Occluder>,
+    ),
+    String,
+> {
+    render_state
+        .lock()
+        .map_err(|_| "render state lock poisoned".to_string())
+        .map(|state| state.last_frame_lighting())
 }
 
 fn command_uses_custom_shader(command: &DrawCommand) -> bool {
@@ -1634,16 +1714,39 @@ impl SoftwareRenderer {
         platform: &SharedPlatformState,
         render_state: &SharedRenderState,
     ) -> Result<(), String> {
-        let commands = render_state
-            .lock()
-            .map_err(|_| "render state lock poisoned".to_string())?
-            .drain_without_remembering();
+        let (commands, lighting, lights, occluders) = {
+            let mut state = render_state
+                .lock()
+                .map_err(|_| "render state lock poisoned".to_string())?;
+            let commands = state.drain_without_remembering();
+            let (lighting, lights, occluders) = state.take_lighting();
+            (commands, lighting, lights, occluders)
+        };
         self.render_command_slice(platform, &commands)?;
+        self.apply_lighting_pass(&lighting, &lights, &occluders);
         render_state
             .lock()
             .map_err(|_| "render state lock poisoned".to_string())?
             .remember_last_frame(commands);
         Ok(())
+    }
+
+    /// Composite the 2D light map over the current framebuffer. A no-op when
+    /// lighting is disabled or has nothing to contribute.
+    pub(crate) fn apply_lighting_pass(
+        &mut self,
+        config: &crate::lighting::LightConfig,
+        lights: &[crate::lighting::Light],
+        occluders: &[crate::lighting::Occluder],
+    ) {
+        crate::lighting::apply_lighting(
+            &mut self.pixels,
+            self.width,
+            self.height,
+            config,
+            lights,
+            occluders,
+        );
     }
 
     pub(crate) fn render_commands(

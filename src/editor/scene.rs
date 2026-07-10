@@ -714,6 +714,8 @@ pub const CORE_COMPONENTS: &[&str] = &[
     "EntityScaler",
     "Collider2D",
     "Rigidbody2D",
+    "Light2D",
+    "LightOccluder2D",
 ];
 
 /// Advanced / legacy core components, shown under an "Advanced" submenu.
@@ -739,6 +741,29 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
     };
     match name {
         "Rect2D" => drawable(),
+        "Light2D" => vec![
+            Prop::enumv(
+                "kind",
+                "Kind",
+                "point",
+                &["point", "spot", "directional"],
+                false,
+            ),
+            Prop::color("color", "Color", [255, 255, 255, 255]),
+            Prop::num("intensity", "Intensity", 1.0),
+            Prop::num("radius", "Radius", 256.0),
+            Prop::num("falloff", "Falloff", 2.0),
+            Prop::num("coneAngle", "Cone °", 60.0),
+            Prop::num_adv("coneSoftness", "Cone Softness", 0.35),
+            Prop::num_adv("angleOffset", "Angle Offset °", 0.0),
+            Prop::boolean("castsShadows", "Casts Shadows", true),
+            Prop::num_adv("shadowSoftness", "Shadow Softness", -1.0),
+            Prop::boolean("visible", "Visible", true),
+        ],
+        "LightOccluder2D" => vec![
+            Prop::enumv("shape", "Shape", "box", &["box", "circle"], false),
+            Prop::boolean("visible", "Visible", true),
+        ],
         "Shape2D" => {
             let mut p = drawable();
             p.push(Prop::enumv(
@@ -1289,9 +1314,77 @@ pub struct Scene {
     /// Geometry and default text anti-aliasing quality: off, standard, or high.
     #[serde(default = "default_antialiasing")]
     pub antialiasing: String,
+    /// Per-scene 2D lighting. Exported as `lighting.*` calls and previewed in
+    /// the viewport. Off by default so scenes render unlit until opted in.
+    #[serde(default)]
+    pub lighting: SceneLighting,
     pub entities: Vec<Entity>,
     #[serde(skip)]
     next_id: u64,
+}
+
+/// Scene-level lighting settings mirrored by the runtime `lighting` global.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SceneLighting {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ambient")]
+    pub ambient: Color,
+    #[serde(default = "default_one")]
+    pub ambient_intensity: f32,
+    #[serde(default)]
+    pub ambient_occlusion: bool,
+    #[serde(default = "default_ao_radius")]
+    pub ao_radius: f32,
+    #[serde(default = "default_ao_intensity")]
+    pub ao_intensity: f32,
+    #[serde(default = "default_true_bool")]
+    pub shadows: bool,
+    #[serde(default)]
+    pub soft_shadows: f32,
+    #[serde(default)]
+    pub bloom: f32,
+    #[serde(default = "default_one")]
+    pub exposure: f32,
+    #[serde(default = "default_quality")]
+    pub quality: String,
+}
+
+fn default_ambient() -> Color {
+    [255, 255, 255, 255]
+}
+fn default_one() -> f32 {
+    1.0
+}
+fn default_ao_radius() -> f32 {
+    32.0
+}
+fn default_ao_intensity() -> f32 {
+    0.6
+}
+fn default_true_bool() -> bool {
+    true
+}
+fn default_quality() -> String {
+    "medium".to_string()
+}
+
+impl Default for SceneLighting {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ambient: default_ambient(),
+            ambient_intensity: 1.0,
+            ambient_occlusion: false,
+            ao_radius: default_ao_radius(),
+            ao_intensity: default_ao_intensity(),
+            shadows: true,
+            soft_shadows: 0.0,
+            bloom: 0.0,
+            exposure: 1.0,
+            quality: default_quality(),
+        }
+    }
 }
 
 const DEFAULT_SCENE_BACKGROUND: Color = [20, 20, 20, 255];
@@ -1311,6 +1404,7 @@ impl Default for Scene {
             background: DEFAULT_SCENE_BACKGROUND,
             nearest_neighbor_scaling: true,
             antialiasing: default_antialiasing(),
+            lighting: SceneLighting::default(),
             entities: Vec::new(),
             next_id: 1,
         };
@@ -1345,6 +1439,7 @@ impl Scene {
             background: DEFAULT_SCENE_BACKGROUND,
             nearest_neighbor_scaling: true,
             antialiasing: default_antialiasing(),
+            lighting: SceneLighting::default(),
             entities,
             next_id,
         }
@@ -1640,6 +1735,43 @@ impl Scene {
         self.to_luau_with_image_mode(ImageEmitMode::Inline)
     }
 
+    /// Emit `lighting.*` configuration when the scene enables lighting. Nothing
+    /// is written for the default disabled state, keeping generated `main.luau`
+    /// clean for scenes that do not use lighting.
+    fn emit_lighting(&self, out: &mut String) {
+        let l = &self.lighting;
+        if !l.enabled {
+            return;
+        }
+        out.push_str("lighting.setEnabled(true)\n");
+        let [ar, ag, ab, _] = l.ambient;
+        out.push_str(&format!(
+            "lighting.setAmbient(Color4({ar}, {ag}, {ab}), {})\n",
+            fmt_num(l.ambient_intensity)
+        ));
+        out.push_str(&format!(
+            "lighting.setAmbientOcclusion({}, {}, {})\n",
+            l.ambient_occlusion,
+            fmt_num(l.ao_radius),
+            fmt_num(l.ao_intensity)
+        ));
+        out.push_str(&format!(
+            "lighting.setShadows({}, {})\n",
+            l.shadows,
+            fmt_num(l.soft_shadows)
+        ));
+        if l.bloom > 0.0 {
+            out.push_str(&format!("lighting.setBloom({})\n", fmt_num(l.bloom)));
+        }
+        if (l.exposure - 1.0).abs() > f32::EPSILON {
+            out.push_str(&format!("lighting.setExposure({})\n", fmt_num(l.exposure)));
+        }
+        out.push_str(&format!(
+            "lighting.setQuality(\"{}\")\n\n",
+            escape_luau(&l.quality)
+        ));
+    }
+
     fn to_luau_with_image_mode(&self, image_mode: ImageEmitMode) -> String {
         let mut out = String::new();
         out.push_str("-- Generated by the NeoLOVE visual editor. Edits may be overwritten.\n");
@@ -1691,6 +1823,8 @@ impl Scene {
             "app.antiAliasing = \"{}\"\n\n",
             escape_luau(&self.antialiasing)
         ));
+
+        self.emit_lighting(&mut out);
 
         // Emit parents before children so `ecs.newEntity(..., parentVar)` works.
         let ordered = self.topological_order();
@@ -2105,6 +2239,48 @@ mod tests {
     }
 
     #[test]
+    fn scene_lighting_round_trips_and_exports_calls() {
+        let mut scene = Scene::default();
+        scene.lighting.enabled = true;
+        scene.lighting.ambient = [10, 20, 30, 255];
+        scene.lighting.ambient_intensity = 0.4;
+        scene.lighting.ambient_occlusion = true;
+        scene.lighting.shadows = true;
+        scene.lighting.soft_shadows = 3.0;
+        scene.lighting.quality = "high".into();
+        let mut light = scene.add_entity("Torch", 100.0, 100.0);
+        light.components.push(Component::core("Light2D"));
+        let id = light.id;
+        scene.replace_entity(id, light);
+
+        // Serialization keeps the settings (binary and legacy JSON).
+        let restored = Scene::from_bytes(&scene.to_bytes().expect("binary")).expect("restore");
+        assert!(restored.lighting.enabled);
+        assert_eq!(restored.lighting.ambient, [10, 20, 30, 255]);
+        assert_eq!(restored.lighting.quality, "high");
+        let json_restored =
+            Scene::from_bytes(scene.to_json().expect("json").as_bytes()).expect("json restore");
+        assert!(json_restored.lighting.enabled);
+
+        // Old scenes with no lighting field default to disabled and unchanged.
+        let legacy = r#"{"name":"Old","background":[0,0,0,255],"entities":[]}"#;
+        let old = Scene::from_bytes(legacy.as_bytes()).expect("legacy scene");
+        assert!(!old.lighting.enabled);
+
+        // Export emits the runtime lighting calls.
+        let luau = scene.to_luau_runtime();
+        assert!(luau.contains("lighting.setEnabled(true)"), "missing enable: {luau}");
+        assert!(luau.contains("lighting.setAmbient(Color4(10, 20, 30)"), "missing ambient");
+        assert!(luau.contains("lighting.setShadows(true"), "missing shadows");
+        assert!(luau.contains("lighting.setQuality(\"high\")"), "missing quality");
+
+        // A disabled scene emits no lighting calls.
+        let mut off = Scene::default();
+        off.lighting.enabled = false;
+        assert!(!off.to_luau_runtime().contains("lighting."));
+    }
+
+    #[test]
     fn prefab_binary_format_round_trips_and_legacy_json_still_loads() {
         let mut root = Entity::new(10, "Root", 1.0, 2.0);
         root.components.push(Component::core("Rect2D"));
@@ -2181,6 +2357,7 @@ mod tests {
             background: [10, 20, 30, 255],
             nearest_neighbor_scaling: true,
             antialiasing: default_antialiasing(),
+            lighting: SceneLighting::default(),
             entities: Vec::new(),
             next_id: 1,
         };
@@ -2375,6 +2552,7 @@ mod tests {
             background: [0, 0, 0, 255],
             nearest_neighbor_scaling: true,
             antialiasing: default_antialiasing(),
+            lighting: SceneLighting::default(),
             entities: Vec::new(),
             next_id: 1,
         };
@@ -2435,6 +2613,7 @@ mod tests {
             background: [0, 0, 0, 255],
             nearest_neighbor_scaling: true,
             antialiasing: default_antialiasing(),
+            lighting: SceneLighting::default(),
             entities: Vec::new(),
             next_id: 1,
         };
@@ -2714,6 +2893,7 @@ mod tests {
             background: [0, 0, 0, 255],
             nearest_neighbor_scaling: true,
             antialiasing: default_antialiasing(),
+            lighting: SceneLighting::default(),
             entities: Vec::new(),
             next_id: 1,
         };

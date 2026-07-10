@@ -985,6 +985,11 @@ pub(crate) fn add_assets_module_with_data_root(
                     .map_err(|error| {
                         mlua::Error::external(format!("snapPhoto failed to render frame: {error}"))
                     })?;
+                // Reproduce the 2D lighting pass so captures match the screen.
+                let (lighting_config, lights, occluders) =
+                    crate::renderer::last_frame_lighting(&render_state)
+                        .map_err(mlua::Error::external)?;
+                renderer.apply_lighting_pass(&lighting_config, &lights, &occluders);
 
                 let photo_width = right - left;
                 let photo_height = bottom - top;

@@ -17,7 +17,9 @@ pub mod hierarchy;
 #[cfg(target_os = "android")]
 mod http;
 #[cfg(target_os = "android")]
+mod lighting;
 mod lua_error;
+mod rng;
 #[cfg(target_os = "android")]
 mod mobile_emulation;
 #[cfg(target_os = "android")]

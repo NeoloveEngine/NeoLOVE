@@ -7,7 +7,9 @@ mod core;
 mod fs_module;
 pub mod hierarchy;
 mod http;
+mod lighting;
 mod lua_error;
+mod rng;
 mod mobile_emulation;
 mod mobile_module;
 mod platform;
@@ -359,6 +361,15 @@ impl WebApp {
         }
         render_web_commands_in_order(&mut self.renderer, &self.platform_state, &pixel_commands)
             .map_err(|error| format!("web renderer failed: {error}"))?;
+        {
+            let (lighting, lights, occluders) = self
+                .render_state
+                .lock()
+                .map_err(|_| "render state lock poisoned".to_string())?
+                .take_lighting();
+            self.renderer
+                .apply_lighting_pass(&lighting, &lights, &occluders);
+        }
         if tick_index <= WEB_DEBUG_TICK_LIMIT {
             let clear = lock_platform_state(&self.platform_state).clear_color();
             debug_log(&format!(

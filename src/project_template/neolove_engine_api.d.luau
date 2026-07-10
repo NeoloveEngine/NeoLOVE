@@ -675,6 +675,44 @@ export type Shape2D = BaseDrawableComponent & {
 	size_y: number,
 }
 
+-- 2D lighting. Emits light into the lighting compositor when the `lighting`
+-- system is enabled. Positions and aim come from the entity transform.
+export type Light2DKind = "point" | "spot" | "directional"
+
+export type Light2D = ComponentInstance & {
+	__neolove_component: "Light2D",
+	NEOLOVE_RENDERING: boolean,
+	-- "point" radiates in every direction, "spot" is a cone aimed by the
+	-- entity's rotation, "directional" floods the scene from one direction.
+	kind: Light2DKind,
+	color: Color4Value,
+	intensity: number,
+	-- Reach in pixels for point/spot lights.
+	radius: number,
+	-- Distance-attenuation exponent: 1 linear, 2 quadratic, and so on.
+	falloff: number,
+	-- Extra aim rotation in degrees added to the entity rotation (spot/directional).
+	angleOffset: number,
+	-- Full cone width in degrees for spot lights.
+	coneAngle: number,
+	-- 0 is a hard cone edge, 1 fades across the whole cone.
+	coneSoftness: number,
+	castsShadows: boolean,
+	-- Per-light penumbra in pixels. Negative means "use lighting.setShadows".
+	shadowSoftness: number,
+	visible: boolean,
+}
+
+-- Blocks light and contributes ambient occlusion using the entity's bounds.
+export type LightOccluderShape = "box" | "circle"
+
+export type LightOccluder2D = ComponentInstance & {
+	__neolove_component: "LightOccluder2D",
+	NEOLOVE_RENDERING: boolean,
+	shape: LightOccluderShape,
+	visible: boolean,
+}
+
 export type ParticleEmitterShape = "point" | "box" | "circle"
 export type ParticleColorKeypoint = { time: number, color: Color4Value }
 export type ParticleNumberKeypoint = { time: number, value: number }
@@ -1177,8 +1215,44 @@ export type Rope2D = ComponentInstance & {
 	link: (self: Rope2D, entityA: Entity, entityB: Entity) -> (),
 }
 
+-- Quality/resolution of the 2D light map.
+export type LightQuality = "low" | "medium" | "high" | "ultra"
+
+-- Global 2D lighting controls. Settings persist across frames; toggle the whole
+-- system with `setEnabled`. Lights and occluders come from `Light2D` /
+-- `LightOccluder2D` components. Applied by the software renderer.
+export type LightingModule = {
+	setEnabled: (enabled: boolean?) -> (),
+	enable: () -> (),
+	disable: () -> (),
+	isEnabled: () -> boolean,
+	-- Base light present everywhere. Full white at intensity 1 leaves the scene
+	-- unlit; lower it to create darkness for lights to cut through.
+	setAmbient: (color: Color4Value, intensity: number?) -> (),
+	setAmbientIntensity: (intensity: number) -> (),
+	getAmbient: () -> (Color4Value, number),
+	-- Darken ambient light near occluder edges. radius/intensity/samples optional.
+	setAmbientOcclusion: (enabled: boolean?, radius: number?, intensity: number?, samples: number?) -> (),
+	-- Toggle occluder shadows. `softness` (pixels) adds a penumbra; 0 is hard.
+	setShadows: (enabled: boolean?, softness: number?) -> (),
+	-- Glow added where light exceeds full brightness.
+	setBloom: (amount: number) -> (),
+	-- Output multiplier applied after lighting.
+	setExposure: (value: number) -> (),
+	setQuality: (quality: LightQuality) -> (),
+	getQuality: () -> LightQuality,
+	-- The light color reaching a screen-space position (from the last completed
+	-- frame), or nil when the point is off-screen. White when lighting is off.
+	sample: (x: number, y: number) -> Color4Value?,
+	getAt: (x: number, y: number) -> Color4Value?,
+	sampleAt: (x: number, y: number) -> Color4Value?,
+	reset: () -> (),
+}
+
 export type CoreModule = {
 	Rect2D: Rect2D,
+	Light2D: Light2D,
+	LightOccluder2D: LightOccluder2D,
 	EntityScaler: EntityScaler,
 	Shape2D: Shape2D,
 	ParticleSystem2D: ParticleSystem2D,
@@ -1208,6 +1282,36 @@ export type CoreModule = {
 	Rope2D: Rope2D,
 	String2D: Rope2D,
 }
+
+-- A seedable random-number generator. Create independent, reproducible streams
+-- with `Rng.new(seed)` instead of sharing `math.random`'s hidden global state.
+export type RngInstance = {
+	-- Float in [0, 1).
+	next: (self: RngInstance) -> number,
+	-- number() -> [0,1); number(max) -> [0,max); number(min,max) -> [min,max).
+	number: (self: RngInstance, min: number?, max: number?) -> number,
+	float: (self: RngInstance, min: number?, max: number?) -> number,
+	range: (self: RngInstance, min: number?, max: number?) -> number,
+	-- Inclusive integer. integer(max) -> [1,max]; integer(min,max) -> [min,max].
+	integer: (self: RngInstance, min: number, max: number?) -> number,
+	int: (self: RngInstance, min: number, max: number?) -> number,
+	-- True with probability p (default 0.5).
+	boolean: (self: RngInstance, p: number?) -> boolean,
+	bool: (self: RngInstance, p: number?) -> boolean,
+	sign: (self: RngInstance) -> number,
+	angle: (self: RngInstance) -> number,
+	unit: (self: RngInstance) -> (number, number),
+	pick: (self: RngInstance, list: { any }) -> any,
+	shuffle: (self: RngInstance, list: { any }) -> { any },
+	seed: (self: RngInstance, seed: number) -> (),
+	clone: (self: RngInstance) -> RngInstance,
+	Clone: (self: RngInstance) -> RngInstance,
+}
+
+export type RngModule = {
+	new: (seed: number?) -> RngInstance,
+	fromString: (text: string) -> RngInstance,
+} & ((seed: number?) -> RngInstance)
 
 declare function Color4(r: number, g: number, b: number, a: number?): Color4Value
 declare function Inspector<T>(defaultValue: T, max: number?, fractional: boolean?): T
@@ -1249,6 +1353,8 @@ declare animations: AnimationModule
 declare transform: TransformModule
 declare transforms: TransformModule
 declare core: CoreModule
+declare lighting: LightingModule
+declare Rng: RngModule
 declare async: AsyncModule
 
 declare mouse: Vec2

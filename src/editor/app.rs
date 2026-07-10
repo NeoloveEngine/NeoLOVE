@@ -381,6 +381,7 @@ impl BuildTarget {
 #[derive(Clone, Debug)]
 enum ColorTarget {
     Background,
+    LightingAmbient,
     Prop { entity: u64, comp: usize, prop: usize },
     Var {
         entity: u64,
@@ -2966,6 +2967,10 @@ impl EditorApp {
 
         let z = self.cam_zoom;
 
+        // Build the scene's lighting once so each entity can be tinted by the
+        // light reaching it — a live, per-object preview rather than a flat veil.
+        let preview_lighting = self.preview_scene_lighting();
+
         // Draw entities sorted by z (lower first).
         let mut entity_order = (0..self.scene.entities.len()).collect::<Vec<_>>();
         entity_order.sort_by(|left, right| {
@@ -2983,7 +2988,7 @@ impl EditorApp {
                 continue;
             };
             let active = self.scene.is_active_in_tree(entity.id);
-            self.draw_entity(ui, entity, rect, z);
+            self.draw_entity(ui, entity, rect, z, preview_lighting.as_ref());
             if !active {
                 // Dim inactive entities, like Unity greys out disabled objects.
                 ui.painter.fill_rect(rect, [30, 30, 30, 150]);
@@ -3232,6 +3237,119 @@ impl EditorApp {
         )
     }
 
+    /// Gather the scene's lighting (config + lights + occluders in world space)
+    /// for the viewport preview, or `None` when the scene has lighting disabled.
+    fn preview_scene_lighting(&self) -> Option<PreviewLighting> {
+        let s = &self.scene.lighting;
+        if !s.enabled {
+            return None;
+        }
+        let to_color = |c: [u8; 4]| crate::platform::Color::rgba(c[0], c[1], c[2], c[3]);
+        let config = crate::lighting::LightConfig {
+            enabled: true,
+            ambient: to_color(s.ambient),
+            ambient_intensity: s.ambient_intensity,
+            ao_enabled: s.ambient_occlusion,
+            ao_radius: s.ao_radius,
+            ao_intensity: s.ao_intensity,
+            ao_samples: 10,
+            shadows_enabled: s.shadows,
+            soft_shadows: s.soft_shadows,
+            bloom: s.bloom,
+            exposure: s.exposure,
+            quality: crate::lighting::LightQuality::parse(&s.quality),
+        };
+
+        let num = |props: &[Prop], name: &str, default: f32| {
+            props
+                .iter()
+                .find(|p| p.name == name)
+                .and_then(|p| match p.value {
+                    PropValue::Number(v) => Some(v),
+                    _ => None,
+                })
+                .unwrap_or(default)
+        };
+        let flag = |props: &[Prop], name: &str, default: bool| {
+            props
+                .iter()
+                .find(|p| p.name == name)
+                .and_then(|p| match p.value {
+                    PropValue::Bool(v) => Some(v),
+                    _ => None,
+                })
+                .unwrap_or(default)
+        };
+        let text = |props: &[Prop], name: &str| {
+            props.iter().find(|p| p.name == name).and_then(|p| match &p.value {
+                PropValue::Enum { value, .. } => Some(value.clone()),
+                PropValue::Text(s) => Some(s.clone()),
+                _ => None,
+            })
+        };
+
+        let mut lights = Vec::new();
+        let mut occluders = Vec::new();
+        for entity in &self.scene.entities {
+            if !self.scene.is_active_in_tree(entity.id) {
+                continue;
+            }
+            let Some(transform) = self.entity_world_transform(entity.id) else {
+                continue;
+            };
+            let (size_x, size_y) =
+                editor_entity_size(&self.scene, entity, self.preview_root_size());
+            for component in &entity.components {
+                let Component::Core { name, props } = component else {
+                    continue;
+                };
+                match name.as_str() {
+                    "Light2D" => {
+                        let kind = crate::lighting::LightKind::parse(
+                            &text(props, "kind").unwrap_or_else(|| "point".into()),
+                        );
+                        let color = prop_color(props, "color").unwrap_or([255, 255, 255, 255]);
+                        lights.push(crate::lighting::Light {
+                            kind,
+                            x: transform.x,
+                            y: transform.y,
+                            radius: num(props, "radius", 256.0),
+                            color: to_color(color),
+                            intensity: num(props, "intensity", 1.0),
+                            falloff: num(props, "falloff", 2.0),
+                            angle: transform.rotation + num(props, "angleOffset", 0.0).to_radians(),
+                            cone: (num(props, "coneAngle", 60.0) * 0.5).to_radians(),
+                            cone_softness: num(props, "coneSoftness", 0.35),
+                            casts_shadows: flag(props, "castsShadows", true),
+                            shadow_softness: num(props, "shadowSoftness", -1.0),
+                        });
+                    }
+                    "LightOccluder2D" => {
+                        let half_w = size_x * transform.scale * 0.5;
+                        let half_h = size_y * transform.scale * 0.5;
+                        occluders.push(crate::lighting::Occluder {
+                            cx: transform.x + half_w,
+                            cy: transform.y + half_h,
+                            half_w,
+                            half_h,
+                            rotation: transform.rotation,
+                            shape: crate::lighting::OccluderShape::parse(
+                                &text(props, "shape").unwrap_or_else(|| "box".into()),
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Some(PreviewLighting {
+            config,
+            lights,
+            occluders,
+        })
+    }
+
     /// Accumulated world rotation (radians) for an entity, matching what the
     /// runtime applies. Falls back to the entity's own rotation if the world
     /// transform can't be resolved.
@@ -3306,11 +3424,34 @@ impl EditorApp {
         }
     }
 
-    fn draw_entity(&self, ui: &mut Ui, entity: &Entity, rect: Rect, zoom: f32) {
+    fn draw_entity(
+        &self,
+        ui: &mut Ui,
+        entity: &Entity,
+        rect: Rect,
+        zoom: f32,
+        lighting: Option<&PreviewLighting>,
+    ) {
         // Rotate the whole entity about its origin (its top-left, which is the
         // runtime's default rotation pivot). All the component draw paths below
         // go through the painter, so they inherit the rotation for free.
         let angle = self.entity_world_rotation(entity);
+        // Light multiplier at this entity's position, sampled once. Multiplying
+        // each component color by it makes lights reveal/darken objects the way
+        // the runtime does, instead of laying a translucent overlay on top.
+        let light_factor = lighting.map(|preview| {
+            // Sample at the entity's world center so large objects read as lit by
+            // the nearest light rather than by whatever reaches their corner.
+            let (wx, wy) = match self.entity_world_transform(entity.id) {
+                Some(t) => {
+                    let (sx, sy) =
+                        editor_entity_size(&self.scene, entity, self.preview_root_size());
+                    (t.x + sx * t.scale * 0.5, t.y + sy * t.scale * 0.5)
+                }
+                None => (rect.x, rect.y),
+            };
+            crate::lighting::sample_light_at(wx, wy, &preview.config, &preview.lights, &preview.occluders)
+        });
         let prev_rot = ui.painter.push_rotation(rect.x, rect.y, angle);
         let world_scale = self
             .entity_world_transform(entity.id)
@@ -3319,7 +3460,10 @@ impl EditorApp {
         let mut drew = false;
         for component in &entity.components {
             if let Component::Core { name, props } = component {
-                let color = prop_color(props, "color").unwrap_or([200, 200, 200, 255]);
+                let color = apply_light_factor(
+                    prop_color(props, "color").unwrap_or([200, 200, 200, 255]),
+                    light_factor,
+                );
                 let prop_num = |n: &str, d: f32| {
                     props.iter().find(|p| p.name == n).and_then(|p| match p.value {
                         PropValue::Number(v) => Some(v),
@@ -4915,6 +5059,134 @@ impl EditorApp {
             }
             ui.tooltip(aa_button, "Choose off, standard (2x), or high (4x / supersampled text)");
             y += FIELD_H + 6.0;
+
+            // 2D lighting: a per-scene toggle exported as `lighting.*` and
+            // previewed live in the viewport.
+            y = self.section_header(ui, x, width, y, icon::PALETTE, "Lighting");
+            self.inspector_label(ui, x, y + 4.0, "Enabled", LABEL_W - 6.0);
+            if let Some(nv) =
+                ui.checkbox(Rect::new(x + LABEL_W, y, FIELD_H, FIELD_H), self.scene.lighting.enabled)
+            {
+                self.scene.lighting.enabled = nv;
+                self.mark_dirty();
+            }
+            y += FIELD_H + 6.0;
+
+            if self.scene.lighting.enabled {
+                let mut amb = self.scene.lighting.ambient;
+                y = self.color_row(
+                    ui,
+                    "scene_ambient",
+                    "Ambient",
+                    &mut amb,
+                    ColorTarget::LightingAmbient,
+                    x,
+                    width,
+                    y,
+                );
+                if amb != self.scene.lighting.ambient {
+                    self.scene.lighting.ambient = amb;
+                    self.mark_dirty();
+                }
+
+                let (ny, v) = self.lighting_num_row(
+                    ui,
+                    "li_amb_int",
+                    "Ambient Int",
+                    x,
+                    width,
+                    y,
+                    self.scene.lighting.ambient_intensity,
+                );
+                y = ny;
+                if let Some(v) = v {
+                    self.scene.lighting.ambient_intensity = v.max(0.0);
+                    self.mark_dirty();
+                }
+
+                // Ambient occlusion.
+                self.inspector_label(ui, x, y + 4.0, "Occlusion", LABEL_W - 6.0);
+                if let Some(nv) = ui.checkbox(
+                    Rect::new(x + LABEL_W, y, FIELD_H, FIELD_H),
+                    self.scene.lighting.ambient_occlusion,
+                ) {
+                    self.scene.lighting.ambient_occlusion = nv;
+                    self.mark_dirty();
+                }
+                y += FIELD_H + 6.0;
+
+                // Shadows + softness.
+                self.inspector_label(ui, x, y + 4.0, "Shadows", LABEL_W - 6.0);
+                if let Some(nv) = ui.checkbox(
+                    Rect::new(x + LABEL_W, y, FIELD_H, FIELD_H),
+                    self.scene.lighting.shadows,
+                ) {
+                    self.scene.lighting.shadows = nv;
+                    self.mark_dirty();
+                }
+                y += FIELD_H + 6.0;
+
+                let (ny, v) = self.lighting_num_row(
+                    ui,
+                    "li_soft",
+                    "Softness",
+                    x,
+                    width,
+                    y,
+                    self.scene.lighting.soft_shadows,
+                );
+                y = ny;
+                if let Some(v) = v {
+                    self.scene.lighting.soft_shadows = v.max(0.0);
+                    self.mark_dirty();
+                }
+
+                let (ny, v) = self.lighting_num_row(
+                    ui,
+                    "li_bloom",
+                    "Bloom",
+                    x,
+                    width,
+                    y,
+                    self.scene.lighting.bloom,
+                );
+                y = ny;
+                if let Some(v) = v {
+                    self.scene.lighting.bloom = v.max(0.0);
+                    self.mark_dirty();
+                }
+
+                let (ny, v) = self.lighting_num_row(
+                    ui,
+                    "li_exposure",
+                    "Exposure",
+                    x,
+                    width,
+                    y,
+                    self.scene.lighting.exposure,
+                );
+                y = ny;
+                if let Some(v) = v {
+                    self.scene.lighting.exposure = v.max(0.0);
+                    self.mark_dirty();
+                }
+
+                // Quality cycles low -> medium -> high -> ultra on click.
+                self.inspector_label(ui, x, y + 4.0, "Quality", LABEL_W - 6.0);
+                let qbtn = Rect::new(x + LABEL_W, y, (width - LABEL_W).max(40.0), FIELD_H);
+                if ui.dropdown_button(qbtn, &self.scene.lighting.quality) {
+                    let order = ["low", "medium", "high", "ultra"];
+                    let current = order
+                        .iter()
+                        .position(|q| *q == self.scene.lighting.quality)
+                        .unwrap_or(1);
+                    self.scene.lighting.quality = order[(current + 1) % order.len()].to_string();
+                    self.mark_dirty();
+                }
+                ui.tooltip(qbtn, "Light-map resolution: low, medium, high, or ultra");
+                y += FIELD_H + 6.0;
+            }
+
             return y + 10.0;
         };
         let Some(mut entity) = self.scene.entity(id).cloned() else {
@@ -6134,6 +6406,30 @@ impl EditorApp {
         let fx = x + LABEL_W;
         self.color_row_inline(ui, id, fx, (x + width) - fx, y, color, target);
         y + FIELD_H + 6.0
+    }
+
+    /// A labeled numeric field for the scene-lighting panel. Returns the new `y`
+    /// and the parsed value when the field changed to a valid number.
+    #[allow(clippy::too_many_arguments)]
+    fn lighting_num_row(
+        &mut self,
+        ui: &mut Ui,
+        id: &str,
+        label: &str,
+        x: f32,
+        width: f32,
+        y: f32,
+        value: f32,
+    ) -> (f32, Option<f32>) {
+        self.inspector_label(ui, x, y + 4.0, label, LABEL_W - 6.0);
+        let field = Rect::new(x + LABEL_W, y, (width - LABEL_W).max(40.0), FIELD_H);
+        let r = ui.text_field(id, field, &format_num(value));
+        let parsed = if r.changed {
+            r.text.trim().parse::<f32>().ok()
+        } else {
+            None
+        };
+        (y + FIELD_H + 6.0, parsed)
     }
 
     fn color_row_inline(&mut self, ui: &mut Ui, id: &str, fx: f32, fw: f32, y: f32, color: &mut [u8; 4], target: ColorTarget) -> bool {
@@ -9215,6 +9511,7 @@ impl EditorApp {
     fn set_target_color(&mut self, target: &ColorTarget, color: [u8; 4]) {
         match target {
             ColorTarget::Background => self.scene.background = color,
+            ColorTarget::LightingAmbient => self.scene.lighting.ambient = color,
             ColorTarget::Prop { entity, comp, prop } => {
                 if let Some(e) = self.scene.entity_mut(*entity) {
                     if let Some(Component::Core { props, .. }) = e.components.get_mut(*comp) {
@@ -9998,6 +10295,25 @@ impl EditorApp {
                 self.build_rx = None;
                 true
             }
+        }
+    }
+}
+
+/// Lighting gathered from the current scene for the viewport preview.
+struct PreviewLighting {
+    config: crate::lighting::LightConfig,
+    lights: Vec<crate::lighting::Light>,
+    occluders: Vec<crate::lighting::Occluder>,
+}
+
+/// Multiply an editor draw color by a sampled light factor (rgb, each `>= 0`),
+/// clamping to bytes. `None` leaves the color unchanged (lighting disabled).
+fn apply_light_factor(color: [u8; 4], factor: Option<(f32, f32, f32)>) -> [u8; 4] {
+    match factor {
+        None => color,
+        Some((lr, lg, lb)) => {
+            let ch = |c: u8, l: f32| ((c as f32 * l).clamp(0.0, 255.0)) as u8;
+            [ch(color[0], lr), ch(color[1], lg), ch(color[2], lb), color[3]]
         }
     }
 }
@@ -11898,6 +12214,49 @@ mod tests {
     fn default_scene_has_no_components() {
         let h = Harness::new(Scene::default());
         assert!(h.app.scene.entities[0].components.is_empty());
+    }
+
+    #[test]
+    fn editor_preview_gathers_scene_lights_when_enabled() {
+        let mut scene = Scene::default();
+        scene.lighting.enabled = true;
+        scene.lighting.ambient = [0, 0, 0, 255];
+        scene.lighting.ambient_intensity = 0.0;
+        let mut torch = scene.add_entity("Torch", 200.0, 150.0);
+        torch.components.push(Component::core("Light2D"));
+        let id = torch.id;
+        scene.replace_entity(id, torch);
+
+        let h = Harness::new(scene);
+        let preview = h
+            .app
+            .preview_scene_lighting()
+            .expect("lighting is enabled");
+        assert_eq!(preview.lights.len(), 1, "one Light2D should be gathered");
+
+        // The light illuminates its own position but not points beyond its reach.
+        let (near, _, _) = crate::lighting::sample_light_at(
+            200.0,
+            150.0,
+            &preview.config,
+            &preview.lights,
+            &preview.occluders,
+        );
+        assert!(near > 0.5, "light should brighten its position, got {near}");
+        let (far, _, _) = crate::lighting::sample_light_at(
+            200.0 + 5000.0,
+            150.0,
+            &preview.config,
+            &preview.lights,
+            &preview.occluders,
+        );
+        assert!(far < 0.01, "beyond the radius should stay dark, got {far}");
+
+        // A scene with lighting disabled produces no preview at all.
+        let mut off = Scene::default();
+        off.lighting.enabled = false;
+        let h2 = Harness::new(off);
+        assert!(h2.app.preview_scene_lighting().is_none());
     }
 
     #[test]
