@@ -1746,10 +1746,13 @@ intensity `1` and no lights, the scene still looks unlit; you create darkness by
 lowering the ambient and letting lights cut through it.
 
 ::: info
-The lighting pass runs on the CPU in the software renderer, which is the default
-desktop path and the WebAssembly and Android paths. Under the optional Vulkan
-desktop build the scene renders without the light pass, the same boundary that
-applies to custom shaders. Positions are ordinary on-screen (logical) pixel
+Both rendering paths composite a **per-pixel** light map over the frame. The
+**software renderer** (the default desktop path, plus WebAssembly and Android)
+multiplies it on the CPU. The optional **Vulkan** desktop build uploads the same
+light map as a texture and multiplies it over the scene in a final GPU pass, so
+gradients, colored lights, soft shadows, and ambient occlusion match. The Vulkan
+pass is a plain multiply, so **bloom and over-bright (> 1) light are not
+represented** there. Positions are ordinary on-screen (logical) pixel
 coordinates, matching draw commands.
 :::
 
@@ -1882,13 +1885,18 @@ and mood.
 
 ## Performance notes
 
-The compositor scatters each light across only its own bounding box, evaluates
-ambient occlusion only near occluders, and rejects shadow rays with a
-per-occluder bounding circle, so cost tracks the **lit area** rather than
-`pixels * lights * occluders`. To tune further: lower `setQuality`, reduce light
-`radius`, disable `castsShadows` on fill lights, and keep soft-shadow softness
-modest on scenes with many occluders. AO sampling is the other main cost; fewer
-`samples` or a smaller `radius` both help.
+The software light pass is built to stay cheap: the light map is computed on
+worker threads (one band of rows each), the final composite is likewise
+parallelized, occluder rotations and bounds are resolved once per frame, ambient
+occlusion is evaluated only near occluders, and **soft shadows are produced by
+blurring the light map** rather than casting many penumbra rays per pixel — so
+softness is nearly free.
+
+To tune further: lower `setQuality` (`low` is quarter-resolution and much
+cheaper; the blur keeps it smooth), reduce light `radius`, disable
+`castsShadows` on fill lights, and prefer fewer shadow-casting **directional**
+lights (they cover the whole screen). Ambient occlusion is the other main cost;
+fewer `samples` or a smaller `radius` both help.
 
 <!-- page: rng | Random Numbers -->
 # Random Numbers

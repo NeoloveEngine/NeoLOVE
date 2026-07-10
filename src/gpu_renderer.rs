@@ -105,6 +105,25 @@ struct CachedTexture {
     descriptor_linear: Arc<PersistentDescriptorSet>,
 }
 
+/// A prepared light-map composite: the multiply pipeline, the uploaded light-map
+/// texture descriptor, and a fullscreen quad. Drawn last, it multiplies the
+/// light over the finished scene.
+struct LightComposite {
+    pipeline: Arc<GraphicsPipeline>,
+    descriptor: Arc<PersistentDescriptorSet>,
+    vertex_buffer: vulkano::buffer::Subbuffer<[GpuVertex]>,
+}
+
+/// Log a GPU-composite failure once. Lighting then falls back to unlit rather
+/// than failing the frame.
+fn warn_light_composite_once(error: &str) {
+    use std::sync::Once;
+    static WARN: Once = Once::new();
+    WARN.call_once(|| {
+        eprintln!("lighting: GPU composite unavailable, rendering scene unlit ({error})");
+    });
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct BatchShaderState {
     pipeline_key: u64,
@@ -144,6 +163,8 @@ pub(crate) struct VulkanPresenter {
     render_pass: Arc<RenderPass>,
     framebuffers: Vec<Arc<Framebuffer>>,
     pipeline: Arc<GraphicsPipeline>,
+    /// Lazily-created multiply-blend pipeline for the light-map composite.
+    composite_pipeline: Option<Arc<GraphicsPipeline>>,
     recreate_swapchain: bool,
     nearest_sampler: Arc<Sampler>,
     linear_sampler: Arc<Sampler>,
@@ -361,6 +382,7 @@ impl VulkanPresenter {
             render_pass,
             framebuffers,
             pipeline,
+            composite_pipeline: None,
             recreate_swapchain: false,
             nearest_sampler,
             linear_sampler,
@@ -490,6 +512,7 @@ impl VulkanPresenter {
             msaa_samples,
             BUILTIN_VERTEX_SHADER,
             BUILTIN_FRAGMENT_SHADER,
+            AttachmentBlend::alpha(),
         )
     }
 
@@ -530,6 +553,7 @@ impl VulkanPresenter {
         msaa_samples: SampleCount,
         vertex_source: &str,
         fragment_source: &str,
+        blend: AttachmentBlend,
     ) -> Result<Arc<GraphicsPipeline>, String> {
         let vs = Self::compile_shader_module(
             device.clone(),
@@ -635,7 +659,7 @@ impl VulkanPresenter {
                 color_blend_state: Some(ColorBlendState::with_attachment_states(
                     1,
                     ColorBlendAttachmentState {
-                        blend: Some(AttachmentBlend::alpha()),
+                        blend: Some(blend),
                         color_write_mask: ColorComponents::all(),
                         color_write_enable: true,
                     },
@@ -664,7 +688,22 @@ impl VulkanPresenter {
             msaa_samples,
             BUILTIN_VERTEX_SHADER,
             fragment_source,
+            AttachmentBlend::alpha(),
         )
+    }
+
+    /// The multiply blend used to composite the light map: `result = src * dst`,
+    /// with the destination alpha preserved.
+    fn multiply_blend() -> AttachmentBlend {
+        use vulkano::pipeline::graphics::color_blend::{BlendFactor, BlendOp};
+        AttachmentBlend {
+            src_color_blend_factor: BlendFactor::DstColor,
+            dst_color_blend_factor: BlendFactor::Zero,
+            color_blend_op: BlendOp::Add,
+            src_alpha_blend_factor: BlendFactor::Zero,
+            dst_alpha_blend_factor: BlendFactor::One,
+            alpha_blend_op: BlendOp::Add,
+        }
     }
 
     fn pipeline_for_batch(
@@ -727,6 +766,7 @@ impl VulkanPresenter {
             self.msaa_samples,
         )?;
         self.shader_cache.clear();
+        self.composite_pipeline = None;
         self.recreate_swapchain = false;
         Ok(())
     }
@@ -748,8 +788,30 @@ impl VulkanPresenter {
 
         let commands = renderer::drain_commands_without_remembering(render_state)?;
         let clear_color = lock_platform_state(platform).clear_color();
+        let (config, lights, occluders) = render_state
+            .lock()
+            .map_err(|_| "render state lock poisoned".to_string())?
+            .take_lighting();
         let batches = self.build_batches(&commands, width.max(1), height.max(1))?;
         renderer::remember_last_frame_commands(render_state, commands)?;
+
+        // Build the per-pixel light map and prepare its GPU composite. Any
+        // failure here is non-fatal: the scene simply renders unlit rather than
+        // taking down the frame.
+        let light_composite = crate::lighting::render_light_map(
+            width.max(1),
+            height.max(1),
+            &config,
+            &lights,
+            &occluders,
+        )
+        .and_then(|map| match self.prepare_light_composite(&map) {
+            Ok(composite) => Some(composite),
+            Err(error) => {
+                warn_light_composite_once(&error);
+                None
+            }
+        });
 
         let (image_index, suboptimal, acquire_future) =
             match swapchain::acquire_next_image(self.swapchain.clone(), None)
@@ -769,6 +831,7 @@ impl VulkanPresenter {
             height.max(1),
             clear_color,
             batches,
+            light_composite,
         )?;
 
         let previous = self
@@ -810,6 +873,131 @@ impl VulkanPresenter {
         self.recreate_swapchain = true;
     }
 
+    /// Upload the light map and assemble everything needed to composite it: the
+    /// multiply pipeline (created once), a fresh texture descriptor, and a
+    /// fullscreen quad. Returns `Err` on any Vulkan failure so the caller can
+    /// fall back to an unlit frame.
+    fn prepare_light_composite(
+        &mut self,
+        map: &crate::lighting::LightMapImage,
+    ) -> Result<LightComposite, String> {
+        if self.composite_pipeline.is_none() {
+            self.composite_pipeline = Some(Self::create_pipeline_with_sources(
+                self.device.clone(),
+                self.render_pass.clone(),
+                1,
+                1,
+                self.msaa_samples,
+                BUILTIN_VERTEX_SHADER,
+                BUILTIN_FRAGMENT_SHADER,
+                Self::multiply_blend(),
+            )?);
+        }
+        let pipeline = self.composite_pipeline.clone().unwrap();
+
+        // Upload the light map as a texture (synchronous, like other uploads).
+        let image = Image::new(
+            self.memory_allocator.clone(),
+            ImageCreateInfo {
+                format: Format::R8G8B8A8_UNORM,
+                extent: [map.width.max(1), map.height.max(1), 1],
+                usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let upload = Buffer::from_iter(
+            self.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            map.rgba.iter().copied(),
+        )
+        .map_err(|e| e.to_string())?;
+        let mut builder = AutoCommandBufferBuilder::primary(
+            &self.command_buffer_allocator,
+            self.queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .map_err(|e| e.to_string())?;
+        builder
+            .copy_buffer_to_image(vulkano::command_buffer::CopyBufferToImageInfo::buffer_image(
+                upload,
+                image.clone(),
+            ))
+            .map_err(|e| e.to_string())?;
+        let command_buffer = builder.build().map_err(|e| e.to_string())?;
+        sync::now(self.device.clone())
+            .then_execute(self.queue.clone(), command_buffer)
+            .map_err(|e| e.to_string())?
+            .then_signal_fence_and_flush()
+            .map_err(Validated::unwrap)
+            .map_err(|e| e.to_string())?
+            .wait(None)
+            .map_err(|e| e.to_string())?;
+
+        let view = ImageView::new_default(image).map_err(|e| e.to_string())?;
+        let layout = pipeline
+            .layout()
+            .set_layouts()
+            .first()
+            .cloned()
+            .ok_or_else(|| "composite pipeline missing descriptor set layout".to_string())?;
+        let descriptor = PersistentDescriptorSet::new(
+            &self.descriptor_set_allocator,
+            layout,
+            [
+                WriteDescriptorSet::image_view(0, view),
+                WriteDescriptorSet::sampler(1, self.linear_sampler.clone()),
+            ],
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+
+        // Fullscreen quad. Positions follow the same convention as the scene
+        // (NDC +1 is screen top); UVs map the light map top-left to screen
+        // top-left. A linear sampler upscales the downsampled map smoothly.
+        let white = [1.0f32; 4];
+        let verts = [
+            GpuVertex { position: [-1.0, 1.0], color: white, uv: [0.0, 0.0] },
+            GpuVertex { position: [1.0, 1.0], color: white, uv: [1.0, 0.0] },
+            GpuVertex { position: [1.0, -1.0], color: white, uv: [1.0, 1.0] },
+            GpuVertex { position: [-1.0, 1.0], color: white, uv: [0.0, 0.0] },
+            GpuVertex { position: [1.0, -1.0], color: white, uv: [1.0, 1.0] },
+            GpuVertex { position: [-1.0, -1.0], color: white, uv: [0.0, 1.0] },
+        ];
+        let vertex_buffer = Buffer::from_iter(
+            self.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::VERTEX_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            verts,
+        )
+        .map_err(|e| e.to_string())?;
+
+        Ok(LightComposite {
+            pipeline,
+            descriptor,
+            vertex_buffer,
+        })
+    }
+
     fn build_command_buffer(
         &mut self,
         image_index: usize,
@@ -817,6 +1005,7 @@ impl VulkanPresenter {
         height: u32,
         clear: Color,
         batches: Vec<TextureBatch>,
+        light_composite: Option<LightComposite>,
     ) -> Result<Arc<PrimaryAutoCommandBuffer>, String> {
         let mut builder = AutoCommandBufferBuilder::primary(
             &self.command_buffer_allocator,
@@ -906,6 +1095,24 @@ impl VulkanPresenter {
                 .bind_vertex_buffers(0, vertex_buffer)
                 .map_err(|e| e.to_string())?
                 .draw(vertex_count, 1, 0, 0)
+                .map_err(|e| e.to_string())?;
+        }
+
+        // Composite the light map over the finished scene (multiply blend).
+        if let Some(composite) = light_composite {
+            builder
+                .bind_pipeline_graphics(composite.pipeline.clone())
+                .map_err(|e| e.to_string())?
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    composite.pipeline.layout().clone(),
+                    0,
+                    composite.descriptor.clone(),
+                )
+                .map_err(|e| e.to_string())?
+                .bind_vertex_buffers(0, composite.vertex_buffer.clone())
+                .map_err(|e| e.to_string())?
+                .draw(6, 1, 0, 0)
                 .map_err(|e| e.to_string())?;
         }
 
@@ -1051,6 +1258,7 @@ impl VulkanPresenter {
                     shader,
                 } => {
                     let shader = self.batch_shader_for_command(shader.as_ref())?;
+                    let color = *color;
                     push_vertices(
                         &mut current,
                         &mut batches,
@@ -1058,9 +1266,9 @@ impl VulkanPresenter {
                         TextureFilter::Nearest,
                         shader,
                         [
-                            vertex_from_point(width, height, *a, *color, [0.0, 0.0]),
-                            vertex_from_point(width, height, *b, *color, [1.0, 0.0]),
-                            vertex_from_point(width, height, *c, *color, [0.5, 1.0]),
+                            vertex_from_point(width, height, *a, color, [0.0, 0.0]),
+                            vertex_from_point(width, height, *b, color, [1.0, 0.0]),
+                            vertex_from_point(width, height, *c, color, [0.5, 1.0]),
                         ],
                     );
                 }

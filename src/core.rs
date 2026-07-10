@@ -3237,18 +3237,20 @@ pub fn add_core_components(
                 if !component.get::<bool>("visible").unwrap_or(true) {
                     return Ok(());
                 }
-                let (_, _, rotation) = crate::window::get_global_transform(&entity)?;
-                let (cx, cy) = crate::window::get_global_rotation_pivot(&entity)?;
+                let (x, y, rotation) = crate::window::get_global_transform(&entity)?;
                 let (w, h) = crate::window::get_global_size(&entity)?;
                 if w <= 0.0 || h <= 0.0 {
                     return Ok(());
                 }
+                // The entity position is its top-left; the occluder center is the
+                // middle of the (possibly rotated) bounds, matching the drawn rect.
+                let (offset_x, offset_y) = rotate_local(w * 0.5, h * 0.5, rotation);
                 render_state
                     .lock()
                     .map_err(|_| mlua::Error::external("render state lock poisoned"))?
                     .queue_occluder(Occluder {
-                        cx,
-                        cy,
+                        cx: x + offset_x,
+                        cy: y + offset_y,
                         half_w: w * 0.5,
                         half_h: h * 0.5,
                         rotation,

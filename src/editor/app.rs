@@ -3327,9 +3327,14 @@ impl EditorApp {
                     "LightOccluder2D" => {
                         let half_w = size_x * transform.scale * 0.5;
                         let half_h = size_y * transform.scale * 0.5;
+                        // Center on the (possibly rotated) visual bounds.
+                        let (cos_r, sin_r) =
+                            (transform.rotation.cos(), transform.rotation.sin());
+                        let offset_x = half_w * cos_r - half_h * sin_r;
+                        let offset_y = half_w * sin_r + half_h * cos_r;
                         occluders.push(crate::lighting::Occluder {
-                            cx: transform.x + half_w,
-                            cy: transform.y + half_h,
+                            cx: transform.x + offset_x,
+                            cy: transform.y + offset_y,
                             half_w,
                             half_h,
                             rotation: transform.rotation,

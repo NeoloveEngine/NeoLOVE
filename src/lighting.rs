@@ -118,6 +118,40 @@ impl Occluder {
     }
 }
 
+/// An occluder with its rotation and bounding radius resolved once, so the hot
+/// shadow/AO loops do no trig or square roots per sample.
+#[derive(Clone, Copy)]
+struct PreparedOccluder {
+    cx: f32,
+    cy: f32,
+    half_w: f32,
+    half_h: f32,
+    shape: OccluderShape,
+    /// cos/sin of the occluder's rotation.
+    cos_r: f32,
+    sin_r: f32,
+    bound_radius_sq: f32,
+}
+
+fn prepare_occluders(occluders: &[Occluder]) -> Vec<PreparedOccluder> {
+    occluders
+        .iter()
+        .map(|o| {
+            let br = o.bound_radius();
+            PreparedOccluder {
+                cx: o.cx,
+                cy: o.cy,
+                half_w: o.half_w,
+                half_h: o.half_h,
+                shape: o.shape,
+                cos_r: o.rotation.cos(),
+                sin_r: o.rotation.sin(),
+                bound_radius_sq: br * br,
+            }
+        })
+        .collect()
+}
+
 /// Resolution of the intermediate light map relative to the framebuffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LightQuality {
@@ -238,18 +272,17 @@ fn clamp01(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
 }
 
-/// Transform a world point into an occluder's local (unrotated, centered) frame.
+/// Transform a world point into an occluder's local (unrotated, centered) frame,
+/// using its precomputed rotation (rotate by `-rotation`).
 #[inline]
-fn to_local(occ: &Occluder, x: f32, y: f32) -> (f32, f32) {
+fn to_local(occ: &PreparedOccluder, x: f32, y: f32) -> (f32, f32) {
     let dx = x - occ.cx;
     let dy = y - occ.cy;
-    let cos_r = (-occ.rotation).cos();
-    let sin_r = (-occ.rotation).sin();
-    (dx * cos_r - dy * sin_r, dx * sin_r + dy * cos_r)
+    (dx * occ.cos_r + dy * occ.sin_r, -dx * occ.sin_r + dy * occ.cos_r)
 }
 
 #[inline]
-fn point_in_occluder(occ: &Occluder, x: f32, y: f32) -> bool {
+fn point_in_occluder(occ: &PreparedOccluder, x: f32, y: f32) -> bool {
     let (lx, ly) = to_local(occ, x, y);
     match occ.shape {
         OccluderShape::Box => lx.abs() <= occ.half_w && ly.abs() <= occ.half_h,
@@ -312,7 +345,7 @@ fn segment_hits_unit_circle(p0: (f32, f32), p1: (f32, f32)) -> bool {
 
 /// Whether the local segment crosses a single occluder's shape.
 #[inline]
-fn local_segment_hits(occ: &Occluder, p0: (f32, f32), p1: (f32, f32)) -> bool {
+fn local_segment_hits(occ: &PreparedOccluder, p0: (f32, f32), p1: (f32, f32)) -> bool {
     match occ.shape {
         OccluderShape::Box => segment_hits_box(p0, p1, occ.half_w, occ.half_h),
         OccluderShape::Circle => {
@@ -342,12 +375,11 @@ fn point_segment_dist_sq(px: f32, py: f32, a: (f32, f32), b: (f32, f32)) -> f32 
 }
 
 /// Whether the segment from a light sample to a pixel is blocked by any occluder.
-fn segment_occluded(sample: (f32, f32), pixel: (f32, f32), occluders: &[Occluder]) -> bool {
+fn segment_occluded(sample: (f32, f32), pixel: (f32, f32), occluders: &[PreparedOccluder]) -> bool {
     occluders.iter().any(|occ| {
         // Cheap reject: if the whole occluder is farther from the ray than its
         // bounding circle, it cannot block.
-        let radius = occ.bound_radius();
-        if point_segment_dist_sq(occ.cx, occ.cy, sample, pixel) > radius * radius {
+        if point_segment_dist_sq(occ.cx, occ.cy, sample, pixel) > occ.bound_radius_sq {
             return false;
         }
         let p0 = to_local(occ, sample.0, sample.1);
@@ -403,7 +435,7 @@ fn visibility(
     light: &Light,
     px: f32,
     py: f32,
-    occluders: &[Occluder],
+    occluders: &[PreparedOccluder],
     soft_radius: f32,
     samples: u32,
 ) -> f32 {
@@ -437,27 +469,25 @@ fn visibility(
 
 /// Ambient-occlusion darkening in `0..=1` (1 = fully occluded) by sampling a
 /// ring around the pixel and measuring how much lands inside occluders.
-fn ambient_occlusion(px: f32, py: f32, occluders: &[Occluder], radius: f32, samples: u32) -> f32 {
+fn ambient_occlusion(px: f32, py: f32, occluders: &[PreparedOccluder], radius: f32, samples: u32) -> f32 {
     if radius <= 0.5 || samples == 0 {
         return 0.0;
     }
     if occluders.iter().any(|occ| point_in_occluder(occ, px, py)) {
         return 1.0;
     }
+    // A single ring of samples; the light-map blur smooths the result, so a
+    // second ring is not worth the extra point-in-occluder tests.
     let mut occluded = 0u32;
-    for ring in 1..=2 {
-        let r = radius * (ring as f32 / 2.0);
-        for i in 0..samples {
-            let theta = (i as f32 / samples as f32) * std::f32::consts::TAU;
-            let sx = px + theta.cos() * r;
-            let sy = py + theta.sin() * r;
-            if occluders.iter().any(|occ| point_in_occluder(occ, sx, sy)) {
-                occluded += 3 - ring as u32;
-            }
+    for i in 0..samples {
+        let theta = (i as f32 / samples as f32) * std::f32::consts::TAU;
+        let sx = px + theta.cos() * radius;
+        let sy = py + theta.sin() * radius;
+        if occluders.iter().any(|occ| point_in_occluder(occ, sx, sy)) {
+            occluded += 1;
         }
     }
-    let max_weight = samples * (2 + 1);
-    clamp01(occluded as f32 / max_weight as f32)
+    clamp01(occluded as f32 / samples as f32)
 }
 
 /// Bilinearly sample a 3-channel light map at fractional texel coordinates.
@@ -490,8 +520,130 @@ struct LightMap {
     scale: usize,
 }
 
-/// Build the (possibly downsampled) light map: ambient + AO, then each light
-/// scattered across its own bounding box.
+/// A light contribution below this (color × attenuation × intensity) changes an
+/// 8-bit channel by less than one level, so its shadow ray is not worth casting.
+const MIN_CONTRIBUTION: f32 = 0.004;
+
+/// A light with its per-frame constants resolved once, so the hot per-texel
+/// loop does no redundant work and can run on worker threads.
+#[derive(Clone, Copy)]
+struct PreparedLight {
+    light: Light,
+    cast_shadows: bool,
+    soft_radius: f32,
+    shadow_samples: u32,
+    color: [f32; 3],
+    // World-space influence box, for a cheap per-texel skip.
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+}
+
+/// Ambient-occlusion region: the occluder union box (world space) plus the
+/// sample count, evaluated only for texels inside it.
+#[derive(Clone, Copy)]
+struct AoRegion {
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    radius: f32,
+    samples: u32,
+    intensity: f32,
+}
+
+/// Resolve a light's per-frame constants once. `bounds` is its world-space
+/// influence box (use infinities to disable the per-texel skip).
+fn prepare_light(
+    light: &Light,
+    config: &LightConfig,
+    occluders_present: bool,
+    sample_scale: u32,
+    bounds: (f32, f32, f32, f32),
+) -> PreparedLight {
+    let cast_shadows = config.shadows_enabled && light.casts_shadows && occluders_present;
+    let soft_radius = if light.shadow_softness >= 0.0 {
+        light.shadow_softness
+    } else {
+        config.soft_shadows
+    };
+    let _ = sample_scale;
+    PreparedLight {
+        light: *light,
+        cast_shadows,
+        soft_radius,
+        // Shadows are always cast hard (one ray); softness is produced by
+        // blurring the finished light map, which is far cheaper than casting
+        // many jittered rays per texel.
+        shadow_samples: 1,
+        color: [
+            light.color.r as f32 / 255.0,
+            light.color.g as f32 / 255.0,
+            light.color.b as f32 / 255.0,
+        ],
+        min_x: bounds.0,
+        min_y: bounds.1,
+        max_x: bounds.2,
+        max_y: bounds.3,
+    }
+}
+
+/// The light reaching one texel: ambient, minus ambient occlusion, plus every
+/// light that contributes meaningfully. Shared by the parallel map build and
+/// [`sample_light_at`] so the two never diverge.
+#[inline]
+fn texel_light(
+    px: f32,
+    py: f32,
+    ambient: [f32; 3],
+    prepared: &[PreparedLight],
+    occluders: &[PreparedOccluder],
+    ao_region: Option<AoRegion>,
+) -> [f32; 3] {
+    let mut acc = ambient;
+
+    if let Some(ao) = ao_region {
+        if px >= ao.min_x && px <= ao.max_x && py >= ao.min_y && py <= ao.max_y {
+            let occ = ambient_occlusion(px, py, occluders, ao.radius, ao.samples);
+            if occ > 0.0 {
+                let factor = 1.0 - ao.intensity * occ;
+                acc[0] *= factor;
+                acc[1] *= factor;
+                acc[2] *= factor;
+            }
+        }
+    }
+
+    for pl in prepared {
+        if px < pl.min_x || px > pl.max_x || py < pl.min_y || py > pl.max_y {
+            continue;
+        }
+        let atten = attenuation(&pl.light, px, py);
+        let contribution = atten * pl.light.intensity;
+        // Skip the (expensive) shadow ray where the light is imperceptible.
+        if contribution < MIN_CONTRIBUTION {
+            continue;
+        }
+        let vis = if pl.cast_shadows {
+            visibility(&pl.light, px, py, occluders, pl.soft_radius, pl.shadow_samples)
+        } else {
+            1.0
+        };
+        if vis <= 0.0 {
+            continue;
+        }
+        let s = contribution * vis;
+        acc[0] += pl.color[0] * s;
+        acc[1] += pl.color[1] * s;
+        acc[2] += pl.color[2] * s;
+    }
+
+    acc
+}
+
+/// Build the (possibly downsampled) light map: ambient + AO + all lights. The
+/// rows are split across worker threads because each texel is independent.
 fn build_light_map(
     fb_width: usize,
     fb_height: usize,
@@ -510,96 +662,91 @@ fn build_light_map(
         config.ambient.b as f32 / 255.0 * config.ambient_intensity,
     ];
 
-    let mut data = vec![0.0f32; lw * lh * 3];
+    // Resolve occluder rotation/bounds once for the whole frame.
+    let occluders = prepare_occluders(occluders);
+    let occluders = occluders.as_slice();
 
-    // Texel center in framebuffer space.
-    let to_world = |i: usize| i as f32 * scale as f32 + scale as f32 * 0.5;
-    // Framebuffer coordinate to texel index (clamped).
-    let to_texel = |c: f32, len: usize| ((c / scale as f32) as isize).clamp(0, len as isize - 1) as usize;
-
-    // Ambient fill.
-    for texel in data.chunks_exact_mut(3) {
-        texel[0] = ambient[0];
-        texel[1] = ambient[1];
-        texel[2] = ambient[2];
-    }
-
-    // Ambient occlusion, only near occluders (their union bbox padded by radius).
-    if config.ao_enabled && config.ao_intensity > 0.0 && !occluders.is_empty() {
-        let ao_samples = (config.ao_samples * sample_scale).max(1);
-        let pad = config.ao_radius.max(0.0) + 1.0;
-        let (min_x, min_y, max_x, max_y) = occluder_bounds(occluders, pad);
-        let tx0 = to_texel(min_x, lw);
-        let tx1 = to_texel(max_x, lw);
-        let ty0 = to_texel(min_y, lh);
-        let ty1 = to_texel(max_y, lh);
-        for ty in ty0..=ty1 {
-            for tx in tx0..=tx1 {
-                let px = to_world(tx);
-                let py = to_world(ty);
-                let ao = ambient_occlusion(px, py, occluders, config.ao_radius, ao_samples);
-                if ao > 0.0 {
-                    let factor = 1.0 - config.ao_intensity * ao;
-                    let idx = (ty * lw + tx) * 3;
-                    data[idx] *= factor;
-                    data[idx + 1] *= factor;
-                    data[idx + 2] *= factor;
-                }
-            }
-        }
-    }
-
-    let shadow_samples_base = (8 * sample_scale).max(4);
-
-    // Scatter each light across only the texels it can reach.
+    // Resolve each light's constants once, dropping off-screen ones.
+    let occluders_present = !occluders.is_empty();
+    let mut prepared: Vec<PreparedLight> = Vec::with_capacity(lights.len());
     for light in lights {
         if light.intensity <= 0.0 {
             continue;
         }
-        let (min_x, min_y, max_x, max_y) = light_bounds(light, fb_width, fb_height);
-        if max_x < 0.0 || max_y < 0.0 || min_x > fb_width as f32 || min_y > fb_height as f32 {
+        let bounds = light_bounds(light, fb_width, fb_height);
+        if bounds.2 < 0.0 || bounds.3 < 0.0 || bounds.0 > fb_width as f32 || bounds.1 > fb_height as f32
+        {
             continue; // fully off-screen
         }
-        let tx0 = to_texel(min_x.max(0.0), lw);
-        let tx1 = to_texel(max_x.min(fb_width as f32), lw);
-        let ty0 = to_texel(min_y.max(0.0), lh);
-        let ty1 = to_texel(max_y.min(fb_height as f32), lh);
+        prepared.push(prepare_light(light, config, occluders_present, sample_scale, bounds));
+    }
 
-        let cast_shadows = config.shadows_enabled && light.casts_shadows && !occluders.is_empty();
-        let soft_radius = if light.shadow_softness >= 0.0 {
-            light.shadow_softness
-        } else {
-            config.soft_shadows
-        };
-        let shadow_samples = if soft_radius > 0.5 { shadow_samples_base } else { 1 };
+    let ao_region = if config.ao_enabled && config.ao_intensity > 0.0 && occluders_present {
+        let pad = config.ao_radius.max(0.0) + 1.0;
+        let (min_x, min_y, max_x, max_y) = occluder_bounds(occluders, pad);
+        Some(AoRegion {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            radius: config.ao_radius,
+            samples: (config.ao_samples * sample_scale).max(1),
+            intensity: config.ao_intensity,
+        })
+    } else {
+        None
+    };
 
-        let lr = light.color.r as f32 / 255.0;
-        let lg = light.color.g as f32 / 255.0;
-        let lb = light.color.b as f32 / 255.0;
+    let mut data = vec![0.0f32; lw * lh * 3];
+    let half = scale as f32 * 0.5;
+    let step = scale as f32;
 
-        for ty in ty0..=ty1 {
-            for tx in tx0..=tx1 {
-                let px = to_world(tx);
-                let py = to_world(ty);
-                let atten = attenuation(light, px, py);
-                if atten <= 0.0 {
-                    continue;
-                }
-                let vis = if cast_shadows {
-                    visibility(light, px, py, occluders, soft_radius, shadow_samples)
-                } else {
-                    1.0
-                };
-                if vis <= 0.0 {
-                    continue;
-                }
-                let s = atten * vis * light.intensity;
-                let idx = (ty * lw + tx) * 3;
-                data[idx] += lr * s;
-                data[idx + 1] += lg * s;
-                data[idx + 2] += lb * s;
+    // One texel's light value, shared by the sequential and threaded paths.
+    let compute_row = |chunk: &mut [f32], row0: usize| {
+        let rows = chunk.len() / (lw * 3);
+        for local in 0..rows {
+            let py = (row0 + local) as f32 * step + half;
+            for lx in 0..lw {
+                let px = lx as f32 * step + half;
+                let acc = texel_light(px, py, ambient, &prepared, occluders, ao_region);
+                let o = (local * lw + lx) * 3;
+                chunk[o] = acc[0];
+                chunk[o + 1] = acc[1];
+                chunk[o + 2] = acc[2];
             }
         }
+    };
+
+    // Parallelize across rows. Each thread owns a disjoint band of the buffer.
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 16)
+        .min(lh.max(1));
+
+    if workers <= 1 || lw * lh < 4096 {
+        compute_row(&mut data, 0);
+    } else {
+        let rows_per = lh.div_ceil(workers);
+        let band = rows_per * lw * 3;
+        let compute_row = &compute_row;
+        std::thread::scope(|scope| {
+            for (index, chunk) in data.chunks_mut(band).enumerate() {
+                scope.spawn(move || compute_row(chunk, index * rows_per));
+            }
+        });
+    }
+
+    // Soft shadows: feather the hard shadow edges by blurring the map. The blur
+    // radius is the largest requested softness (in texels) among shadow casters.
+    let soft_px = prepared
+        .iter()
+        .filter(|p| p.cast_shadows)
+        .map(|p| p.soft_radius)
+        .fold(0.0f32, f32::max);
+    let blur_radius = ((soft_px / scale as f32).round() as usize).min(24);
+    if blur_radius >= 1 {
+        blur_light_map(&mut data, lw, lh, blur_radius, 2);
     }
 
     LightMap {
@@ -607,6 +754,58 @@ fn build_light_map(
         width: lw,
         height: lh,
         scale,
+    }
+}
+
+/// Separable box blur of the 3-channel light map, run `iterations` times to
+/// approximate a Gaussian. This is how soft shadows are produced: hard shadow
+/// edges in the map get feathered for a fraction of the cost of per-texel
+/// penumbra ray sampling.
+fn blur_light_map(data: &mut [f32], lw: usize, lh: usize, radius: usize, iterations: usize) {
+    if radius == 0 || lw == 0 || lh == 0 {
+        return;
+    }
+    let mut buf = vec![0.0f32; data.len()];
+    for _ in 0..iterations {
+        // Horizontal pass: data -> buf.
+        for y in 0..lh {
+            let row = y * lw;
+            for x in 0..lw {
+                let x0 = x.saturating_sub(radius);
+                let x1 = (x + radius).min(lw - 1);
+                let n = (x1 - x0 + 1) as f32;
+                let mut s = [0.0f32; 3];
+                for xx in x0..=x1 {
+                    let i = (row + xx) * 3;
+                    s[0] += data[i];
+                    s[1] += data[i + 1];
+                    s[2] += data[i + 2];
+                }
+                let o = (row + x) * 3;
+                buf[o] = s[0] / n;
+                buf[o + 1] = s[1] / n;
+                buf[o + 2] = s[2] / n;
+            }
+        }
+        // Vertical pass: buf -> data.
+        for y in 0..lh {
+            let y0 = y.saturating_sub(radius);
+            let y1 = (y + radius).min(lh - 1);
+            let n = (y1 - y0 + 1) as f32;
+            for x in 0..lw {
+                let mut s = [0.0f32; 3];
+                for yy in y0..=y1 {
+                    let i = (yy * lw + x) * 3;
+                    s[0] += buf[i];
+                    s[1] += buf[i + 1];
+                    s[2] += buf[i + 2];
+                }
+                let o = (y * lw + x) * 3;
+                data[o] = s[0] / n;
+                data[o + 1] = s[1] / n;
+                data[o + 2] = s[2] / n;
+            }
+        }
     }
 }
 
@@ -622,13 +821,13 @@ fn light_bounds(light: &Light, fb_width: usize, fb_height: usize) -> (f32, f32, 
 }
 
 /// Union bounding box of all occluders, padded on every side.
-fn occluder_bounds(occluders: &[Occluder], pad: f32) -> (f32, f32, f32, f32) {
+fn occluder_bounds(occluders: &[PreparedOccluder], pad: f32) -> (f32, f32, f32, f32) {
     let mut min_x = f32::INFINITY;
     let mut min_y = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
     let mut max_y = f32::NEG_INFINITY;
     for occ in occluders {
-        let r = occ.bound_radius() + pad;
+        let r = occ.bound_radius_sq.sqrt() + pad;
         min_x = min_x.min(occ.cx - r);
         min_y = min_y.min(occ.cy - r);
         max_x = max_x.max(occ.cx + r);
@@ -670,41 +869,106 @@ pub(crate) fn apply_lighting(
         1.0
     };
     let inv_scale = 1.0 / scale as f32;
-    for y in 0..h {
-        let fy = (y as f32 * inv_scale).min(lh as f32 - 1.0);
-        for x in 0..w {
-            let fx = (x as f32 * inv_scale).min(lw as f32 - 1.0);
-            let (mut lr, mut lg, mut lb) = if scale == 1 {
-                let idx = (y * lw + x) * 3;
-                (lightmap[idx], lightmap[idx + 1], lightmap[idx + 2])
-            } else {
-                sample_lightmap(&lightmap, lw, lh, fx, fy)
-            };
-            lr *= exposure;
-            lg *= exposure;
-            lb *= exposure;
+    let bloom = config.bloom;
+    let lightmap = lightmap.as_slice();
 
-            let idx = (y * w + x) * 4;
-            let sr = pixels[idx] as f32 / 255.0;
-            let sg = pixels[idx + 1] as f32 / 255.0;
-            let sb = pixels[idx + 2] as f32 / 255.0;
+    // Composite one band of framebuffer rows (multiply scene by the light map).
+    let composite_rows = move |chunk: &mut [u8], row0: usize| {
+        let rows = chunk.len() / (w * 4);
+        for local in 0..rows {
+            let y = row0 + local;
+            let fy = (y as f32 * inv_scale).min(lh as f32 - 1.0);
+            for x in 0..w {
+                let (mut lr, mut lg, mut lb) = if scale == 1 {
+                    let idx = (y * lw + x) * 3;
+                    (lightmap[idx], lightmap[idx + 1], lightmap[idx + 2])
+                } else {
+                    let fx = (x as f32 * inv_scale).min(lw as f32 - 1.0);
+                    sample_lightmap(lightmap, lw, lh, fx, fy)
+                };
+                lr *= exposure;
+                lg *= exposure;
+                lb *= exposure;
 
-            let mut or = sr * lr;
-            let mut og = sg * lg;
-            let mut ob = sb * lb;
+                let idx = (local * w + x) * 4;
+                let sr = chunk[idx] as f32 / 255.0;
+                let sg = chunk[idx + 1] as f32 / 255.0;
+                let sb = chunk[idx + 2] as f32 / 255.0;
 
-            if config.bloom > 0.0 {
-                or += (lr - 1.0).max(0.0) * config.bloom * sr;
-                og += (lg - 1.0).max(0.0) * config.bloom * sg;
-                ob += (lb - 1.0).max(0.0) * config.bloom * sb;
+                let mut or = sr * lr;
+                let mut og = sg * lg;
+                let mut ob = sb * lb;
+
+                if bloom > 0.0 {
+                    or += (lr - 1.0).max(0.0) * bloom * sr;
+                    og += (lg - 1.0).max(0.0) * bloom * sg;
+                    ob += (lb - 1.0).max(0.0) * bloom * sb;
+                }
+
+                chunk[idx] = (clamp01(or) * 255.0).round() as u8;
+                chunk[idx + 1] = (clamp01(og) * 255.0).round() as u8;
+                chunk[idx + 2] = (clamp01(ob) * 255.0).round() as u8;
+                // Alpha (chunk[idx + 3]) is left untouched.
             }
-
-            pixels[idx] = (clamp01(or) * 255.0).round() as u8;
-            pixels[idx + 1] = (clamp01(og) * 255.0).round() as u8;
-            pixels[idx + 2] = (clamp01(ob) * 255.0).round() as u8;
-            // Alpha (pixels[idx + 3]) is left untouched.
         }
+    };
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 16)
+        .min(h.max(1));
+    if workers <= 1 || w * h < 4096 {
+        composite_rows(&mut pixels[..h * w * 4], 0);
+    } else {
+        let rows_per = h.div_ceil(workers);
+        let band = rows_per * w * 4;
+        let composite_rows = &composite_rows;
+        std::thread::scope(|scope| {
+            for (index, chunk) in pixels[..h * w * 4].chunks_mut(band).enumerate() {
+                scope.spawn(move || composite_rows(chunk, index * rows_per));
+            }
+        });
     }
+}
+
+/// A downsampled light map encoded as RGBA8, for uploading to the GPU. Each
+/// texel is the clamped light color (× exposure); the GPU multiplies it over
+/// the scene with a linear sampler, matching the software composite. Bloom and
+/// over-bright (> 1) light are not represented — the GPU path is a plain
+/// multiply.
+pub(crate) struct LightMapImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Build the light map for a GPU composite, or `None` when lighting would not
+/// change the frame.
+pub(crate) fn render_light_map(
+    fb_width: u32,
+    fb_height: u32,
+    config: &LightConfig,
+    lights: &[Light],
+    occluders: &[Occluder],
+) -> Option<LightMapImage> {
+    if fb_width == 0 || fb_height == 0 || config.is_noop(lights, occluders) {
+        return None;
+    }
+    let map = build_light_map(fb_width as usize, fb_height as usize, config, lights, occluders);
+    let exposure = if config.exposure > 0.0 { config.exposure } else { 1.0 };
+    let mut rgba = Vec::with_capacity(map.width * map.height * 4);
+    for texel in map.data.chunks_exact(3) {
+        rgba.push((clamp01(texel[0] * exposure) * 255.0).round() as u8);
+        rgba.push((clamp01(texel[1] * exposure) * 255.0).round() as u8);
+        rgba.push((clamp01(texel[2] * exposure) * 255.0).round() as u8);
+        rgba.push(255);
+    }
+    Some(LightMapImage {
+        width: map.width as u32,
+        height: map.height as u32,
+        rgba,
+    })
 }
 
 /// Sample the light multiplier (rgb, each `>= 0`) at a single world point. Used
@@ -717,48 +981,67 @@ pub(crate) fn sample_light_at(
     lights: &[Light],
     occluders: &[Occluder],
 ) -> (f32, f32, f32) {
-    let mut r = config.ambient.r as f32 / 255.0 * config.ambient_intensity;
-    let mut g = config.ambient.g as f32 / 255.0 * config.ambient_intensity;
-    let mut b = config.ambient.b as f32 / 255.0 * config.ambient_intensity;
+    LightSampler::new(config, lights, occluders).sample(x, y)
+}
 
-    if config.ao_enabled && config.ao_intensity > 0.0 && !occluders.is_empty() {
-        let ao = ambient_occlusion(x, y, occluders, config.ao_radius, config.ao_samples.max(1));
-        let factor = 1.0 - config.ao_intensity * ao;
-        r *= factor;
-        g *= factor;
-        b *= factor;
+/// A prepared point-sampler for the light at arbitrary positions. Building it
+/// resolves lights and occluders once; `sample` is then cheap, so callers that
+/// probe many points (the GPU per-vertex path, the editor preview) build one
+/// per frame and reuse it.
+pub(crate) struct LightSampler {
+    ambient: [f32; 3],
+    exposure: f32,
+    prepared: Vec<PreparedLight>,
+    occluders: Vec<PreparedOccluder>,
+    ao_region: Option<AoRegion>,
+}
+
+impl LightSampler {
+    pub(crate) fn new(config: &LightConfig, lights: &[Light], occluders: &[Occluder]) -> Self {
+        let ambient = [
+            config.ambient.r as f32 / 255.0 * config.ambient_intensity,
+            config.ambient.g as f32 / 255.0 * config.ambient_intensity,
+            config.ambient.b as f32 / 255.0 * config.ambient_intensity,
+        ];
+        let occluders = prepare_occluders(occluders);
+        let occluders_present = !occluders.is_empty();
+        let sample_scale = config.quality.sample_scale();
+        let infinite = (f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::INFINITY);
+        let prepared: Vec<PreparedLight> = lights
+            .iter()
+            .filter(|l| l.intensity > 0.0)
+            .map(|l| prepare_light(l, config, occluders_present, sample_scale, infinite))
+            .collect();
+
+        let ao_region = if config.ao_enabled && config.ao_intensity > 0.0 && occluders_present {
+            let pad = config.ao_radius.max(0.0) + 1.0;
+            let (min_x, min_y, max_x, max_y) = occluder_bounds(&occluders, pad);
+            Some(AoRegion {
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+                radius: config.ao_radius,
+                samples: (config.ao_samples * sample_scale).max(1),
+                intensity: config.ao_intensity,
+            })
+        } else {
+            None
+        };
+
+        Self {
+            ambient,
+            exposure: if config.exposure > 0.0 { config.exposure } else { 1.0 },
+            prepared,
+            occluders,
+            ao_region,
+        }
     }
 
-    for light in lights {
-        if light.intensity <= 0.0 {
-            continue;
-        }
-        let atten = attenuation(light, x, y);
-        if atten <= 0.0 {
-            continue;
-        }
-        let cast = config.shadows_enabled && light.casts_shadows && !occluders.is_empty();
-        let soft = if light.shadow_softness >= 0.0 {
-            light.shadow_softness
-        } else {
-            config.soft_shadows
-        };
-        let vis = if cast {
-            visibility(light, x, y, occluders, soft, if soft > 0.5 { 8 } else { 1 })
-        } else {
-            1.0
-        };
-        if vis <= 0.0 {
-            continue;
-        }
-        let s = atten * vis * light.intensity;
-        r += light.color.r as f32 / 255.0 * s;
-        g += light.color.g as f32 / 255.0 * s;
-        b += light.color.b as f32 / 255.0 * s;
+    pub(crate) fn sample(&self, x: f32, y: f32) -> (f32, f32, f32) {
+        let acc = texel_light(x, y, self.ambient, &self.prepared, &self.occluders, self.ao_region);
+        (acc[0] * self.exposure, acc[1] * self.exposure, acc[2] * self.exposure)
     }
-
-    let exposure = if config.exposure > 0.0 { config.exposure } else { 1.0 };
-    (r * exposure, g * exposure, b * exposure)
 }
 
 #[cfg(test)]
