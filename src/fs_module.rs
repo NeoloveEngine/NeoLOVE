@@ -291,6 +291,17 @@ pub(crate) fn add_fs_module_with_data_root(
         })?,
     )?;
 
+    let read_bytes_resource_root = resource_root.clone();
+    let read_bytes_data_root = data_root.clone();
+    module.set(
+        "readBytes",
+        lua.create_function(move |lua, path: String| {
+            let path = resolve_read_path(&read_bytes_resource_root, &read_bytes_data_root, &path)?;
+            let bytes = fs::read(&path).map_err(|error| io_error("read file", &path, &error))?;
+            lua.create_string(&bytes)
+        })?,
+    )?;
+
     let write_root = data_root.clone();
     module.set(
         "writeFile",
@@ -511,6 +522,7 @@ mod tests {
             assert(fs.isWebAssembly() == expectedWebasm)
             assert(fs.getDataDirectory() ~= "")
             assert(fs.readFile("bundled.txt") == "bundled")
+            assert(fs.readBytes("bundled.txt") == "bundled")
             fs.writeFile("save/state.txt", "saved")
             assert(fs.readFile("save/state.txt") == "saved")
             fs.copy("bundled.txt", "copied.txt")

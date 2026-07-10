@@ -86,9 +86,10 @@ mod native {
     }
 
     #[derive(Debug)]
-    struct ServerInboundEvent {
-        client_key: String,
-        payload: Vec<u8>,
+    enum ServerInboundEvent {
+        Connected { client_key: String },
+        Payload { client_key: String, payload: Vec<u8> },
+        Disconnected { client_key: String },
     }
 
     #[derive(Debug)]
@@ -132,8 +133,14 @@ mod native {
         transport: ClientTransport,
     }
 
+    struct InlineHostedState {
+        definition: RegistryKey,
+        receiver: Receiver<ServerInboundEvent>,
+    }
+
     struct HostedHandleState {
         shared: Arc<HostedServerShared>,
+        inline: Option<InlineHostedState>,
     }
 
     struct ServersState {
@@ -946,9 +953,14 @@ mod native {
 
     fn register_remote_client(shared: &Arc<HostedServerShared>) -> ConnectResponse {
         let client_key = generate_client_key();
-        let mut clients = lock_clients(shared);
-        clients.insert(client_key.clone(), new_runtime_client_state(false, None));
+        {
+            let mut clients = lock_clients(shared);
+            clients.insert(client_key.clone(), new_runtime_client_state(false, None));
+        }
         shared.condvar.notify_all();
+        let _ = shared.inbound_sender.send(ServerInboundEvent::Connected {
+            client_key: client_key.clone(),
+        });
         ConnectResponse {
             ok: true,
             client_key,
@@ -1022,6 +1034,9 @@ mod native {
         if let Some(sender) = local_event {
             let _ = sender.send(ClientEvent::Kicked(reason));
         }
+        let _ = shared.inbound_sender.send(ServerInboundEvent::Disconnected {
+            client_key: client_key.to_string(),
+        });
         Ok(())
     }
 
@@ -1043,6 +1058,11 @@ mod native {
             changed
         };
         shared.condvar.notify_all();
+        if changed {
+            let _ = shared.inbound_sender.send(ServerInboundEvent::Disconnected {
+                client_key: client_key.to_string(),
+            });
+        }
         changed
     }
 
@@ -1261,15 +1281,18 @@ mod native {
                 }
 
                 match inbound_receiver.recv_timeout(Duration::from_millis(25)) {
-                    Ok(event) => {
+                    Ok(ServerInboundEvent::Payload {
+                        client_key,
+                        payload,
+                    }) => {
                         let functions = {
                             let callbacks = callbacks.borrow();
                             collect_registry_functions(&lua, callbacks.as_slice())?
                         };
-                        let payload = lua.create_buffer(event.payload)?;
+                        let payload = lua.create_buffer(payload)?;
                         for callback in functions {
                             if let Err(error) = protect_lua_call("running server callback", || {
-                                callback.call::<()>((event.client_key.clone(), payload.clone()))
+                                callback.call::<()>((client_key.clone(), payload.clone()))
                             }) {
                                 eprintln!(
                                     "\x1b[31mLua Error in server callback:\x1b[0m\n{}",
@@ -1278,6 +1301,8 @@ mod native {
                             }
                         }
                     }
+                    Ok(ServerInboundEvent::Connected { .. })
+                    | Ok(ServerInboundEvent::Disconnected { .. }) => {}
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
@@ -1358,7 +1383,7 @@ mod native {
                 }
                 shared
                     .inbound_sender
-                    .send(ServerInboundEvent {
+                    .send(ServerInboundEvent::Payload {
                         client_key,
                         payload: request.body,
                     })
@@ -1706,7 +1731,7 @@ mod native {
                         } else {
                             shared
                                 .inbound_sender
-                                .send(ServerInboundEvent {
+                                .send(ServerInboundEvent::Payload {
                                     client_key,
                                     payload: bytes,
                                 })
@@ -1842,6 +1867,54 @@ mod native {
         Ok(table)
     }
 
+    fn create_server_client_proxy(
+        lua: &Lua,
+        shared: Arc<HostedServerShared>,
+        client_key: String,
+    ) -> mlua::Result<Table> {
+        let table = lua.create_table()?;
+        table.set("key", client_key.clone())?;
+        table.set("is_host", client_is_host(&shared, &client_key))?;
+        let tags = lua.create_table()?;
+        for tag in client_tags(&shared, &client_key).unwrap_or_default() {
+            tags.push(tag)?;
+        }
+        table.set("tags", tags)?;
+
+        let send_shared = shared.clone();
+        let send_key = client_key.clone();
+        table.set(
+            "send",
+            lua.create_function(move |_lua, args: MultiValue| {
+                let payload = extract_last_buffer(args)?;
+                send_to_client(&send_shared, &send_key, payload.to_vec())
+                    .map(|_| true)
+                    .map_err(mlua::Error::external)
+            })?,
+        )?;
+        let kick_shared = shared.clone();
+        let kick_key = client_key.clone();
+        table.set(
+            "kick",
+            lua.create_function(move |_lua, args: MultiValue| {
+                let reason = args.into_iter().rev().find_map(|value| match value {
+                    Value::String(reason) => reason.to_str().ok().map(|value| value.to_string()),
+                    _ => None,
+                });
+                kick_client(&kick_shared, &kick_key, reason).map_err(mlua::Error::external)
+            })?,
+        )?;
+        let connected_shared = shared;
+        let connected_key = client_key;
+        table.set(
+            "isConnected",
+            lua.create_function(move |_lua, _args: MultiValue| {
+                Ok(client_is_active(&connected_shared, &connected_key))
+            })?,
+        )?;
+        Ok(table)
+    }
+
     fn create_hosted_handle(
         lua: &Lua,
         state: Rc<RefCell<ServersState>>,
@@ -1854,6 +1927,109 @@ mod native {
         table.set("client", client)?;
         table.set("port", port)?;
         table.set("url", url.clone())?;
+
+        let send_state = state.clone();
+        table.set(
+            "send",
+            lua.create_function(move |_lua, args: MultiValue| {
+                let values = args.into_vec();
+                if values.len() < 2 {
+                    return Err(mlua::Error::external(
+                        "hostedServer:send expects a client key and buffer",
+                    ));
+                }
+                let payload = match values.last() {
+                    Some(Value::Buffer(payload)) => payload.to_vec(),
+                    _ => return Err(mlua::Error::external("send payload must be a buffer")),
+                };
+                let client_key = values[..values.len() - 1]
+                    .iter()
+                    .rev()
+                    .find_map(|value| match value {
+                        Value::String(value) => value.to_str().ok().map(|value| value.to_string()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| mlua::Error::external("send client key must be a string"))?;
+                let shared = send_state
+                    .borrow()
+                    .hosted
+                    .get(&hosted_id)
+                    .map(|hosted| hosted.shared.clone())
+                    .ok_or_else(|| mlua::Error::external("hosted server is stopped"))?;
+                send_to_client(&shared, &client_key, payload).map_err(mlua::Error::external)?;
+                Ok(true)
+            })?,
+        )?;
+
+        let broadcast_state = state.clone();
+        table.set(
+            "broadcast",
+            lua.create_function(move |_lua, args: MultiValue| {
+                let payload = extract_last_buffer(args)?.to_vec();
+                let shared = broadcast_state
+                    .borrow()
+                    .hosted
+                    .get(&hosted_id)
+                    .map(|hosted| hosted.shared.clone())
+                    .ok_or_else(|| mlua::Error::external("hosted server is stopped"))?;
+                let keys = {
+                    let clients = lock_clients(&shared);
+                    clients
+                        .iter()
+                        .filter(|(_, client)| client.connected && !client.is_host)
+                        .map(|(key, _)| key.clone())
+                        .collect::<Vec<_>>()
+                };
+                let mut sent = 0usize;
+                for key in keys {
+                    if send_to_client(&shared, &key, payload.clone()).is_ok() {
+                        sent += 1;
+                    }
+                }
+                Ok(sent)
+            })?,
+        )?;
+
+        let clients_state = state.clone();
+        table.set(
+            "getClients",
+            lua.create_function(move |lua, _args: MultiValue| {
+                let shared = clients_state
+                    .borrow()
+                    .hosted
+                    .get(&hosted_id)
+                    .map(|hosted| hosted.shared.clone())
+                    .ok_or_else(|| mlua::Error::external("hosted server is stopped"))?;
+                let clients = lock_clients(&shared);
+                let result = lua.create_table()?;
+                for (key, client) in clients.iter() {
+                    if client.connected && !client.is_host {
+                        result.push(key.clone())?;
+                    }
+                }
+                Ok(result)
+            })?,
+        )?;
+
+        let count_state = state.clone();
+        table.set(
+            "getClientCount",
+            lua.create_function(move |_lua, _args: MultiValue| {
+                let shared = count_state
+                    .borrow()
+                    .hosted
+                    .get(&hosted_id)
+                    .map(|hosted| hosted.shared.clone());
+                Ok(shared
+                    .map(|shared| {
+                        lock_clients(&shared)
+                            .values()
+                            .filter(|client| client.connected && !client.is_host)
+                            .count()
+                    })
+                    .unwrap_or(0))
+            })?,
+        )?;
 
         let stop_state = state.clone();
         table.set(
@@ -1880,6 +2056,115 @@ mod native {
         )?;
 
         Ok(table)
+    }
+
+    fn host_inline_service(
+        lua: &Lua,
+        root: &Path,
+        state: Rc<RefCell<ServersState>>,
+        definition: Table,
+        port: u16,
+        options: Option<Table>,
+    ) -> mlua::Result<Table> {
+        let bind_host = match &options {
+            Some(options) => get_option_string(options, &["host"])?
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
+            None => "127.0.0.1".to_string(),
+        };
+        let cert_path = match &options {
+            Some(options) => get_option_string(options, &["certPath", "cert_path"])?,
+            None => None,
+        };
+        let key_path = match &options {
+            Some(options) => get_option_string(options, &["keyPath", "key_path"])?,
+            None => None,
+        };
+        let tls_config = match (cert_path, key_path) {
+            (Some(cert_path), Some(key_path)) => {
+                let cert_path = canonicalize_project_path(root, &cert_path)
+                    .map_err(mlua::Error::external)?;
+                let key_path = canonicalize_project_path(root, &key_path)
+                    .map_err(mlua::Error::external)?;
+                Some(build_server_tls_config(&cert_path, &key_path).map_err(mlua::Error::external)?)
+            }
+            (None, None) => None,
+            _ => {
+                return Err(mlua::Error::external(
+                    "certPath and keyPath must either both be set or both be omitted",
+                ));
+            }
+        };
+
+        let listener = TcpListener::bind(format_socket_addr(&bind_host, port))
+            .map_err(mlua::Error::external)?;
+        listener
+            .set_nonblocking(true)
+            .map_err(mlua::Error::external)?;
+        let actual_port = listener.local_addr().map_err(mlua::Error::external)?.port();
+        let url = format_public_url(
+            if tls_config.is_some() {
+                HttpScheme::Https
+            } else {
+                HttpScheme::Http
+            },
+            &bind_host,
+            actual_port,
+        );
+
+        let (inbound_sender, inbound_receiver) = mpsc::channel::<ServerInboundEvent>();
+        let host_client_key = generate_client_key();
+        let (host_event_sender, host_event_receiver) = mpsc::channel::<ClientEvent>();
+        let mut clients = HashMap::new();
+        clients.insert(
+            host_client_key.clone(),
+            new_runtime_client_state(true, Some(host_event_sender)),
+        );
+        let shared = Arc::new(HostedServerShared {
+            clients: Mutex::new(clients),
+            condvar: Condvar::new(),
+            stop_flag: AtomicBool::new(false),
+            host_client_key: host_client_key.clone(),
+            inbound_sender,
+        });
+
+        let accept_shared = shared.clone();
+        thread::spawn(move || accept_server_connections(listener, tls_config, accept_shared));
+
+        let definition = lua.create_registry_value(definition)?;
+        let (client_id, hosted_id) = {
+            let mut state = state.borrow_mut();
+            let client_id = state.next_client_id;
+            state.next_client_id = state.next_client_id.saturating_add(1);
+            state.clients.insert(
+                client_id,
+                ClientHandleState {
+                    key: host_client_key,
+                    is_host: true,
+                    connected: true,
+                    kick_reason: None,
+                    callbacks: Vec::new(),
+                    receiver: host_event_receiver,
+                    transport: ClientTransport::Local {
+                        shared: shared.clone(),
+                    },
+                },
+            );
+            let hosted_id = state.next_hosted_id;
+            state.next_hosted_id = state.next_hosted_id.saturating_add(1);
+            state.hosted.insert(
+                hosted_id,
+                HostedHandleState {
+                    shared,
+                    inline: Some(InlineHostedState {
+                        definition,
+                        receiver: inbound_receiver,
+                    }),
+                },
+            );
+            (client_id, hosted_id)
+        };
+        let client = create_client_handle(lua, state.clone(), client_id)?;
+        create_hosted_handle(lua, state, hosted_id, client, actual_port, url)
     }
 
     pub(crate) fn add_servers_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()> {
@@ -2027,7 +2312,13 @@ mod native {
 
                         let hosted_id = state.next_hosted_id;
                         state.next_hosted_id = state.next_hosted_id.saturating_add(1);
-                        state.hosted.insert(hosted_id, HostedHandleState { shared });
+                        state.hosted.insert(
+                            hosted_id,
+                            HostedHandleState {
+                                shared,
+                                inline: None,
+                            },
+                        );
                         (client_id, hosted_id)
                     };
 
@@ -2039,6 +2330,24 @@ mod native {
                         client,
                         actual_port,
                         url,
+                    )
+                },
+            )?,
+        )?;
+
+        let inline_root = env_root.clone();
+        let inline_state = state.clone();
+        module.set(
+            "_hostClass",
+            lua.create_function(
+                move |lua, (definition, port, options): (Table, u16, Option<Table>)| {
+                    host_inline_service(
+                        lua,
+                        &inline_root,
+                        inline_state.clone(),
+                        definition,
+                        port,
+                        options,
                     )
                 },
             )?,
@@ -2093,6 +2402,63 @@ mod native {
         module.set(
             "_poll",
             lua.create_function(move |lua, ()| {
+                let hosted_events = {
+                    let mut state = poll_state.borrow_mut();
+                    let mut events = Vec::new();
+                    for hosted in state.hosted.values_mut() {
+                        let Some(inline) = hosted.inline.as_mut() else {
+                            continue;
+                        };
+                        let definition = lua.registry_value::<Table>(&inline.definition)?;
+                        loop {
+                            match inline.receiver.try_recv() {
+                                Ok(event) => events.push((
+                                    definition.clone(),
+                                    hosted.shared.clone(),
+                                    event,
+                                )),
+                                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                            }
+                        }
+                    }
+                    events
+                };
+
+                for (definition, shared, event) in hosted_events {
+                    let (callback_name, client_key, payload) = match event {
+                        ServerInboundEvent::Connected { client_key } => {
+                            ("onConnect", client_key, None)
+                        }
+                        ServerInboundEvent::Payload {
+                            client_key,
+                            payload,
+                        } => ("onMessage", client_key, Some(payload)),
+                        ServerInboundEvent::Disconnected { client_key } => {
+                            ("onDisconnect", client_key, None)
+                        }
+                    };
+                    let Ok(callback) = definition.get::<Function>(callback_name) else {
+                        continue;
+                    };
+                    let client = create_server_client_proxy(lua, shared, client_key)?;
+                    let result = if let Some(payload) = payload {
+                        let payload = lua.create_buffer(payload)?;
+                        protect_lua_call("running server class message callback", || {
+                            callback.call::<()>((definition.clone(), client, payload))
+                        })
+                    } else {
+                        protect_lua_call("running server class lifecycle callback", || {
+                            callback.call::<()>((definition.clone(), client))
+                        })
+                    };
+                    if let Err(error) = result {
+                        eprintln!(
+                            "\x1b[31mLua Error in server class callback:\x1b[0m\n{}",
+                            describe_lua_error(&error)
+                        );
+                    }
+                }
+
                 let client_ids: Vec<u64> = poll_state.borrow().clients.keys().copied().collect();
 
                 for client_id in client_ids {
@@ -2157,6 +2523,152 @@ mod native {
 
         install_common_helpers(lua, &module)?;
         lua.globals().set("servers", module)?;
+        lua.load(
+            r#"
+            local rawConnect = servers.connect
+            local rawHostClass = servers._hostClass
+
+            local function encodeEvent(eventName, data)
+                return servers.serializeTable({
+                    __neolove_event = true,
+                    event = eventName,
+                    data = data,
+                })
+            end
+
+            local function decodeEvent(payload)
+                local ok, packet = pcall(servers.deserializeTable, payload)
+                if ok and type(packet) == "table" and packet.__neolove_event == true then
+                    return packet.event, packet.data, true
+                end
+                return "message", payload, false
+            end
+
+            local function decoratePeer(peer)
+                if peer.emit == nil then
+                    function peer:emit(eventName, data)
+                        return self:send(encodeEvent(eventName, data))
+                    end
+                    peer.sendEvent = peer.emit
+                end
+                return peer
+            end
+
+            local function decorateClient(client)
+                local listeners = {}
+                local anyListeners = {}
+
+                function client:on(eventName, callback)
+                    assert(type(eventName) == "string", "client:on expects an event name")
+                    assert(type(callback) == "function", "client:on expects a callback")
+                    local callbacks = listeners[eventName]
+                    if callbacks == nil then
+                        callbacks = {}
+                        listeners[eventName] = callbacks
+                    end
+                    table.insert(callbacks, callback)
+                    return callback
+                end
+
+                function client:once(eventName, callback)
+                    local connection
+                    connection = function(data, receivedEvent, source)
+                        self:off(eventName, connection)
+                        callback(data, receivedEvent, source)
+                    end
+                    self:on(eventName, connection)
+                    return connection
+                end
+
+                function client:off(eventName, callback)
+                    local callbacks = listeners[eventName]
+                    if callbacks == nil then return false end
+                    for index, candidate in ipairs(callbacks) do
+                        if candidate == callback then
+                            table.remove(callbacks, index)
+                            return true
+                        end
+                    end
+                    return false
+                end
+
+                function client:onAny(callback)
+                    assert(type(callback) == "function", "client:onAny expects a callback")
+                    table.insert(anyListeners, callback)
+                    return callback
+                end
+
+                function client:emit(eventName, data)
+                    return self:send(encodeEvent(eventName, data))
+                end
+                client.sendEvent = client.emit
+
+                client:addCallback(function(payload)
+                    local eventName, data = decodeEvent(payload)
+                    local callbacks = listeners[eventName]
+                    if callbacks ~= nil then
+                        local snapshot = table.clone(callbacks)
+                        for _, callback in ipairs(snapshot) do
+                            callback(data, eventName, client)
+                        end
+                    end
+                    for _, callback in ipairs(table.clone(anyListeners)) do
+                        callback(eventName, data, client)
+                    end
+                end)
+                return client
+            end
+
+            function servers.define(definition)
+                assert(type(definition) == "table", "servers.define expects a class-like table")
+                if definition.__neolove_service == true then return definition end
+                definition.__neolove_service = true
+
+                local onStart = definition.onStart
+                local onConnect = definition.onConnect
+                local onMessage = definition.onMessage
+                local onDisconnect = definition.onDisconnect
+
+                definition.onConnect = function(self, peer)
+                    if onConnect ~= nil then onConnect(self, decoratePeer(peer)) end
+                end
+                definition.onMessage = function(self, peer, payload)
+                    if onMessage ~= nil then
+                        local eventName, data = decodeEvent(payload)
+                        onMessage(self, decoratePeer(peer), eventName, data)
+                    end
+                end
+                definition.onDisconnect = function(self, peer)
+                    if onDisconnect ~= nil then onDisconnect(self, decoratePeer(peer)) end
+                end
+
+                function definition:host(port, options)
+                    local hosted = rawHostClass(self, port, options)
+                    hosted.service = self
+                    function hosted:emit(eventName, data)
+                        return self:broadcast(encodeEvent(eventName, data))
+                    end
+                    hosted.sendEvent = function(self, clientKey, eventName, data)
+                        return self:send(clientKey, encodeEvent(eventName, data))
+                    end
+                    if onStart ~= nil then onStart(self, hosted) end
+                    return hosted
+                end
+
+                function definition:connect(url)
+                    return decorateClient(rawConnect(url))
+                end
+
+                return definition
+            end
+
+            servers.service = servers.define
+            servers.createService = servers.define
+            servers.create_service = servers.define
+            "#,
+        )
+        .set_name("@neolove/servers-class-api")
+        .exec()?;
         Ok(())
     }
 
@@ -2210,6 +2722,71 @@ mod native {
             assert_eq!(v4.get_version_num(), 4);
             assert_eq!(v7.get_version_num(), 7);
         }
+
+        #[test]
+        fn class_service_connects_and_round_trips_events_over_loopback() -> mlua::Result<()> {
+            let root = std::env::temp_dir().join(format!(
+                "neolove_server_e2e_{}_{}",
+                std::process::id(),
+                Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).map_err(mlua::Error::external)?;
+            let lua = Lua::new();
+            add_servers_module(&lua, root.clone())?;
+            lua.load(
+                r#"
+                connected = false
+                disconnected = false
+                reply = nil
+                TestService = servers.define({
+                    onConnect = function(self, client)
+                        connected = client:isConnected()
+                    end,
+                    onMessage = function(self, client, eventName, data)
+                        if eventName == "ping" then
+                            client:emit("pong", { value = data.value + 1 })
+                        end
+                    end,
+                    onDisconnect = function(self, client)
+                        disconnected = true
+                    end,
+                })
+                testHost = TestService:host(0)
+                testClient = TestService:connect(testHost.url)
+                testClient:on("pong", function(data)
+                    reply = data.value
+                end)
+                assert(testClient:emit("ping", { value = 41 }))
+                "#,
+            )
+            .exec()?;
+
+            let poll: Function = lua.globals().get::<Table>("servers")?.get("_poll")?;
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while Instant::now() < deadline {
+                poll.call::<()>(())?;
+                if lua.globals().get::<Option<i64>>("reply")? == Some(42) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(lua.globals().get::<bool>("connected")?);
+            assert_eq!(lua.globals().get::<Option<i64>>("reply")?, Some(42));
+
+            lua.load("testClient:disconnect()").exec()?;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                poll.call::<()>(())?;
+                if lua.globals().get::<bool>("disconnected")? {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(lua.globals().get::<bool>("disconnected")?);
+            lua.load("testHost:stop()").exec()?;
+            std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+            Ok(())
+        }
     }
 }
 
@@ -2227,6 +2804,10 @@ mod native {
 
         module.set("host", unsupported.clone())?;
         module.set("connect", unsupported.clone())?;
+        module.set("define", unsupported.clone())?;
+        module.set("service", unsupported.clone())?;
+        module.set("createService", unsupported.clone())?;
+        module.set("create_service", unsupported.clone())?;
         module.set("serializeTable", unsupported.clone())?;
         module.set("serialize_table", unsupported.clone())?;
         module.set("deserializeTable", unsupported.clone())?;

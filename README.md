@@ -128,16 +128,23 @@ NeoLOVE ships with a built-in visual scene editor, similar in spirit to the
 Unity or Godot editors:
 
 ```bash
+neolove hub             # open the project Hub
 neolove editor          # edit the project in the current directory
 neolove editor my-game  # edit a specific project
 ```
+
+The Hub is the GUI launcher for creating a project, loading a project folder,
+or reopening recent projects. Running the desktop NeoLOVE executable also
+refreshes a user application-launcher entry that opens this Hub directly
+(Start Menu on Windows, `~/Applications` on macOS, and the XDG application menu
+on Linux desktop environments).
 
 The editor opens a window with a dockable or detachable **Hierarchy**, a 2D
 **Viewport**, an **Inspector**, and a bottom **Project** file browser:
 
 - Build scenes from entities and the real engine components — `Rect2D`,
   `Shape2D`, `ParticleSystem2D`, `AnimationController`, `SpatialSound2D`,
-  `TextBox`, `Sprite2D`, `NineSliceSprite2D`, `Tilemap2D`, `TileTexture2D`,
+  `TextBox`, `TextInput`, `Sprite2D`, `SpriteSheet2D`, `NineSliceSprite2D`, `Tilemap2D`, `TileTexture2D`,
   `Collider2D`, `Rigidbody2D`, `Bolt2D`, `Rope2D` — added from a dropdown,
   each with its inspector-editable properties (advanced fields collapse away).
 - Nest entities into a hierarchy by dragging rows; set per-entity `z` order and
@@ -155,7 +162,7 @@ The editor opens a window with a dockable or detachable **Hierarchy**, a 2D
   folders in your OS file manager. Create shader and animation assets from the
   editor, open `.neoanim` clips in the Bezier animation editor, and toggle the
   grid overlay and grid snapping.
-- Image components (`Sprite2D`, `Image2D`, `NineSliceSprite2D`, `TileTexture2D`)
+- Image components (`Sprite2D`, `SpriteSheet2D`, `Image2D`, `NineSliceSprite2D`, `TileTexture2D`)
   and `ParticleSystem2D` emitters load and preview their real assets in the
   viewport (with true 9-slice, tiling, and particle sprites). Paint `Tilemap2D`
   tiles directly inside selected tilemap entities. Copy/paste components
@@ -196,14 +203,16 @@ Global editor preferences are stored in your user config directory
 (`%APPDATA%\NeoLOVE\editor.json` on Windows,
 `~/Library/Application Support/NeoLOVE/editor.json` on macOS, or
 `$XDG_CONFIG_HOME/neolove/editor.json` / `~/.config/neolove/editor.json` on
-Linux). The Settings button opens editor-wide theme, font, tooltip, overlay,
-and autosave options. Older project-local `editor.json` files are still read as
-a fallback.
+Linux). The compact scene menu opens editor-wide settings with live theme
+previews, an editable persistent custom palette, and a native font-file picker;
+font changes apply immediately. Tooltip, overlay, and autosave preferences live
+there too. Older project-local `editor.json` files are still read as a fallback.
 
 ## CLI
 
 | Command | Description |
 | --- | --- |
+| `neolove hub` | Open the project Hub |
 | `neolove new <project-name>` | Create a new project |
 | `neolove run [project-dir]` | Run a project |
 | `neolove run [project-dir] --mobile` | Run with the locked mobile emulator |
@@ -215,6 +224,7 @@ a fallback.
 | `neolove api [project-dir]` | Refresh the Luau API type definitions |
 | `neolove update` | Pull, rebuild, and install the latest engine revision |
 | `neolove setup-path` | Add NeoLOVE to the user PATH |
+| `neolove setup-start-menu` | Refresh the user application-launcher entry |
 | `neolove --help` | Show CLI usage |
 | `neolove --version` | Print the installed version |
 
@@ -237,6 +247,27 @@ NeoLOVE exposes its APIs as Luau globals:
 | Gameplay helpers | `prefabs`, `prefab`, `tweening`, `tween`, `animation`, `animations` |
 | Rendering | `shaders` |
 
+Servers can be declared in-process as class-like services; no separate server
+script is needed:
+
+```luau
+local Chat = servers.define({
+    onMessage = function(self, client, event, data)
+        if event == "chat" then
+            self.hostHandle:emit("chat", { from = client.key, text = data.text })
+        end
+    end,
+    onStart = function(self, host)
+        self.hostHandle = host
+    end,
+})
+
+local host = Chat:host(4040)
+local client = Chat:connect(host.url)
+client:on("chat", function(message) print(message.text) end)
+client:emit("chat", { text = "hello" })
+```
+
 The complete typed API is defined in
 [`neolove_engine_api.d.luau`](neolove_engine_api.d.luau). Running
 `neolove api` copies the current definitions into a project's `types/`
@@ -252,6 +283,13 @@ neolove build
 
 The executable is written to `dist/<project-name>` (`.exe` on Windows) and
 contains the game files and assets.
+
+From Linux, `neolove build --windows` builds a Windows `.exe` when the
+`x86_64-pc-windows-gnu` Rust target and MinGW-w64 linker are available. From
+Windows, `neolove build --linux` builds a Linux executable when a Linux GNU
+cross linker is available. Linux-to-Windows builds statically link the MinGW
+C/C++ runtimes used by Luau, so the output remains a standalone executable and
+does not require `libstdc++-6.dll` beside it.
 
 Build for the web:
 

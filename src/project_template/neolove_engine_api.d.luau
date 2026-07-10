@@ -24,6 +24,10 @@ export type EntityListenInfo = {
 	y: number,
 	mouseX: number,
 	mouseY: number,
+	localX: number,
+	localY: number,
+	local_x: number,
+	local_y: number,
 	wheelX: number,
 	wheelY: number,
 	amount: number,
@@ -246,6 +250,7 @@ export type FsModule = {
 	getDataDirectory: () -> string,
 	dataPath: (path: string) -> string,
 	readFile: (path: string) -> string,
+	readBytes: (path: string) -> string,
 	writeFile: (path: string, content: string) -> (),
 	appendFile: (path: string, content: string) -> (),
 	exists: (path: string) -> boolean,
@@ -377,6 +382,11 @@ export type ServerClientHandle = {
 	getKey: () -> string,
 	isHost: () -> boolean,
 	getKickReason: () -> string?,
+	on: ((self: ServerClientHandle, eventName: string, callback: (data: any, eventName: string, client: ServerClientHandle) -> ()) -> ((data: any, eventName: string, client: ServerClientHandle) -> ()))?,
+	once: ((self: ServerClientHandle, eventName: string, callback: (data: any, eventName: string, client: ServerClientHandle) -> ()) -> ((data: any, eventName: string, client: ServerClientHandle) -> ()))?,
+	off: ((self: ServerClientHandle, eventName: string, callback: (...any) -> ()) -> boolean)?,
+	onAny: ((self: ServerClientHandle, callback: (eventName: string, data: any, client: ServerClientHandle) -> ()) -> ((eventName: string, data: any, client: ServerClientHandle) -> ()))?,
+	emit: ((self: ServerClientHandle, eventName: string, data: any) -> boolean)?,
 }
 
 export type HostedServerHandle = {
@@ -386,11 +396,42 @@ export type HostedServerHandle = {
 	stop: () -> boolean,
 	getPort: () -> number,
 	getUrl: () -> string,
+	send: (self: HostedServerHandle, clientKey: string, payload: buffer) -> boolean,
+	broadcast: (self: HostedServerHandle, payload: buffer) -> number,
+	getClients: (self: HostedServerHandle) -> { string },
+	getClientCount: (self: HostedServerHandle) -> number,
+	emit: ((self: HostedServerHandle, eventName: string, data: any) -> number)?,
+	sendEvent: ((self: HostedServerHandle, clientKey: string, eventName: string, data: any) -> boolean)?,
+}
+
+export type ServerPeer = {
+	key: string,
+	is_host: boolean,
+	tags: { string },
+	send: (self: ServerPeer, payload: buffer) -> boolean,
+	emit: (self: ServerPeer, eventName: string, data: any) -> boolean,
+	kick: (self: ServerPeer, reason: string?) -> (),
+	isConnected: (self: ServerPeer) -> boolean,
+}
+
+export type ServerService = {
+	name: string?,
+	onStart: ((self: ServerService, host: HostedServerHandle) -> ())?,
+	onConnect: ((self: ServerService, client: ServerPeer) -> ())?,
+	onMessage: ((self: ServerService, client: ServerPeer, eventName: string, data: any) -> ())?,
+	onDisconnect: ((self: ServerService, client: ServerPeer) -> ())?,
+	host: (self: ServerService, port: number, options: ServerHostOptions?) -> HostedServerHandle,
+	connect: (self: ServerService, url: string) -> ServerClientHandle,
+	[string]: any,
 }
 
 export type ServersModule = {
 	host: (scriptPath: string, port: number, options: ServerHostOptions?) -> HostedServerHandle,
 	connect: (url: string) -> ServerClientHandle,
+	define: (definition: { [string]: any }) -> ServerService,
+	service: (definition: { [string]: any }) -> ServerService,
+	createService: (definition: { [string]: any }) -> ServerService,
+	create_service: (definition: { [string]: any }) -> ServerService,
 	serializeTable: (value: any) -> buffer,
 	serialize_table: (value: any) -> buffer,
 	deserializeTable: (payload: buffer) -> any,
@@ -423,6 +464,8 @@ export type ShadersModule = {
 export type TransformModule = {
 	getWorldPosition: (entity: Entity) -> (number, number),
 	getWorldRotation: (entity: Entity) -> number,
+	lookAt: (from_x: number, from_y: number, to_x: number, to_y: number) -> number,
+	look_at: (from_x: number, from_y: number, to_x: number, to_y: number) -> number,
 	GetEntitiesInFront: (world_x: number, world_y: number, minimum_z: number?) -> { Entity },
 	getEntitiesInFront: (world_x: number, world_y: number, minimum_z: number?) -> { Entity },
 	doTheyOverlap: (entities: { Entity }) -> boolean,
@@ -760,6 +803,159 @@ export type TextBox = BaseDrawableComponent & UiTextStyle & {
 export type TextLabel = TextBox
 export type RudimentaryTextLabel = TextBox
 
+export type TextInput = BaseDrawableComponent & UiTextStyle & {
+	__neolove_component: "TextInput",
+	text: string,
+	placeholder: string,
+	enabled: boolean,
+	locked: boolean,
+	focused: boolean,
+	password: boolean,
+	max_length: number,
+	submit_on_enter: boolean,
+	clear_on_submit: boolean,
+	blur_on_submit: boolean,
+	cursor_index: number,
+	text_color: Color4Value,
+	placeholder_color: Color4Value,
+	caret_color: Color4Value,
+	background_color: Color4Value,
+	border_color: Color4Value,
+	border_width: number,
+	corner_radius: number,
+	caret_width: number,
+	setBold: (self: TextInput, startIndex: number, endIndex: number) -> (),
+	setItalic: (self: TextInput, startIndex: number, endIndex: number) -> (),
+	setUnderline: (self: TextInput, startIndex: number, endIndex: number) -> (),
+	setColor: (self: TextInput, startIndex: number, endIndex: number, color: Color4Value) -> (),
+	setSize: (self: TextInput, startIndex: number, endIndex: number, scale: number) -> (),
+	setFont: (self: TextInput, startIndex: number, endIndex: number, fontPath: string) -> (),
+	setOffset: (self: TextInput, startIndex: number, endIndex: number, x: number, y: number) -> (),
+	setPixelOffset: (self: TextInput, startIndex: number, endIndex: number, x: number, y: number) -> (),
+	setCharacterOffset: (self: TextInput, charIndex: number, x: number, y: number) -> (),
+	clearFormatting: (self: TextInput, startIndex: number?, endIndex: number?) -> (),
+	clearAllFormatting: (self: TextInput) -> (),
+	focus: (self: TextInput) -> (),
+	blur: (self: TextInput) -> (),
+	onChanged: ((self: Entity, text: string) -> ())?,
+	onSubmit: ((self: Entity, text: string) -> ())?,
+	onFocus: ((self: Entity) -> ())?,
+	onBlur: ((self: Entity) -> ())?,
+}
+
+-- A customizable UI container. Defaults match Visual Studio Code's Dark+ theme.
+export type Panel = BaseDrawableComponent & {
+	__neolove_component: "Panel",
+	background_color: Color4Value,
+	border_color: Color4Value,
+	border_width: number,
+	corner_radius: number,
+	background_image: ImageHandle?,
+	slice_left: number,
+	slice_right: number,
+	slice_top: number,
+	slice_bottom: number,
+}
+export type Frame = Panel
+
+-- An interactive button. Every state colour (including hover) is configurable.
+export type Button = BaseDrawableComponent & UiTextStyle & {
+	__neolove_component: "Button",
+	text: string,
+	enabled: boolean,
+	hovered: boolean,
+	pressed: boolean,
+	background_color: Color4Value,
+	hover_background_color: Color4Value,
+	pressed_background_color: Color4Value,
+	disabled_background_color: Color4Value,
+	border_color: Color4Value,
+	hover_border_color: Color4Value,
+	pressed_border_color: Color4Value,
+	disabled_border_color: Color4Value,
+	text_color: Color4Value,
+	hover_text_color: Color4Value,
+	pressed_text_color: Color4Value,
+	disabled_text_color: Color4Value,
+	border_width: number,
+	corner_radius: number,
+	icon_image: ImageHandle?,
+	icon_color: Color4Value,
+	icon_size: number,
+	icon_gap: number,
+	icon_side: "left" | "right",
+	onClick: ((self: Entity) -> ())?,
+	onPress: ((self: Entity) -> ())?,
+	onRelease: ((self: Entity) -> ())?,
+	onHoverEnter: ((self: Entity) -> ())?,
+	onHoverLeave: ((self: Entity) -> ())?,
+}
+
+-- A draggable value slider. Hover colours for the track, fill, and thumb are
+-- each configurable.
+export type Slider = BaseDrawableComponent & {
+	__neolove_component: "Slider",
+	enabled: boolean,
+	hovered: boolean,
+	dragging: boolean,
+	min: number,
+	max: number,
+	value: number,
+	fraction: number,
+	step: number,
+	orientation: "horizontal" | "vertical",
+	track_thickness: number,
+	thumb_size: number,
+	thumb_corner_radius: number,
+	corner_radius: number,
+	background_color: Color4Value,
+	hover_background_color: Color4Value,
+	disabled_background_color: Color4Value,
+	fill_color: Color4Value,
+	hover_fill_color: Color4Value,
+	disabled_fill_color: Color4Value,
+	thumb_color: Color4Value,
+	hover_thumb_color: Color4Value,
+	disabled_thumb_color: Color4Value,
+	setValue: (self: Slider, value: number) -> (),
+	onChanged: ((self: Entity, value: number) -> ())?,
+}
+
+-- A selectable dropdown with a scrollable popup menu.
+export type Dropdown = BaseDrawableComponent & UiTextStyle & {
+	__neolove_component: "Dropdown",
+	enabled: boolean,
+	open: boolean,
+	hovered: boolean,
+	selected_index: number,
+	selected_text: string,
+	selected_value: string,
+	placeholder: string,
+	options: { any },
+	item_height: number,
+	max_visible_items: number,
+	open_upwards: boolean,
+	background_color: Color4Value,
+	hover_background_color: Color4Value,
+	open_background_color: Color4Value,
+	disabled_background_color: Color4Value,
+	border_color: Color4Value,
+	hover_border_color: Color4Value,
+	open_border_color: Color4Value,
+	text_color: Color4Value,
+	menu_background_color: Color4Value,
+	menu_border_color: Color4Value,
+	item_background_color: Color4Value,
+	item_hover_background_color: Color4Value,
+	item_selected_background_color: Color4Value,
+	item_text_color: Color4Value,
+	item_hover_text_color: Color4Value,
+	item_selected_text_color: Color4Value,
+	border_width: number,
+	corner_radius: number,
+	onChanged: ((self: Entity, index: number, value: any) -> ())?,
+}
+
 export type Sprite2D = BaseDrawableComponent & {
 	__neolove_component: "Sprite2D" | "Image2D",
 	image: ImageHandle?,
@@ -778,6 +974,26 @@ export type Sprite2D = BaseDrawableComponent & {
 }
 
 export type Image2D = Sprite2D
+
+export type SpriteSheet2D = BaseDrawableComponent & {
+	__neolove_component: "SpriteSheet2D",
+	image: ImageHandle?,
+	frame_width: number,
+	frame_height: number,
+	columns: number,
+	frame_count: number,
+	spacing: number,
+	margin: number,
+	frame: number,
+	fps: number,
+	playing: boolean,
+	looping: boolean,
+	play: (self: SpriteSheet2D) -> (),
+	pause: (self: SpriteSheet2D) -> (),
+	stop: (self: SpriteSheet2D) -> (),
+	setFrame: (self: SpriteSheet2D, frame: number) -> (),
+	set_frame: (self: SpriteSheet2D, frame: number) -> (),
+}
 
 export type NineSliceSprite2D = BaseDrawableComponent & {
 	__neolove_component: "NineSliceSprite2D",
@@ -971,7 +1187,14 @@ export type CoreModule = {
 	TextBox: TextBox,
 	TextLabel: TextLabel,
 	RudimentaryTextLabel: RudimentaryTextLabel,
+	TextInput: TextInput,
+	Panel: Panel,
+	Frame: Frame,
+	Button: Button,
+	Slider: Slider,
+	Dropdown: Dropdown,
 	Sprite2D: Sprite2D,
+	SpriteSheet2D: SpriteSheet2D,
 	Image2D: Image2D,
 	NineSliceSprite2D: NineSliceSprite2D,
 	["9SliceSprite2D"]: NineSliceSprite2D,
@@ -996,6 +1219,10 @@ declare IImage: ImageHandle
 declare IAudio: SoundHandle
 declare IShader: ShaderHandle
 declare IAnimation: AnimationClip
+-- Register the current behaviour module in the editor's "Add Component" picker,
+-- so it can be attached to entities like a core component. Call it at module
+-- scope, e.g. `IComponentPicker(Behaviour)`.
+declare function IComponentPicker(behaviour: any): ()
 declare function die(): ()
 declare function softrequire(modulePathOrSource: string, allowedModules: { [string]: any } | { string }?): any
 

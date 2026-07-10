@@ -4,15 +4,78 @@
 //! and any number of [`Component`]s. Components are data-driven: a built-in
 //! ("core") component is just a kind name plus a list of typed [`Prop`]s that
 //! mirror the real engine `core.*` components, so the inspector and the Luau
-//! exporter stay in lockstep with the runtime. Scenes are persisted as JSON
-//! (`*.neoscene`) and can be exported to a runnable `main.luau`.
+//! exporter stay in lockstep with the runtime. Scenes are persisted as compact
+//! binary `*.neoscene` files, with legacy JSON reads preserved, and can be
+//! exported to a runnable `main.luau`.
 
+use std::io::{Read, Write};
 use std::path::Path;
 
+use flate2::Compression;
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+const SCENE_BINARY_MAGIC: &[u8] = b"NEOLSCN1";
+const PREFAB_BINARY_MAGIC: &[u8] = b"NEOLPFB1";
 
 /// An RGBA color stored as four bytes in `[r, g, b, a]` order.
 pub type Color = [u8; 4];
+
+fn encode_binary_document<T: Serialize>(
+    label: &str,
+    magic: &[u8],
+    value: &T,
+) -> Result<Vec<u8>, String> {
+    let mut packed = Vec::new();
+    value
+        .serialize(&mut rmp_serde::Serializer::new(&mut packed).with_struct_map())
+        .map_err(|error| format!("failed to serialize {label}: {error}"))?;
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    encoder
+        .write_all(&packed)
+        .map_err(|error| format!("failed to compress {label}: {error}"))?;
+    let compressed = encoder
+        .finish()
+        .map_err(|error| format!("failed to finish compressing {label}: {error}"))?;
+
+    let mut out = Vec::with_capacity(magic.len() + compressed.len());
+    out.extend_from_slice(magic);
+    out.extend_from_slice(&compressed);
+    Ok(out)
+}
+
+fn decode_binary_document<T: DeserializeOwned>(
+    label: &str,
+    magic: &[u8],
+    bytes: &[u8],
+) -> Result<T, String> {
+    let payload = bytes
+        .strip_prefix(magic)
+        .ok_or_else(|| format!("{label} is missing binary format header"))?;
+    let mut decoder = ZlibDecoder::new(payload);
+    let mut packed = Vec::new();
+    decoder
+        .read_to_end(&mut packed)
+        .map_err(|error| format!("failed to decompress {label}: {error}"))?;
+    rmp_serde::from_slice(&packed).map_err(|error| format!("failed to parse {label}: {error}"))
+}
+
+fn normalize_entities(entities: &mut [Entity]) {
+    for entity in entities {
+        for component in &mut entity.components {
+            normalize_core_component(component);
+        }
+    }
+}
+
+fn finish_loaded_scene(mut scene: Scene) -> Scene {
+    normalize_entities(&mut scene.entities);
+    scene.next_id = scene.entities.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+    scene
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ColorKeypoint {
@@ -147,6 +210,9 @@ impl Prop {
     }
     fn color(name: &str, label: &str, v: Color) -> Self {
         Self::new(name, label, PropValue::Color(v), false)
+    }
+    fn color_adv(name: &str, label: &str, v: Color) -> Self {
+        Self::new(name, label, PropValue::Color(v), true)
     }
     fn enumv(name: &str, label: &str, value: &str, options: &[&str], advanced: bool) -> Self {
         Self::new(
@@ -599,7 +665,15 @@ fn normalize_core_component(component: &mut Component) {
         }
     }
 
-    if name == "EntityScaler" {
+    // Components whose editable field set has grown over time. Merge in any
+    // default props this editor version knows about that the stored component is
+    // missing, so existing scenes gain new fields (e.g. UI hover colours)
+    // without losing user-authored values. Ordering follows the current
+    // defaults; unknown/forward-compatible fields are preserved at the end.
+    if matches!(
+        name.as_str(),
+        "EntityScaler" | "Panel" | "Frame" | "Button" | "Slider" | "Dropdown" | "TextInput"
+    ) {
         let mut existing = std::mem::take(props);
         let mut normalized = Vec::new();
         for default in core_component_props(name) {
@@ -625,7 +699,13 @@ pub const CORE_COMPONENTS: &[&str] = &[
     "SpatialSound2D",
     "TextBox",
     "TextLabel",
+    "TextInput",
+    "Panel",
+    "Button",
+    "Slider",
+    "Dropdown",
     "Sprite2D",
+    "SpriteSheet2D",
     "Image2D",
     "NineSliceSprite2D",
     "Tilemap2D",
@@ -809,6 +889,22 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             p.push(Prop::num_adv("source_h", "Source H", 0.0));
             p
         }
+        "SpriteSheet2D" => vec![
+            Prop::image("image", "Sprite Sheet", "assets/spritesheet.png"),
+            Prop::color("color", "Tint", [255, 255, 255, 255]),
+            Prop::boolean("visible", "Visible", true),
+            Prop::shader("shader", "Shader"),
+            Prop::num("frame_width", "Frame W", 32.0),
+            Prop::num("frame_height", "Frame H", 32.0),
+            Prop::int("frame", "Frame", 0),
+            Prop::int("frame_count", "Frame Count", 0),
+            Prop::int("columns", "Columns", 0),
+            Prop::num_adv("spacing", "Spacing", 0.0),
+            Prop::num_adv("margin", "Margin", 0.0),
+            Prop::num("fps", "FPS", 12.0),
+            Prop::boolean("playing", "Playing", true),
+            Prop::boolean("looping", "Looping", true),
+        ],
         "NineSliceSprite2D" => {
             let mut p = vec![
                 Prop::image("image", "Image", "assets/sprite.png"),
@@ -913,11 +1009,50 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
         ],
         "LegacyBolt2D" => core_component_props("Bolt2D"),
         // ---- UI components ----
-        "Frame" => vec![
-            Prop::color("color", "Color", [255, 255, 255, 255]),
+        "Frame" | "Panel" => vec![
+            Prop::color("background_color", "Background", [37, 37, 38, 255]),
+            Prop::color("border_color", "Border Color", [69, 69, 69, 255]),
             Prop::boolean("visible", "Visible", true),
-            Prop::num("corner_radius", "Corner", 10.0),
-            Prop::num("padding", "Padding", 8.0),
+            Prop::color("color", "Tint", [255, 255, 255, 255]),
+            Prop::num("corner_radius", "Corner", 4.0),
+            Prop::num_adv("border_width", "Border", 1.0),
+            Prop::image("background_image", "Background Image", ""),
+            Prop::num_adv("slice_left", "Slice L", 0.0),
+            Prop::num_adv("slice_right", "Slice R", 0.0),
+            Prop::num_adv("slice_top", "Slice T", 0.0),
+            Prop::num_adv("slice_bottom", "Slice B", 0.0),
+        ],
+        "Slider" => vec![
+            Prop::num("min", "Min", 0.0),
+            Prop::num("max", "Max", 100.0),
+            Prop::num("value", "Value", 0.0),
+            Prop::num("step", "Step", 0.0),
+            Prop::color("fill_color", "Fill", [0, 122, 204, 255]),
+            Prop::color("hover_fill_color", "Fill Hover", [17, 119, 187, 255]),
+            Prop::color("background_color", "Track", [60, 60, 60, 255]),
+            Prop::color("hover_background_color", "Track Hover", [66, 66, 66, 255]),
+            Prop::color("thumb_color", "Thumb", [204, 204, 204, 255]),
+            Prop::color("hover_thumb_color", "Thumb Hover", [255, 255, 255, 255]),
+            // Alpha of any colour below the 255 default makes it translucent.
+            Prop::color_adv("disabled_fill_color", "Fill Off", [60, 60, 60, 180]),
+            Prop::color_adv("disabled_background_color", "Track Off", [60, 60, 60, 120]),
+            Prop::color_adv("disabled_thumb_color", "Thumb Off", [128, 128, 128, 255]),
+            Prop::color_adv("border_color", "Track Border", [60, 60, 60, 255]),
+            Prop::color_adv("hover_border_color", "Border Hover", [98, 98, 98, 255]),
+            Prop::color_adv("disabled_border_color", "Border Off", [60, 60, 60, 120]),
+            Prop::boolean("visible", "Visible", true),
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::enumv(
+                "orientation",
+                "Orientation",
+                "horizontal",
+                &["horizontal", "vertical"],
+                false,
+            ),
+            Prop::num("thumb_size", "Thumb Size", 16.0),
+            Prop::num_adv("track_thickness", "Track Thick", 6.0),
+            Prop::num_adv("corner_radius", "Corner", 3.0),
+            Prop::num_adv("thumb_corner_radius", "Thumb Corner", 8.0),
         ],
         "Button" => vec![
             Prop::text("text", "Text", "Button"),
@@ -931,16 +1066,51 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
                 &["left", "center", "right"],
                 false,
             ),
-            Prop::num("corner_radius", "Corner", 8.0),
+            Prop::color("background_color", "Background", [14, 99, 156, 255]),
+            Prop::color("hover_background_color", "Bg Hover", [17, 119, 187, 255]),
+            Prop::color("text_color", "Text Color", [255, 255, 255, 255]),
+            // Extra states — each swatch opens a picker with an alpha (A) slider
+            // for transparency.
+            Prop::color_adv("pressed_background_color", "Bg Pressed", [10, 76, 121, 255]),
+            Prop::color_adv("disabled_background_color", "Bg Off", [37, 37, 38, 190]),
+            Prop::color_adv("hover_text_color", "Text Hover", [255, 255, 255, 255]),
+            Prop::color_adv("pressed_text_color", "Text Pressed", [255, 255, 255, 255]),
+            Prop::color_adv("disabled_text_color", "Text Off", [204, 204, 204, 120]),
+            Prop::color_adv("border_color", "Border Color", [14, 99, 156, 255]),
+            Prop::color_adv("hover_border_color", "Border Hover", [17, 119, 187, 255]),
+            Prop::color_adv("pressed_border_color", "Border Pressed", [10, 76, 121, 255]),
+            Prop::color_adv("disabled_border_color", "Border Off", [37, 37, 38, 190]),
+            Prop::num("corner_radius", "Corner", 2.0),
+            Prop::num_adv("border_width", "Border", 0.0),
             Prop::num_adv("padding_x", "Padding X", 12.0),
             Prop::num_adv("padding_y", "Padding Y", 8.0),
             Prop::num_adv("icon_gap", "Icon Gap", 8.0),
         ],
         "TextInput" => vec![
             Prop::text("text", "Text", ""),
-            Prop::color("color", "Color", [255, 255, 255, 255]),
+            Prop::text("placeholder", "Placeholder", "Type here"),
+            Prop::color("text_color", "Text Color", [204, 204, 204, 255]),
+            Prop::color(
+                "placeholder_color",
+                "Placeholder Color",
+                [166, 166, 166, 255],
+            ),
+            Prop::color("caret_color", "Caret Color", [174, 175, 173, 255]),
+            Prop::color("background_color", "Background", [60, 60, 60, 255]),
+            Prop::color("border_color", "Border Color", [60, 60, 60, 255]),
+            Prop::color("hover_border_color", "Border Hover", [98, 98, 98, 255]),
+            Prop::color("focus_border_color", "Focus Border", [0, 127, 212, 255]),
+            Prop::color_adv("hover_background_color", "Bg Hover", [66, 66, 66, 255]),
+            Prop::color_adv("focus_background_color", "Bg Focus", [60, 60, 60, 255]),
+            Prop::color_adv("disabled_background_color", "Bg Off", [60, 60, 60, 120]),
+            Prop::color_adv("disabled_border_color", "Border Off", [60, 60, 60, 120]),
+            Prop::color_adv("disabled_text_color", "Text Off", [204, 204, 204, 120]),
             Prop::boolean("visible", "Visible", true),
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::boolean("locked", "Locked", false),
             Prop::num("scale", "Scale", 18.0),
+            Prop::num_adv("min_scale", "Min Scale", 12.0),
+            Prop::font("font", "Font", ""),
             Prop::enumv(
                 "align_x",
                 "Align X",
@@ -948,22 +1118,58 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
                 &["left", "center", "right"],
                 false,
             ),
-            Prop::num("corner_radius", "Corner", 8.0),
+            Prop::enumv(
+                "align_y",
+                "Align Y",
+                "center",
+                &["top", "center", "bottom"],
+                false,
+            ),
+            Prop::enumv(
+                "antialiasing",
+                "Anti-aliasing",
+                "inherit",
+                &["inherit", "off", "standard", "high"],
+                false,
+            ),
+            Prop::num("corner_radius", "Corner", 2.0),
             Prop::int("max_length", "Max Length", 0),
             Prop::boolean("password", "Password", false),
             Prop::boolean_adv("submit_on_enter", "Submit Enter", true),
             Prop::boolean_adv("clear_on_submit", "Clear Submit", false),
+            Prop::boolean_adv("blur_on_submit", "Blur Submit", false),
             Prop::num_adv("border_width", "Border", 1.0),
+            Prop::num_adv("caret_width", "Caret Width", 2.0),
             Prop::num_adv("padding_x", "Padding X", 10.0),
             Prop::num_adv("padding_y", "Padding Y", 8.0),
+            Prop::num_adv("letter_spacing", "Letter Space", 0.0),
         ],
         "Dropdown" => vec![
-            Prop::color("color", "Color", [255, 255, 255, 255]),
+            Prop::color("background_color", "Background", [60, 60, 60, 255]),
+            Prop::color("hover_background_color", "Bg Hover", [74, 74, 74, 255]),
+            Prop::color("text_color", "Text Color", [240, 240, 240, 255]),
+            Prop::color("item_hover_background_color", "Item Hover", [42, 45, 46, 255]),
+            Prop::color("item_selected_background_color", "Item Selected", [9, 71, 113, 255]),
             Prop::boolean("visible", "Visible", true),
             Prop::num("scale", "Scale", 18.0),
             Prop::num("item_height", "Item H", 32.0),
             Prop::int("max_visible_items", "Max Items", 8),
-            Prop::num("corner_radius", "Corner", 8.0),
+            Prop::num("corner_radius", "Corner", 2.0),
+            // Extra state / menu colours — each swatch's picker has an alpha (A)
+            // slider for transparency.
+            Prop::color_adv("open_background_color", "Bg Open", [60, 60, 60, 255]),
+            Prop::color_adv("disabled_background_color", "Bg Off", [60, 60, 60, 120]),
+            Prop::color_adv("border_color", "Border Color", [69, 69, 69, 255]),
+            Prop::color_adv("hover_border_color", "Border Hover", [98, 98, 98, 255]),
+            Prop::color_adv("open_border_color", "Border Open", [0, 127, 212, 255]),
+            Prop::color_adv("disabled_border_color", "Border Off", [69, 69, 69, 120]),
+            Prop::color_adv("disabled_text_color", "Text Off", [204, 204, 204, 120]),
+            Prop::color_adv("menu_background_color", "Menu Bg", [37, 37, 38, 255]),
+            Prop::color_adv("menu_border_color", "Menu Border", [69, 69, 69, 255]),
+            Prop::color_adv("item_background_color", "Item Bg", [37, 37, 38, 0]),
+            Prop::color_adv("item_text_color", "Item Text", [204, 204, 204, 255]),
+            Prop::color_adv("item_hover_text_color", "Item Hover Text", [255, 255, 255, 255]),
+            Prop::color_adv("item_selected_text_color", "Item Sel Text", [255, 255, 255, 255]),
             Prop::boolean_adv("open_upwards", "Open Up", false),
             Prop::num_adv("padding_x", "Padding X", 10.0),
             Prop::num_adv("padding_y", "Padding Y", 8.0),
@@ -1006,6 +1212,24 @@ pub struct Entity {
     pub anchor_x: f32,
     #[serde(default)]
     pub anchor_y: f32,
+    /// Named position pivot. Empty means the runtime default, top-left.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub position_pivot: String,
+    /// Optional numeric position pivot fractions. When present, these override
+    /// `position_pivot`; rotation falls back to them unless it has its own
+    /// numeric pivot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pivot_x: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pivot_y: Option<f32>,
+    /// Named rotation pivot. Empty means the runtime default, top-left.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rotation_pivot: String,
+    /// Optional numeric rotation pivot fractions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_pivot_x: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_pivot_y: Option<f32>,
     /// Optional parent entity id for hierarchy nesting.
     #[serde(default)]
     pub parent: Option<u64>,
@@ -1039,6 +1263,12 @@ impl Entity {
             scale: 1.0,
             anchor_x: 0.0,
             anchor_y: 0.0,
+            position_pivot: String::new(),
+            pivot_x: None,
+            pivot_y: None,
+            rotation_pivot: String::new(),
+            rotation_pivot_x: None,
+            rotation_pivot_y: None,
             parent: None,
             enabled: true,
             components: Vec::new(),
@@ -1089,6 +1319,16 @@ impl Default for Scene {
         scene.add_entity("Entity", 200.0, 150.0);
         scene
     }
+}
+
+/// How a generated scene should obtain its shared image cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageEmitMode {
+    /// `require("./images")` — the exported start scene's cache module written
+    /// next to `main.luau`.
+    SharedModule,
+    /// Inline `assets.loadImage(...)` calls, so the scene is self-contained.
+    Inline,
 }
 
 impl Scene {
@@ -1334,31 +1574,58 @@ impl Scene {
         serde_json::to_string_pretty(self).map_err(|e| format!("failed to serialize scene: {e}"))
     }
 
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        encode_binary_document("scene", SCENE_BINARY_MAGIC, self)
+    }
+
     pub fn from_json(text: &str) -> Result<Self, String> {
-        let mut scene: Scene =
+        let scene: Scene =
             serde_json::from_str(text).map_err(|e| format!("failed to parse scene: {e}"))?;
-        for entity in &mut scene.entities {
-            for component in &mut entity.components {
-                normalize_core_component(component);
-            }
+        Ok(finish_loaded_scene(scene))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.starts_with(SCENE_BINARY_MAGIC) {
+            let scene: Scene = decode_binary_document("scene", SCENE_BINARY_MAGIC, bytes)?;
+            return Ok(finish_loaded_scene(scene));
         }
-        scene.next_id = scene.entities.iter().map(|e| e.id).max().unwrap_or(0) + 1;
-        Ok(scene)
+
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| format!("failed to read scene as UTF-8 JSON: {error}"))?;
+        Self::from_json(text)
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-        Self::from_json(&text)
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        Self::from_bytes(&bytes)
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        std::fs::write(path, self.to_json()?)
+        std::fs::write(path, self.to_bytes()?)
             .map_err(|e| format!("failed to write {}: {e}", path.display()))
     }
 
-    /// Generate a runnable `main.luau` reconstructing this scene.
+    /// Generate a runnable `main.luau` reconstructing this scene. The image
+    /// cache is pulled from the shared `./images` module written alongside
+    /// `main.luau`, so the exported start scene loads each image once.
     pub fn to_luau(&self) -> String {
+        self.to_luau_with_image_mode(ImageEmitMode::SharedModule)
+    }
+
+    /// Like [`Scene::to_luau`], but self-contained: the image cache is inlined
+    /// rather than required from the shared `./images` module. Used by the
+    /// runtime `loadScene`, which can load any scene in the project — including
+    /// scenes whose images are absent from the exported start scene's
+    /// `images.luau` (or when that module was never written because the start
+    /// scene had no images at all). Inlining keeps each loaded scene's images
+    /// present without depending on the exported cache. `assets.loadImage`
+    /// caches by path, so re-loading a shared image stays cheap.
+    pub fn to_luau_runtime(&self) -> String {
+        self.to_luau_with_image_mode(ImageEmitMode::Inline)
+    }
+
+    fn to_luau_with_image_mode(&self, image_mode: ImageEmitMode) -> String {
         let mut out = String::new();
         out.push_str("-- Generated by the NeoLOVE visual editor. Edits may be overwritten.\n");
         out.push_str(&format!("-- Scene: {}\n\n", self.name));
@@ -1368,7 +1635,20 @@ impl Scene {
         // asset work, while component code belongs in the entry module.
         let (image_paths, script_paths) = self.collect_assets();
         if !image_paths.is_empty() {
-            out.push_str("local Images = require(\"./images\")\n");
+            match image_mode {
+                ImageEmitMode::SharedModule => {
+                    out.push_str("local Images = require(\"./images\")\n");
+                }
+                ImageEmitMode::Inline => {
+                    out.push_str("local Images = {}\n");
+                    for path in &image_paths {
+                        let escaped = escape_luau(path);
+                        out.push_str(&format!(
+                            "Images[\"{escaped}\"] = assets.loadImage(\"{escaped}\")\n"
+                        ));
+                    }
+                }
+            }
         }
         let script_vars: std::collections::HashMap<String, String> = script_paths
             .iter()
@@ -1455,6 +1735,30 @@ impl Scene {
             }
             if entity.anchor_y != 0.0 {
                 out.push_str(&format!("{var}.anchor_y = {}\n", fmt_num(entity.anchor_y)));
+            }
+            if !entity.position_pivot.trim().is_empty() {
+                out.push_str(&format!(
+                    "{var}.position_pivot = \"{}\"\n",
+                    escape_luau(entity.position_pivot.trim())
+                ));
+            }
+            if let Some(pivot_x) = entity.pivot_x.filter(|value| value.is_finite()) {
+                out.push_str(&format!("{var}.pivot_x = {}\n", fmt_num(pivot_x)));
+            }
+            if let Some(pivot_y) = entity.pivot_y.filter(|value| value.is_finite()) {
+                out.push_str(&format!("{var}.pivot_y = {}\n", fmt_num(pivot_y)));
+            }
+            if !entity.rotation_pivot.trim().is_empty() {
+                out.push_str(&format!(
+                    "{var}.rotation_pivot = \"{}\"\n",
+                    escape_luau(entity.rotation_pivot.trim())
+                ));
+            }
+            if let Some(pivot_x) = entity.rotation_pivot_x.filter(|value| value.is_finite()) {
+                out.push_str(&format!("{var}.rotation_pivot_x = {}\n", fmt_num(pivot_x)));
+            }
+            if let Some(pivot_y) = entity.rotation_pivot_y.filter(|value| value.is_finite()) {
+                out.push_str(&format!("{var}.rotation_pivot_y = {}\n", fmt_num(pivot_y)));
             }
 
             for (ci, component) in entity.components.iter().enumerate() {
@@ -1642,6 +1946,45 @@ impl Scene {
     }
 }
 
+pub fn prefab_to_json(entities: &[Entity]) -> Result<String, String> {
+    serde_json::to_string_pretty(entities).map_err(|e| format!("failed to serialize prefab: {e}"))
+}
+
+pub fn prefab_to_bytes(entities: &[Entity]) -> Result<Vec<u8>, String> {
+    encode_binary_document("prefab", PREFAB_BINARY_MAGIC, &entities)
+}
+
+pub fn prefab_from_json(text: &str) -> Result<Vec<Entity>, String> {
+    let mut entities: Vec<Entity> =
+        serde_json::from_str(text).map_err(|e| format!("failed to parse prefab: {e}"))?;
+    normalize_entities(&mut entities);
+    Ok(entities)
+}
+
+pub fn prefab_from_bytes(bytes: &[u8]) -> Result<Vec<Entity>, String> {
+    if bytes.starts_with(PREFAB_BINARY_MAGIC) {
+        let mut entities: Vec<Entity> =
+            decode_binary_document("prefab", PREFAB_BINARY_MAGIC, bytes)?;
+        normalize_entities(&mut entities);
+        return Ok(entities);
+    }
+
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| format!("failed to read prefab as UTF-8 JSON: {error}"))?;
+    prefab_from_json(text)
+}
+
+pub fn load_prefab(path: &Path) -> Result<Vec<Entity>, String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    prefab_from_bytes(&bytes)
+}
+
+pub fn save_prefab(path: &Path, entities: &[Entity]) -> Result<(), String> {
+    std::fs::write(path, prefab_to_bytes(entities)?)
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
 fn fmt_num(value: f32) -> String {
     if value.fract() == 0.0 {
         format!("{}", value as i64)
@@ -1715,6 +2058,61 @@ mod tests {
         let restored = Scene::from_json(&json).expect("deserialize");
         assert_eq!(restored.entities.len(), scene.entities.len());
         assert_eq!(restored.name, scene.name);
+    }
+
+    #[test]
+    fn scene_binary_format_round_trips_and_is_smaller_for_editor_documents() {
+        let mut scene = Scene::default();
+        scene.name = "Compact".into();
+        scene.background = [1, 2, 3, 255];
+        for index in 0..40 {
+            let mut entity = scene.add_entity(format!("Entity {index}"), index as f32, 12.0);
+            entity.components.push(Component::core("Rect2D"));
+            let id = entity.id;
+            scene.replace_entity(id, entity);
+        }
+
+        let json = scene.to_json().expect("json");
+        let bytes = scene.to_bytes().expect("binary");
+        assert!(bytes.starts_with(SCENE_BINARY_MAGIC));
+        assert!(
+            bytes.len() < json.len(),
+            "binary={} json={}",
+            bytes.len(),
+            json.len()
+        );
+
+        let restored = Scene::from_bytes(&bytes).expect("restore binary");
+        assert_eq!(restored.name, "Compact");
+        assert_eq!(restored.entities.len(), scene.entities.len());
+        let json_restored = Scene::from_bytes(json.as_bytes()).expect("restore legacy json");
+        assert_eq!(json_restored.entities.len(), scene.entities.len());
+    }
+
+    #[test]
+    fn prefab_binary_format_round_trips_and_legacy_json_still_loads() {
+        let mut root = Entity::new(10, "Root", 1.0, 2.0);
+        root.components.push(Component::core("Rect2D"));
+        let mut child = Entity::new(11, "Child", 3.0, 4.0);
+        child.parent = Some(root.id);
+        child.components.push(Component::Script {
+            path: "scripts/Child.luau".into(),
+            variables: Vec::new(),
+        });
+        let entities = vec![root, child];
+
+        let json = prefab_to_json(&entities).expect("json");
+        let bytes = prefab_to_bytes(&entities).expect("binary");
+        assert!(bytes.starts_with(PREFAB_BINARY_MAGIC));
+
+        let restored = prefab_from_bytes(&bytes).expect("restore binary");
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].name, "Root");
+        assert_eq!(restored[1].parent, Some(10));
+
+        let legacy = prefab_from_bytes(json.as_bytes()).expect("restore json");
+        assert_eq!(legacy.len(), 2);
+        assert_eq!(legacy[1].name, "Child");
     }
 
     #[test]
@@ -1980,6 +2378,29 @@ mod tests {
     }
 
     #[test]
+    fn entity_pivots_export_to_luau() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        {
+            let entity = scene.entity_mut(id).expect("entity");
+            entity.position_pivot = "center".to_string();
+            entity.pivot_x = Some(0.25);
+            entity.pivot_y = Some(0.75);
+            entity.rotation_pivot = "center".to_string();
+            entity.rotation_pivot_x = Some(0.5);
+            entity.rotation_pivot_y = Some(1.0);
+        }
+
+        let luau = scene.to_luau();
+        assert!(luau.contains(".position_pivot = \"center\""));
+        assert!(luau.contains(".pivot_x = 0.25"));
+        assert!(luau.contains(".pivot_y = 0.75"));
+        assert!(luau.contains(".rotation_pivot = \"center\""));
+        assert!(luau.contains(".rotation_pivot_x = 0.5"));
+        assert!(luau.contains(".rotation_pivot_y = 1"));
+    }
+
+    #[test]
     fn reparent_cycle_detection() {
         let mut scene = Scene::default();
         let a = scene.add_entity("A", 0.0, 0.0).id;
@@ -2190,6 +2611,34 @@ mod tests {
     }
 
     #[test]
+    fn runtime_luau_inlines_images_instead_of_requiring_shared_module() {
+        // Scenes loaded at runtime via `loadScene` cannot rely on the exported
+        // start scene's `./images` module, so their image cache is inlined and
+        // self-contained.
+        let mut scene = Scene::default();
+        let mut e = scene.add_entity("Sprite", 0.0, 0.0);
+        let mut sprite = Component::core("Sprite2D");
+        if let Component::Core { props, .. } = &mut sprite {
+            for prop in props.iter_mut() {
+                if let PropValue::Image(path) = &mut prop.value {
+                    *path = "assets/only-in-scene-2.png".into();
+                }
+            }
+        }
+        e.components.push(sprite);
+        let id = e.id;
+        scene.replace_entity(id, e);
+
+        let luau = scene.to_luau_runtime();
+        assert!(!luau.contains("require(\"./images\")"));
+        assert!(luau.contains(
+            "Images[\"assets/only-in-scene-2.png\"] = assets.loadImage(\"assets/only-in-scene-2.png\")"
+        ));
+        // The component still reads its handle from the inlined cache table.
+        assert!(luau.contains("Images[\"assets/only-in-scene-2.png\"]"));
+    }
+
+    #[test]
     fn scene_without_images_emits_no_images_module() {
         let mut scene = Scene::default();
         let id = scene.entities[0].id;
@@ -2352,7 +2801,9 @@ mod tests {
     fn ui_and_legacy_components_export() {
         for name in [
             "Frame",
+            "Panel",
             "Button",
+            "Slider",
             "TextInput",
             "Dropdown",
             "ScrollList",
@@ -2372,6 +2823,34 @@ mod tests {
                 "missing {name}"
             );
         }
+    }
+
+    #[test]
+    fn normalize_merges_new_ui_state_colours_into_existing_components() {
+        // A Button saved before hover/state colours existed: only the old field
+        // set is present.
+        let mut component = Component::Core {
+            name: "Button".to_string(),
+            props: vec![
+                Prop::text("text", "Text", "Connect"),
+                Prop::color("background_color", "Background", [131, 131, 131, 255]),
+            ],
+        };
+        normalize_core_component(&mut component);
+        let Component::Core { props, .. } = &component else {
+            panic!("expected core component");
+        };
+        // The user's authored value is preserved.
+        let bg = props
+            .iter()
+            .find(|prop| prop.name == "background_color")
+            .expect("background preserved");
+        assert!(matches!(bg.value, PropValue::Color([131, 131, 131, 255])));
+        // The new hover colour is merged in.
+        assert!(
+            props.iter().any(|prop| prop.name == "hover_background_color"),
+            "hover_background_color should be added"
+        );
     }
 
     #[test]

@@ -8,14 +8,53 @@ use crate::scene::{DictionaryEntry, ScriptVar, VarControl, VarKey, VarValue};
 
 const MAX_INSPECTOR_INSTRUCTIONS: usize = 200_000;
 
+/// The editor-relevant facts a behaviour module exposes: its `Inspector(...)`
+/// fields plus whether it opted into the "Add Component" picker by calling
+/// `IComponentPicker(Behaviour)` at module scope.
+pub(crate) struct InspectorModule {
+    pub variables: Vec<ScriptVar>,
+    pub registers_component_picker: bool,
+}
+
+/// Backwards-compatible helper returning only a module's inspector variables.
 pub(crate) fn parse_inspector_variables(
     source: &str,
     source_name: &str,
 ) -> Result<Vec<ScriptVar>, String> {
+    parse_inspector_module(source, source_name).map(|module| module.variables)
+}
+
+/// Whether a behaviour script registers itself as a picker component via
+/// `IComponentPicker(Behaviour)`. Parse failures resolve to `false` so a broken
+/// script never blocks the picker.
+pub(crate) fn script_registers_component_picker(source: &str, source_name: &str) -> bool {
+    parse_inspector_module(source, source_name)
+        .map(|module| module.registers_component_picker)
+        .unwrap_or(false)
+}
+
+pub(crate) fn parse_inspector_module(
+    source: &str,
+    source_name: &str,
+) -> Result<InspectorModule, String> {
     let lua = Lua::new();
     let environment = lua.create_table().map_err(|error| error.to_string())?;
     let declaration_order = Rc::new(Cell::new(0usize));
     let order_for_inspector = declaration_order.clone();
+
+    // `IComponentPicker(Behaviour)` marks a script for the "Add Component"
+    // picker. We only need to know that it was called; the argument is ignored.
+    let registers_component_picker = Rc::new(Cell::new(false));
+    let registers_flag = registers_component_picker.clone();
+    let picker_fn = lua
+        .create_function(move |_, _args: Variadic<Value>| {
+            registers_flag.set(true);
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?;
+    environment
+        .raw_set("IComponentPicker", picker_fn)
+        .map_err(|error| error.to_string())?;
     let inspector = lua
         .create_function(move |lua, arguments: Variadic<Value>| {
             if arguments.is_empty() {
@@ -209,7 +248,10 @@ pub(crate) fn parse_inspector_variables(
         variables.push((order, variable));
     }
     variables.sort_by_key(|(order, _)| *order);
-    Ok(variables.into_iter().map(|(_, variable)| variable).collect())
+    Ok(InspectorModule {
+        variables: variables.into_iter().map(|(_, variable)| variable).collect(),
+        registers_component_picker: registers_component_picker.get(),
+    })
 }
 
 /// A permissive placeholder table used in place of engine globals during
@@ -530,6 +572,29 @@ mod tests {
         assert_eq!(variables.len(), 1);
         assert_eq!(variables[0].name, "Padding");
         assert!(matches!(variables[0].value, VarValue::Number(10.0)));
+    }
+
+    #[test]
+    fn detects_component_picker_registration() {
+        let registered = r#"
+            local Behaviour = {
+                speed = Inspector(100),
+            }
+            function Behaviour.awake(entity, self) end
+            IComponentPicker(Behaviour)
+            return Behaviour
+        "#;
+        assert!(script_registers_component_picker(registered, "Registered.luau"));
+        // Inspector variables are still extracted from a registered module.
+        let variables = parse_inspector_variables(registered, "Registered.luau").expect("parse");
+        assert_eq!(variables.len(), 1);
+        assert_eq!(variables[0].name, "speed");
+
+        let plain = r#"
+            local Behaviour = { speed = Inspector(100) }
+            return Behaviour
+        "#;
+        assert!(!script_registers_component_picker(plain, "Plain.luau"));
     }
 
     #[test]

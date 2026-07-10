@@ -104,6 +104,88 @@ fn rotate_local(x: f32, y: f32, rotation: f32) -> (f32, f32) {
     (x * cos_r - y * sin_r, x * sin_r + y * cos_r)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VisibleTileCells {
+    column_start: usize,
+    column_end: usize,
+    row_start: usize,
+    row_end: usize,
+}
+
+/// Conservative tile-cell culling in the layer's unrotated coordinate space.
+/// Rotating the viewport corners back into the map makes this work for both
+/// ordinary and rotated tilemaps while keeping large maps from queueing every
+/// off-screen tile each frame.
+#[allow(clippy::too_many_arguments)]
+fn visible_tile_cells(
+    base_x: f32,
+    base_y: f32,
+    width: f32,
+    height: f32,
+    pivot: Vec2,
+    rotation: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+    columns: usize,
+    rows: usize,
+) -> Option<VisibleTileCells> {
+    if width <= 0.0
+        || height <= 0.0
+        || viewport_width <= 0.0
+        || viewport_height <= 0.0
+        || columns == 0
+        || rows == 0
+    {
+        return None;
+    }
+
+    let mut left = f32::INFINITY;
+    let mut top = f32::INFINITY;
+    let mut right = f32::NEG_INFINITY;
+    let mut bottom = f32::NEG_INFINITY;
+    for (screen_x, screen_y) in [
+        (0.0, 0.0),
+        (viewport_width, 0.0),
+        (viewport_width, viewport_height),
+        (0.0, viewport_height),
+    ] {
+        let (local_x, local_y) =
+            rotate_local(screen_x - pivot.x, screen_y - pivot.y, -rotation);
+        let x = pivot.x + local_x;
+        let y = pivot.y + local_y;
+        left = left.min(x);
+        top = top.min(y);
+        right = right.max(x);
+        bottom = bottom.max(y);
+    }
+
+    left = left.max(base_x);
+    top = top.max(base_y);
+    right = right.min(base_x + width);
+    bottom = bottom.min(base_y + height);
+    if right <= left || bottom <= top {
+        return None;
+    }
+
+    let cell_width = width / columns as f32;
+    let cell_height = height / rows as f32;
+    let column_start = (((left - base_x) / cell_width).floor() as isize)
+        .clamp(0, columns as isize) as usize;
+    let column_end = (((right - base_x) / cell_width).ceil() as isize)
+        .clamp(0, columns as isize) as usize;
+    let row_start = (((top - base_y) / cell_height).floor() as isize)
+        .clamp(0, rows as isize) as usize;
+    let row_end = (((bottom - base_y) / cell_height).ceil() as isize)
+        .clamp(0, rows as isize) as usize;
+
+    (column_start < column_end && row_start < row_end).then_some(VisibleTileCells {
+        column_start,
+        column_end,
+        row_start,
+        row_end,
+    })
+}
+
 fn particle_random(seed: &mut u32) -> f32 {
     *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
     (*seed as f32) / (u32::MAX as f32)
@@ -1847,7 +1929,7 @@ fn build_text_request(
         tab_size,
         stretch_width: 0.0,
         stretch_height: 0.0,
-        rich_text: Vec::new(),
+        rich_text: rich_text_ranges_from_component(root, component).unwrap_or_default(),
         antialiasing: component
             .get::<String>("antialiasing")
             .ok()
@@ -2574,6 +2656,20 @@ fn call_component_string_callback(
         let value = value.to_string();
         protect_lua_call(&format!("running component callback '{name}'"), || {
             callback.call::<()>((entity.clone(), component.clone(), value.clone()))
+        })?;
+    }
+    Ok(())
+}
+
+fn call_component_number_callback(
+    component: &Table,
+    entity: &Table,
+    name: &str,
+    value: f32,
+) -> mlua::Result<()> {
+    if let Ok(callback) = component.get::<Function>(name) {
+        protect_lua_call(&format!("running component callback '{name}'"), || {
+            callback.call::<()>((entity.clone(), component.clone(), value))
         })?;
     }
     Ok(())
@@ -3605,11 +3701,12 @@ pub fn add_core_components(
         core_components.set("RudimentaryTextLabel", textbox)?;
     }
 
-    // Legacy interactive UI components are intentionally disabled.
-    #[cfg(any())]
+    // Interactive UI components. These share the ordinary component lifecycle,
+    // so they can be composed with transforms, prefabs, and scene export.
     {
-        // Frame
-        // customizable UI panel with borders, rounded corners, and optional 9-slice background image
+        // Panel
+        // customizable UI container with borders, rounded corners, and optional 9-slice background image.
+        // Defaults follow Visual Studio Code's Dark+ theme (editor sidebar/panel colours).
         {
             let frame = create_basic_drawable(lua)?;
             frame.set(
@@ -3617,11 +3714,12 @@ pub fn add_core_components(
                 lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
                     component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
                     component.set("visible", true)?;
-                    component.set("__neolove_component", "Frame")?;
-                    component.set("background_color", color4(ctx, 32, 36, 44, 230)?)?;
-                    component.set("border_color", color4(ctx, 92, 106, 130, 255)?)?;
+                    component.set("__neolove_component", "Panel")?;
+                    // VS Code Dark+: sideBar.background #252526, widget border #454545.
+                    component.set("background_color", color4(ctx, 37, 37, 38, 255)?)?;
+                    component.set("border_color", color4(ctx, 69, 69, 69, 255)?)?;
                     component.set("border_width", 1.0)?;
-                    component.set("corner_radius", 10.0)?;
+                    component.set("corner_radius", 4.0)?;
                     component.set("background_image", Value::Nil)?;
                     component.set("slice_left", 0.0)?;
                     component.set("slice_right", 0.0)?;
@@ -3660,11 +3758,13 @@ pub fn add_core_components(
                 })?,
             )?;
 
+            core_components.set("Panel", frame.clone())?;
             core_components.set("Frame", frame)?;
         }
 
         // Button
-        // interactive UI button with customizable panel states and text rendering
+        // interactive UI button with customizable panel states and text rendering.
+        // Defaults follow Visual Studio Code's Dark+ theme (button.* colours).
         {
             let button = create_basic_drawable(lua)?;
             button.set(
@@ -3689,20 +3789,23 @@ pub fn add_core_components(
                     component.set("line_spacing", 1.0)?;
                     component.set("letter_spacing", 0.0)?;
                     component.set("font", Value::Nil)?;
-                    component.set("background_color", color4(ctx, 52, 68, 94, 255)?)?;
-                    component.set("hover_background_color", color4(ctx, 67, 86, 118, 255)?)?;
-                    component.set("pressed_background_color", color4(ctx, 39, 51, 73, 255)?)?;
-                    component.set("disabled_background_color", color4(ctx, 45, 48, 52, 190)?)?;
-                    component.set("border_color", color4(ctx, 140, 164, 196, 255)?)?;
-                    component.set("hover_border_color", color4(ctx, 180, 205, 235, 255)?)?;
-                    component.set("pressed_border_color", color4(ctx, 110, 130, 158, 255)?)?;
-                    component.set("disabled_border_color", color4(ctx, 80, 84, 92, 170)?)?;
-                    component.set("text_color", color4(ctx, 242, 245, 250, 255)?)?;
+                    // VS Code Dark+: button.background #0e639c, hoverBackground #1177bb,
+                    // foreground #ffffff. Buttons are borderless; keep border colours in
+                    // sync with the fill so users can opt into a border by widening it.
+                    component.set("background_color", color4(ctx, 14, 99, 156, 255)?)?;
+                    component.set("hover_background_color", color4(ctx, 17, 119, 187, 255)?)?;
+                    component.set("pressed_background_color", color4(ctx, 10, 76, 121, 255)?)?;
+                    component.set("disabled_background_color", color4(ctx, 37, 37, 38, 190)?)?;
+                    component.set("border_color", color4(ctx, 14, 99, 156, 255)?)?;
+                    component.set("hover_border_color", color4(ctx, 17, 119, 187, 255)?)?;
+                    component.set("pressed_border_color", color4(ctx, 10, 76, 121, 255)?)?;
+                    component.set("disabled_border_color", color4(ctx, 37, 37, 38, 190)?)?;
+                    component.set("text_color", color4(ctx, 255, 255, 255, 255)?)?;
                     component.set("hover_text_color", color4(ctx, 255, 255, 255, 255)?)?;
-                    component.set("pressed_text_color", color4(ctx, 220, 228, 239, 255)?)?;
-                    component.set("disabled_text_color", color4(ctx, 170, 175, 182, 210)?)?;
-                    component.set("border_width", 1.0)?;
-                    component.set("corner_radius", 8.0)?;
+                    component.set("pressed_text_color", color4(ctx, 255, 255, 255, 255)?)?;
+                    component.set("disabled_text_color", color4(ctx, 204, 204, 204, 120)?)?;
+                    component.set("border_width", 0.0)?;
+                    component.set("corner_radius", 2.0)?;
                     component.set("background_image", Value::Nil)?;
                     component.set("icon_image", Value::Nil)?;
                     component.set("icon_color", color4(ctx, 255, 255, 255, 255)?)?;
@@ -3878,6 +3981,7 @@ pub fn add_core_components(
                     component.set("text", "")?;
                     component.set("placeholder", "Type here")?;
                     component.set("enabled", true)?;
+                    component.set("locked", false)?;
                     component.set("hovered", false)?;
                     component.set("focused", false)?;
                     component.set("password", false)?;
@@ -3901,20 +4005,24 @@ pub fn add_core_components(
                     component.set("line_spacing", 1.0)?;
                     component.set("letter_spacing", 0.0)?;
                     component.set("font", Value::Nil)?;
-                    component.set("background_color", color4(ctx, 22, 26, 33, 245)?)?;
-                    component.set("hover_background_color", color4(ctx, 26, 31, 40, 250)?)?;
-                    component.set("focus_background_color", color4(ctx, 18, 24, 34, 255)?)?;
-                    component.set("disabled_background_color", color4(ctx, 33, 35, 40, 200)?)?;
-                    component.set("border_color", color4(ctx, 86, 96, 116, 255)?)?;
-                    component.set("hover_border_color", color4(ctx, 124, 141, 170, 255)?)?;
-                    component.set("focus_border_color", color4(ctx, 166, 204, 255, 255)?)?;
-                    component.set("disabled_border_color", color4(ctx, 66, 72, 84, 180)?)?;
-                    component.set("text_color", color4(ctx, 235, 239, 244, 255)?)?;
-                    component.set("placeholder_color", color4(ctx, 138, 147, 162, 220)?)?;
-                    component.set("disabled_text_color", color4(ctx, 150, 154, 162, 210)?)?;
-                    component.set("caret_color", color4(ctx, 240, 244, 250, 255)?)?;
+                    component.set("antialiasing", "inherit")?;
+                    component.set("__rich_text_ranges", ctx.create_table()?)?;
+                    // VS Code Dark+: input.background #3c3c3c, foreground #cccccc,
+                    // placeholderForeground #a6a6a6, focusBorder #007fd4, cursor #aeafad.
+                    component.set("background_color", color4(ctx, 60, 60, 60, 255)?)?;
+                    component.set("hover_background_color", color4(ctx, 66, 66, 66, 255)?)?;
+                    component.set("focus_background_color", color4(ctx, 60, 60, 60, 255)?)?;
+                    component.set("disabled_background_color", color4(ctx, 60, 60, 60, 120)?)?;
+                    component.set("border_color", color4(ctx, 60, 60, 60, 255)?)?;
+                    component.set("hover_border_color", color4(ctx, 98, 98, 98, 255)?)?;
+                    component.set("focus_border_color", color4(ctx, 0, 127, 212, 255)?)?;
+                    component.set("disabled_border_color", color4(ctx, 60, 60, 60, 120)?)?;
+                    component.set("text_color", color4(ctx, 204, 204, 204, 255)?)?;
+                    component.set("placeholder_color", color4(ctx, 166, 166, 166, 255)?)?;
+                    component.set("disabled_text_color", color4(ctx, 204, 204, 204, 120)?)?;
+                    component.set("caret_color", color4(ctx, 174, 175, 173, 255)?)?;
                     component.set("border_width", 1.0)?;
-                    component.set("corner_radius", 8.0)?;
+                    component.set("corner_radius", 2.0)?;
                     component.set("background_image", Value::Nil)?;
                     component.set("icon_image", Value::Nil)?;
                     component.set("icon_color", color4(ctx, 255, 255, 255, 255)?)?;
@@ -3929,6 +4037,37 @@ pub fn add_core_components(
                 })?,
             )?;
 
+            // TextInput uses the same rich-text editing surface as TextBox.
+            // Reusing the functions keeps formatting behavior and indexing
+            // identical across display and editable text.
+            let textbox: Table = core_components.get("TextBox")?;
+            for method in [
+                "setBold",
+                "setItalic",
+                "setUnderline",
+                "setColor",
+                "setSize",
+                "setFont",
+                "setOffset",
+                "setPixelOffset",
+                "setCharacterOffset",
+                "clearFormatting",
+                "clearAllFormatting",
+            ] {
+                text_input.set(method, textbox.get::<Value>(method)?)?;
+            }
+            let focus_input = lua.create_function(|_ctx, component: Table| {
+                let enabled = component.get::<bool>("enabled").unwrap_or(true)
+                    && !component.get::<bool>("locked").unwrap_or(false);
+                component.set("focused", enabled)
+            })?;
+            text_input.set("focus", focus_input.clone())?;
+            text_input.set("Focus", focus_input)?;
+            let blur_input =
+                lua.create_function(|_ctx, component: Table| component.set("focused", false))?;
+            text_input.set("blur", blur_input.clone())?;
+            text_input.set("Blur", blur_input)?;
+
             let input_platform = platform.clone();
             let text_root = env_root.clone();
             let render_state = render_state.clone();
@@ -3942,7 +4081,8 @@ pub fn add_core_components(
                     let draw = get_entity_draw_context(&entity)?;
                     let snapshot = current_input_snapshot(&input_platform)?;
                     let owner_key = component_owner_key(&entity, &component);
-                    let enabled = component.get::<bool>("enabled").unwrap_or(true);
+                    let enabled = component.get::<bool>("enabled").unwrap_or(true)
+                        && !component.get::<bool>("locked").unwrap_or(false);
                     let hovered = enabled
                         && point_in_bounds(snapshot.mouse, draw.bounds, draw.pivot, draw.rotation)
                         && !point_blocked_by_popup(snapshot.mouse, &owner_key);
@@ -3975,6 +4115,48 @@ pub fn add_core_components(
                         .unwrap_or_else(|_| char_count(&text))
                         .min(char_count(&text));
                     let mut changed = false;
+
+                    // Place the caret at the closest character when focus was
+                    // acquired by clicking, including on rotated inputs.
+                    if left_pressed && hovered {
+                        let local = world_point_to_local(
+                            snapshot.mouse,
+                            draw.pivot,
+                            draw.rotation,
+                        );
+                        let border = component.get::<f32>("border_width").unwrap_or(1.0).max(0.0);
+                        let padding = component.get::<f32>("padding").unwrap_or(8.0).max(0.0);
+                        let padding_x = component
+                            .get::<f32>("padding_x")
+                            .unwrap_or(padding)
+                            .max(0.0);
+                        let target_x = (local.x - draw.bounds.x - border - padding_x).max(0.0);
+                        let display = if component.get::<bool>("password").unwrap_or(false) {
+                            "*".repeat(char_count(&text))
+                        } else {
+                            text.clone()
+                        };
+                        let view_start = component.get::<usize>("view_start").unwrap_or(0);
+                        cursor = view_start.min(char_count(&display));
+                        for index in (cursor + 1)..=char_count(&display) {
+                            let previous = measure_inline_text(
+                                &text_root,
+                                &component,
+                                &slice_chars(&display, view_start, index - 1),
+                                None,
+                            );
+                            let current = measure_inline_text(
+                                &text_root,
+                                &component,
+                                &slice_chars(&display, view_start, index),
+                                None,
+                            );
+                            if target_x < (previous + current) * 0.5 {
+                                break;
+                            }
+                            cursor = index;
+                        }
+                    }
 
                     if focused && enabled {
                         if let Some(key) = snapshot.input.last_key_pressed.clone() {
@@ -4155,7 +4337,7 @@ pub fn add_core_components(
                         let placeholder =
                             component.get::<String>("placeholder").unwrap_or_default();
                         if !placeholder.is_empty() {
-                            renderer.queue(DrawCommand::Text(build_text_request(
+                            let mut request = build_text_request(
                                 &text_root,
                                 &component,
                                 placeholder,
@@ -4170,10 +4352,12 @@ pub fn add_core_components(
                                 TextWrapMode::None,
                                 0.0,
                                 0.0,
-                            )));
+                            );
+                            request.rich_text.clear();
+                            renderer.queue(DrawCommand::Text(request));
                         }
                     } else {
-                        renderer.queue(DrawCommand::Text(build_text_request(
+                        let mut request = build_text_request(
                             &text_root,
                             &component,
                             visible_text.clone(),
@@ -4188,17 +4372,51 @@ pub fn add_core_components(
                             TextWrapMode::None,
                             0.0,
                             0.0,
-                        )));
+                        );
+                        request.rich_text = request
+                            .rich_text
+                            .into_iter()
+                            .filter_map(|mut range| {
+                                let start = range.start.max(view_start);
+                                let end = range.end.min(visible_end);
+                                if end <= start {
+                                    return None;
+                                }
+                                range.start = start - view_start;
+                                range.end = end - view_start;
+                                Some(range)
+                            })
+                            .collect();
+                        renderer.queue(DrawCommand::Text(request));
                     }
 
                     if focused && ((blink * 1.6).floor() as i32 % 2 == 0) {
                         let caret_prefix = slice_chars(&display_text, view_start, cursor);
                         let caret_offset =
                             measure_inline_text(&text_root, &component, &caret_prefix, None);
+                        let visible_width =
+                            measure_inline_text(&text_root, &component, &visible_text, None);
+                        let caret_origin = match get_string_field(
+                            &component,
+                            "align_x",
+                            "alignX",
+                        )
+                        .as_deref()
+                        .map(parse_align_x)
+                        .unwrap_or(TextAlignX::Left)
+                        {
+                            TextAlignX::Center => {
+                                text_bounds.x + (text_bounds.w - visible_width).max(0.0) * 0.5
+                            }
+                            TextAlignX::Right => {
+                                text_bounds.x + (text_bounds.w - visible_width).max(0.0)
+                            }
+                            TextAlignX::Left => text_bounds.x,
+                        };
                         let caret_width =
                             component.get::<f32>("caret_width").unwrap_or(2.0).max(1.0);
                         let caret_bounds = Rect {
-                            x: text_bounds.x + caret_offset,
+                            x: caret_origin + caret_offset,
                             y: text_bounds.y + 3.0,
                             w: caret_width,
                             h: (text_bounds.h - 6.0).max(4.0),
@@ -4220,7 +4438,8 @@ pub fn add_core_components(
         }
 
         // Dropdown
-        // selectable list with customizable closed/open state styling
+        // selectable list with customizable closed/open state styling.
+        // Defaults follow Visual Studio Code's Dark+ theme (dropdown.* / list.* colours).
         {
             let dropdown = create_basic_drawable(lua)?;
             dropdown.set(
@@ -4259,32 +4478,36 @@ pub fn add_core_components(
                     component.set("line_spacing", 1.0)?;
                     component.set("letter_spacing", 0.0)?;
                     component.set("font", Value::Nil)?;
-                    component.set("background_color", color4(ctx, 34, 40, 52, 255)?)?;
-                    component.set("hover_background_color", color4(ctx, 43, 52, 67, 255)?)?;
-                    component.set("open_background_color", color4(ctx, 28, 36, 48, 255)?)?;
-                    component.set("disabled_background_color", color4(ctx, 42, 44, 48, 200)?)?;
-                    component.set("border_color", color4(ctx, 112, 126, 151, 255)?)?;
-                    component.set("hover_border_color", color4(ctx, 154, 173, 205, 255)?)?;
-                    component.set("open_border_color", color4(ctx, 180, 210, 255, 255)?)?;
-                    component.set("disabled_border_color", color4(ctx, 76, 80, 90, 180)?)?;
-                    component.set("text_color", color4(ctx, 240, 244, 250, 255)?)?;
-                    component.set("disabled_text_color", color4(ctx, 168, 172, 180, 210)?)?;
-                    component.set("menu_background_color", color4(ctx, 20, 24, 30, 250)?)?;
-                    component.set("menu_border_color", color4(ctx, 112, 126, 151, 255)?)?;
-                    component.set("item_background_color", color4(ctx, 20, 24, 30, 0)?)?;
+                    // VS Code Dark+: dropdown.background #3c3c3c, foreground #f0f0f0,
+                    // border #454545, focusBorder #007fd4. Menu uses editorWidget.background
+                    // #252526; items use list.hoverBackground #2a2d2e and
+                    // list.activeSelectionBackground #094771.
+                    component.set("background_color", color4(ctx, 60, 60, 60, 255)?)?;
+                    component.set("hover_background_color", color4(ctx, 74, 74, 74, 255)?)?;
+                    component.set("open_background_color", color4(ctx, 60, 60, 60, 255)?)?;
+                    component.set("disabled_background_color", color4(ctx, 60, 60, 60, 120)?)?;
+                    component.set("border_color", color4(ctx, 69, 69, 69, 255)?)?;
+                    component.set("hover_border_color", color4(ctx, 98, 98, 98, 255)?)?;
+                    component.set("open_border_color", color4(ctx, 0, 127, 212, 255)?)?;
+                    component.set("disabled_border_color", color4(ctx, 69, 69, 69, 120)?)?;
+                    component.set("text_color", color4(ctx, 240, 240, 240, 255)?)?;
+                    component.set("disabled_text_color", color4(ctx, 204, 204, 204, 120)?)?;
+                    component.set("menu_background_color", color4(ctx, 37, 37, 38, 255)?)?;
+                    component.set("menu_border_color", color4(ctx, 69, 69, 69, 255)?)?;
+                    component.set("item_background_color", color4(ctx, 37, 37, 38, 0)?)?;
                     component.set(
                         "item_hover_background_color",
-                        color4(ctx, 56, 74, 104, 240)?,
+                        color4(ctx, 42, 45, 46, 255)?,
                     )?;
                     component.set(
                         "item_selected_background_color",
-                        color4(ctx, 42, 58, 84, 235)?,
+                        color4(ctx, 9, 71, 113, 255)?,
                     )?;
-                    component.set("item_text_color", color4(ctx, 234, 238, 244, 255)?)?;
+                    component.set("item_text_color", color4(ctx, 204, 204, 204, 255)?)?;
                     component.set("item_hover_text_color", color4(ctx, 255, 255, 255, 255)?)?;
                     component.set("item_selected_text_color", color4(ctx, 255, 255, 255, 255)?)?;
                     component.set("border_width", 1.0)?;
-                    component.set("corner_radius", 8.0)?;
+                    component.set("corner_radius", 2.0)?;
                     component.set("background_image", Value::Nil)?;
                     component.set("icon_image", Value::Nil)?;
                     component.set("icon_color", color4(ctx, 255, 255, 255, 255)?)?;
@@ -4700,8 +4923,310 @@ pub fn add_core_components(
             core_components.set("Dropdown", dropdown)?;
         }
 
+        // Slider
+        // draggable value slider with a track, filled range, and thumb.
+        // Defaults follow Visual Studio Code's Dark+ theme (input background track,
+        // #007acc filled range, #cccccc thumb). Hover colours are fully configurable.
+        {
+            let slider = create_basic_drawable(lua)?;
+            slider.set(
+                "awake",
+                lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
+                    component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
+                    component.set("visible", true)?;
+                    component.set("__neolove_component", "Slider")?;
+                    component.set("enabled", true)?;
+                    component.set("hovered", false)?;
+                    component.set("dragging", false)?;
+                    component.set("min", 0.0)?;
+                    component.set("max", 100.0)?;
+                    component.set("value", 0.0)?;
+                    component.set("fraction", 0.0)?;
+                    // 0 = continuous; otherwise the value snaps to multiples of `step`.
+                    component.set("step", 0.0)?;
+                    component.set("orientation", "horizontal")?;
+                    component.set("track_thickness", 6.0)?;
+                    component.set("thumb_size", 16.0)?;
+                    component.set("thumb_corner_radius", 8.0)?;
+                    component.set("corner_radius", 3.0)?;
+                    component.set("border_width", 0.0)?;
+                    // VS Code Dark+ derived palette.
+                    component.set("background_color", color4(ctx, 60, 60, 60, 255)?)?;
+                    component.set("hover_background_color", color4(ctx, 66, 66, 66, 255)?)?;
+                    component.set("disabled_background_color", color4(ctx, 60, 60, 60, 120)?)?;
+                    component.set("border_color", color4(ctx, 60, 60, 60, 255)?)?;
+                    component.set("hover_border_color", color4(ctx, 98, 98, 98, 255)?)?;
+                    component.set("disabled_border_color", color4(ctx, 60, 60, 60, 120)?)?;
+                    component.set("fill_color", color4(ctx, 0, 122, 204, 255)?)?;
+                    component.set("hover_fill_color", color4(ctx, 17, 119, 187, 255)?)?;
+                    component.set("disabled_fill_color", color4(ctx, 60, 60, 60, 180)?)?;
+                    component.set("thumb_color", color4(ctx, 204, 204, 204, 255)?)?;
+                    component.set("hover_thumb_color", color4(ctx, 255, 255, 255, 255)?)?;
+                    component.set("disabled_thumb_color", color4(ctx, 128, 128, 128, 255)?)?;
+                    component.set("background_image", Value::Nil)?;
+                    component.set("slice_left", 0.0)?;
+                    component.set("slice_right", 0.0)?;
+                    component.set("slice_top", 0.0)?;
+                    component.set("slice_bottom", 0.0)?;
+                    Ok(())
+                })?,
+            )?;
+
+            let set_value = lua.create_function(
+                |_ctx, (component, value): (Table, f32)| {
+                    let min = component.get::<f32>("min").unwrap_or(0.0);
+                    let max = component.get::<f32>("max").unwrap_or(100.0);
+                    let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
+                    let clamped = value.clamp(lo, hi);
+                    component.set("value", clamped)?;
+                    let range = hi - lo;
+                    let fraction = if range.abs() > f32::EPSILON {
+                        ((clamped - min) / (max - min)).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    component.set("fraction", fraction)?;
+                    Ok(())
+                },
+            )?;
+            slider.set("setValue", set_value.clone())?;
+            slider.set("SetValue", set_value)?;
+
+            let slider_platform = platform.clone();
+            let render_state = render_state.clone();
+            slider.set(
+                "update",
+                lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
+                    if !component.get::<bool>("visible").unwrap_or(true) {
+                        return Ok(());
+                    }
+
+                    let draw = get_entity_draw_context(&entity)?;
+                    let snapshot = current_input_snapshot(&slider_platform)?;
+                    let owner_key = component_owner_key(&entity, &component);
+                    let enabled = component.get::<bool>("enabled").unwrap_or(true);
+
+                    let min = component.get::<f32>("min").unwrap_or(0.0);
+                    let max = component.get::<f32>("max").unwrap_or(100.0);
+                    let range = max - min;
+                    let step = component.get::<f32>("step").unwrap_or(0.0).max(0.0);
+                    let mut value = component.get::<f32>("value").unwrap_or(min);
+
+                    let vertical = get_string_field(&component, "orientation", "orientation")
+                        .map(|value| value.eq_ignore_ascii_case("vertical"))
+                        .unwrap_or(false);
+                    let thumb_size = component.get::<f32>("thumb_size").unwrap_or(16.0).max(0.0);
+                    let half_thumb = thumb_size * 0.5;
+
+                    let hovered = enabled
+                        && point_in_bounds(snapshot.mouse, draw.bounds, draw.pivot, draw.rotation)
+                        && !point_blocked_by_popup(snapshot.mouse, &owner_key);
+
+                    let left_pressed = snapshot.input.mouse_pressed.contains("left");
+                    let left_down = snapshot.input.mouse_down.contains("left");
+                    let mut dragging = component.get::<bool>("dragging").unwrap_or(false);
+                    if !enabled || !left_down {
+                        dragging = false;
+                    } else if left_pressed && hovered {
+                        dragging = true;
+                    }
+
+                    // Usable travel distance for the thumb centre.
+                    let track_len = ((if vertical {
+                        draw.bounds.h
+                    } else {
+                        draw.bounds.w
+                    }) - thumb_size)
+                        .max(0.0);
+
+                    let mut changed = false;
+                    if dragging && enabled {
+                        let local =
+                            world_point_to_local(snapshot.mouse, draw.pivot, draw.rotation);
+                        let fraction = if track_len <= 0.0 {
+                            0.0
+                        } else if vertical {
+                            // Top of the widget is `max`, bottom is `min`.
+                            let pos = (draw.bounds.y + draw.bounds.h - half_thumb) - local.y;
+                            (pos / track_len).clamp(0.0, 1.0)
+                        } else {
+                            let pos = local.x - draw.bounds.x - half_thumb;
+                            (pos / track_len).clamp(0.0, 1.0)
+                        };
+                        let mut new_value = min + fraction * range;
+                        if step > 0.0 {
+                            new_value = min + (((new_value - min) / step).round()) * step;
+                        }
+                        let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
+                        new_value = new_value.clamp(lo, hi);
+                        if (new_value - value).abs() > f32::EPSILON {
+                            value = new_value;
+                            changed = true;
+                        }
+                    }
+
+                    let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
+                    value = value.clamp(lo, hi);
+                    let fraction = if range.abs() > f32::EPSILON {
+                        ((value - min) / range).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+
+                    component.set("hovered", hovered)?;
+                    component.set("dragging", dragging)?;
+                    component.set("value", value)?;
+                    component.set("fraction", fraction)?;
+                    if changed {
+                        call_component_number_callback(&component, &entity, "onChanged", value)?;
+                    }
+
+                    let active = hovered || dragging;
+                    let track_color = if !enabled {
+                        get_color_field(&component, "disabled_background_color")
+                    } else if active {
+                        get_color_field(&component, "hover_background_color")
+                    } else {
+                        get_color_field(&component, "background_color")
+                    }
+                    .unwrap_or(Color::rgba(60, 60, 60, 255));
+                    let border_color = if !enabled {
+                        get_color_field(&component, "disabled_border_color")
+                    } else if active {
+                        get_color_field(&component, "hover_border_color")
+                    } else {
+                        get_color_field(&component, "border_color")
+                    }
+                    .unwrap_or(track_color);
+                    let fill_color = if !enabled {
+                        get_color_field(&component, "disabled_fill_color")
+                    } else if active {
+                        get_color_field(&component, "hover_fill_color")
+                    } else {
+                        get_color_field(&component, "fill_color")
+                    }
+                    .unwrap_or(Color::rgba(0, 122, 204, 255));
+                    let thumb_color = if !enabled {
+                        get_color_field(&component, "disabled_thumb_color")
+                    } else if active {
+                        get_color_field(&component, "hover_thumb_color")
+                    } else {
+                        get_color_field(&component, "thumb_color")
+                    }
+                    .unwrap_or(Color::rgba(204, 204, 204, 255));
+
+                    let track_thickness = component
+                        .get::<f32>("track_thickness")
+                        .unwrap_or(6.0)
+                        .max(0.0);
+                    let corner_radius =
+                        component.get::<f32>("corner_radius").unwrap_or(3.0).max(0.0);
+                    let thumb_corner_radius = component
+                        .get::<f32>("thumb_corner_radius")
+                        .unwrap_or(thumb_size * 0.5)
+                        .max(0.0);
+
+                    // Track rectangle: a thin bar centred along the cross axis.
+                    let track_bounds = if vertical {
+                        let thickness = if track_thickness > 0.0 {
+                            track_thickness.min(draw.bounds.w)
+                        } else {
+                            draw.bounds.w
+                        };
+                        Rect {
+                            x: draw.bounds.x + (draw.bounds.w - thickness) * 0.5,
+                            y: draw.bounds.y,
+                            w: thickness,
+                            h: draw.bounds.h,
+                        }
+                    } else {
+                        let thickness = if track_thickness > 0.0 {
+                            track_thickness.min(draw.bounds.h)
+                        } else {
+                            draw.bounds.h
+                        };
+                        Rect {
+                            x: draw.bounds.x,
+                            y: draw.bounds.y + (draw.bounds.h - thickness) * 0.5,
+                            w: draw.bounds.w,
+                            h: thickness,
+                        }
+                    };
+
+                    let style = resolve_panel_style(ctx, &component, track_color, border_color)?;
+
+                    // Thumb centre in local (unrotated) coordinates.
+                    let thumb_center_x;
+                    let thumb_center_y;
+                    let fill_bounds;
+                    if vertical {
+                        thumb_center_x = track_bounds.x + track_bounds.w * 0.5;
+                        thumb_center_y =
+                            draw.bounds.y + draw.bounds.h - half_thumb - fraction * track_len;
+                        let fill_top = thumb_center_y;
+                        fill_bounds = Rect {
+                            x: track_bounds.x,
+                            y: fill_top,
+                            w: track_bounds.w,
+                            h: (track_bounds.y + track_bounds.h - fill_top).max(0.0),
+                        };
+                    } else {
+                        thumb_center_y = track_bounds.y + track_bounds.h * 0.5;
+                        thumb_center_x = draw.bounds.x + half_thumb + fraction * track_len;
+                        fill_bounds = Rect {
+                            x: track_bounds.x,
+                            y: track_bounds.y,
+                            w: (thumb_center_x - track_bounds.x).max(0.0),
+                            h: track_bounds.h,
+                        };
+                    }
+                    let thumb_bounds = Rect {
+                        x: thumb_center_x - half_thumb,
+                        y: thumb_center_y - half_thumb,
+                        w: thumb_size,
+                        h: thumb_size,
+                    };
+
+                    let mut renderer = render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
+                    render_panel(
+                        &mut renderer,
+                        track_bounds,
+                        draw.pivot,
+                        draw.rotation,
+                        &style,
+                    )?;
+                    if fill_bounds.w > 0.0 && fill_bounds.h > 0.0 && fill_color.a > 0 {
+                        queue_rounded_rect_fill(
+                            &mut renderer,
+                            fill_bounds,
+                            draw.pivot,
+                            draw.rotation,
+                            fill_color,
+                            corner_radius,
+                        );
+                    }
+                    if thumb_size > 0.0 && thumb_color.a > 0 {
+                        queue_rounded_rect_fill(
+                            &mut renderer,
+                            thumb_bounds,
+                            draw.pivot,
+                            draw.rotation,
+                            thumb_color,
+                            thumb_corner_radius,
+                        );
+                    }
+                    Ok(())
+                })?,
+            )?;
+
+            core_components.set("Slider", slider)?;
+        }
+
         // ScrollList
         // scrolling list view with selection, keyboard navigation, and customizable item styling
+        #[cfg(any())]
         {
             let scroll_list = create_basic_drawable(lua)?;
             scroll_list.set(
@@ -5423,6 +5948,175 @@ pub fn add_core_components(
         core_components.set("Sprite2D", sprite2d)?;
     }
 
+    // SpriteSheet2D: frame-based atlas animation without requiring gameplay
+    // code to calculate source rectangles every frame.
+    {
+        let sprite_sheet = create_basic_drawable(lua)?;
+        sprite_sheet.set(
+            "awake",
+            lua.create_function(move |ctx, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "SpriteSheet2D")?;
+                component.set("color", color4(ctx, 255, 255, 255, 255)?)?;
+                component.set("visible", true)?;
+                component.set("shader", Value::Nil)?;
+                component.set("image", Value::Nil)?;
+                component.set("frame_width", 32.0)?;
+                component.set("frame_height", 32.0)?;
+                component.set("columns", 0)?;
+                component.set("frame_count", 0)?;
+                component.set("spacing", 0.0)?;
+                component.set("margin", 0.0)?;
+                component.set("frame", 0)?;
+                component.set("fps", 12.0)?;
+                component.set("playing", true)?;
+                component.set("looping", true)?;
+                component.set("__frame_time", 0.0)?;
+                Ok(())
+            })?,
+        )?;
+
+        let play = lua.create_function(|_ctx, component: Table| component.set("playing", true))?;
+        sprite_sheet.set("play", play.clone())?;
+        sprite_sheet.set("Play", play)?;
+        let pause =
+            lua.create_function(|_ctx, component: Table| component.set("playing", false))?;
+        sprite_sheet.set("pause", pause.clone())?;
+        sprite_sheet.set("Pause", pause)?;
+        let stop = lua.create_function(|_ctx, component: Table| {
+            component.set("playing", false)?;
+            component.set("frame", 0)?;
+            component.set("__frame_time", 0.0)
+        })?;
+        sprite_sheet.set("stop", stop.clone())?;
+        sprite_sheet.set("Stop", stop)?;
+        let set_frame = lua.create_function(|_ctx, (component, frame): (Table, i64)| {
+            component.set("frame", frame.max(0))?;
+            component.set("__frame_time", 0.0)
+        })?;
+        sprite_sheet.set("setFrame", set_frame.clone())?;
+        sprite_sheet.set("set_frame", set_frame)?;
+
+        let sprite_sheet_render_state = render_state.clone();
+        sprite_sheet.set(
+            "update",
+            lua.create_function(
+                move |ctx, (entity, component, dt): (Table, Table, f32)| {
+                    if !component.get::<bool>("visible").unwrap_or(true) {
+                        return Ok(());
+                    }
+                    let Some(image) = component.get::<Option<AnyUserData>>("image")? else {
+                        return Ok(());
+                    };
+                    let image = image.borrow::<crate::assets::ImageHandle>()?;
+                    image.ensure_uploaded()?;
+                    let (image_w, image_h) = image.dimensions()?;
+                    let frame_w = component
+                        .get::<f32>("frame_width")
+                        .unwrap_or(32.0)
+                        .max(1.0)
+                        .min(image_w as f32);
+                    let frame_h = component
+                        .get::<f32>("frame_height")
+                        .unwrap_or(32.0)
+                        .max(1.0)
+                        .min(image_h as f32);
+                    let spacing = component.get::<f32>("spacing").unwrap_or(0.0).max(0.0);
+                    let margin = component
+                        .get::<f32>("margin")
+                        .unwrap_or(0.0)
+                        .max(0.0)
+                        .min(((image_w as f32 - frame_w) * 0.5).max(0.0))
+                        .min(((image_h as f32 - frame_h) * 0.5).max(0.0));
+                    let usable_w = (image_w as f32 - margin * 2.0).max(frame_w);
+                    let usable_h = (image_h as f32 - margin * 2.0).max(frame_h);
+                    let available_columns =
+                        (((usable_w + spacing) / (frame_w + spacing)).floor() as i64).max(1);
+                    let columns = component
+                        .get::<i64>("columns")
+                        .unwrap_or(0)
+                        .max(0);
+                    let columns = if columns == 0 {
+                        available_columns
+                    } else {
+                        columns.min(available_columns).max(1)
+                    };
+                    let available_rows =
+                        (((usable_h + spacing) / (frame_h + spacing)).floor() as i64).max(1);
+                    let available_frames = columns.saturating_mul(available_rows).max(1);
+                    let configured_count = component.get::<i64>("frame_count").unwrap_or(0);
+                    let frame_count = if configured_count <= 0 {
+                        available_frames
+                    } else {
+                        configured_count.min(available_frames).max(1)
+                    };
+                    let mut frame = component.get::<i64>("frame").unwrap_or(0).max(0);
+
+                    let fps = component.get::<f32>("fps").unwrap_or(12.0);
+                    if component.get::<bool>("playing").unwrap_or(true)
+                        && fps.is_finite()
+                        && fps > 0.0
+                    {
+                        let frame_duration = 1.0 / fps;
+                        let mut elapsed = component.get::<f32>("__frame_time").unwrap_or(0.0)
+                            + dt.max(0.0);
+                        let steps = (elapsed / frame_duration).floor() as i64;
+                        if steps > 0 {
+                            elapsed -= steps as f32 * frame_duration;
+                            frame = frame.saturating_add(steps);
+                            if component.get::<bool>("looping").unwrap_or(true) {
+                                frame %= frame_count;
+                            } else if frame >= frame_count {
+                                frame = frame_count - 1;
+                                component.set("playing", false)?;
+                            }
+                            component.set("frame", frame)?;
+                        }
+                        component.set("__frame_time", elapsed)?;
+                    }
+                    frame = frame.min(frame_count - 1);
+
+                    let source = Rect {
+                        x: margin + (frame % columns) as f32 * (frame_w + spacing),
+                        y: margin + (frame / columns) as f32 * (frame_h + spacing),
+                        w: frame_w,
+                        h: frame_h,
+                    };
+                    let (x, y, rotation) = crate::window::get_global_transform(&entity)?;
+                    let (w, h) = crate::window::get_global_size(&entity)?;
+                    let use_middle_pivot = crate::window::uses_middle_pivot(&entity);
+                    let (draw_x, draw_y, pivot) = if use_middle_pivot {
+                        let (px, py) = crate::window::get_global_rotation_pivot(&entity)?;
+                        (px - w * 0.5, py - h * 0.5, Vec2 { x: px, y: py })
+                    } else {
+                        (x, y, Vec2 { x, y })
+                    };
+                    let tint: Color = color4_to_color(component.get("color")?)?;
+                    let shader = shader_from_component(&component)?;
+                    let mut renderer = sprite_sheet_render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
+                    renderer.queue(DrawCommand::Image {
+                        image: image.clone(),
+                        dest: Rect {
+                            x: draw_x,
+                            y: draw_y,
+                            w,
+                            h,
+                        },
+                        source: Some(source),
+                        rotation,
+                        pivot,
+                        tint,
+                        filter: app_texture_filter(ctx),
+                        shader,
+                    });
+                    Ok(())
+                },
+            )?,
+        )?;
+        core_components.set("SpriteSheet2D", sprite_sheet)?;
+    }
+
     // NineSliceSprite2D / 9SliceSprite2D
     // draw a sprite with fixed-size edges and stretched center.
     {
@@ -5812,6 +6506,7 @@ pub fn add_core_components(
                 Ok(())
             })?,
         )?;
+        let tilemap_platform = platform.clone();
         let render_state = render_state.clone();
         tilemap.set(
             "update",
@@ -5870,14 +6565,33 @@ pub fn add_core_components(
                 };
                 let cell_width = width / map_width as f32;
                 let cell_height = height / map_height as f32;
+                let (viewport_width, viewport_height) = {
+                    let platform = lock_platform_state(&tilemap_platform);
+                    let window = platform.window();
+                    (window.width, window.height)
+                };
+                let Some(visible) = visible_tile_cells(
+                    base_x,
+                    base_y,
+                    width,
+                    height,
+                    pivot,
+                    rotation,
+                    viewport_width,
+                    viewport_height,
+                    map_width,
+                    map_height,
+                ) else {
+                    return Ok(());
+                };
                 let tint = color4_to_color(component.get("color")?)?;
                 let filter = app_texture_filter(ctx);
                 let shader = shader_from_component(&component)?;
                 let mut renderer = render_state
                     .lock()
                     .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
-                for row in 0..map_height {
-                    for column in 0..map_width {
+                for row in visible.row_start..visible.row_end {
+                    for column in visible.column_start..visible.column_end {
                         let index = row * map_width + column;
                         let tile = tiles.get(index).copied().unwrap_or(-1);
                         if tile < 0 || tile as usize >= atlas_len {
@@ -6224,6 +6938,11 @@ pub fn add_core_components(
         core_components.set("String2D", rope2d)?;
     }
 
+    for pair in core_components.pairs::<Value, Value>() {
+        if let Ok((_, Value::Table(component))) = pair {
+            component.raw_set("__neolove_core_component", true)?;
+        }
+    }
     lua.globals().set("core", core_components)?;
     Ok(())
 }
@@ -6231,6 +6950,57 @@ pub fn add_core_components(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tilemap_visibility_culls_large_maps_and_supports_rotation() {
+        let visible = visible_tile_cells(
+            -320.0,
+            -320.0,
+            1280.0,
+            1280.0,
+            Vec2 { x: -320.0, y: -320.0 },
+            0.0,
+            320.0,
+            240.0,
+            40,
+            40,
+        )
+        .expect("map overlaps viewport");
+        assert_eq!(visible.column_start, 10);
+        assert_eq!(visible.column_end, 20);
+        assert_eq!(visible.row_start, 10);
+        assert_eq!(visible.row_end, 18);
+
+        let rotated = visible_tile_cells(
+            200.0,
+            -40.0,
+            320.0,
+            320.0,
+            Vec2 { x: 200.0, y: -40.0 },
+            std::f32::consts::FRAC_PI_2,
+            320.0,
+            240.0,
+            10,
+            10,
+        )
+        .expect("rotated map overlaps viewport");
+        assert!(rotated.column_start < rotated.column_end);
+        assert!(rotated.row_start < rotated.row_end);
+
+        assert!(visible_tile_cells(
+            1000.0,
+            1000.0,
+            320.0,
+            320.0,
+            Vec2 { x: 1000.0, y: 1000.0 },
+            0.0,
+            320.0,
+            240.0,
+            10,
+            10,
+        )
+        .is_none());
+    }
 
     fn component_with_letter_bounds(lua: &Lua) -> mlua::Result<Table> {
         let component = lua.create_table()?;

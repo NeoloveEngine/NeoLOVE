@@ -189,6 +189,7 @@ impl DesktopPresenter {
 #[derive(Default, Clone)]
 struct ProjectSettings {
     package_name: Option<String>,
+    start_scene: Option<String>,
     window_title: Option<String>,
     window_icon: Option<String>,
     window_width: Option<f32>,
@@ -359,6 +360,170 @@ fn setup_path_for_neolove() -> Result<bool, String> {
     ensure_path_contains_self_dir(binary_dir)
 }
 
+fn write_text_if_changed(path: &Path, contents: &str) -> std::io::Result<bool> {
+    let existing = fs::read_to_string(path).ok();
+    if existing.as_deref() == Some(contents) {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, contents)?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(windows)]
+fn ensure_start_menu_entry(exe: &Path) -> Result<bool, String> {
+    let work_dir = exe
+        .parent()
+        .ok_or_else(|| "executable has no parent directory".to_string())?;
+    let exe = powershell_quote(&exe.to_string_lossy());
+    let work_dir = powershell_quote(&work_dir.to_string_lossy());
+    let script = format!(
+        "$exe={exe}; \
+         $args='hub'; \
+         $work={work_dir}; \
+         $programs=[Environment]::GetFolderPath('Programs'); \
+         if(-not $programs){{ $programs=Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs' }}; \
+         New-Item -ItemType Directory -Force -Path $programs | Out-Null; \
+         $shortcut=Join-Path $programs 'NeoLOVE.lnk'; \
+         $shell=New-Object -ComObject WScript.Shell; \
+         $link=$shell.CreateShortcut($shortcut); \
+         $changed=(-not (Test-Path $shortcut)) -or ($link.TargetPath -ne $exe) -or ($link.Arguments -ne $args) -or ($link.WorkingDirectory -ne $work); \
+         $link.TargetPath=$exe; \
+         $link.Arguments=$args; \
+         $link.WorkingDirectory=$work; \
+         $link.IconLocation=\"$exe,0\"; \
+         $link.Description='Open the NeoLOVE Hub'; \
+         $link.Save(); \
+         if($changed){{ Write-Output 'updated' }}else{{ Write-Output 'exists' }}"
+    );
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|e| format!("failed to run powershell for Start Menu setup: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("failed to update Start Menu shortcut: {}", stderr.trim()));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).contains("updated"))
+}
+
+#[cfg(target_os = "macos")]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_start_menu_entry(exe: &Path) -> Result<bool, String> {
+    let home = user_home_dir().ok_or_else(|| "could not resolve home directory".to_string())?;
+    let app_root = home
+        .join("Applications")
+        .join("NeoLOVE Hub.app")
+        .join("Contents");
+    let macos_dir = app_root.join("MacOS");
+    let script_path = macos_dir.join("NeoLOVE Hub");
+    let plist_path = app_root.join("Info.plist");
+
+    let script = format!("#!/bin/sh\nexec {} hub \"$@\"\n", shell_quote(&exe.to_string_lossy()));
+    let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>NeoLOVE Hub</string>
+  <key>CFBundleIdentifier</key>
+  <string>org.neolove.hub</string>
+  <key>CFBundleName</key>
+  <string>NeoLOVE Hub</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>10.13</string>
+</dict>
+</plist>
+"#;
+
+    let mut changed = write_text_if_changed(&script_path, &script).map_err(|e| {
+        format!(
+            "failed to write launcher script {}: {e}",
+            script_path.display()
+        )
+    })?;
+    changed |= write_text_if_changed(&plist_path, plist)
+        .map_err(|e| format!("failed to write launcher plist {}: {e}", plist_path.display()))?;
+
+    let metadata = fs::metadata(&script_path)
+        .map_err(|e| format!("failed to stat launcher script {}: {e}", script_path.display()))?;
+    let mut perms = metadata.permissions();
+    let mode = perms.mode();
+    if mode & 0o111 == 0 {
+        perms.set_mode(mode | 0o755);
+        fs::set_permissions(&script_path, perms).map_err(|e| {
+            format!(
+                "failed to make launcher script executable {}: {e}",
+                script_path.display()
+            )
+        })?;
+        changed = true;
+    }
+
+    Ok(changed)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn desktop_exec_quote(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn ensure_start_menu_entry(exe: &Path) -> Result<bool, String> {
+    let home = user_home_dir().ok_or_else(|| "could not resolve home directory".to_string())?;
+    let data_home = env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local").join("share"));
+    let applications = data_home.join("applications");
+    let desktop_file = applications.join("neolove-hub.desktop");
+    let icon_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("logo.png");
+    let icon_line = if icon_path.is_file() {
+        format!("Icon={}\n", icon_path.to_string_lossy())
+    } else {
+        String::new()
+    };
+    let contents = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Version=1.0\n\
+         Name=NeoLOVE\n\
+         GenericName=Game Engine\n\
+         Comment=Open the NeoLOVE Hub\n\
+         Exec={} hub\n\
+         Terminal=false\n\
+         Categories=Development;IDE;Game;\n\
+         StartupNotify=true\n\
+         {icon_line}",
+        desktop_exec_quote(exe)
+    );
+
+    write_text_if_changed(&desktop_file, &contents)
+        .map_err(|e| format!("failed to write app launcher {}: {e}", desktop_file.display()))
+}
+
+fn setup_start_menu_for_neolove() -> Result<bool, String> {
+    let exe = env::current_exe().map_err(|e| format!("could not resolve executable path: {e}"))?;
+    ensure_start_menu_entry(&exe)
+}
+
 fn parse_quoted(input: &str) -> Option<String> {
     let value = input.trim();
     if value.len() < 2 {
@@ -408,6 +573,11 @@ fn parse_project_settings(project_root: &Path) -> ProjectSettings {
             "package" if key == "name" => {
                 if let Some(value) = parse_quoted(value_raw) {
                     settings.package_name = Some(value);
+                }
+            }
+            "project" if key == "start_scene" => {
+                if let Some(value) = parse_quoted(value_raw) {
+                    settings.start_scene = Some(value);
                 }
             }
             "window" if key == "title" => {
@@ -583,7 +753,7 @@ fn build_payload(project_root: &Path) -> Result<Vec<u8>, String> {
         .set_debug_level(0)
         .set_type_info_level(1);
 
-    let total_steps = files.len() + 3;
+    let total_steps = files.len() + 2;
     let mut step = 0usize;
 
     step += 1;
@@ -832,6 +1002,117 @@ fn project_output_stem(project_root: &Path) -> String {
     sanitize_executable_name(&name_seed)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DesktopPackageTarget {
+    Host,
+    Windows,
+    Linux,
+}
+
+impl DesktopPackageTarget {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Host => "desktop",
+            Self::Windows => "Windows desktop",
+            Self::Linux => "Linux desktop",
+        }
+    }
+
+    fn target_triple(self) -> Option<&'static str> {
+        match self {
+            Self::Host => None,
+            Self::Windows if cfg!(windows) => None,
+            Self::Windows => Some("x86_64-pc-windows-gnu"),
+            Self::Linux if cfg!(target_os = "linux") => None,
+            Self::Linux => Some("x86_64-unknown-linux-gnu"),
+        }
+    }
+
+    fn target_dir_name(self) -> &'static str {
+        match self.target_triple() {
+            Some("x86_64-pc-windows-gnu") => "neolove-packaged-runtime-windows-x86_64",
+            Some("x86_64-unknown-linux-gnu") => "neolove-packaged-runtime-linux-x86_64",
+            _ => "neolove-packaged-runtime",
+        }
+    }
+
+    fn is_windows(self) -> bool {
+        match self {
+            Self::Windows => true,
+            Self::Linux => false,
+            Self::Host => cfg!(windows),
+        }
+    }
+}
+
+/// MinGW can otherwise leave a cross-built game dependent on
+/// `libstdc++-6.dll` from the build machine. Native Windows builds typically
+/// find that runtime through their toolchain installation, but a distributed
+/// single-file game will fail at process startup. Link the small GNU C/C++
+/// runtime portions into Linux-to-Windows artifacts instead.
+fn cross_target_rustflags_config(
+    target: DesktopPackageTarget,
+    cpp_runtime_dir: Option<&Path>,
+) -> Option<String> {
+    match target.target_triple() {
+        Some("x86_64-pc-windows-gnu") => {
+            let mut flags = Vec::new();
+            if let Some(dir) = cpp_runtime_dir {
+                flags.push("-L".to_string());
+                flags.push(format!("native={}", dir.display()));
+            }
+            flags.extend([
+                "-C".to_string(),
+                "link-arg=-static-libgcc".to_string(),
+                "-C".to_string(),
+                "link-arg=-static-libstdc++".to_string(),
+            ]);
+            let flags = serde_json::to_string(&flags).ok()?;
+            Some(format!(
+                "target.x86_64-pc-windows-gnu.rustflags={flags}"
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn cross_target_cpp_stdlib(target: DesktopPackageTarget) -> Option<(&'static str, &'static str)> {
+    match target.target_triple() {
+        // luau0-src honors this target-qualified variable and forwards its
+        // value as a Cargo link kind. Without `static=`, mlua-sys emits a
+        // dynamic `stdc++` dependency even when GCC's own runtime flags are
+        // static.
+        Some("x86_64-pc-windows-gnu") => {
+            Some(("CXXSTDLIB_x86_64_pc_windows_gnu", "static=stdc++"))
+        }
+        _ => None,
+    }
+}
+
+fn mingw_cpp_runtime_dir(target: DesktopPackageTarget) -> Result<Option<PathBuf>, String> {
+    if target.target_triple() != Some("x86_64-pc-windows-gnu") {
+        return Ok(None);
+    }
+    let compiler = "x86_64-w64-mingw32-gcc";
+    let output = std::process::Command::new(compiler)
+        .arg("-print-file-name=libstdc++.a")
+        .output()
+        .map_err(|error| format!("failed to locate the MinGW static C++ runtime: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to locate the MinGW static C++ runtime with {compiler}"
+        ));
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    if !path.is_file() {
+        return Err(format!(
+            "MinGW static C++ runtime was not found (expected libstdc++.a, got {})",
+            path.display()
+        ));
+    }
+    Ok(path.parent().map(Path::to_path_buf))
+}
+
 /// Rewrite the PE `Subsystem` field of a Windows executable image in place,
 /// switching it from the console subsystem (used by the `neolove` CLI) to the
 /// GUI subsystem so a compiled game launches without spawning a terminal window.
@@ -839,7 +1120,6 @@ fn project_output_stem(project_root: &Path) -> String {
 /// The dev `neolove.exe` stays a console application; only the copy we hand to
 /// players is patched. Field offsets follow the PE/COFF specification and are
 /// identical for PE32 and PE32+ images.
-#[cfg(windows)]
 fn patch_subsystem_to_gui(image: &mut [u8]) -> Result<(), String> {
     const IMAGE_SUBSYSTEM_WINDOWS_GUI: u16 = 2;
 
@@ -867,32 +1147,86 @@ fn patch_subsystem_to_gui(image: &mut [u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn executable_file_name(output_stem: &str) -> String {
-    #[cfg(windows)]
-    {
-        let mut output_name = output_stem.to_string();
-        if !output_name.to_ascii_lowercase().ends_with(".exe") {
-            output_name.push_str(".exe");
+fn executable_file_name(output_stem: &str, target: DesktopPackageTarget) -> String {
+    let mut output_name = output_stem.to_string();
+    if target.is_windows() && !output_name.to_ascii_lowercase().ends_with(".exe") {
+        output_name.push_str(".exe");
+    }
+    output_name
+}
+
+fn runtime_executable_file_name(target: DesktopPackageTarget) -> String {
+    executable_file_name(env!("CARGO_PKG_NAME"), target)
+}
+
+fn find_on_path(program: &str) -> Option<PathBuf> {
+    env::var_os("PATH").and_then(|path| {
+        env::split_paths(&path)
+            .map(|dir| dir.join(program))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+fn ensure_cross_desktop_linker(
+    target: DesktopPackageTarget,
+) -> Result<Option<(&'static str, &'static str)>, String> {
+    match target.target_triple() {
+        Some("x86_64-pc-windows-gnu") => {
+            let linker = "x86_64-w64-mingw32-gcc";
+            if find_on_path(linker).is_none() {
+                return Err(
+                    "Windows desktop builds from this host need the MinGW-w64 cross linker \
+                     `x86_64-w64-mingw32-gcc` on PATH. Install MinGW-w64, then run \
+                     `neolove build --windows` again."
+                        .to_string(),
+                );
+            }
+            Ok(Some(("CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER", linker)))
         }
-        output_name
-    }
-    #[cfg(not(windows))]
-    {
-        output_stem.to_string()
+        Some("x86_64-unknown-linux-gnu") => {
+            let linker = "x86_64-linux-gnu-gcc";
+            if find_on_path(linker).is_none() {
+                return Err(
+                    "Linux desktop builds from this host need the cross linker \
+                     `x86_64-linux-gnu-gcc` on PATH. Install a Linux GNU cross toolchain \
+                     or build from Linux/WSL, then run `neolove build --linux` again."
+                        .to_string(),
+                );
+            }
+            Ok(Some(("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER", linker)))
+        }
+        Some(target_triple) => Err(format!("unsupported desktop cross target: {target_triple}")),
+        None => Ok(None),
     }
 }
 
-fn runtime_executable_file_name() -> String {
-    executable_file_name(env!("CARGO_PKG_NAME"))
+fn ensure_rust_target_installed(target_triple: &str) -> Result<(), String> {
+    println!("Ensuring Rust target {target_triple} is installed...");
+    let mut rustup = std::process::Command::new("rustup");
+    rustup.args(["target", "add", target_triple]);
+    run_checked_command(&mut rustup, "installing desktop Rust target")
 }
 
-fn build_packaged_runtime() -> Result<PathBuf, String> {
+fn build_packaged_runtime(target: DesktopPackageTarget) -> Result<PathBuf, String> {
     let engine_root = engine_source_root()?;
-    let cargo_target_dir = engine_root.join("target").join("neolove-packaged-runtime");
+    let cargo_target_dir = engine_root.join("target").join(target.target_dir_name());
+    let rust_target = target.target_triple();
+    if let Some(target_triple) = rust_target {
+        ensure_rust_target_installed(target_triple)?;
+    }
+    let linker_env = ensure_cross_desktop_linker(target)?;
+    let cpp_runtime_dir = mingw_cpp_runtime_dir(target)?;
 
-    println!("Building compact packaged runtime...");
+    println!("Building compact {} runtime...", target.label());
+    println!("This can take a few minutes the first time; Cargo output will be shown below.");
     let mut cargo = std::process::Command::new("cargo");
     apply_size_optimized_release_env(&mut cargo);
+    if let Some(config) = cross_target_rustflags_config(target, cpp_runtime_dir.as_deref()) {
+        cargo.arg("--config").arg(config);
+    }
+    if let Some((key, value)) = cross_target_cpp_stdlib(target) {
+        cargo.env(key, value);
+    }
     cargo
         .env("NEOLOVE_PACKAGED_RUNTIME", "1")
         .env("CARGO_TARGET_DIR", &cargo_target_dir)
@@ -900,15 +1234,28 @@ fn build_packaged_runtime() -> Result<PathBuf, String> {
         .arg("--release")
         .arg("--bin")
         .arg(env!("CARGO_PKG_NAME"));
+    if let Some(target_triple) = rust_target {
+        cargo.arg("--target").arg(target_triple);
+    }
+    if let Some((env_key, linker)) = linker_env {
+        cargo.env(env_key, linker);
+    }
     if cfg!(feature = "vulkan") {
         cargo.args(["--features", "vulkan"]);
     }
     cargo.current_dir(&engine_root);
-    run_checked_command_quiet(&mut cargo, "building compact packaged runtime")?;
+    run_checked_command(&mut cargo, "building compact packaged runtime")?;
 
-    let artifact = cargo_target_dir
-        .join("release")
-        .join(runtime_executable_file_name());
+    let artifact = if rust_target.is_some() {
+        cargo_target_dir
+            .join(rust_target.expect("checked above"))
+            .join("release")
+            .join(runtime_executable_file_name(target))
+    } else {
+        cargo_target_dir
+            .join("release")
+            .join(runtime_executable_file_name(target))
+    };
     if !artifact.is_file() {
         return Err(format!(
             "packaged runtime build succeeded but output was not found: {}",
@@ -918,13 +1265,13 @@ fn build_packaged_runtime() -> Result<PathBuf, String> {
     Ok(artifact)
 }
 
-fn build_executable(project_root: &Path) -> Result<PathBuf, String> {
+fn build_executable(project_root: &Path, target: DesktopPackageTarget) -> Result<PathBuf, String> {
     let output_stem = project_output_stem(project_root);
-    let output_name = executable_file_name(&output_stem);
+    let output_name = executable_file_name(&output_stem, target);
 
     let payload = build_payload(project_root)?;
 
-    let packaged_runtime = build_packaged_runtime()?;
+    let packaged_runtime = build_packaged_runtime(target)?;
     #[allow(unused_mut)]
     let mut engine_bytes = fs::read(&packaged_runtime).map_err(|e| {
         format!(
@@ -933,11 +1280,13 @@ fn build_executable(project_root: &Path) -> Result<PathBuf, String> {
         )
     })?;
 
-    // Compiled games should not pop up a console window; flip the copied image to
-    // the GUI subsystem before embedding the payload.
-    #[cfg(windows)]
-    patch_subsystem_to_gui(&mut engine_bytes)
-        .map_err(|e| format!("failed to prepare windowed game executable: {e}"))?;
+    // Compiled Windows games should not pop up a console window; flip the copied
+    // image to the GUI subsystem before embedding the payload, even when the
+    // host building it is not Windows.
+    if target.is_windows() {
+        patch_subsystem_to_gui(&mut engine_bytes)
+            .map_err(|e| format!("failed to prepare windowed game executable: {e}"))?;
+    }
 
     let output_dir = project_root.join("dist");
     fs::create_dir_all(&output_dir).map_err(|e| {
@@ -3371,10 +3720,12 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
     });
 }
 
-fn handle_new_command(project_name: &str) -> Result<PathBuf, String> {
-    let project_path = resolve_from_cwd(project_name)
-        .map_err(|error| format!("failed to resolve project path '{project_name}': {error}"))?;
-    fs::create_dir(&project_path).map_err(|error| {
+fn create_project_at(project_path: &Path, project_name: &str) -> Result<PathBuf, String> {
+    if let Some(parent) = project_path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    fs::create_dir(project_path).map_err(|error| {
         format!(
             "failed to create project directory {}: {error}",
             project_path.display()
@@ -3387,6 +3738,9 @@ fn handle_new_command(project_name: &str) -> Result<PathBuf, String> {
 [package]
 name = \"{}\"
 version = \"0.1.0\"
+
+[project]
+start_scene = \"scene.neoscene\"
 
 [window]
 title = \"{}\"
@@ -3429,7 +3783,18 @@ resizable = true
     fs::write(&api_path, TEMPLATE_NEOLOVE_ENGINE_API)
         .map_err(|error| format!("failed to write {}: {error}", api_path.display()))?;
 
-    Ok(project_path)
+    Ok(project_path.to_path_buf())
+}
+
+fn handle_new_command(project_name: &str) -> Result<PathBuf, String> {
+    let project_path = resolve_from_cwd(project_name)
+        .map_err(|error| format!("failed to resolve project path '{project_name}': {error}"))?;
+    let display_name = project_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(project_name);
+    create_project_at(&project_path, display_name)
 }
 
 fn handle_api_command(project_dir: Option<&str>) -> Result<Vec<PathBuf>, String> {
@@ -3462,13 +3827,15 @@ fn handle_api_command(project_dir: Option<&str>) -> Result<Vec<PathBuf>, String>
 fn print_usage() {
     println!("NeoLOVE CLI");
     println!("Usage:");
+    println!("  neolove hub");
     println!("  neolove new <project-name>");
     println!("  neolove run [project-dir] [--mobile] [--portrait|--landscape] [--wifi|--cellular|--offline]");
     println!("  neolove editor [project-dir]");
-    println!("  neolove build [project-dir] [--webasm|--android|--apk|--ios]");
+    println!("  neolove build [project-dir] [--windows|--linux|--webasm|--android|--apk|--ios]");
     println!("  neolove api [project-dir]");
     println!("  neolove update");
     println!("  neolove setup-path");
+    println!("  neolove setup-start-menu");
     println!("  neolove --help");
     println!("  neolove --version");
 }
@@ -3508,6 +3875,17 @@ fn resolve_target_project_root(project_dir: Option<&str>) -> Result<PathBuf, Str
         Some(dir) => resolve_from_cwd(dir)
             .map_err(|error| format!("failed to resolve project path '{dir}': {error}")),
         None => env::current_dir().map_err(|error| format!("failed to get current directory: {error}")),
+    }
+}
+
+fn graphical_desktop_available() -> bool {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        true
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        env::var_os("WAYLAND_DISPLAY").is_some() || env::var_os("DISPLAY").is_some()
     }
 }
 
@@ -3624,7 +4002,21 @@ fn run_cli() -> Result<(), String> {
             }
         }
 
+        match setup_start_menu_for_neolove() {
+            Ok(true) => {
+                eprintln!("Added NeoLOVE to your application launcher.");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("Start menu setup warning: {}", e);
+            }
+        }
+
         if args.len() <= 1 {
+            if graphical_desktop_available() {
+                editor::run_hub().map_err(|error| format!("hub failed: {error}"))?;
+                return Ok(());
+            }
             print_usage();
             return Ok(());
         }
@@ -3641,6 +4033,20 @@ fn run_cli() -> Result<(), String> {
                 Ok(false) => println!("PATH already contains Neolove."),
                 Err(error) => return Err(format!("failed to set PATH: {error}")),
             },
+            "setup-start-menu" => match setup_start_menu_for_neolove() {
+                Ok(true) => println!("Application launcher entry updated."),
+                Ok(false) => println!("Application launcher entry is already up to date."),
+                Err(error) => return Err(format!("failed to set up application launcher: {error}")),
+            },
+            "hub" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "hub failed: expected no arguments, got {}",
+                        args.len().saturating_sub(2)
+                    ));
+                }
+                editor::run_hub().map_err(|error| format!("hub failed: {error}"))?;
+            }
             "update" => {
                 if args.len() != 2 {
                     return Err(format!(
@@ -3700,6 +4106,7 @@ fn run_cli() -> Result<(), String> {
             }
             "build" => {
                 let mut project_arg: Option<&str> = None;
+                let mut desktop_target = DesktopPackageTarget::Host;
                 let mut webasm = false;
                 let mut android = false;
                 let mut ios = false;
@@ -3710,6 +4117,16 @@ fn run_cli() -> Result<(), String> {
                         android = true;
                     } else if arg == "--ios" {
                         ios = true;
+                    } else if arg == "--windows" || arg == "--win" || arg == "--exe" {
+                        if desktop_target != DesktopPackageTarget::Host {
+                            return Err("build failed: choose only one desktop target".to_string());
+                        }
+                        desktop_target = DesktopPackageTarget::Windows;
+                    } else if arg == "--linux" {
+                        if desktop_target != DesktopPackageTarget::Host {
+                            return Err("build failed: choose only one desktop target".to_string());
+                        }
+                        desktop_target = DesktopPackageTarget::Linux;
                     } else if arg.starts_with('-') {
                         return Err(format!("build failed: unrecognized option: {arg}"));
                     } else if project_arg.is_none() {
@@ -3723,7 +4140,7 @@ fn run_cli() -> Result<(), String> {
                 validate_project_root(&project_root)
                     .map_err(|error| format!("build failed: {error}"))?;
 
-                if [webasm, android, ios]
+                if [webasm, android, ios, desktop_target != DesktopPackageTarget::Host]
                     .into_iter()
                     .filter(|enabled| *enabled)
                     .count()
@@ -3746,7 +4163,7 @@ fn run_cli() -> Result<(), String> {
                         build_ios(&project_root).map_err(|error| format!("build failed: {error}"))?;
                     println!("Built iOS simulator app: {}", output.display());
                 } else {
-                    let output = build_executable(&project_root)
+                    let output = build_executable(&project_root, desktop_target)
                         .map_err(|error| format!("build failed: {error}"))?;
                     println!("Built executable: {}", output.display());
                 }
@@ -3807,6 +4224,26 @@ mod build_compression_tests {
     use super::*;
 
     #[test]
+    fn linux_to_windows_builds_link_mingw_runtimes_statically() {
+        let config = cross_target_rustflags_config(
+            DesktopPackageTarget::Windows,
+            Some(Path::new("/mingw/lib")),
+        )
+            .expect("cross Windows target should add linker flags");
+        assert!(config.contains("native=/mingw/lib"));
+        assert!(config.contains("link-arg=-static-libgcc"));
+        assert!(config.contains("link-arg=-static-libstdc++"));
+        assert_eq!(
+            cross_target_cpp_stdlib(DesktopPackageTarget::Windows),
+            Some(("CXXSTDLIB_x86_64_pc_windows_gnu", "static=stdc++"))
+        );
+        assert_eq!(
+            cross_target_rustflags_config(DesktopPackageTarget::Linux, None),
+            None
+        );
+    }
+
+    #[test]
     fn project_settings_parse_resizable_window_flag() {
         let root = std::env::temp_dir().join(format!(
             "neolove_window_settings_test_{}",
@@ -3816,11 +4253,12 @@ mod build_compression_tests {
         std::fs::create_dir_all(&root).expect("create temp project");
         std::fs::write(
             root.join("neolove.toml"),
-            "[window]\nwidth = 800\nheight = 600\nfullscreen = false\nresizable = false\n",
+            "[project]\nstart_scene = \"levels/title.neoscene\"\n\n[window]\nwidth = 800\nheight = 600\nfullscreen = false\nresizable = false\n",
         )
         .expect("write settings");
 
         let settings = parse_project_settings(&root);
+        assert_eq!(settings.start_scene.as_deref(), Some("levels/title.neoscene"));
         assert_eq!(settings.window_width, Some(800.0));
         assert_eq!(settings.window_height, Some(600.0));
         assert_eq!(settings.window_fullscreen, Some(false));

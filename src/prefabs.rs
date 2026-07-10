@@ -1,6 +1,6 @@
 use crate::lua_error::protect_lua_call;
 use crate::window::create_entity_table;
-use mlua::{Function, Lua, Table, Value};
+use mlua::{Function, Lua, String as LuaString, Table, Value};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -935,12 +935,14 @@ fn load_editor_component(
 
 fn load_neoprefab(
     lua: &Lua,
-    text: &str,
+    bytes: &[u8],
     path: &str,
     project_require: &Function,
 ) -> mlua::Result<Table> {
-    let document: JsonValue =
-        serde_json::from_str(text).map_err(|error| prefab_json_error(path, error))?;
+    let entities = crate::scene::prefab_from_bytes(bytes)
+        .map_err(|error| prefab_json_error(path, error))?;
+    let document =
+        serde_json::to_value(&entities).map_err(|error| prefab_json_error(path, error))?;
     let entities = document
         .as_array()
         .ok_or_else(|| prefab_json_error(path, "root JSON value must be an entity array"))?;
@@ -1113,9 +1115,9 @@ pub(crate) fn add_prefab_module(lua: &Lua, project_root: &Path) -> mlua::Result<
     let load_project_require = project_require.clone();
     let load = lua.create_function(move |lua, path: String| {
         let fs: Table = lua.globals().get("fs")?;
-        let read_file: Function = fs.get("readFile")?;
-        let text: String = read_file.call(path.as_str())?;
-        load_neoprefab(lua, &text, &path, &load_project_require)
+        let read_bytes: Function = fs.get("readBytes")?;
+        let bytes: LuaString = read_bytes.call(path.as_str())?;
+        load_neoprefab(lua, bytes.as_bytes().as_ref(), &path, &load_project_require)
     })?;
     module.set("load", load)?;
 

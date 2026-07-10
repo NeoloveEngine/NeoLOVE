@@ -8,10 +8,13 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::SystemTime;
 
+use rodio::Source;
 use serde::{Deserialize, Serialize};
 
 use crate::platform::Color;
@@ -20,12 +23,13 @@ use crate::renderer::{
     TextRenderRequest, TextScaleMode, TextWrapMode, Vec2 as RenderVec2,
 };
 use crate::scene::{
-    ColorKeypoint, Component, ComponentReference, DictionaryEntry, Entity, NumberKeypoint, Prop,
-    PropValue, Scene, ScriptVar, VarControl, VarKey, VarValue, ADVANCED_COMPONENTS, CORE_COMPONENTS,
+    load_prefab as load_prefab_file, save_prefab as save_prefab_file, ColorKeypoint, Component,
+    ComponentReference, DictionaryEntry, Entity, NumberKeypoint, Prop, PropValue, Scene, ScriptVar,
+    VarControl, VarKey, VarValue, ADVANCED_COMPONENTS, CORE_COMPONENTS,
 };
 use crate::update::AvailableUpdate;
 
-use super::inspector::parse_inspector_variables;
+use super::inspector::{parse_inspector_variables, script_registers_component_picker};
 use super::ui::{icon, Painter, Rect, Rgba, Theme, Ui};
 
 const TOOLBAR_H: f32 = 40.0;
@@ -40,6 +44,7 @@ const MIN_VIEWPORT_W: f32 = 160.0;
 const SPLIT_HALF: f32 = 4.0;
 const PREVIEW_ROOT_WIDTH: f32 = 1280.0;
 const PREVIEW_ROOT_HEIGHT: f32 = 720.0;
+const WAVEFORM_PREVIEW_BUCKETS: usize = 192;
 /// Screen-space length of the rotation gizmo's stalk above the entity.
 const ROT_HANDLE_DIST: f32 = 28.0;
 
@@ -56,6 +61,59 @@ fn rotate_point_about(px: f32, py: f32, cx: f32, cy: f32, angle: f32) -> (f32, f
     let dx = px - cx;
     let dy = py - cy;
     (cx + dx * cos - dy * sin, cy + dx * sin + dy * cos)
+}
+
+fn rotate_vector(x: f32, y: f32, angle: f32) -> (f32, f32) {
+    let (sin, cos) = (angle.sin(), angle.cos());
+    (x * cos - y * sin, x * sin + y * cos)
+}
+
+fn normalized_position_pivot_name(value: &str) -> &'static str {
+    let name = value
+        .trim()
+        .to_ascii_lowercase()
+        .replace(' ', "_")
+        .replace('-', "_");
+    match name.as_str() {
+        "center" | "middle" => "center",
+        "top_right" | "topright" => "top_right",
+        _ => "top_left",
+    }
+}
+
+fn normalized_rotation_pivot_name(value: &str) -> &'static str {
+    let name = value
+        .trim()
+        .to_ascii_lowercase()
+        .replace(' ', "_")
+        .replace('-', "_");
+    match name.as_str() {
+        "center" | "middle" => "center",
+        _ => "top_left",
+    }
+}
+
+fn pivot_storage_value(key: &str) -> String {
+    if key == "top_left" {
+        String::new()
+    } else {
+        key.to_string()
+    }
+}
+
+fn position_pivot_fraction_from_name(value: &str) -> (f32, f32) {
+    match normalized_position_pivot_name(value) {
+        "center" => (0.5, 0.5),
+        "top_right" => (1.0, 0.0),
+        _ => (0.0, 0.0),
+    }
+}
+
+fn rotation_pivot_fraction_from_name(value: &str) -> (f32, f32) {
+    match normalized_rotation_pivot_name(value) {
+        "center" => (0.5, 0.5),
+        _ => (0.0, 0.0),
+    }
 }
 
 fn short_revision(revision: &str) -> &str {
@@ -242,6 +300,9 @@ struct EnumPropMenuTarget {
 #[serde(default)]
 pub struct EditorConfig {
     pub theme: Theme,
+    /// The user's editable palette is retained even while a named preset is
+    /// active, so switching themes never destroys custom work.
+    pub custom_theme: Theme,
     pub layout: Layout,
     pub settings: EditorSettings,
 }
@@ -285,6 +346,8 @@ impl Default for EditorSettings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BuildTarget {
     Desktop,
+    WindowsDesktop,
+    LinuxDesktop,
     Webasm,
     Android,
     Ios,
@@ -294,6 +357,8 @@ impl BuildTarget {
     fn label(self) -> &'static str {
         match self {
             Self::Desktop => "Desktop",
+            Self::WindowsDesktop => "Windows Desktop",
+            Self::LinuxDesktop => "Linux Desktop",
             Self::Webasm => "WebAssembly",
             Self::Android => "Android APK",
             Self::Ios => "iOS Simulator",
@@ -303,6 +368,8 @@ impl BuildTarget {
     fn cli_arg(self) -> Option<&'static str> {
         match self {
             Self::Desktop => None,
+            Self::WindowsDesktop => Some("--windows"),
+            Self::LinuxDesktop => Some("--linux"),
             Self::Webasm => Some("--webasm"),
             Self::Android => Some("--android"),
             Self::Ios => Some("--ios"),
@@ -332,9 +399,15 @@ enum VarPathPart {
 /// An action a menu item or dialog performs.
 #[derive(Clone, Debug)]
 enum Action {
+    NewScene,
+    SaveScene,
+    LoadScene,
+    ExportScene,
+    RunScene,
     AddComponent(u64, String),
+    /// Add a user-authored behaviour script component by project-relative path.
+    AddScriptComponent(u64, String),
     PasteComponent(u64),
-    OpenAdvancedComponents(u64, f32, f32),
     AddEntity(Option<u64>),
     /// Add an entity at a specific world position (viewport context menu).
     AddEntityAt(f32, f32),
@@ -434,6 +507,7 @@ enum Action {
 
 #[derive(Clone, Debug)]
 struct ProjectWindowSettings {
+    start_scene: String,
     width: f32,
     height: f32,
     fullscreen: bool,
@@ -443,6 +517,7 @@ struct ProjectWindowSettings {
 impl Default for ProjectWindowSettings {
     fn default() -> Self {
         Self {
+            start_scene: super::DEFAULT_SCENE_FILE.to_string(),
             width: PREVIEW_ROOT_WIDTH,
             height: PREVIEW_ROOT_HEIGHT,
             fullscreen: false,
@@ -578,6 +653,7 @@ enum Pending {
     CreateShader,
     CreateAnimation,
     RenameEntity(u64),
+    CloseDocument(usize),
     UpdateEngine,
 }
 
@@ -670,8 +746,25 @@ enum AssetTarget {
 }
 
 /// An overlay drawn above everything, with input precedence.
+/// One selectable row in the searchable "Add Component" picker.
+#[derive(Clone)]
+struct ComponentPickerEntry {
+    label: String,
+    glyph: char,
+    action: Action,
+}
+
 enum Popup {
     Menu { x: f32, y: f32, items: Vec<MenuItem> },
+    /// Searchable "Add Component" list: filtered live by `query`, auto-focused,
+    /// and Enter adds the top match.
+    ComponentPicker {
+        x: f32,
+        y: f32,
+        query: String,
+        scroll: f32,
+        entries: Vec<ComponentPickerEntry>,
+    },
     Color {
         target: ColorTarget,
         x: f32,
@@ -702,6 +795,7 @@ enum Popup {
     Error { message: String, copied: bool },
     BuildTarget,
     ProjectWindow {
+        start_scene: String,
         width: String,
         height: String,
         fullscreen: bool,
@@ -716,6 +810,8 @@ enum Popup {
     },
     EditorSettings {
         theme_name: String,
+        custom_theme: Theme,
+        original_theme: Theme,
         font_path: String,
         show_tooltips: bool,
         show_window_bounds: bool,
@@ -807,6 +903,12 @@ pub struct EditorApp {
     /// Lazily-loaded image assets for accurate viewport previews. `None` marks
     /// a path that failed to load so we don't retry it every frame.
     image_cache: RefCell<HashMap<String, EditorImageCacheEntry>>,
+    /// Downsampled audio peaks for asset-picker waveform previews.
+    waveform_cache: RefCell<HashMap<String, EditorWaveformCacheEntry>>,
+    project_directory_cache: RefCell<HashMap<PathBuf, ProjectDirectoryCacheEntry>>,
+    /// World transforms are requested repeatedly by drawing, selection,
+    /// gizmos, and collider previews. Cache each hierarchy walk once per frame.
+    world_transform_cache: RefCell<HashMap<u64, EditorWorldTransform>>,
     /// Parsed Inspector schemas cached by source path and modification time.
     script_schema_cache: ScriptSchemaCache,
     /// Receiver for the outcome of a launched `Run` (None when finished).
@@ -826,6 +928,12 @@ pub struct EditorApp {
     dirty: bool,
     focus: Option<String>,
     edit_buffer: String,
+    edit_cursor: usize,
+    edit_selection_anchor: Option<usize>,
+    pointer_capture: Option<String>,
+    /// A validated font selection waiting for the window layer to install it.
+    /// An empty string switches back to the bundled font.
+    font_reload_request: Option<String>,
 }
 
 impl EditorApp {
@@ -905,6 +1013,9 @@ impl EditorApp {
             tile_paint_tile: 0,
             popup: None,
             image_cache: RefCell::new(HashMap::new()),
+            waveform_cache: RefCell::new(HashMap::new()),
+            project_directory_cache: RefCell::new(HashMap::new()),
+            world_transform_cache: RefCell::new(HashMap::new()),
             script_schema_cache: HashMap::new(),
             run_rx: None,
             build_rx: None,
@@ -917,6 +1028,10 @@ impl EditorApp {
             dirty: false,
             focus: None,
             edit_buffer: String::new(),
+            edit_cursor: 0,
+            edit_selection_anchor: None,
+            pointer_capture: None,
+            font_reload_request: None,
         }
     }
 
@@ -1021,9 +1136,40 @@ impl EditorApp {
         std::mem::take(&mut self.edit_buffer)
     }
 
-    pub fn set_focus(&mut self, focus: Option<String>, edit_buffer: String) {
-        self.focus = focus;
-        self.edit_buffer = edit_buffer;
+    pub fn take_edit_cursor(&mut self) -> usize {
+        std::mem::take(&mut self.edit_cursor)
+    }
+
+    pub fn take_edit_selection_anchor(&mut self) -> Option<usize> {
+        self.edit_selection_anchor.take()
+    }
+
+    pub fn take_pointer_capture(&mut self) -> Option<String> {
+        self.pointer_capture.take()
+    }
+
+    pub fn set_focus(
+        &mut self,
+        focus: Option<String>,
+        edit_buffer: String,
+        edit_cursor: usize,
+        edit_selection_anchor: Option<usize>,
+        pointer_capture: Option<String>,
+    ) {
+        // A dialog may request focus while the immediate-mode frame is being
+        // drawn. Preserve that newer request instead of overwriting it with
+        // the focus state captured at the beginning of the frame.
+        if self.focus.is_none() {
+            self.focus = focus;
+            self.edit_buffer = edit_buffer;
+            self.edit_cursor = edit_cursor;
+            self.edit_selection_anchor = edit_selection_anchor;
+        }
+        self.pointer_capture = pointer_capture;
+    }
+
+    pub fn take_font_reload_request(&mut self) -> Option<String> {
+        self.font_reload_request.take()
     }
 
     pub fn flush_config(&mut self) {
@@ -1154,6 +1300,7 @@ impl EditorApp {
     }
 
     fn mark_dirty(&mut self) {
+        self.world_transform_cache.borrow_mut().clear();
         self.scene_dirty = true;
         if let Some(document) = self.documents.get_mut(self.active_document) {
             document.dirty = true;
@@ -1185,6 +1332,50 @@ impl EditorApp {
         self.undo_baseline = self.scene.to_json().unwrap_or_default();
         self.clear_scene_view_state();
         self.status = format!("Switched to {}", self.scene.name);
+    }
+
+    fn request_close_document(&mut self, index: usize) {
+        if self.documents.len() <= 1 || index >= self.documents.len() {
+            return;
+        }
+        self.sync_active_document();
+        if self.documents[index].dirty {
+            self.open_confirm(
+                &format!(
+                    "Discard unsaved changes in '{}' and close it?",
+                    self.documents[index].scene.name
+                ),
+                Pending::CloseDocument(index),
+            );
+        } else {
+            self.close_document(index);
+        }
+    }
+
+    fn close_document(&mut self, index: usize) {
+        if self.documents.len() <= 1 || index >= self.documents.len() {
+            return;
+        }
+        self.sync_active_document();
+        let closed_name = self.documents[index].scene.name.clone();
+        let closing_active = index == self.active_document;
+        self.documents.remove(index);
+
+        if index < self.active_document {
+            self.active_document -= 1;
+        } else if closing_active {
+            self.active_document = index.min(self.documents.len() - 1);
+            let document = self.documents[self.active_document].clone();
+            self.scene_path = document.path;
+            self.scene = document.scene;
+            self.document_kind = document.kind;
+            self.scene_dirty = document.dirty;
+            self.undo_stack.clear();
+            self.redo_stack.clear();
+            self.undo_baseline = self.scene.to_json().unwrap_or_default();
+            self.clear_scene_view_state();
+        }
+        self.status = format!("Closed {closed_name}");
     }
 
     fn add_document(&mut self, path: PathBuf, scene: Scene, kind: DocumentKind) {
@@ -1902,6 +2093,8 @@ impl EditorApp {
 
     fn refresh_project_browser(&mut self) {
         self.image_cache.borrow_mut().clear();
+        self.waveform_cache.borrow_mut().clear();
+        self.project_directory_cache.borrow_mut().clear();
         self.script_schema_cache.clear();
         self.bin_scroll = 0.0;
         self.status = "Refreshed project browser and editor caches".to_string();
@@ -1938,6 +2131,7 @@ impl EditorApp {
     // ---- Frame -------------------------------------------------------------
 
     pub fn frame(&mut self, ui: &mut Ui) {
+        self.world_transform_cache.borrow_mut().clear();
         self.prune_selection();
         let w = ui.painter.width();
         let h = ui.painter.height();
@@ -2185,42 +2379,54 @@ impl EditorApp {
         let y = 6.0;
         let bh = TOOLBAR_H - 12.0;
         let mut x = 8.0;
-        // Labelled action button.
-        let act = |ui: &mut Ui, glyph: char, label: &str, x: &mut f32| -> bool {
-            let tw = ui.painter.text_width(label, 14.0) + 30.0;
-            let rect = Rect::new(*x, y, tw, bh);
-            let clicked = ui.icon_button(rect, glyph, label);
-            *x += tw + 5.0;
-            clicked
-        };
 
-        if act(ui, icon::NOTE_ADD, "New", &mut x) {
-            self.new_scene();
+        // Keep the top bar focused on high-frequency work. Scene lifecycle,
+        // export, build, mobile and settings actions live in one compact menu.
+        let scene_menu = Rect::new(x, y, 30.0, bh);
+        if ui.icon_toggle(scene_menu, icon::FOLDER_OPEN, false, self.config.theme.text) {
+            self.open_scene_menu(scene_menu.x, scene_menu.bottom() + 2.0);
         }
-        if act(ui, icon::SAVE, "Save", &mut x) {
+        ui.tooltip(scene_menu, "Scene, project and build actions");
+        x += 35.0;
+
+        let dirty_mark = if self.scene_dirty { " •" } else { "" };
+        let scene_label = format!("{}{dirty_mark}", self.scene.name);
+        let scene_width = (ui.painter.text_width(&scene_label, 13.0) + 34.0)
+            .clamp(96.0, 200.0)
+            .min((w - 520.0).max(96.0));
+        let scene_rect = Rect::new(x, y, scene_width, bh);
+        if ui.icon_button(scene_rect, icon::EDIT, &scene_label) {
+            self.open_prompt("Rename scene", Pending::RenameScene, &self.scene.name.clone());
+        }
+        ui.tooltip(scene_rect, "Rename the active scene");
+        x += scene_width + 5.0;
+
+        let save = Rect::new(x, y, 30.0, bh);
+        if ui.icon_toggle(save, icon::SAVE, false, self.config.theme.text) {
             self.save();
         }
-        if act(ui, icon::FOLDER_OPEN, "Load", &mut x) {
-            self.load_requested();
-        }
-        if act(ui, icon::CODE, "Export", &mut x) {
-            self.export_luau();
-        }
-        if act(ui, icon::PLAY, "Run", &mut x) {
+        ui.tooltip(save, "Save scene (Ctrl+S)");
+        x += 35.0;
+
+        let run_width = ui.painter.text_width("Run", 14.0) + 31.0;
+        let run = Rect::new(x, y, run_width, bh);
+        if ui.icon_button(run, icon::PLAY, "Run") {
             self.run_scene();
         }
-        if act(ui, icon::PHONE_ANDROID, "Mobile", &mut x) {
-            self.open_mobile_emulator();
-        }
-        if act(ui, icon::DATA_OBJECT, "Build", &mut x) {
-            self.open_build_target();
-        }
-        x += 6.0;
-        if act(ui, icon::ADD_CIRCLE, "Entity", &mut x) {
+        ui.tooltip(run, "Run the current project");
+        x += run_width + 5.0;
+
+        let add_entity = Rect::new(x, y, 30.0, bh);
+        if ui.icon_toggle(add_entity, icon::ADD_CIRCLE, false, self.config.theme.text) {
             self.add_entity(None);
         }
+        ui.tooltip(add_entity, "Add entity");
+        x += 40.0;
 
-        x += 10.0;
+        ui.painter.fill_rect(
+            Rect::new(x - 5.0, y + 3.0, 1.0, bh - 6.0),
+            self.config.theme.border,
+        );
         for (tool, glyph, tip) in [
             (ViewTool::Move, icon::OPEN_WITH, "Move tool"),
             (ViewTool::Scale, icon::ASPECT_RATIO, "Scale tool"),
@@ -2259,26 +2465,30 @@ impl EditorApp {
         }
         ui.tooltip(gr, "Show grid");
         x += 35.0;
-        let grid_field = Rect::new(x, y, 46.0, bh);
-        let grid_str = format_num(self.config.layout.grid);
-        let r = ui.text_field("grid_size", grid_field, &grid_str);
-        if r.changed {
-            if let Ok(v) = r.text.trim().parse::<f32>() {
-                self.config.layout.grid = v.clamp(1.0, 512.0);
-                self.dirty = true;
-            }
-        }
-        ui.tooltip(grid_field, "Grid size");
-        x += 50.0;
 
-        // Reset camera to the origin.
-        let cam_rect = Rect::new(x, y, 30.0, bh);
-        if ui.icon_toggle(cam_rect, icon::MY_LOCATION, false, self.config.theme.text) {
-            self.reset_view();
-            self.status = "Camera reset to (0, 0)".to_string();
+        if w >= 900.0 {
+            let grid_field = Rect::new(x, y, 46.0, bh);
+            let grid_str = format_num(self.config.layout.grid);
+            let r = ui.text_field("grid_size", grid_field, &grid_str);
+            if r.changed {
+                if let Ok(v) = r.text.trim().parse::<f32>() {
+                    self.config.layout.grid = v.clamp(1.0, 512.0);
+                    self.dirty = true;
+                }
+            }
+            ui.tooltip(grid_field, "Grid size");
+            x += 50.0;
         }
-        ui.tooltip(cam_rect, "Reset camera to origin (0)");
-        x += 35.0;
+
+        if w >= 820.0 {
+            let cam_rect = Rect::new(x, y, 30.0, bh);
+            if ui.icon_toggle(cam_rect, icon::MY_LOCATION, false, self.config.theme.text) {
+                self.reset_view();
+                self.status = "Camera reset to (0, 0)".to_string();
+            }
+            ui.tooltip(cam_rect, "Reset camera to origin (0)");
+            x += 35.0;
+        }
 
         // Compact Unity-style utility menu for selection, hierarchy, arrange,
         // and Scene-view commands without crowding the main toolbar.
@@ -2294,23 +2504,6 @@ impl EditorApp {
             self.open_window_menu(window_rect.x, window_rect.bottom() + 2.0);
         }
         ui.tooltip(window_rect, "Window panels and project window settings");
-        x += 35.0;
-
-        let settings_rect = Rect::new(x, y, 30.0, bh);
-        if ui.icon_toggle(settings_rect, icon::TUNE, false, self.config.theme.text) {
-            self.open_editor_settings();
-        }
-        ui.tooltip(settings_rect, "Editor settings");
-        x += 35.0;
-
-        // Scene name (read-only display; rename via the dialog button).
-        let name_label = format!("Scene: {}", self.scene.name);
-        let avail = (w - x - 8.0).max(60.0);
-        let nr = Rect::new(w - avail - 8.0, y, avail, bh);
-        if ui.icon_button(nr, icon::EDIT, &name_label) {
-            self.open_prompt("Rename scene", Pending::RenameScene, &self.scene.name.clone());
-        }
-        ui.tooltip(nr, "Rename scene (also renames the file)");
     }
 
     fn document_tabs(&mut self, ui: &mut Ui, w: f32, y: f32) {
@@ -2319,21 +2512,69 @@ impl EditorApp {
         }
         let bar = Rect::new(0.0, y, w, STATUS_H);
         ui.painter.fill_rect(bar, self.config.theme.header);
-        ui.painter.stroke_rect(bar, self.config.theme.border);
+        ui.painter.fill_rect(
+            Rect::new(bar.x, bar.y, bar.w, 1.0),
+            self.config.theme.border,
+        );
         let mut x = 6.0;
         let mut activate = None;
+        let mut close = None;
         for (index, document) in self.documents.iter().enumerate() {
             let active = index == self.active_document;
             let dirty = if active { self.scene_dirty } else { document.dirty };
             let kind = if document.kind == DocumentKind::Prefab { "◆" } else { "" };
             let label = format!("{kind}{}{}", document.scene.name, if dirty { " •" } else { "" });
-            let width = (ui.painter.text_width(&label, 13.0) + 28.0).clamp(90.0, 220.0);
-            let tab = Rect::new(x, y + 1.0, width, STATUS_H - 2.0);
-            if active {
-                ui.painter.fill_rect(tab, self.config.theme.panel);
-                ui.painter.fill_rect(Rect::new(tab.x, tab.y, tab.w, 2.0), self.config.theme.accent);
+            let width = (ui.painter.text_width(&label, 13.0) + 44.0).clamp(94.0, 220.0);
+            let tab = Rect::new(x, y + 3.0, width, STATUS_H - 6.0);
+            let hovered = tab.contains(ui.input.mouse_x, ui.input.mouse_y);
+            if active || hovered {
+                let fill = if active {
+                    self.config.theme.panel
+                } else {
+                    self.config.theme.panel_alt
+                };
+                ui.painter.fill_round_rect(tab, 4.0, fill);
+                ui.painter.stroke_round_rect(tab, 4.0, self.config.theme.border);
             }
-            if ui.button(tab, &label) {
+            if active {
+                ui.painter.fill_round_rect(
+                    Rect::new(tab.x + 5.0, tab.bottom() - 2.0, tab.w - 10.0, 2.0),
+                    1.0,
+                    self.config.theme.accent,
+                );
+            }
+            ui.painter.text(
+                tab.x + 12.0,
+                tab.y + (tab.h - 13.0) * 0.5,
+                &label,
+                13.0,
+                if active {
+                    self.config.theme.text
+                } else {
+                    self.config.theme.text_dim
+                },
+            );
+            let close_rect = Rect::new(tab.right() - 25.0, tab.y, 24.0, tab.h);
+            if active || hovered {
+                ui.icon(
+                    close_rect.x + close_rect.w * 0.5,
+                    close_rect.y + close_rect.h * 0.5,
+                    icon::CLOSE,
+                    15.0,
+                    if close_rect.contains(ui.input.mouse_x, ui.input.mouse_y) {
+                        self.config.theme.text
+                    } else {
+                        self.config.theme.text_dim
+                    },
+                );
+            }
+            if ui.input.mouse_pressed
+                && close_rect.contains(ui.input.mouse_x, ui.input.mouse_y)
+            {
+                close = Some(index);
+            } else if ui.input.middle_pressed && hovered {
+                close = Some(index);
+            } else if ui.input.mouse_pressed && hovered {
                 activate = Some(index);
             }
             x += width + 3.0;
@@ -2341,7 +2582,9 @@ impl EditorApp {
                 break;
             }
         }
-        if let Some(index) = activate {
+        if let Some(index) = close {
+            self.request_close_document(index);
+        } else if let Some(index) = activate {
             self.switch_document(index);
         }
     }
@@ -2724,9 +2967,15 @@ impl EditorApp {
         let z = self.cam_zoom;
 
         // Draw entities sorted by z (lower first).
-        let mut entities: Vec<Entity> = self.scene.entities.clone();
-        entities.sort_by(compare_editor_entity_order);
-        for entity in &entities {
+        let mut entity_order = (0..self.scene.entities.len()).collect::<Vec<_>>();
+        entity_order.sort_by(|left, right| {
+            compare_editor_entity_order(
+                &self.scene.entities[*left],
+                &self.scene.entities[*right],
+            )
+        });
+        for index in entity_order {
+            let entity = &self.scene.entities[index];
             if self.hidden_ids.contains(&entity.id) {
                 continue;
             }
@@ -2942,8 +3191,45 @@ impl EditorApp {
         loaded
     }
 
+    fn load_sound_waveform(&self, path: &str) -> Option<Rc<Vec<f32>>> {
+        if path.is_empty() {
+            return None;
+        }
+        let full = self.project_root.join(path);
+        let modified = std::fs::metadata(&full)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        if let Some(entry) = self.waveform_cache.borrow().get(path) {
+            if entry.modified == modified {
+                return entry.peaks.clone();
+            }
+        }
+        let peaks = decode_waveform_peaks(&full, WAVEFORM_PREVIEW_BUCKETS)
+            .ok()
+            .map(Rc::new);
+        self.waveform_cache.borrow_mut().insert(
+            path.to_string(),
+            EditorWaveformCacheEntry {
+                modified,
+                peaks: peaks.clone(),
+            },
+        );
+        peaks
+    }
+
     fn entity_world_transform(&self, id: u64) -> Option<EditorWorldTransform> {
-        scene_world_transform(&self.scene, id, self.preview_root_size())
+        if let Some(transform) = self.world_transform_cache.borrow().get(&id).copied() {
+            return Some(transform);
+        }
+        let mut cache = self.world_transform_cache.borrow_mut();
+        let mut visiting = HashSet::new();
+        scene_world_transform_cached(
+            &self.scene,
+            id,
+            self.preview_root_size(),
+            &mut visiting,
+            &mut cache,
+        )
     }
 
     /// Accumulated world rotation (radians) for an entity, matching what the
@@ -3060,7 +3346,7 @@ impl EditorApp {
                     }).unwrap_or(d)
                 };
                 match name.as_str() {
-                    "Rect2D" | "Frame" | "ScrollList" => {
+                    "Rect2D" | "ScrollList" => {
                         let radius = prop_num("corner_radius", 0.0) * zoom;
                         ui.painter.fill_round_rect(rect, radius, color);
                         drew = true;
@@ -3209,7 +3495,12 @@ impl EditorApp {
                     }
                     "Button" | "Dropdown" | "TextInput" => {
                         let radius = prop_num("corner_radius", 6.0) * zoom;
-                        ui.painter.fill_round_rect(rect, radius, color);
+                        let fill_default = match name.as_str() {
+                            "Button" => [14, 99, 156, 255],
+                            _ => [60, 60, 60, 255],
+                        };
+                        let fill = prop_color(props, "background_color").unwrap_or(fill_default);
+                        ui.painter.fill_round_rect(rect, radius, fill);
                         let defaults = match name.as_str() {
                             "Button" => TextPreviewDefaults {
                                 default_scale: 18.0,
@@ -3268,6 +3559,54 @@ impl EditorApp {
                         }
                         drew = true;
                     }
+                    "SpriteSheet2D" => {
+                        if let Some(img) = prop_img("image").and_then(|p| self.load_image(&p)) {
+                            let frame_w = prop_num("frame_width", 32.0)
+                                .max(1.0)
+                                .min(img.width() as f32);
+                            let frame_h = prop_num("frame_height", 32.0)
+                                .max(1.0)
+                                .min(img.height() as f32);
+                            let spacing = prop_num("spacing", 0.0).max(0.0);
+                            let margin = prop_num("margin", 0.0)
+                                .max(0.0)
+                                .min(((img.width() as f32 - frame_w) * 0.5).max(0.0))
+                                .min(((img.height() as f32 - frame_h) * 0.5).max(0.0));
+                            let usable_w = (img.width() as f32 - margin * 2.0).max(frame_w);
+                            let usable_h = (img.height() as f32 - margin * 2.0).max(frame_h);
+                            let available_columns = (((usable_w + spacing)
+                                / (frame_w + spacing))
+                                .floor() as i32)
+                                .max(1);
+                            let configured_columns = prop_int("columns", 0).max(0);
+                            let columns = if configured_columns == 0 {
+                                available_columns
+                            } else {
+                                configured_columns.min(available_columns).max(1)
+                            };
+                            let rows = (((usable_h + spacing) / (frame_h + spacing)).floor()
+                                as i32)
+                                .max(1);
+                            let available_frames = columns.saturating_mul(rows).max(1);
+                            let configured_count = prop_int("frame_count", 0);
+                            let frame_count = if configured_count <= 0 {
+                                available_frames
+                            } else {
+                                configured_count.min(available_frames).max(1)
+                            };
+                            let frame = prop_int("frame", 0).clamp(0, frame_count - 1);
+                            let source = Rect::new(
+                                margin + (frame % columns) as f32 * (frame_w + spacing),
+                                margin + (frame / columns) as f32 * (frame_h + spacing),
+                                frame_w,
+                                frame_h,
+                            );
+                            ui.painter.draw_image(&img, rect, Some(source), color);
+                        } else {
+                            self.draw_missing_image(ui, rect, color);
+                        }
+                        drew = true;
+                    }
                     "NineSliceSprite2D" => {
                         if let Some(img) = prop_img("image").and_then(|p| self.load_image(&p)) {
                             draw_nine_slice(
@@ -3309,6 +3648,77 @@ impl EditorApp {
                             );
                         } else {
                             self.draw_missing_image(ui, rect, color);
+                        }
+                        drew = true;
+                    }
+                    "Panel" | "Frame" => {
+                        let bg = prop_color(props, "background_color").unwrap_or([37, 37, 38, 255]);
+                        let border =
+                            prop_color(props, "border_color").unwrap_or([69, 69, 69, 255]);
+                        let radius = prop_num("corner_radius", 4.0) * zoom;
+                        ui.painter.fill_round_rect(rect, radius, bg);
+                        ui.painter.stroke_round_rect(rect, radius, border);
+                        drew = true;
+                    }
+                    "Slider" => {
+                        let track =
+                            prop_color(props, "background_color").unwrap_or([60, 60, 60, 255]);
+                        let fill = prop_color(props, "fill_color").unwrap_or([0, 122, 204, 255]);
+                        let thumb =
+                            prop_color(props, "thumb_color").unwrap_or([204, 204, 204, 255]);
+                        let vertical = prop_enum("orientation")
+                            .map(|value| value.eq_ignore_ascii_case("vertical"))
+                            .unwrap_or(false);
+                        let min = prop_num("min", 0.0);
+                        let max = prop_num("max", 100.0);
+                        let range = max - min;
+                        let fraction = if range.abs() > f32::EPSILON {
+                            ((prop_num("value", 0.0) - min) / range).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let thumb_size = prop_num("thumb_size", 16.0).max(0.0) * zoom;
+                        let half = thumb_size * 0.5;
+                        let thickness = prop_num("track_thickness", 6.0).max(0.0) * zoom;
+                        let radius = prop_num("corner_radius", 3.0) * zoom;
+                        if vertical {
+                            let tw = if thickness > 0.0 { thickness.min(rect.w) } else { rect.w };
+                            let track_rect =
+                                Rect::new(rect.x + (rect.w - tw) * 0.5, rect.y, tw, rect.h);
+                            ui.painter.fill_round_rect(track_rect, radius, track);
+                            let travel = (rect.h - thumb_size).max(0.0);
+                            let cy = rect.y + rect.h - half - fraction * travel;
+                            let fill_rect = Rect::new(
+                                track_rect.x,
+                                cy,
+                                tw,
+                                (track_rect.y + track_rect.h - cy).max(0.0),
+                            );
+                            ui.painter.fill_round_rect(fill_rect, radius, fill);
+                            ui.painter.fill_round_rect(
+                                Rect::new(track_rect.x + tw * 0.5 - half, cy - half, thumb_size, thumb_size),
+                                half,
+                                thumb,
+                            );
+                        } else {
+                            let th = if thickness > 0.0 { thickness.min(rect.h) } else { rect.h };
+                            let track_rect =
+                                Rect::new(rect.x, rect.y + (rect.h - th) * 0.5, rect.w, th);
+                            ui.painter.fill_round_rect(track_rect, radius, track);
+                            let travel = (rect.w - thumb_size).max(0.0);
+                            let cx = rect.x + half + fraction * travel;
+                            let fill_rect = Rect::new(
+                                track_rect.x,
+                                track_rect.y,
+                                (cx - track_rect.x).max(0.0),
+                                th,
+                            );
+                            ui.painter.fill_round_rect(fill_rect, radius, fill);
+                            ui.painter.fill_round_rect(
+                                Rect::new(cx - half, track_rect.y + th * 0.5 - half, thumb_size, thumb_size),
+                                half,
+                                thumb,
+                            );
                         }
                         drew = true;
                     }
@@ -3787,17 +4197,10 @@ impl EditorApp {
     }
 
     fn instantiate_prefab(&mut self, path: &Path, wx: f32, wy: f32) {
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
-                self.status = format!("Prefab load failed: {e}");
-                return;
-            }
-        };
-        let mut proto: Vec<Entity> = match serde_json::from_str(&text) {
+        let mut proto = match load_prefab_file(path) {
             Ok(p) => p,
             Err(e) => {
-                self.status = format!("Prefab parse failed: {e}");
+                self.status = format!("Prefab load failed: {e}");
                 return;
             }
         };
@@ -4550,6 +4953,70 @@ impl EditorApp {
         if now {
             dirty |= self.num_row(ui, "ent_ax", "Anchor X", &mut entity.anchor_x, x + 8.0, width - 8.0, &mut y);
             dirty |= self.num_row(ui, "ent_ay", "Anchor Y", &mut entity.anchor_y, x + 8.0, width - 8.0, &mut y);
+            dirty |= self.position_pivot_mode_row(
+                ui,
+                "Position Pivot",
+                &mut entity.position_pivot,
+                x + 8.0,
+                width - 8.0,
+                &mut y,
+            );
+            let (position_default_x, position_default_y) =
+                position_pivot_fraction_from_name(&entity.position_pivot);
+            dirty |= self.optional_num_row(
+                ui,
+                "ent_pivot_x",
+                "Pivot X",
+                &mut entity.pivot_x,
+                position_default_x,
+                x + 8.0,
+                width - 8.0,
+                &mut y,
+            );
+            dirty |= self.optional_num_row(
+                ui,
+                "ent_pivot_y",
+                "Pivot Y",
+                &mut entity.pivot_y,
+                position_default_y,
+                x + 8.0,
+                width - 8.0,
+                &mut y,
+            );
+            dirty |= self.rotation_pivot_mode_row(
+                ui,
+                "Rotation Pivot",
+                &mut entity.rotation_pivot,
+                x + 8.0,
+                width - 8.0,
+                &mut y,
+            );
+            let (rotation_default_x, rotation_default_y) =
+                if entity.pivot_x.is_some() || entity.pivot_y.is_some() {
+                    (entity.pivot_x.unwrap_or(0.0), entity.pivot_y.unwrap_or(0.0))
+                } else {
+                    rotation_pivot_fraction_from_name(&entity.rotation_pivot)
+                };
+            dirty |= self.optional_num_row(
+                ui,
+                "ent_rotation_pivot_x",
+                "Rot Pivot X",
+                &mut entity.rotation_pivot_x,
+                rotation_default_x,
+                x + 8.0,
+                width - 8.0,
+                &mut y,
+            );
+            dirty |= self.optional_num_row(
+                ui,
+                "ent_rotation_pivot_y",
+                "Rot Pivot Y",
+                &mut entity.rotation_pivot_y,
+                rotation_default_y,
+                x + 8.0,
+                width - 8.0,
+                &mut y,
+            );
         }
         y += 6.0;
 
@@ -4882,6 +5349,10 @@ impl EditorApp {
             if hovered { self.config.theme.accent } else { self.config.theme.border },
         );
         if hovered && ui.input.mouse_pressed {
+            self.focus = Some("sequence_time".to_string());
+            self.edit_buffer = "0".to_string();
+            self.edit_cursor = 1;
+            self.edit_selection_anchor = None;
             self.popup = Some(Popup::Sequence {
                 target,
                 kind,
@@ -4911,6 +5382,10 @@ impl EditorApp {
         let button = Rect::new(x + field_width + 4.0, y, picker_width, FIELD_H);
         if ui.icon_toggle(button, kind.glyph(), false, self.config.theme.text_dim) {
             let files = self.asset_paths(kind);
+            self.focus = Some("asset_picker_search".to_string());
+            self.edit_buffer.clear();
+            self.edit_cursor = 0;
+            self.edit_selection_anchor = None;
             self.popup = Some(Popup::Asset {
                 target,
                 kind,
@@ -5497,6 +5972,147 @@ impl EditorApp {
         dirty
     }
 
+    fn optional_num_row(
+        &mut self,
+        ui: &mut Ui,
+        id: &str,
+        label: &str,
+        value: &mut Option<f32>,
+        default_value: f32,
+        x: f32,
+        width: f32,
+        y: &mut f32,
+    ) -> bool {
+        self.inspector_label(ui, x, *y + 4.0, label, LABEL_W - 6.0);
+        let fx = x + LABEL_W;
+        let fw = (width - LABEL_W).max(30.0);
+        let clear_w = FIELD_H;
+        let field_w = (fw - clear_w - 4.0).max(24.0);
+        let current = value.unwrap_or(default_value);
+        let r = ui.text_field(id, Rect::new(fx, *y, field_w, FIELD_H), &format_num(current));
+        let clear = Rect::new(fx + field_w + 4.0, *y, clear_w, FIELD_H);
+        let clear_clicked = ui.icon_toggle(clear, icon::RESTART_ALT, value.is_some(), self.config.theme.text_dim);
+        ui.tooltip(clear, "Clear numeric override");
+        let mut dirty = false;
+        if r.changed {
+            let trimmed = r.text.trim();
+            if trimmed.is_empty() {
+                if value.is_some() {
+                    *value = None;
+                    dirty = true;
+                }
+            } else if let Ok(v) = trimmed.parse::<f32>() {
+                let v = if v.is_finite() { v } else { 0.0 };
+                let changed = match *value {
+                    Some(old) => (old - v).abs() > f32::EPSILON,
+                    None => true,
+                };
+                if changed {
+                    *value = Some(v);
+                    dirty = true;
+                }
+            }
+        }
+        if clear_clicked && value.is_some() {
+            *value = None;
+            dirty = true;
+        }
+        *y += FIELD_H + 6.0;
+        dirty
+    }
+
+    fn position_pivot_mode_row(
+        &mut self,
+        ui: &mut Ui,
+        label: &str,
+        value: &mut String,
+        x: f32,
+        width: f32,
+        y: &mut f32,
+    ) -> bool {
+        let current = normalized_position_pivot_name(value);
+        self.pivot_mode_row(
+            ui,
+            label,
+            value,
+            current,
+            &[
+                ("top_left", "TL", "Top-left pivot"),
+                ("center", "Center", "Center pivot"),
+                ("top_right", "TR", "Top-right pivot"),
+            ],
+            x,
+            width,
+            y,
+        )
+    }
+
+    fn rotation_pivot_mode_row(
+        &mut self,
+        ui: &mut Ui,
+        label: &str,
+        value: &mut String,
+        x: f32,
+        width: f32,
+        y: &mut f32,
+    ) -> bool {
+        let current = normalized_rotation_pivot_name(value);
+        self.pivot_mode_row(
+            ui,
+            label,
+            value,
+            current,
+            &[
+                ("top_left", "TL", "Top-left pivot"),
+                ("center", "Center", "Center pivot"),
+            ],
+            x,
+            width,
+            y,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pivot_mode_row(
+        &mut self,
+        ui: &mut Ui,
+        label: &str,
+        value: &mut String,
+        current: &str,
+        options: &[(&str, &str, &str)],
+        x: f32,
+        width: f32,
+        y: &mut f32,
+    ) -> bool {
+        self.inspector_label(ui, x, *y + 4.0, label, LABEL_W - 6.0);
+        let fx = x + LABEL_W;
+        let fw = (width - LABEL_W).max(30.0);
+        let gap = 4.0;
+        let count = options.len().max(1) as f32;
+        let button_w = ((fw - gap * (count - 1.0)) / count).max(24.0);
+        let mut dirty = false;
+        for (index, (key, text, tooltip)) in options.iter().enumerate() {
+            let bx = fx + index as f32 * (button_w + gap);
+            let rect = Rect::new(bx, *y, button_w, FIELD_H);
+            let active = current == *key;
+            let base = if active {
+                self.config.theme.button_active
+            } else {
+                self.config.theme.button
+            };
+            if ui.button_colored(rect, text, base, self.config.theme.text) {
+                let next = pivot_storage_value(key);
+                if *value != next {
+                    *value = next;
+                    dirty = true;
+                }
+            }
+            ui.tooltip(rect, tooltip);
+        }
+        *y += FIELD_H + 6.0;
+        dirty
+    }
+
     fn text_row(&mut self, ui: &mut Ui, id: &str, label: &str, value: &mut String, x: f32, width: f32, y: &mut f32) -> bool {
         self.inspector_label(ui, x, *y + 4.0, label, LABEL_W - 6.0);
         let fx = x + LABEL_W;
@@ -5525,13 +6141,22 @@ impl EditorApp {
         let swatch = Rect::new(fx, y, 22.0, FIELD_H);
         if ui.swatch_button(swatch, *color) {
             let hue = rgb_to_hsv(*color).0;
+            if self.config.layout.hsv_picker {
+                let value = format!("{:02X}{:02X}{:02X}", color[0], color[1], color[2]);
+                self.focus = Some("cp_hex".to_string());
+                self.edit_cursor = value.chars().count();
+                self.edit_selection_anchor = None;
+                self.edit_buffer = value;
+            }
             self.popup = Some(Popup::Color { target, x: fx, y: y + FIELD_H + 2.0, rgba: *color, hue });
         }
-        ui.tooltip(swatch, "Open color picker");
+        ui.tooltip(swatch, "Open color picker (with alpha)");
+        // Four inline cells: R, G, B, and A (alpha / transparency, 0 = fully
+        // transparent, 255 = opaque).
         let cells_x = fx + 28.0;
         let avail = (fx + fw) - cells_x;
-        let cell_w = ((avail - 8.0) / 3.0).max(22.0);
-        for i in 0..3 {
+        let cell_w = ((avail - 12.0) / 4.0).max(18.0);
+        for i in 0..4 {
             let cx = cells_x + i as f32 * (cell_w + 4.0);
             let r = ui.text_field(&format!("{id}_{i}"), Rect::new(cx, y, cell_w, FIELD_H), &color[i].to_string());
             if r.changed {
@@ -5620,24 +6245,9 @@ impl EditorApp {
         }
 
         let content = Rect::new(area.x, area.y + HEADER_H, area.w, (area.h - HEADER_H).max(0.0));
-        let (mut dirs, mut files) = (Vec::new(), Vec::new());
-        if let Ok(read) = std::fs::read_dir(&self.bin_dir) {
-            for entry in read.flatten() {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with('.') {
-                    continue;
-                }
-                if path.is_dir() {
-                    dirs.push((path, name));
-                } else {
-                    let glyph = file_icon(&name);
-                    files.push((path, name, glyph));
-                }
-            }
-        }
-        dirs.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
-        files.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        let listing = self.project_directory_listing();
+        let dirs = &listing.dirs;
+        let files = &listing.files;
 
         if content.contains(ui.input.mouse_x, ui.input.mouse_y) && ui.input.scroll != 0.0 {
             self.bin_scroll -= ui.input.scroll * 32.0;
@@ -5664,7 +6274,7 @@ impl EditorApp {
             ui.painter.text_clipped(row.x + 26.0, yy + (row_h - 14.0) / 2.0, name, 14.0, theme.text, row.w - 30.0);
             (hovered && ui.input.mouse_pressed, hovered && ui.input.double_click, hovered && ui.input.right_pressed)
         };
-        for (path, name) in &dirs {
+        for (path, name) in dirs {
             let (click, dbl, rc) = draw(ui, yy, icon::FOLDER, name, true);
             if click || dbl {
                 navigate = Some(path.clone());
@@ -5676,7 +6286,7 @@ impl EditorApp {
         }
         let mut start_prefab_drag: Option<PathBuf> = None;
         let mut start_script_drag: Option<PathBuf> = None;
-        for (path, name, glyph) in &files {
+        for (path, name, glyph) in files {
             let (click, dbl, rc) = draw(ui, yy, *glyph, name, false);
             if dbl {
                 if path.extension().is_some_and(|e| e == "neoscene") {
@@ -5749,6 +6359,45 @@ impl EditorApp {
             .unwrap_or_else(|| ".".to_string())
     }
 
+    fn project_directory_listing(&self) -> Rc<ProjectDirectoryListing> {
+        let modified = std::fs::metadata(&self.bin_dir)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        if let Some(entry) = self.project_directory_cache.borrow().get(&self.bin_dir) {
+            if entry.modified == modified {
+                return entry.listing.clone();
+            }
+        }
+
+        let (mut dirs, mut files) = (Vec::new(), Vec::new());
+        if let Ok(read) = std::fs::read_dir(&self.bin_dir) {
+            for entry in read.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+                if path.is_dir() {
+                    dirs.push((path, name));
+                } else {
+                    let glyph = file_icon(&name);
+                    files.push((path, name, glyph));
+                }
+            }
+        }
+        dirs.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        files.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        let listing = Rc::new(ProjectDirectoryListing { dirs, files });
+        self.project_directory_cache.borrow_mut().insert(
+            self.bin_dir.clone(),
+            ProjectDirectoryCacheEntry {
+                modified,
+                listing: listing.clone(),
+            },
+        );
+        listing
+    }
+
     fn navigate_bin(&mut self, dir: PathBuf) {
         if !dir.starts_with(&self.project_root) {
             return;
@@ -5803,47 +6452,87 @@ impl EditorApp {
     // ---- Popups ------------------------------------------------------------
 
     fn open_add_component_menu(&mut self, entity: u64, x: f32, y: f32) {
-        let mut items: Vec<MenuItem> = Vec::new();
+        let mut entries: Vec<ComponentPickerEntry> = Vec::new();
         if let Some(c) = &self.component_clipboard {
-            items.push(MenuItem {
+            entries.push(ComponentPickerEntry {
                 action: Action::PasteComponent(entity),
                 glyph: icon::CONTENT_PASTE,
                 label: format!("Paste {}", c.label()),
-                danger: false,
             });
         }
-        items.extend(CORE_COMPONENTS.iter().map(|name| MenuItem {
+        entries.extend(CORE_COMPONENTS.iter().map(|name| ComponentPickerEntry {
             action: Action::AddComponent(entity, name.to_string()),
             glyph: core_icon(name),
             label: name.to_string(),
-            danger: false,
         }));
-        items.push(MenuItem {
+        // Custom behaviour scripts that opted in via IComponentPicker(Behaviour).
+        for (label, path) in self.custom_picker_scripts() {
+            entries.push(ComponentPickerEntry {
+                action: Action::AddScriptComponent(entity, path),
+                glyph: icon::DATA_OBJECT,
+                label,
+            });
+        }
+        entries.push(ComponentPickerEntry {
             action: Action::AddComponent(entity, "Script".to_string()),
             glyph: icon::DATA_OBJECT,
             label: "Script".to_string(),
-            danger: false,
         });
-        items.push(MenuItem {
-            action: Action::OpenAdvancedComponents(entity, x, y),
-            glyph: icon::EXPAND_MORE,
-            label: "Advanced…".to_string(),
-            danger: false,
+        entries.extend(ADVANCED_COMPONENTS.iter().map(|name| ComponentPickerEntry {
+            action: Action::AddComponent(entity, name.to_string()),
+            glyph: core_icon(name),
+            label: name.to_string(),
+        }));
+        self.focus = Some("component_picker_search".to_string());
+        self.popup = Some(Popup::ComponentPicker {
+            x,
+            y,
+            query: String::new(),
+            scroll: 0.0,
+            entries,
         });
-        self.popup = Some(Popup::Menu { x, y, items });
     }
 
-    fn open_advanced_component_menu(&mut self, entity: u64, x: f32, y: f32) {
-        let items: Vec<MenuItem> = ADVANCED_COMPONENTS
-            .iter()
-            .map(|name| MenuItem {
-                action: Action::AddComponent(entity, name.to_string()),
-                glyph: core_icon(name),
-                label: name.to_string(),
-                danger: false,
-            })
-            .collect();
-        self.popup = Some(Popup::Menu { x, y, items });
+    /// Discover behaviour scripts in the project that register themselves in the
+    /// "Add Component" picker by calling `IComponentPicker(Behaviour)`.
+    /// Returns `(display label, project-relative path)` pairs.
+    fn custom_picker_scripts(&self) -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        collect_files_with_extension(&self.project_root, "luau", &mut files);
+        collect_files_with_extension(&self.project_root, "lua", &mut files);
+        let mut out = Vec::new();
+        for path in files {
+            // Skip `.d.luau` type-definition files (they only *declare*
+            // IComponentPicker) and other non-runtime modules.
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".d.luau"))
+            {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if !source.contains("IComponentPicker") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&self.project_root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !script_registers_component_picker(&source, &rel) {
+                continue;
+            }
+            let label = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| rel.clone());
+            out.push((label, rel));
+        }
+        out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        out
     }
 
     fn open_entity_menu(&mut self, id: u64, x: f32, y: f32) {
@@ -5870,11 +6559,23 @@ impl EditorApp {
         self.popup = Some(Popup::Menu { x, y, items });
     }
 
+    fn open_scene_menu(&mut self, x: f32, y: f32) {
+        let items = vec![
+            MenuItem { action: Action::NewScene, glyph: icon::NOTE_ADD, label: "New Scene".into(), danger: false },
+            MenuItem { action: Action::LoadScene, glyph: icon::FOLDER_OPEN, label: "Reload Scene".into(), danger: false },
+            MenuItem { action: Action::SaveScene, glyph: icon::SAVE, label: "Save Scene     Ctrl+S".into(), danger: false },
+            MenuItem { action: Action::ExportScene, glyph: icon::CODE, label: "Export Luau".into(), danger: false },
+            MenuItem { action: Action::RunScene, glyph: icon::PLAY, label: "Run Project".into(), danger: false },
+            MenuItem { action: Action::BuildProject, glyph: icon::DATA_OBJECT, label: "Build Project…".into(), danger: false },
+            MenuItem { action: Action::OpenMobileEmulator, glyph: icon::PHONE_ANDROID, label: "Mobile Emulator…".into(), danger: false },
+            MenuItem { action: Action::OpenProjectWindowSettings, glyph: icon::TUNE, label: "Project Settings…".into(), danger: false },
+            MenuItem { action: Action::OpenEditorSettings, glyph: icon::PALETTE, label: "Editor Settings…".into(), danger: false },
+        ];
+        self.popup = Some(Popup::Menu { x, y, items });
+    }
+
     fn open_tools_menu(&mut self, x: f32, y: f32) {
         let items = vec![
-            MenuItem { action: Action::OpenEditorSettings, glyph: icon::TUNE, label: "Editor Settings".into(), danger: false },
-            MenuItem { action: Action::OpenMobileEmulator, glyph: icon::PHONE_ANDROID, label: "Mobile Emulator".into(), danger: false },
-            MenuItem { action: Action::BuildProject, glyph: icon::DATA_OBJECT, label: "Build Project".into(), danger: false },
             MenuItem { action: Action::OpenSelectionTools(x, y), glyph: icon::SELECT_ALL, label: "Selection".into(), danger: false },
             MenuItem { action: Action::OpenHierarchyTools(x, y), glyph: icon::ACCOUNT_TREE, label: "Hierarchy".into(), danger: false },
             MenuItem { action: Action::OpenArrangeTools(x, y), glyph: icon::VIEW_QUILT, label: "Align & Snap".into(), danger: false },
@@ -5980,8 +6681,8 @@ impl EditorApp {
         let items = vec![
             MenuItem {
                 action: Action::OpenProjectWindowSettings,
-                glyph: icon::FULLSCREEN,
-                label: "Project Window Settings".into(),
+                glyph: icon::TUNE,
+                label: "Project Settings".into(),
                 danger: false,
             },
             MenuItem {
@@ -6145,15 +6846,22 @@ impl EditorApp {
     fn open_prompt(&mut self, title: &str, action: Pending, initial: &str) {
         self.focus = Some("prompt_field".to_string());
         self.edit_buffer = initial.to_string();
+        self.edit_cursor = initial.chars().count();
+        self.edit_selection_anchor = None;
         self.popup = Some(Popup::Prompt { title: title.to_string(), action });
     }
 
     fn open_editor_settings(&mut self) {
+        let font_path = self.config.settings.font_path.clone();
         self.focus = Some("editor_font_path".to_string());
-        self.edit_buffer = self.config.settings.font_path.clone();
+        self.edit_cursor = font_path.chars().count();
+        self.edit_selection_anchor = None;
+        self.edit_buffer = font_path.clone();
         self.popup = Some(Popup::EditorSettings {
             theme_name: self.config.settings.theme_name.clone(),
-            font_path: self.config.settings.font_path.clone(),
+            custom_theme: self.config.custom_theme.clone(),
+            original_theme: self.config.theme.clone(),
+            font_path,
             show_tooltips: self.config.settings.show_tooltips,
             show_window_bounds: self.config.settings.show_window_bounds,
             show_transform_hud: self.config.settings.show_transform_hud,
@@ -6182,14 +6890,18 @@ impl EditorApp {
             None => return,
         };
         // Escape closes any popup (but not on the frame it just opened).
-        if interactive && ui.input.escape {
-            if matches!(popup, Popup::Prompt { .. } | Popup::Asset { .. } | Popup::Sequence { .. }) {
-                ui.clear_focus();
-            }
+        if interactive
+            && ui.input.escape
+            && !matches!(&popup, Popup::EditorSettings { .. })
+        {
+            ui.clear_focus();
             return;
         }
         match popup {
             Popup::Menu { x, y, items } => self.draw_menu(ui, x, y, items, w, h, interactive),
+            Popup::ComponentPicker { x, y, query, scroll, entries } => {
+                self.draw_component_picker(ui, x, y, query, scroll, entries, w, h, interactive)
+            }
             Popup::Color { target, x, y, rgba, hue } => self.draw_color_picker(ui, target, x, y, rgba, hue, w, h, interactive),
             Popup::Confirm { message, action } => self.draw_confirm(ui, message, action, w, h, interactive),
             Popup::Prompt { title, action } => self.draw_prompt(ui, title, action, w, h, interactive),
@@ -6208,12 +6920,14 @@ impl EditorApp {
             Popup::Error { message, copied } => self.draw_error(ui, message, copied, w, h, interactive),
             Popup::BuildTarget => self.draw_build_target_picker(ui, w, h, interactive),
             Popup::ProjectWindow {
+                start_scene,
                 width,
                 height,
                 fullscreen,
                 resizable,
             } => self.draw_project_window_settings(
                 ui,
+                start_scene,
                 width,
                 height,
                 fullscreen,
@@ -6231,6 +6945,8 @@ impl EditorApp {
             } => self.draw_mobile_emulator(ui, enabled, orientation, wifi, cellular, low_power, w, h, interactive),
             Popup::EditorSettings {
                 theme_name,
+                custom_theme,
+                original_theme,
                 font_path,
                 show_tooltips,
                 show_window_bounds,
@@ -6240,6 +6956,8 @@ impl EditorApp {
             } => self.draw_editor_settings(
                 ui,
                 theme_name,
+                custom_theme,
+                original_theme,
                 font_path,
                 show_tooltips,
                 show_window_bounds,
@@ -6265,6 +6983,9 @@ impl EditorApp {
                 h,
                 interactive,
             ),
+        }
+        if self.popup.is_none() {
+            ui.clear_focus();
         }
     }
 
@@ -6457,7 +7178,17 @@ impl EditorApp {
                             rgba: keypoint.color,
                             hue: rgb_to_hsv(keypoint.color).0,
                         });
-                        ui.clear_focus();
+                        if self.config.layout.hsv_picker {
+                            ui.focus_text(
+                                "cp_hex",
+                                &format!(
+                                    "{:02X}{:02X}{:02X}",
+                                    keypoint.color[0], keypoint.color[1], keypoint.color[2]
+                                ),
+                            );
+                        } else {
+                            ui.clear_focus();
+                        }
                     }
                     ui.tooltip(swatch, "Open color picker");
                     let labels = ["R", "G", "B"];
@@ -6648,11 +7379,26 @@ impl EditorApp {
         h: f32,
         interactive: bool,
     ) {
-        let width = (w - 32.0).min(520.0).max(280.0);
-        let height = (h - 48.0).min(440.0).max(220.0);
+        let has_preview = matches!(kind, AssetKind::Image | AssetKind::Sound);
+        let width = if has_preview {
+            (w - 32.0).min(760.0).max(340.0)
+        } else {
+            (w - 32.0).min(520.0).max(280.0)
+        };
+        let height = if has_preview {
+            (h - 48.0).min(480.0).max(260.0)
+        } else {
+            (h - 48.0).min(440.0).max(220.0)
+        };
         let x = (w - width) * 0.5;
         let y = (h - height) * 0.5;
         let panel = Rect::new(x, y, width, height);
+        let preview_w = if has_preview && width >= 620.0 { 220.0 } else { 0.0 };
+        let list_w = if preview_w > 0.0 {
+            (width - preview_w - 36.0).max(180.0)
+        } else {
+            width - 24.0
+        };
         ui.painter.fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 120]);
         ui.painter.fill_round_rect(panel, 6.0, self.config.theme.panel);
         ui.painter.stroke_round_rect(panel, 6.0, self.config.theme.accent);
@@ -6665,7 +7411,7 @@ impl EditorApp {
 
         let search = ui.text_field(
             "asset_picker_search",
-            Rect::new(x + 12.0, y + 40.0, width - 24.0, FIELD_H + 2.0),
+            Rect::new(x + 12.0, y + 40.0, list_w, FIELD_H + 2.0),
             &query,
         );
         if search.changed {
@@ -6679,7 +7425,7 @@ impl EditorApp {
             .filter(|path| query_lower.is_empty() || path.to_lowercase().contains(&query_lower))
             .collect();
 
-        let list = Rect::new(x + 12.0, y + 72.0, width - 24.0, height - 116.0);
+        let list = Rect::new(x + 12.0, y + 72.0, list_w, height - 116.0);
         let row_h = 26.0;
         let content_h = (paths.len() + 1) as f32 * row_h;
         let max_scroll = (content_h - list.h).max(0.0);
@@ -6693,8 +7439,9 @@ impl EditorApp {
         let previous_clip = ui.painter.push_clip(list);
         ui.set_input_clip(list);
         let mut chosen: Option<String> = None;
+        let mut preview_asset: Option<String> = None;
         let mut row_y = list.y - scroll;
-        let draw_asset = |ui: &mut Ui, row_y: f32, glyph: char, label: &str| -> bool {
+        let draw_asset = |ui: &mut Ui, row_y: f32, glyph: char, label: &str| -> (bool, bool) {
             let row = Rect::new(list.x, row_y, list.w, row_h - 1.0);
             let hovered = row.contains(ui.input.mouse_x, ui.input.mouse_y);
             if hovered {
@@ -6709,20 +7456,27 @@ impl EditorApp {
                 ui.theme.text,
                 row.w - 34.0,
             );
-            hovered && ui.input.mouse_pressed
+            (hovered && ui.input.mouse_pressed, hovered)
         };
-        if draw_asset(ui, row_y, icon::DELETE, "None") && interactive {
+        if draw_asset(ui, row_y, icon::DELETE, "None").0 && interactive {
             chosen = Some(String::new());
         }
         row_y += row_h;
         for path in &paths {
-            if draw_asset(ui, row_y, kind.glyph(), path) && interactive {
+            let (clicked, hovered) = draw_asset(ui, row_y, kind.glyph(), path);
+            if hovered {
+                preview_asset = Some((*path).clone());
+            }
+            if clicked && interactive {
                 chosen = Some((*path).clone());
             }
             row_y += row_h;
         }
         ui.reset_input_clip();
         ui.painter.set_clip_raw(previous_clip);
+        if preview_asset.is_none() {
+            preview_asset = paths.first().map(|path| (*path).clone());
+        }
 
         if paths.is_empty() {
             ui.painter.text(
@@ -6741,6 +7495,10 @@ impl EditorApp {
                 1.5,
                 self.config.theme.text_dim,
             );
+        }
+        if preview_w > 0.0 {
+            let preview = Rect::new(list.right() + 12.0, y + 40.0, preview_w, height - 84.0);
+            self.draw_asset_preview(ui, preview, kind, preview_asset.as_deref());
         }
 
         ui.painter.text(
@@ -6764,6 +7522,78 @@ impl EditorApp {
                 query,
                 scroll,
             });
+        }
+    }
+
+    fn draw_asset_preview(
+        &self,
+        ui: &mut Ui,
+        rect: Rect,
+        kind: AssetKind,
+        path: Option<&str>,
+    ) {
+        ui.painter.fill_round_rect(rect, 4.0, self.config.theme.field);
+        ui.painter.stroke_round_rect(rect, 4.0, self.config.theme.border);
+        ui.icon(rect.x + 18.0, rect.y + 18.0, kind.glyph(), 16.0, self.config.theme.accent);
+        ui.painter
+            .text(rect.x + 32.0, rect.y + 10.0, "Preview", 14.0, self.config.theme.text);
+
+        let body = Rect::new(rect.x + 10.0, rect.y + 36.0, rect.w - 20.0, rect.h - 62.0);
+        ui.painter.fill_round_rect(body, 3.0, self.config.theme.panel_alt);
+
+        match (kind, path) {
+            (AssetKind::Image, Some(path)) => {
+                if let Some(image) = self.load_image(path) {
+                    let fit = fit_rect_to_bounds(
+                        image.width() as f32,
+                        image.height() as f32,
+                        body.shrink(8.0),
+                    );
+                    ui.painter.draw_image(&image, fit, None, [255, 255, 255, 255]);
+                    ui.painter.stroke_rect(fit, self.config.theme.border);
+                } else {
+                    ui.painter.text(
+                        body.x + 10.0,
+                        body.y + body.h * 0.5 - 7.0,
+                        "Image preview unavailable",
+                        13.0,
+                        self.config.theme.text_dim,
+                    );
+                }
+            }
+            (AssetKind::Sound, Some(path)) => {
+                if let Some(peaks) = self.load_sound_waveform(path) {
+                    draw_waveform_preview(ui, body.shrink(10.0), &peaks);
+                } else {
+                    ui.painter.text(
+                        body.x + 10.0,
+                        body.y + body.h * 0.5 - 7.0,
+                        "Waveform unavailable",
+                        13.0,
+                        self.config.theme.text_dim,
+                    );
+                }
+            }
+            _ => {
+                ui.painter.text(
+                    body.x + 10.0,
+                    body.y + body.h * 0.5 - 7.0,
+                    "Hover an asset to preview",
+                    13.0,
+                    self.config.theme.text_dim,
+                );
+            }
+        }
+
+        if let Some(path) = path {
+            ui.painter.text_clipped(
+                rect.x + 10.0,
+                rect.bottom() - 19.0,
+                path,
+                11.0,
+                self.config.theme.text_dim,
+                rect.w - 20.0,
+            );
         }
     }
 
@@ -6908,12 +7738,13 @@ impl EditorApp {
         let do_close = interactive && (ui.button(close, "Close") || ui.input.escape);
         if do_copy {
             copied = copy_to_clipboard(&message);
-            if !copied {
+            if copied {
+                self.status = "Copied error to clipboard".to_string();
+            } else {
                 // Fall back to a file the user can open.
                 let path = self.project_root.join("last_error.txt");
                 let _ = std::fs::write(&path, &message);
                 self.status = format!("Clipboard unavailable; wrote {}", path.display());
-                copied = true;
             }
         }
         if !do_close {
@@ -6923,8 +7754,22 @@ impl EditorApp {
 
     fn draw_build_target_picker(&mut self, ui: &mut Ui, w: f32, h: f32, interactive: bool) {
         ui.painter.fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 120]);
+        let mut targets = vec![
+            (BuildTarget::Desktop, icon::VIEW_IN_AR),
+            (BuildTarget::Webasm, icon::CODE),
+            (BuildTarget::Android, icon::PHONE_ANDROID),
+            (BuildTarget::Ios, icon::PHONE_ANDROID),
+        ];
+        if cfg!(target_os = "linux") {
+            targets.insert(1, (BuildTarget::WindowsDesktop, icon::VIEW_IN_AR));
+        } else if cfg!(windows) {
+            targets.insert(1, (BuildTarget::LinuxDesktop, icon::VIEW_IN_AR));
+        } else {
+            targets.insert(1, (BuildTarget::WindowsDesktop, icon::VIEW_IN_AR));
+            targets.insert(2, (BuildTarget::LinuxDesktop, icon::VIEW_IN_AR));
+        }
         let width = (w - 32.0).min(430.0).max(340.0);
-        let height = 238.0_f32.min(h - 24.0).max(210.0);
+        let height = (96.0 + targets.len() as f32 * 34.0).min(h - 24.0).max(210.0);
         let px = (w - width) * 0.5;
         let py = (h - height) * 0.5;
         let panel = Rect::new(px, py, width, height);
@@ -6935,12 +7780,7 @@ impl EditorApp {
 
         let mut y = py + 46.0;
         let mut chosen = None;
-        for (target, glyph) in [
-            (BuildTarget::Desktop, icon::VIEW_IN_AR),
-            (BuildTarget::Webasm, icon::CODE),
-            (BuildTarget::Android, icon::PHONE_ANDROID),
-            (BuildTarget::Ios, icon::PHONE_ANDROID),
-        ] {
+        for (target, glyph) in targets {
             let row = Rect::new(px + 16.0, y, width - 32.0, 28.0);
             if interactive && ui.icon_button(row, glyph, target.label()) {
                 chosen = Some(target);
@@ -7085,6 +7925,113 @@ impl EditorApp {
         }
     }
 
+    /// The searchable "Add Component" picker: a text field that filters the list
+    /// live, auto-focused on open, where Enter adds the top match. Custom scripts
+    /// that call `IComponentPicker(Behaviour)` appear alongside core components.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_component_picker(
+        &mut self,
+        ui: &mut Ui,
+        x: f32,
+        y: f32,
+        mut query: String,
+        mut scroll: f32,
+        entries: Vec<ComponentPickerEntry>,
+        w: f32,
+        h: f32,
+        interactive: bool,
+    ) {
+        let width = 260.0_f32;
+        let row_h = 26.0;
+        let field_h = FIELD_H + 2.0;
+        let pad = 6.0;
+
+        let filter = |query: &str| -> Vec<ComponentPickerEntry> {
+            let q = query.trim().to_lowercase();
+            entries
+                .iter()
+                .filter(|entry| q.is_empty() || entry.label.to_lowercase().contains(&q))
+                .cloned()
+                .collect()
+        };
+
+        let visible_rows = filter(&query).len().clamp(1, 10);
+        let list_h = visible_rows as f32 * row_h;
+        let height = pad + field_h + 6.0 + list_h + pad;
+        let px = x.min(w - width - 4.0).max(2.0);
+        let py = y.min(h - height - 4.0).max(2.0);
+        let rect = Rect::new(px, py, width, height);
+        ui.painter.fill_round_rect(rect, 5.0, self.config.theme.panel);
+        ui.painter.stroke_round_rect(rect, 5.0, self.config.theme.border);
+
+        // Enter is captured before drawing the field, which clears focus on Enter.
+        let submit = interactive && ui.input.enter && ui.has_focus();
+
+        let field = Rect::new(px + pad, py + pad, width - pad * 2.0, field_h);
+        let search = ui.text_field("component_picker_search", field, &query);
+        if search.changed {
+            query = search.text;
+            scroll = 0.0;
+        }
+
+        let filtered = filter(&query);
+        let list = Rect::new(px + pad, py + pad + field_h + 6.0, width - pad * 2.0, list_h);
+        let content_h = filtered.len() as f32 * row_h;
+        let max_scroll = (content_h - list.h).max(0.0);
+        if interactive
+            && list.contains(ui.input.mouse_x, ui.input.mouse_y)
+            && ui.input.scroll != 0.0
+        {
+            scroll = (scroll - ui.input.scroll * row_h * 2.0).clamp(0.0, max_scroll);
+            ui.wants_redraw = true;
+        } else {
+            scroll = scroll.clamp(0.0, max_scroll);
+        }
+
+        let mut chosen: Option<Action> = None;
+        let prev_clip = ui.painter.push_clip(list);
+        ui.set_input_clip(list);
+        let mut ry = list.y - scroll;
+        for entry in &filtered {
+            let r = Rect::new(list.x, ry, list.w, row_h);
+            if ui.menu_item(r, entry.glyph, &entry.label, false) && interactive {
+                chosen = Some(entry.action.clone());
+            }
+            ry += row_h;
+        }
+        ui.reset_input_clip();
+        ui.painter.set_clip_raw(prev_clip);
+
+        if filtered.is_empty() {
+            ui.painter.text(
+                list.x + 8.0,
+                list.y + 6.0,
+                "No matching components",
+                13.0,
+                self.config.theme.text_dim,
+            );
+        }
+
+        // Enter adds the top match.
+        if submit && chosen.is_none() {
+            if let Some(top) = filtered.first() {
+                chosen = Some(top.action.clone());
+            }
+        }
+
+        let clicked_outside = interactive
+            && ui.input.mouse_pressed
+            && !rect.contains(ui.input.mouse_x, ui.input.mouse_y);
+        if let Some(action) = chosen.filter(|_| interactive) {
+            ui.clear_focus();
+            self.perform(action);
+        } else if clicked_outside {
+            ui.clear_focus();
+        } else {
+            self.popup = Some(Popup::ComponentPicker { x, y, query, scroll, entries });
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn draw_color_picker(&mut self, ui: &mut Ui, target: ColorTarget, x: f32, y: f32, rgba: [u8; 4], hue: f32, w: f32, h: f32, interactive: bool) {
         let response = self.draw_color_picker_panel(ui, x, y, rgba, hue, w, h, interactive);
@@ -7145,7 +8092,7 @@ impl EditorApp {
 
             // Interaction.
             let (_, mut s, mut v) = rgb_to_hsv(rgba);
-            if interactive && ui.input.mouse_down && sq.contains(ui.input.mouse_x, ui.input.mouse_y) {
+            if interactive && ui.pointer_drag("color-picker-sv", sq) {
                 s = ((ui.input.mouse_x - sq.x) / sq.w).clamp(0.0, 1.0);
                 v = (1.0 - (ui.input.mouse_y - sq.y) / sq.h).clamp(0.0, 1.0);
                 let c = hsv_to_rgb(hue, s, v);
@@ -7153,7 +8100,7 @@ impl EditorApp {
                 changed = true;
                 ui.wants_redraw = true;
             }
-            if interactive && ui.input.mouse_down && strip.contains(ui.input.mouse_x, ui.input.mouse_y) {
+            if interactive && ui.pointer_drag("color-picker-hue", strip) {
                 hue = ((ui.input.mouse_y - strip.y) / strip.h * 360.0).clamp(0.0, 359.999);
                 let c = hsv_to_rgb(hue, s, v);
                 rgba = [c[0], c[1], c[2], rgba[3]];
@@ -7267,9 +8214,15 @@ impl EditorApp {
         let cancelled = interactive && ui.button(cancel, "Cancel");
         if submit {
             self.focus = None;
+            self.edit_buffer.clear();
+            self.edit_cursor = 0;
+            self.edit_selection_anchor = None;
             self.perform_pending_with(action, value);
         } else if cancelled {
             self.focus = None;
+            self.edit_buffer.clear();
+            self.edit_cursor = 0;
+            self.edit_selection_anchor = None;
         } else {
             self.popup = Some(Popup::Prompt { title, action });
         }
@@ -7280,6 +8233,8 @@ impl EditorApp {
         &mut self,
         ui: &mut Ui,
         mut theme_name: String,
+        mut custom_theme: Theme,
+        original_theme: Theme,
         mut font_path: String,
         mut show_tooltips: bool,
         mut show_window_bounds: bool,
@@ -7291,8 +8246,8 @@ impl EditorApp {
         interactive: bool,
     ) {
         ui.painter.fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 120]);
-        let width = (w - 32.0).min(560.0).max(360.0);
-        let height = 430.0_f32.min(h - 24.0).max(300.0);
+        let width = (w - 24.0).min(640.0).max(400.0);
+        let height = 500.0_f32.min(h - 24.0).max(360.0);
         let px = (w - width) * 0.5;
         let py = (h - height) * 0.5;
         let panel = Rect::new(px, py, width, height);
@@ -7302,44 +8257,126 @@ impl EditorApp {
         ui.painter.text(px + 34.0, py + 12.0, "Editor Settings", 16.0, self.config.theme.text);
 
         let mut y = py + 42.0;
-        ui.painter.text(px + 16.0, y, "Theme", 14.0, self.config.theme.text_dim);
-        y += 20.0;
-        let theme_area = Rect::new(px + 16.0, y, width - 32.0, 162.0);
-        ui.painter.fill_rect(theme_area, self.config.theme.field);
-        ui.painter.stroke_rect(theme_area, self.config.theme.border);
-        let mut row_y = theme_area.y + 4.0;
+        ui.painter.text(px + 16.0, y, "APPEARANCE", 11.0, self.config.theme.text_dim);
+        y += 17.0;
+        let preset_width = (width - 32.0) / theme_presets().len() as f32;
+        let previous_theme_name = theme_name.clone();
         for (name, label) in theme_presets() {
-            let row = Rect::new(theme_area.x + 4.0, row_y, theme_area.w - 8.0, 24.0);
+            let index = theme_presets()
+                .iter()
+                .position(|(candidate, _)| candidate == name)
+                .unwrap_or(0);
+            let row = Rect::new(px + 16.0 + index as f32 * preset_width, y, preset_width - 3.0, 24.0);
             if interactive && ui.list_row(row, label, theme_name == *name, 0.0) {
+                if *name == "custom" && previous_theme_name != "custom" {
+                    custom_theme = self.config.theme.clone();
+                }
                 theme_name = (*name).to_string();
+                self.config.theme = if *name == "custom" {
+                    custom_theme.clone()
+                } else {
+                    theme_preset(name).unwrap_or_default()
+                };
             }
-            row_y += 25.0;
         }
+        y += 36.0;
 
-        y = theme_area.bottom() + 14.0;
-        self.inspector_label(ui, px + 16.0, y + 4.0, "Font Path", 90.0);
+        self.inspector_label(ui, px + 16.0, y + 4.0, "Editor Font", 90.0);
+        let browse_w = 76.0;
+        let reset_w = FIELD_H;
         let font_result = ui.text_field(
             "editor_font_path",
-            Rect::new(px + 106.0, y, width - 122.0, FIELD_H),
+            Rect::new(
+                px + 106.0,
+                y,
+                width - 122.0 - browse_w - reset_w - 8.0,
+                FIELD_H,
+            ),
             &font_path,
         );
         if font_result.changed {
             font_path = font_result.text;
         }
-        y += FIELD_H + 10.0;
+        let browse = Rect::new(panel.right() - 16.0 - browse_w - reset_w - 4.0, y, browse_w, FIELD_H);
+        if interactive && ui.button(browse, "Browse…") {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Font files", &["ttf", "otf"])
+                .pick_file()
+            {
+                font_path = path.to_string_lossy().into_owned();
+                ui.clear_focus();
+            }
+        }
+        ui.tooltip(browse, "Choose a TrueType or OpenType editor font");
+        let reset_font = Rect::new(panel.right() - 16.0 - reset_w, y, reset_w, FIELD_H);
+        if interactive
+            && ui.icon_toggle(reset_font, icon::RESTART_ALT, false, self.config.theme.text_dim)
+        {
+            font_path.clear();
+            ui.clear_focus();
+        }
+        ui.tooltip(reset_font, "Use the bundled editor font");
+        y += FIELD_H + 12.0;
 
-        for (label, value) in [
+        if theme_name == "custom" {
+            ui.painter.text(px + 16.0, y, "CUSTOM PALETTE", 11.0, self.config.theme.text_dim);
+            y += 17.0;
+            let gap = 12.0;
+            let column_width = (width - 32.0 - gap) * 0.5;
+            let left = px + 16.0;
+            let right = left + column_width + gap;
+            let mut changed = false;
+            changed |= Self::theme_color_field(ui, "theme_panel", "Surface", &mut custom_theme.panel, Rect::new(left, y, column_width, FIELD_H));
+            changed |= Self::theme_color_field(ui, "theme_raised", "Raised", &mut custom_theme.panel_alt, Rect::new(right, y, column_width, FIELD_H));
+            y += FIELD_H + 3.0;
+            changed |= Self::theme_color_field(ui, "theme_toolbar", "Toolbar", &mut custom_theme.toolbar, Rect::new(left, y, column_width, FIELD_H));
+            changed |= Self::theme_color_field(ui, "theme_viewport", "Viewport", &mut custom_theme.viewport_bg, Rect::new(right, y, column_width, FIELD_H));
+            y += FIELD_H + 3.0;
+            changed |= Self::theme_color_field(ui, "theme_text", "Text", &mut custom_theme.text, Rect::new(left, y, column_width, FIELD_H));
+            changed |= Self::theme_color_field(ui, "theme_muted", "Muted", &mut custom_theme.text_dim, Rect::new(right, y, column_width, FIELD_H));
+            y += FIELD_H + 3.0;
+            changed |= Self::theme_color_field(ui, "theme_accent", "Accent", &mut custom_theme.accent, Rect::new(left, y, column_width, FIELD_H));
+            changed |= Self::theme_color_field(ui, "theme_danger", "Danger", &mut custom_theme.danger, Rect::new(right, y, column_width, FIELD_H));
+            y += FIELD_H + 10.0;
+            if changed {
+                custom_theme.button = custom_theme.accent;
+                custom_theme.splitter_hover = custom_theme.accent;
+                self.config.theme = custom_theme.clone();
+            }
+        } else {
+            let notice = Rect::new(px + 16.0, y, width - 32.0, 32.0);
+            ui.painter.fill_round_rect(notice, 4.0, self.config.theme.panel_alt);
+            ui.painter.text(
+                notice.x + 10.0,
+                notice.y + 8.0,
+                "Choose Custom to edit and preview your own palette.",
+                12.0,
+                self.config.theme.text_dim,
+            );
+            y += 42.0;
+        }
+
+        ui.painter.text(px + 16.0, y, "WORKFLOW", 11.0, self.config.theme.text_dim);
+        y += 17.0;
+        let preference_width = (width - 32.0) * 0.5;
+        for (index, (label, value)) in [
             ("Show tooltips", &mut show_tooltips),
             ("Show default window bounds", &mut show_window_bounds),
             ("Show Scene transform HUD", &mut show_transform_hud),
             ("Autosave before Run", &mut autosave_before_run),
             ("Autosave before Build", &mut autosave_before_build),
-        ] {
-            self.inspector_label(ui, px + 16.0, y + 4.0, label, 220.0);
-            if let Some(next) = ui.checkbox(Rect::new(px + 240.0, y, FIELD_H, FIELD_H), *value) {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let column = index % 2;
+            let row = index / 2;
+            let item_x = px + 16.0 + column as f32 * preference_width;
+            let item_y = y + row as f32 * 25.0;
+            ui.painter.text(item_x + 28.0, item_y + 4.0, label, 12.0, self.config.theme.text);
+            if let Some(next) = ui.checkbox(Rect::new(item_x, item_y, FIELD_H, FIELD_H), *value) {
                 *value = next;
             }
-            y += FIELD_H + 7.0;
         }
 
         let save = Rect::new(panel.right() - 204.0, panel.bottom() - 36.0, 92.0, 26.0);
@@ -7347,21 +8384,53 @@ impl EditorApp {
         let save_clicked = interactive && ui.button_colored(save, "Save", self.config.theme.button, self.config.theme.text);
         let cancel_clicked = interactive && (ui.button(cancel, "Cancel") || ui.input.escape);
         if save_clicked {
+            let next_font_path = font_path.trim().to_string();
+            let font_result = if next_font_path.is_empty() {
+                super::ui::load_fonts()
+            } else {
+                super::ui::load_fonts_from_path(Some(Path::new(&next_font_path)))
+            };
+            if let Err(error) = font_result {
+                self.status = error;
+                self.popup = Some(Popup::EditorSettings {
+                    theme_name,
+                    custom_theme,
+                    original_theme,
+                    font_path,
+                    show_tooltips,
+                    show_window_bounds,
+                    show_transform_hud,
+                    autosave_before_run,
+                    autosave_before_build,
+                });
+                return;
+            }
+            let font_changed = self.config.settings.font_path != next_font_path;
             self.config.settings.theme_name = theme_name.clone();
-            self.config.settings.font_path = font_path.trim().to_string();
+            self.config.settings.font_path = next_font_path.clone();
             self.config.settings.show_tooltips = show_tooltips;
             self.config.settings.show_window_bounds = show_window_bounds;
             self.config.settings.show_transform_hud = show_transform_hud;
             self.config.settings.autosave_before_run = autosave_before_run;
             self.config.settings.autosave_before_build = autosave_before_build;
-            if let Some(theme) = theme_preset(&theme_name) {
-                self.config.theme = theme;
+            self.config.custom_theme = custom_theme.clone();
+            self.config.theme = if theme_name == "custom" {
+                custom_theme
+            } else {
+                theme_preset(&theme_name).unwrap_or_default()
+            };
+            if font_changed {
+                self.font_reload_request = Some(next_font_path);
             }
             self.dirty = true;
-            self.status = format!("Saved global editor settings ({})", theme_label(&theme_name));
-        } else if !cancel_clicked {
+            self.status = format!("Applied editor appearance ({})", theme_label(&theme_name));
+        } else if cancel_clicked {
+            self.config.theme = original_theme;
+        } else {
             self.popup = Some(Popup::EditorSettings {
                 theme_name,
+                custom_theme,
+                original_theme,
                 font_path,
                 show_tooltips,
                 show_window_bounds,
@@ -7372,9 +8441,36 @@ impl EditorApp {
         }
     }
 
+    fn theme_color_field(
+        ui: &mut Ui,
+        id: &str,
+        label: &str,
+        color: &mut [u8; 4],
+        rect: Rect,
+    ) -> bool {
+        ui.painter.text(rect.x, rect.y + 4.0, label, 12.0, ui.theme.text_dim);
+        let swatch = Rect::new(rect.right() - 104.0, rect.y + 1.0, 22.0, rect.h - 2.0);
+        ui.painter.fill_round_rect(swatch, 3.0, *color);
+        ui.painter.stroke_round_rect(swatch, 3.0, ui.theme.border);
+        let field = Rect::new(rect.right() - 78.0, rect.y, 78.0, rect.h);
+        let result = ui.text_field(
+            id,
+            field,
+            &format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]),
+        );
+        if result.changed
+            && let Some(next) = parse_hex(&result.text)
+        {
+            *color = [next[0], next[1], next[2], color[3]];
+            return true;
+        }
+        false
+    }
+
     fn draw_project_window_settings(
         &mut self,
         ui: &mut Ui,
+        mut start_scene: String,
         mut width: String,
         mut height: String,
         mut fullscreen: bool,
@@ -7384,18 +8480,29 @@ impl EditorApp {
         interactive: bool,
     ) {
         ui.painter.fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 120]);
-        let panel_w = 360.0;
-        let panel_h = 204.0;
+        let panel_w = 452.0;
+        let panel_h = 252.0;
         let px = (w - panel_w) * 0.5;
         let py = (h - panel_h) * 0.5;
         let panel = Rect::new(px, py, panel_w, panel_h);
         ui.painter.fill_round_rect(panel, 6.0, self.config.theme.panel);
         ui.painter.stroke_round_rect(panel, 6.0, self.config.theme.accent);
-        ui.icon(px + 20.0, py + 22.0, icon::FULLSCREEN, 16.0, self.config.theme.accent);
+        ui.icon(px + 20.0, py + 22.0, icon::TUNE, 16.0, self.config.theme.accent);
         ui.painter
-            .text(px + 36.0, py + 14.0, "Project Window", 16.0, self.config.theme.text);
+            .text(px + 36.0, py + 14.0, "Project Settings", 16.0, self.config.theme.text);
 
         let mut y = py + 48.0;
+        self.inspector_label(ui, px + 18.0, y + 4.0, "Start Scene", LABEL_W - 6.0);
+        let current = Rect::new(panel.right() - 102.0, y, 78.0, FIELD_H);
+        let field = Rect::new(px + LABEL_W, y, current.x - (px + LABEL_W) - 8.0, FIELD_H);
+        let start_result = ui.text_field("project_start_scene", field, &start_scene);
+        if start_result.changed {
+            start_scene = start_result.text;
+        }
+        if interactive && ui.button(current, "Current") {
+            start_scene = project_relative_path(&self.project_root, &self.scene_path);
+        }
+        y += FIELD_H + 12.0;
         self.inspector_label(ui, px + 18.0, y + 4.0, "Width", LABEL_W - 6.0);
         let width_result = ui.text_field(
             "project_window_width",
@@ -7433,29 +8540,46 @@ impl EditorApp {
         if save_clicked {
             let parsed_w = width.trim().parse::<f32>().ok().filter(|value| value.is_finite());
             let parsed_h = height.trim().parse::<f32>().ok().filter(|value| value.is_finite());
-            if let (Some(width), Some(height)) = (parsed_w, parsed_h) {
-                self.project_window.width = width.clamp(1.0, 16384.0);
-                self.project_window.height = height.clamp(1.0, 16384.0);
-                self.project_window.fullscreen = fullscreen;
-                self.project_window.resizable = resizable;
-                match save_project_window_settings(&self.project_root, &self.project_window) {
-                    Ok(()) => {
-                        self.status = "Saved project window settings".to_string();
-                        self.dirty = true;
+            let parsed_start_scene = normalize_start_scene_setting(&self.project_root, &start_scene);
+            match (parsed_start_scene, parsed_w, parsed_h) {
+                (Ok(next_start_scene), Some(width), Some(height)) => {
+                    self.project_window.start_scene = next_start_scene;
+                    self.project_window.width = width.clamp(1.0, 16384.0);
+                    self.project_window.height = height.clamp(1.0, 16384.0);
+                    self.project_window.fullscreen = fullscreen;
+                    self.project_window.resizable = resizable;
+                    match save_project_window_settings(&self.project_root, &self.project_window) {
+                        Ok(()) => {
+                            self.status = "Saved project settings".to_string();
+                            self.dirty = true;
+                        }
+                        Err(error) => self.status = format!("Project settings save failed: {error}"),
                     }
-                    Err(error) => self.status = format!("Project settings save failed: {error}"),
                 }
-            } else {
-                self.status = "Window width and height must be numbers".to_string();
-                self.popup = Some(Popup::ProjectWindow {
-                    width,
-                    height,
-                    fullscreen,
-                    resizable,
-                });
+                (Err(error), _, _) => {
+                    self.status = error;
+                    self.popup = Some(Popup::ProjectWindow {
+                        start_scene,
+                        width,
+                        height,
+                        fullscreen,
+                        resizable,
+                    });
+                }
+                _ => {
+                    self.status = "Window width and height must be numbers".to_string();
+                    self.popup = Some(Popup::ProjectWindow {
+                        start_scene,
+                        width,
+                        height,
+                        fullscreen,
+                        resizable,
+                    });
+                }
             }
         } else if !cancel_clicked {
             self.popup = Some(Popup::ProjectWindow {
+                start_scene,
                 width,
                 height,
                 fullscreen,
@@ -7714,6 +8838,13 @@ impl EditorApp {
 
     fn perform(&mut self, action: Action) {
         match action {
+            Action::NewScene => self.new_scene(),
+            Action::SaveScene => self.save(),
+            Action::LoadScene => self.load_requested(),
+            Action::ExportScene => {
+                self.export_luau();
+            }
+            Action::RunScene => self.run_scene(),
             Action::AddComponent(id, name) => {
                 if let Some(e) = self.scene.entity_mut(id) {
                     if name == "Script" {
@@ -7725,6 +8856,10 @@ impl EditorApp {
                     self.status = format!("Added {name}");
                 }
             }
+            Action::AddScriptComponent(id, path) => {
+                let full = self.project_root.join(&path);
+                self.add_script_component_from_path(id, &full);
+            }
             Action::PasteComponent(id) => {
                 if let Some(c) = self.component_clipboard.clone() {
                     if let Some(e) = self.scene.entity_mut(id) {
@@ -7735,7 +8870,6 @@ impl EditorApp {
                     }
                 }
             }
-            Action::OpenAdvancedComponents(id, x, y) => self.open_advanced_component_menu(id, x, y),
             Action::AddEntity(parent) => self.add_entity(parent),
             Action::AddEntityAt(x, y) => self.add_entity_at(None, x, y),
             Action::Rename(id) => {
@@ -7802,7 +8936,13 @@ impl EditorApp {
             Action::OpenEditorSettings => self.open_editor_settings(),
             Action::OpenMobileEmulator => self.open_mobile_emulator(),
             Action::OpenProjectWindowSettings => {
+                let start_scene = self.project_window.start_scene.clone();
+                self.focus = Some("project_start_scene".to_string());
+                self.edit_buffer = start_scene.clone();
+                self.edit_cursor = start_scene.chars().count();
+                self.edit_selection_anchor = None;
                 self.popup = Some(Popup::ProjectWindow {
+                    start_scene,
                     width: format_num(self.project_window.width),
                     height: format_num(self.project_window.height),
                     fullscreen: self.project_window.fullscreen,
@@ -7997,6 +9137,7 @@ impl EditorApp {
         match action {
             Pending::LoadScene => self.load(),
             Pending::Quit => self.should_quit = true,
+            Pending::CloseDocument(index) => self.close_document(index),
             Pending::UpdateEngine => self.launch_update(),
             _ => {}
         }
@@ -8146,10 +9287,7 @@ impl EditorApp {
                 for entity in &mut entities {
                     entity.prefab_source = None;
                 }
-                serde_json::to_string_pretty(&entities)
-                    .map_err(|error| format!("failed to serialize prefab: {error}"))
-                    .and_then(|json| std::fs::write(&self.scene_path, json)
-                        .map_err(|error| format!("failed to write {}: {error}", self.scene_path.display())))
+                save_prefab_file(&self.scene_path, &entities)
             }
         };
         match result {
@@ -8199,10 +9337,7 @@ impl EditorApp {
             self.status = "Prefab is outside the project".to_string();
             return;
         }
-        let result = std::fs::read_to_string(&path)
-            .map_err(|error| error.to_string())
-            .and_then(|json| serde_json::from_str::<Vec<Entity>>(&json).map_err(|error| error.to_string()));
-        match result {
+        match load_prefab_file(&path) {
             Ok(entities) if !entities.is_empty() => {
                 let name = path.file_stem().map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Prefab".to_string());
@@ -8351,6 +9486,11 @@ impl EditorApp {
         {
             Ok(()) => {
                 self.status = format!("Created animation {name}");
+                let duration = format_num(clip.duration);
+                self.focus = Some("anim_duration".to_string());
+                self.edit_cursor = duration.chars().count();
+                self.edit_selection_anchor = None;
+                self.edit_buffer = duration;
                 self.popup = Some(Popup::AnimationEditor {
                     path,
                     clip,
@@ -8369,6 +9509,11 @@ impl EditorApp {
         {
             Ok(mut clip) => {
                 normalize_animation_clip(&mut clip);
+                let duration = format_num(clip.duration);
+                self.focus = Some("anim_duration".to_string());
+                self.edit_cursor = duration.chars().count();
+                self.edit_selection_anchor = None;
+                self.edit_buffer = duration;
                 self.popup = Some(Popup::AnimationEditor {
                     path,
                     clip,
@@ -8550,15 +9695,47 @@ impl EditorApp {
         }
     }
 
+    fn configured_start_scene_path(&self) -> PathBuf {
+        resolve_project_start_scene_path(&self.project_root, &self.project_window.start_scene)
+    }
+
+    fn scene_for_export(&mut self) -> Result<(PathBuf, Scene), String> {
+        self.sync_active_document();
+        let start_path = self.configured_start_scene_path();
+        if self.document_kind == DocumentKind::Scene && self.scene_path == start_path {
+            return Ok((start_path, self.scene.clone()));
+        }
+        if let Some(document) = self
+            .documents
+            .iter()
+            .find(|document| document.kind == DocumentKind::Scene && document.path == start_path)
+        {
+            return Ok((start_path, document.scene.clone()));
+        }
+        if start_path.exists() {
+            return Scene::load(&start_path)
+                .map(|scene| (start_path.clone(), scene))
+                .map_err(|error| format!("Failed to load start scene {}: {error}", start_path.display()));
+        }
+        Err(format!("Start scene not found: {}", start_path.display()))
+    }
+
     fn export_luau(&mut self) -> bool {
+        let (scene_path, scene) = match self.scene_for_export() {
+            Ok(scene) => scene,
+            Err(error) => {
+                self.status = error;
+                return false;
+            }
+        };
         let path = self.project_root.join("main.luau");
-        if let Err(e) = std::fs::write(&path, self.scene.to_luau()) {
+        if let Err(e) = std::fs::write(&path, scene.to_luau()) {
             self.status = format!("Export failed: {e}");
             return false;
         }
         // Write (or clean up) the shared image-cache module alongside main.luau.
         let images_path = self.project_root.join("images.luau");
-        match self.scene.to_images_luau() {
+        match scene.to_images_luau() {
             Some(content) => {
                 if let Err(e) = std::fs::write(&images_path, content) {
                     self.status = format!("Export failed (images.luau): {e}");
@@ -8570,7 +9747,11 @@ impl EditorApp {
         // Migrate projects produced by older editor builds. Hand-authored
         // assets.luau files are preserved by remove_generated_file.
         remove_generated_file(&self.project_root.join("assets.luau"));
-        self.status = format!("Exported {}", path.display());
+        self.status = format!(
+            "Exported {} from {}",
+            path.display(),
+            project_relative_path(&self.project_root, &scene_path)
+        );
         true
     }
 
@@ -8587,28 +9768,65 @@ impl EditorApp {
         for entity in &mut entities {
             entity.prefab_source = None;
         }
-        match serde_json::to_string_pretty(&entities) {
-            Ok(json) => match std::fs::write(&path, json) {
-                Ok(()) => {
-                    let source = self.prefab_source_key(&path);
-                    if let Some(root) = self.scene.entity_mut(id) {
-                        root.prefab_source = Some(source);
-                    }
-                    self.mark_dirty();
-                    self.status = format!("Saved linked prefab {}", path.display());
+        match save_prefab_file(&path, &entities) {
+            Ok(()) => {
+                let source = self.prefab_source_key(&path);
+                if let Some(root) = self.scene.entity_mut(id) {
+                    root.prefab_source = Some(source);
                 }
-                Err(e) => self.status = format!("Save prefab failed: {e}"),
-            },
+                self.mark_dirty();
+                self.status = format!("Saved linked prefab {}", path.display());
+            }
             Err(e) => self.status = format!("Save prefab failed: {e}"),
         }
     }
 
-    fn run_scene(&mut self) {
-        if self.config.settings.autosave_before_run && self.scene_dirty {
+    /// Flush unsaved edits in every open document to disk. The runtime loads
+    /// non-start scenes from disk with `loadScene`, so persisting only the
+    /// active tab leaves those scenes stale — a just-assigned asset reverts to
+    /// unset and the loaded scene can crash (e.g. `audio.play(nil)`). Returns
+    /// false if any save failed, in which case the caller should abort.
+    fn save_all_open_documents(&mut self) -> bool {
+        // Persist the active tab first; `save` also finalizes prefab
+        // propagation and refreshes its document copy from the live scene.
+        if self.scene_dirty {
             self.save();
             if self.scene_dirty {
-                return;
+                return false;
             }
+        } else {
+            self.sync_active_document();
+        }
+        let mut ok = true;
+        for index in 0..self.documents.len() {
+            if index == self.active_document || !self.documents[index].dirty {
+                continue;
+            }
+            let path = self.documents[index].path.clone();
+            let result = match self.documents[index].kind {
+                DocumentKind::Scene => self.documents[index].scene.save(&path),
+                DocumentKind::Prefab => {
+                    let mut entities = self.documents[index].scene.entities.clone();
+                    for entity in &mut entities {
+                        entity.prefab_source = None;
+                    }
+                    save_prefab_file(&path, &entities)
+                }
+            };
+            match result {
+                Ok(()) => self.documents[index].dirty = false,
+                Err(error) => {
+                    self.status = format!("Save failed for {}: {error}", path.display());
+                    ok = false;
+                }
+            }
+        }
+        ok
+    }
+
+    fn run_scene(&mut self) {
+        if self.config.settings.autosave_before_run && !self.save_all_open_documents() {
+            return;
         }
         if !self.export_luau() {
             return;
@@ -8670,11 +9888,8 @@ impl EditorApp {
             self.status = "Build already running".to_string();
             return;
         }
-        if self.config.settings.autosave_before_build && self.scene_dirty {
-            self.save();
-            if self.scene_dirty {
-                return;
-            }
+        if self.config.settings.autosave_before_build && !self.save_all_open_documents() {
+            return;
         }
         if !self.export_luau() {
             return;
@@ -8813,6 +10028,8 @@ struct EditorLocalTransform {
     anchor_y: f32,
     pivot_x: f32,
     pivot_y: f32,
+    rotation_pivot_x: f32,
+    rotation_pivot_y: f32,
 }
 
 #[derive(Clone)]
@@ -8821,11 +10038,139 @@ struct EditorImageCacheEntry {
     image: Option<Rc<image::RgbaImage>>,
 }
 
+#[derive(Clone)]
+struct EditorWaveformCacheEntry {
+    modified: Option<SystemTime>,
+    peaks: Option<Rc<Vec<f32>>>,
+}
+
+#[derive(Clone)]
+struct ProjectDirectoryListing {
+    dirs: Vec<(PathBuf, String)>,
+    files: Vec<(PathBuf, String, char)>,
+}
+
+#[derive(Clone)]
+struct ProjectDirectoryCacheEntry {
+    modified: Option<SystemTime>,
+    listing: Rc<ProjectDirectoryListing>,
+}
+
+fn decode_waveform_peaks(path: &Path, buckets: usize) -> Result<Vec<f32>, String> {
+    if buckets == 0 {
+        return Ok(Vec::new());
+    }
+    let file = File::open(path).map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+    let decoder = rodio::Decoder::new(BufReader::new(file))
+        .map_err(|error| format!("failed to decode {}: {error}", path.display()))?;
+    let channels = decoder.channels().max(1) as usize;
+    let samples = decoder.convert_samples::<f32>().collect::<Vec<_>>();
+    if samples.is_empty() {
+        return Ok(vec![0.0; buckets]);
+    }
+    let frames = (samples.len() / channels).max(1);
+    let mut peaks = vec![0.0_f32; buckets];
+    for frame in 0..frames {
+        let bucket = (frame * buckets / frames).min(buckets - 1);
+        let start = frame * channels;
+        let mut level = 0.0_f32;
+        for channel in 0..channels {
+            level += samples.get(start + channel).copied().unwrap_or_default().abs();
+        }
+        level /= channels as f32;
+        peaks[bucket] = peaks[bucket].max(level);
+    }
+    let max_peak = peaks.iter().copied().fold(0.0_f32, f32::max);
+    if max_peak > f32::EPSILON {
+        for peak in &mut peaks {
+            *peak = (*peak / max_peak).clamp(0.0, 1.0);
+        }
+    }
+    Ok(peaks)
+}
+
+fn fit_rect_to_bounds(width: f32, height: f32, bounds: Rect) -> Rect {
+    if width <= 0.0 || height <= 0.0 || bounds.w <= 0.0 || bounds.h <= 0.0 {
+        return bounds;
+    }
+    let scale = (bounds.w / width).min(bounds.h / height);
+    let w = width * scale;
+    let h = height * scale;
+    Rect::new(
+        bounds.x + (bounds.w - w) * 0.5,
+        bounds.y + (bounds.h - h) * 0.5,
+        w,
+        h,
+    )
+}
+
+fn draw_waveform_preview(ui: &mut Ui, rect: Rect, peaks: &[f32]) {
+    if rect.w <= 0.0 || rect.h <= 0.0 {
+        return;
+    }
+    let center_y = rect.y + rect.h * 0.5;
+    ui.painter.fill_rect(
+        Rect::new(rect.x, center_y, rect.w, 1.0),
+        [
+            ui.theme.text_dim[0],
+            ui.theme.text_dim[1],
+            ui.theme.text_dim[2],
+            90,
+        ],
+    );
+    if peaks.is_empty() {
+        return;
+    }
+    let columns = rect.w.floor().max(1.0) as usize;
+    for column in 0..columns {
+        let sample = column * peaks.len() / columns;
+        let peak = peaks[sample].clamp(0.0, 1.0);
+        let height = (peak * rect.h * 0.46).max(1.0);
+        let color = [
+            ui.theme.accent[0],
+            ui.theme.accent[1],
+            ui.theme.accent[2],
+            220,
+        ];
+        ui.painter.fill_rect(
+            Rect::new(rect.x + column as f32, center_y - height, 1.0, height * 2.0),
+            color,
+        );
+    }
+}
+
 fn editor_entity_scale(entity: &Entity) -> f32 {
     if entity.scale.is_finite() {
         entity.scale.max(0.0)
     } else {
         1.0
+    }
+}
+
+fn editor_entity_position_pivot_fraction(entity: &Entity) -> (f32, f32) {
+    if entity.pivot_x.is_some() || entity.pivot_y.is_some() {
+        (
+            entity.pivot_x.unwrap_or(0.0),
+            entity.pivot_y.unwrap_or(0.0),
+        )
+    } else {
+        position_pivot_fraction_from_name(&entity.position_pivot)
+    }
+}
+
+fn editor_entity_rotation_pivot_fraction(entity: &Entity) -> (f32, f32) {
+    if entity.rotation_pivot_x.is_some() || entity.rotation_pivot_y.is_some() {
+        (
+            entity.rotation_pivot_x.unwrap_or(0.0),
+            entity.rotation_pivot_y.unwrap_or(0.0),
+        )
+    } else if entity.pivot_x.is_some() || entity.pivot_y.is_some() {
+        (
+            entity.pivot_x.unwrap_or(0.0),
+            entity.pivot_y.unwrap_or(0.0),
+        )
+    } else {
+        rotation_pivot_fraction_from_name(&entity.rotation_pivot)
     }
 }
 
@@ -8898,14 +10243,18 @@ fn editor_anchor_offset(
 }
 
 fn editor_entity_local_transform(entity: &Entity) -> EditorLocalTransform {
+    let (pivot_x, pivot_y) = editor_entity_position_pivot_fraction(entity);
+    let (rotation_pivot_x, rotation_pivot_y) = editor_entity_rotation_pivot_fraction(entity);
     let mut transform = EditorLocalTransform {
         x: entity.x,
         y: entity.y,
         scale: editor_entity_scale(entity),
         anchor_x: entity.anchor_x,
         anchor_y: entity.anchor_y,
-        pivot_x: 0.0,
-        pivot_y: 0.0,
+        pivot_x,
+        pivot_y,
+        rotation_pivot_x,
+        rotation_pivot_y,
     };
 
     for component in &entity.components {
@@ -8924,16 +10273,40 @@ fn editor_entity_local_transform(entity: &Entity) -> EditorLocalTransform {
             .clamp(0.0, 1.0);
         transform.x = prop_number(props, &["offset_x", "offsetX"]).unwrap_or(0.0);
         transform.y = prop_number(props, &["offset_y", "offsetY"]).unwrap_or(0.0);
-        transform.pivot_x = prop_number(props, &["pivot_x", "pivotX", "anchor_x", "anchorX"])
+        let scaler_pivot_x = prop_number(props, &["pivot_x", "pivotX", "anchor_x", "anchorX"])
             .unwrap_or(0.0)
             .clamp(0.0, 1.0);
-        transform.pivot_y = prop_number(props, &["pivot_y", "pivotY", "anchor_y", "anchorY"])
+        let scaler_pivot_y = prop_number(props, &["pivot_y", "pivotY", "anchor_y", "anchorY"])
             .unwrap_or(0.0)
             .clamp(0.0, 1.0);
+        transform.pivot_x = scaler_pivot_x;
+        transform.pivot_y = scaler_pivot_y;
+        if entity.rotation_pivot_x.is_none() && entity.rotation_pivot_y.is_none() {
+            transform.rotation_pivot_x = scaler_pivot_x;
+            transform.rotation_pivot_y = scaler_pivot_y;
+        }
         break;
     }
 
     transform
+}
+
+fn editor_pivot_origin_compensation(
+    size_x: f32,
+    size_y: f32,
+    local: EditorLocalTransform,
+    rotation: f32,
+) -> (f32, f32) {
+    let position_pivot_x = size_x * local.scale * local.pivot_x;
+    let position_pivot_y = size_y * local.scale * local.pivot_y;
+    let rotation_pivot_x = size_x * local.scale * local.rotation_pivot_x;
+    let rotation_pivot_y = size_y * local.scale * local.rotation_pivot_y;
+    let (rotated_pivot_x, rotated_pivot_y) =
+        rotate_vector(rotation_pivot_x, rotation_pivot_y, rotation);
+    (
+        -position_pivot_x + rotation_pivot_x - rotated_pivot_x,
+        -position_pivot_y + rotation_pivot_y - rotated_pivot_y,
+    )
 }
 
 fn scene_world_transform(
@@ -8942,15 +10315,20 @@ fn scene_world_transform(
     root_size: (f32, f32),
 ) -> Option<EditorWorldTransform> {
     let mut visiting = HashSet::new();
-    scene_world_transform_inner(scene, id, root_size, &mut visiting)
+    let mut cache = HashMap::new();
+    scene_world_transform_cached(scene, id, root_size, &mut visiting, &mut cache)
 }
 
-fn scene_world_transform_inner(
+fn scene_world_transform_cached(
     scene: &Scene,
     id: u64,
     root_size: (f32, f32),
     visiting: &mut HashSet<u64>,
+    cache: &mut HashMap<u64, EditorWorldTransform>,
 ) -> Option<EditorWorldTransform> {
+    if let Some(transform) = cache.get(&id).copied() {
+        return Some(transform);
+    }
     if !visiting.insert(id) {
         return None;
     }
@@ -8959,24 +10337,29 @@ fn scene_world_transform_inner(
     let local = editor_entity_local_transform(entity);
     let parent_transform = entity
         .parent
-        .and_then(|parent| scene_world_transform_inner(scene, parent, root_size, visiting))
+        .and_then(|parent| {
+            scene_world_transform_cached(scene, parent, root_size, visiting, cache)
+        })
         .unwrap_or(EditorWorldTransform {
             x: 0.0,
             y: 0.0,
             scale: 1.0,
             rotation: 0.0,
-        });
+    });
     let (anchor_x, anchor_y) = editor_anchor_offset(scene, entity, local, root_size);
     let (size_x, size_y) = editor_entity_size(scene, entity, root_size);
-    let pivot_x = size_x * local.scale * local.pivot_x;
-    let pivot_y = size_y * local.scale * local.pivot_y;
+    let (pivot_offset_x, pivot_offset_y) =
+        editor_pivot_origin_compensation(size_x, size_y, local, entity.rotation);
     let transform = EditorWorldTransform {
-        x: parent_transform.x + (anchor_x + local.x - pivot_x) * parent_transform.scale,
-        y: parent_transform.y + (anchor_y + local.y - pivot_y) * parent_transform.scale,
+        x: parent_transform.x
+            + (anchor_x + local.x + pivot_offset_x) * parent_transform.scale,
+        y: parent_transform.y
+            + (anchor_y + local.y + pivot_offset_y) * parent_transform.scale,
         scale: parent_transform.scale * local.scale,
         rotation: parent_transform.rotation + entity.rotation,
     };
     visiting.remove(&id);
+    cache.insert(id, transform);
     Some(transform)
 }
 
@@ -9005,11 +10388,11 @@ fn scene_world_origin_to_local_position(
     };
     let (anchor_x, anchor_y) = editor_anchor_offset(scene, entity, local, root_size);
     let (size_x, size_y) = editor_entity_size(scene, entity, root_size);
-    let pivot_x = size_x * local.scale * local.pivot_x;
-    let pivot_y = size_y * local.scale * local.pivot_y;
+    let (pivot_offset_x, pivot_offset_y) =
+        editor_pivot_origin_compensation(size_x, size_y, local, entity.rotation);
     Some((
-        (world_x - parent_transform.x) / parent_scale - anchor_x + pivot_x,
-        (world_y - parent_transform.y) / parent_scale - anchor_y + pivot_y,
+        (world_x - parent_transform.x) / parent_scale - anchor_x - pivot_offset_x,
+        (world_y - parent_transform.y) / parent_scale - anchor_y - pivot_offset_y,
     ))
 }
 
@@ -9712,7 +11095,21 @@ fn wrap_line(painter: &Painter, text: &str, size: f32, max_w: f32) -> Vec<String
 fn copy_to_clipboard(text: &str) -> bool {
     use std::io::Write;
     use std::process::{Command, Stdio};
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    {
+        if arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.set_text(text.to_string()))
+            .is_ok()
+        {
+            return true;
+        }
+    }
+
+    const POWERSHELL_WRITE: &str = "Set-Clipboard -Value ([Console]::In.ReadToEnd())";
     let candidates: &[(&str, &[&str])] = &[
+        ("powershell", &["-NoProfile", "-Command", POWERSHELL_WRITE]),
+        ("powershell.exe", &["-NoProfile", "-Command", POWERSHELL_WRITE]),
         ("wl-copy", &[]),
         ("xclip", &["-selection", "clipboard"]),
         ("xsel", &["--clipboard", "--input"]),
@@ -9720,9 +11117,18 @@ fn copy_to_clipboard(text: &str) -> bool {
         ("clip", &[]),
     ];
     for (cmd, args) in candidates {
-        if let Ok(mut child) = Command::new(cmd).args(*args).stdin(Stdio::piped()).spawn() {
+        if let Ok(mut child) = Command::new(cmd)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
             if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
+                if stdin.write_all(text.as_bytes()).is_err() {
+                    let _ = child.kill();
+                    continue;
+                }
             }
             if child.wait().map(|s| s.success()).unwrap_or(false) {
                 return true;
@@ -9745,13 +11151,14 @@ fn core_icon(name: &str) -> char {
         "ParticleSystem2D" => icon::PALETTE,
         "SpatialSound2D" => icon::AUDIOTRACK,
         "TextBox" | "TextLabel" | "RudimentaryTextLabel" | "TextInput" => icon::TITLE,
-        "Sprite2D" | "Image2D" | "NineSliceSprite2D" | "TileTexture2D" | "Tilemap2D" | "Spritebox2D" => icon::IMAGE,
+        "Sprite2D" | "SpriteSheet2D" | "Image2D" | "NineSliceSprite2D" | "TileTexture2D" | "Tilemap2D" | "Spritebox2D" => icon::IMAGE,
         "Collider2D" => icon::BORDER_ALL,
         "Rigidbody2D" => icon::VIEW_IN_AR,
         "EntityScaler" | "Bolt2D" | "Rope2D" | "LegacyBolt2D" | "String2D" => icon::TUNE,
-        "Frame" | "ScrollList" => icon::VIEW_QUILT,
+        "Frame" | "Panel" | "ScrollList" => icon::VIEW_QUILT,
         "Button" => icon::ADD_CIRCLE,
         "Dropdown" => icon::EXPAND_MORE,
+        "Slider" => icon::TUNE,
         _ => icon::VIEW_QUILT,
     }
 }
@@ -9960,12 +11367,16 @@ pub fn load_config(path: &Path) -> EditorConfig {
     match std::fs::read_to_string(path) {
         Ok(text) => {
             let has_settings = text.contains("\"settings\"");
+            let has_custom_theme = text.contains("\"custom_theme\"");
             let mut config = serde_json::from_str::<EditorConfig>(&text).unwrap_or_else(|error| {
                 eprintln!("warning: failed to parse {}: {error}", path.display());
                 EditorConfig::default()
             });
             if !has_settings && text.contains("\"theme\"") {
                 config.settings.theme_name = "custom".to_string();
+            }
+            if !has_custom_theme && config.settings.theme_name == "custom" {
+                config.custom_theme = config.theme.clone();
             }
             normalize_config(&mut config);
             config
@@ -9991,12 +11402,14 @@ fn normalize_config(config: &mut EditorConfig) {
     if config.settings.theme_name.trim().is_empty() {
         config.settings.theme_name = "dark_plus".to_string();
     }
-    if let Some(theme) = theme_preset(&config.settings.theme_name) {
+    if config.settings.theme_name == "custom" {
+        config.theme = config.custom_theme.clone();
+    } else if let Some(theme) = theme_preset(&config.settings.theme_name) {
         config.theme = theme;
     }
 }
 
-fn theme_preset(name: &str) -> Option<Theme> {
+pub(crate) fn theme_preset(name: &str) -> Option<Theme> {
     match name {
         "dark_plus" => Some(Theme::default()),
         "gruvbox_dark" => Some(Theme {
@@ -10113,7 +11526,7 @@ fn theme_preset(name: &str) -> Option<Theme> {
     }
 }
 
-fn theme_label(name: &str) -> &'static str {
+pub(crate) fn theme_label(name: &str) -> &'static str {
     match name {
         "dark_plus" => "Dark+",
         "gruvbox_dark" => "Gruvbox Dark",
@@ -10126,7 +11539,7 @@ fn theme_label(name: &str) -> &'static str {
     }
 }
 
-fn theme_presets() -> &'static [(&'static str, &'static str)] {
+pub(crate) fn theme_presets() -> &'static [(&'static str, &'static str)] {
     &[
         ("dark_plus", "Dark+"),
         ("gruvbox_dark", "Gruvbox Dark"),
@@ -10144,6 +11557,97 @@ fn parse_toml_bool(value: &str) -> Option<bool> {
         "false" | "no" | "off" | "0" => Some(false),
         _ => None,
     }
+}
+
+fn parse_toml_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.len() < 2 || !value.starts_with('"') || !value.ends_with('"') {
+        return None;
+    }
+    let value = &value[1..value.len() - 1];
+    Some(value.replace("\\\"", "\"").replace("\\\\", "\\"))
+}
+
+fn toml_string_literal(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn default_start_scene_setting() -> String {
+    super::DEFAULT_SCENE_FILE.to_string()
+}
+
+fn project_relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn resolve_project_start_scene_path(root: &Path, setting: &str) -> PathBuf {
+    let setting = setting.trim();
+    let path = if setting.is_empty() {
+        PathBuf::from(default_start_scene_setting())
+    } else {
+        PathBuf::from(setting)
+    };
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
+fn normalize_start_scene_setting(root: &Path, setting: &str) -> Result<String, String> {
+    let mut setting = setting.trim().replace('\\', "/");
+    while let Some(stripped) = setting.strip_prefix("./") {
+        setting = stripped.to_string();
+    }
+    if setting.is_empty() {
+        setting = default_start_scene_setting();
+    }
+
+    let path = PathBuf::from(&setting);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(root)
+            .map_err(|_| "Start scene must be inside the project".to_string())?
+            .to_path_buf()
+    } else {
+        path
+    };
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err("Start scene must stay inside the project".to_string());
+    }
+    if relative.extension().is_none_or(|ext| ext != "neoscene") {
+        return Err("Start scene must be a .neoscene file".to_string());
+    }
+    Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
+pub(crate) fn configured_start_scene_path(root: &Path) -> PathBuf {
+    let settings = load_project_window_settings(root);
+    normalize_start_scene_setting(root, &settings.start_scene)
+        .map(|setting| resolve_project_start_scene_path(root, &setting))
+        .unwrap_or_else(|_| root.join(super::DEFAULT_SCENE_FILE))
 }
 
 fn flatpak_app_installed(app_id: &str) -> std::io::Result<bool> {
@@ -10171,29 +11675,34 @@ fn load_project_window_settings(root: &Path) -> ProjectWindowSettings {
             section = line[1..line.len() - 1].trim().to_ascii_lowercase();
             continue;
         }
-        if section != "window" {
-            continue;
-        }
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        match key.trim().to_ascii_lowercase().as_str() {
-            "width" => {
+        let key = key.trim().to_ascii_lowercase();
+        match (section.as_str(), key.as_str()) {
+            ("project", "start_scene") => {
+                if let Some(value) = parse_toml_string(value)
+                    && let Ok(value) = normalize_start_scene_setting(root, &value)
+                {
+                    settings.start_scene = value;
+                }
+            }
+            ("window", "width") => {
                 if let Ok(value) = value.trim().parse::<f32>() && value.is_finite() {
                     settings.width = value.clamp(1.0, 16384.0);
                 }
             }
-            "height" => {
+            ("window", "height") => {
                 if let Ok(value) = value.trim().parse::<f32>() && value.is_finite() {
                     settings.height = value.clamp(1.0, 16384.0);
                 }
             }
-            "fullscreen" => {
+            ("window", "fullscreen") => {
                 if let Some(value) = parse_toml_bool(value) {
                     settings.fullscreen = value;
                 }
             }
-            "resizable" => {
+            ("window", "resizable") => {
                 if let Some(value) = parse_toml_bool(value) {
                     settings.resizable = value;
                 }
@@ -10213,23 +11722,22 @@ fn save_project_window_settings(root: &Path, settings: &ProjectWindowSettings) -
         existing.lines().map(ToString::to_string).collect()
     };
 
-    if !lines
-        .iter()
-        .any(|line| line.trim().eq_ignore_ascii_case("[window]"))
-    {
-        if !lines.is_empty() {
-            lines.push(String::new());
-        }
-        lines.push("[window]".to_string());
-    }
+    ensure_toml_section(&mut lines, "project");
+    upsert_toml_section_key(
+        &mut lines,
+        "project",
+        "start_scene",
+        &toml_string_literal(&settings.start_scene),
+    );
 
+    ensure_toml_section(&mut lines, "window");
     for (key, value) in [
         ("width", format!("{}", settings.width.round() as i32)),
         ("height", format!("{}", settings.height.round() as i32)),
         ("fullscreen", settings.fullscreen.to_string()),
         ("resizable", settings.resizable.to_string()),
     ] {
-        upsert_toml_window_key(&mut lines, key, &value);
+        upsert_toml_section_key(&mut lines, "window", key, &value);
     }
 
     let mut out = lines.join("\n");
@@ -10237,20 +11745,35 @@ fn save_project_window_settings(root: &Path, settings: &ProjectWindowSettings) -
     std::fs::write(&path, out).map_err(|error| format!("failed to write {}: {error}", path.display()))
 }
 
-fn upsert_toml_window_key(lines: &mut Vec<String>, key: &str, value: &str) {
-    let mut in_window = false;
+fn ensure_toml_section(lines: &mut Vec<String>, section: &str) {
+    let header = format!("[{section}]");
+    if lines
+        .iter()
+        .any(|line| line.trim().eq_ignore_ascii_case(&header))
+    {
+        return;
+    }
+    if !lines.is_empty() && lines.last().is_some_and(|line| !line.trim().is_empty()) {
+        lines.push(String::new());
+    }
+    lines.push(header);
+}
+
+fn upsert_toml_section_key(lines: &mut Vec<String>, section: &str, key: &str, value: &str) {
+    let target_header = format!("[{section}]");
+    let mut in_section = false;
     let mut insert_at = lines.len();
     for (index, line) in lines.iter_mut().enumerate() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if in_window {
+            if in_section {
                 insert_at = index;
                 break;
             }
-            in_window = trimmed.eq_ignore_ascii_case("[window]");
+            in_section = trimmed.eq_ignore_ascii_case(&target_header);
             continue;
         }
-        if in_window {
+        if in_section {
             insert_at = index + 1;
             if let Some((line_key, _)) = trimmed.split_once('=')
                 && line_key.trim().eq_ignore_ascii_case(key)
@@ -10344,10 +11867,19 @@ mod tests {
         fn frame(&mut self, input: FrameInput) {
             let painter = Painter::new(&mut self.buffer, self.w, self.h, self.fonts.clone());
             let theme = self.app.theme();
-            let mut ui = Ui::new(painter, input, theme, self.app.take_focus(), self.app.take_edit_buffer());
+            let mut ui = Ui::new(
+                painter,
+                input,
+                theme,
+                self.app.take_focus(),
+                self.app.take_edit_buffer(),
+                self.app.take_edit_cursor(),
+                self.app.take_edit_selection_anchor(),
+                self.app.take_pointer_capture(),
+            );
             self.app.frame(&mut ui);
-            let (f, e) = ui.into_focus_state();
-            self.app.set_focus(f, e);
+            let (f, e, c, a, p) = ui.into_focus_state();
+            self.app.set_focus(f, e, c, a, p);
         }
         fn click(&mut self, x: f32, y: f32) {
             self.frame(FrameInput { mouse_x: x, mouse_y: y, mouse_pressed: true, mouse_down: true, ..Default::default() });
@@ -10389,14 +11921,19 @@ mod tests {
         assert_eq!(config.settings.theme_name, "custom");
         assert_eq!(config.theme.panel, [1, 2, 3, 255]);
         assert_eq!(config.theme.button, [4, 5, 6, 255]);
+        assert_eq!(config.custom_theme.panel, [1, 2, 3, 255]);
         assert_eq!(config.layout.grid, 24.0);
 
         std::fs::create_dir_all(global.parent().expect("global parent")).expect("global dir");
-        std::fs::write(&global, r#"{"settings":{"theme_name":"gruvbox_dark"}}"#)
-            .expect("write global config");
+        std::fs::write(
+            &global,
+            r#"{"custom_theme":{"panel":[9,8,7,255]},"settings":{"theme_name":"gruvbox_dark"}}"#,
+        )
+        .expect("write global config");
         let config = load_config_with_fallback(&global, &legacy);
         assert_eq!(config.settings.theme_name, "gruvbox_dark");
         assert_eq!(config.theme.panel, [40, 40, 40, 255]);
+        assert_eq!(config.custom_theme.panel, [9, 8, 7, 255]);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -10407,17 +11944,19 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create project dir");
         std::fs::write(
             dir.join("neolove.toml"),
-            "[window]\nwidth = 900\nheight = 500\nfullscreen = false\nresizable = false\n",
+            "[project]\nstart_scene = \"levels/title.neoscene\"\n\n[window]\nwidth = 900\nheight = 500\nfullscreen = false\nresizable = false\n",
         )
         .expect("write project settings");
 
         let loaded = load_project_window_settings(&dir);
+        assert_eq!(loaded.start_scene, "levels/title.neoscene");
         assert_eq!(loaded.width, 900.0);
         assert_eq!(loaded.height, 500.0);
         assert!(!loaded.fullscreen);
         assert!(!loaded.resizable);
 
         let updated = ProjectWindowSettings {
+            start_scene: "scene.neoscene".to_string(),
             width: 1024.0,
             height: 768.0,
             fullscreen: true,
@@ -10425,8 +11964,45 @@ mod tests {
         };
         save_project_window_settings(&dir, &updated).expect("save project settings");
         let saved = std::fs::read_to_string(dir.join("neolove.toml")).expect("read saved settings");
+        assert!(saved.contains("start_scene = \"scene.neoscene\""));
         assert!(saved.contains("resizable = true"));
         assert!(load_project_window_settings(&dir).resizable);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn export_luau_uses_project_start_scene() {
+        let dir = unique_test_path("project_start_scene_export");
+        let levels = dir.join("levels");
+        std::fs::create_dir_all(&levels).expect("create project dir");
+        std::fs::write(
+            dir.join("neolove.toml"),
+            "[project]\nstart_scene = \"levels/title.neoscene\"\n",
+        )
+        .expect("write project settings");
+
+        let mut start_scene = Scene::default();
+        start_scene.name = "Configured Start".to_string();
+        start_scene.entities[0].name = "ConfiguredStartEntity".to_string();
+        start_scene
+            .save(&levels.join("title.neoscene"))
+            .expect("save start scene");
+
+        let mut active_scene = Scene::default();
+        active_scene.name = "Active Scene".to_string();
+        active_scene.entities[0].name = "ActiveSceneEntity".to_string();
+
+        let mut app = EditorApp::new(
+            dir.clone(),
+            dir.join("scene.neoscene"),
+            active_scene,
+            EditorConfig::default(),
+        );
+        assert!(app.export_luau());
+        let luau = std::fs::read_to_string(dir.join("main.luau")).expect("read exported main");
+        assert!(luau.contains("ConfiguredStartEntity"));
+        assert!(!luau.contains("ActiveSceneEntity"));
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -10548,6 +12124,54 @@ mod tests {
     }
 
     #[test]
+    fn running_flushes_unsaved_background_scene_documents() {
+        // A scene the game loads with `loadScene` (not the active tab) must be
+        // written to disk before running, or its unsaved edits — like a freshly
+        // assigned IAudio script variable — are lost and `audio.play(nil)`
+        // crashes the game at runtime.
+        use crate::scene::{Component, ScriptVar, VarControl};
+        let mut harness = Harness::new(Scene::default());
+        let root = harness.app.project_root.clone();
+        let level_path = root.join("level_bg.neoscene");
+
+        // Stale on-disk version: the audio variable is unset.
+        let mut disk = Scene::default();
+        disk.entities[0].components.push(Component::Script {
+            path: "scripts/Jump.luau".into(),
+            variables: vec![ScriptVar {
+                name: "sfx".into(),
+                value: VarValue::Audio(String::new()),
+                control: VarControl::Field,
+            }],
+        });
+        disk.save(&level_path).expect("write stale scene");
+
+        // A background document holding the assignment, not yet saved to disk.
+        let mut edited = disk.clone();
+        if let Component::Script { variables, .. } = &mut edited.entities[0].components[0] {
+            variables[0].value = VarValue::Audio("assets/jump.wav".into());
+        }
+        harness.app.documents.push(OpenDocument {
+            path: level_path.clone(),
+            scene: edited,
+            kind: DocumentKind::Scene,
+            dirty: true,
+        });
+
+        assert!(harness.app.save_all_open_documents());
+
+        let reloaded = Scene::load(&level_path).expect("reload scene");
+        let Component::Script { variables, .. } = &reloaded.entities[0].components[0] else {
+            panic!("not a script component");
+        };
+        assert_eq!(
+            variables[0].value,
+            VarValue::Audio("assets/jump.wav".into()),
+            "background scene edits were not flushed to disk before running"
+        );
+    }
+
+    #[test]
     fn particle_sequences_interpolate_at_authored_times() {
         let colors = vec![
             ColorKeypoint { time: 0.0, color: [0, 20, 40, 255] },
@@ -10595,6 +12219,9 @@ mod tests {
                 h.app.theme(),
                 None,
                 String::new(),
+                0,
+                None,
+                None,
             );
             let mut y = 100.0;
             let mut dirty = false;
@@ -10636,6 +12263,9 @@ mod tests {
                 h.app.theme(),
                 None,
                 String::new(),
+                0,
+                None,
+                None,
             );
             let mut y = 100.0;
             let mut dirty = false;
@@ -10766,10 +12396,21 @@ mod tests {
     fn add_entity_via_toolbar() {
         let mut h = Harness::new(Scene::default());
         let before = h.app.scene.entities.len();
-        // The "Entity" toolbar button; click within its area.
-        h.click(360.0, 20.0);
-        // Whether or not the exact hit lands, ensure no panic and selection API works.
-        assert!(h.app.scene.entities.len() >= before);
+        h.click(250.0, 20.0);
+        assert_eq!(h.app.scene.entities.len(), before + 1);
+    }
+
+    #[test]
+    fn compact_toolbar_scene_menu_contains_low_frequency_actions() {
+        let mut h = Harness::new(Scene::default());
+        h.click(20.0, 20.0);
+        let Popup::Menu { items, .. } = h.app.popup.as_ref().expect("scene menu should open") else {
+            panic!("expected scene menu");
+        };
+        let labels = items.iter().map(|item| item.label.as_str()).collect::<Vec<_>>();
+        assert!(labels.contains(&"Export Luau"));
+        assert!(labels.contains(&"Build Project…"));
+        assert!(labels.contains(&"Editor Settings…"));
     }
 
     #[test]
@@ -10880,6 +12521,42 @@ mod tests {
         let center_after = world_center(&h.app, id);
         assert!((center_after.0 - center_before.0).abs() < 1.0, "center x drifted {} -> {}", center_before.0, center_after.0);
         assert!((center_after.1 - center_before.1).abs() < 1.0, "center y drifted {} -> {}", center_before.1, center_after.1);
+    }
+
+    #[test]
+    fn editor_world_transform_applies_entity_pivots() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        {
+            let e = scene.entity_mut(id).expect("entity");
+            e.x = 50.0;
+            e.y = 25.0;
+            e.size_x = 100.0;
+            e.size_y = 50.0;
+            e.position_pivot = "center".to_string();
+        }
+
+        let transform = scene_world_transform(&scene, id, (1280.0, 720.0)).expect("transform");
+        assert!((transform.x - 0.0).abs() < 0.001, "x was {}", transform.x);
+        assert!((transform.y - 0.0).abs() < 0.001, "y was {}", transform.y);
+
+        {
+            let e = scene.entity_mut(id).expect("entity");
+            e.x = 0.0;
+            e.y = 0.0;
+            e.position_pivot.clear();
+            e.rotation_pivot = "center".to_string();
+            e.rotation = std::f32::consts::FRAC_PI_2;
+        }
+
+        let transform = scene_world_transform(&scene, id, (1280.0, 720.0)).expect("transform");
+        assert!((transform.x - 75.0).abs() < 0.001, "x was {}", transform.x);
+        assert!((transform.y + 25.0).abs() < 0.001, "y was {}", transform.y);
+        let (local_x, local_y) =
+            scene_world_origin_to_local_position(&scene, id, transform.x, transform.y, (1280.0, 720.0))
+                .expect("local position");
+        assert!((local_x - 0.0).abs() < 0.001, "local x was {}", local_x);
+        assert!((local_y - 0.0).abs() < 0.001, "local y was {}", local_y);
     }
 
     #[test]
@@ -11051,6 +12728,40 @@ mod tests {
         h.app.perform(Action::AddComponent(id, "TextBox".to_string()));
         let e = h.app.scene.entity(id).expect("entity");
         assert!(matches!(e.components.last(), Some(Component::Core { name, .. }) if name == "TextBox"));
+    }
+
+    #[test]
+    fn component_picker_discovers_icomponentpicker_scripts() {
+        let mut h = Harness::new(Scene::default());
+        std::fs::write(
+            h.app.project_root.join("Health.luau"),
+            "local Behaviour = { hp = Inspector(100) }\nIComponentPicker(Behaviour)\nreturn Behaviour\n",
+        )
+        .expect("write registered script");
+        std::fs::write(
+            h.app.project_root.join("Plain.luau"),
+            "local Behaviour = { hp = Inspector(100) }\nreturn Behaviour\n",
+        )
+        .expect("write plain script");
+
+        let scripts = h.app.custom_picker_scripts();
+        assert!(
+            scripts.iter().any(|(label, path)| label == "Health" && path == "Health.luau"),
+            "Health should be discovered, got {scripts:?}"
+        );
+        assert!(
+            !scripts.iter().any(|(label, _)| label == "Plain"),
+            "Plain must not be offered in the picker"
+        );
+
+        // Opening the picker lists it and auto-focuses the search field.
+        let id = h.app.scene.entities[0].id;
+        h.app.open_add_component_menu(id, 10.0, 10.0);
+        let Some(Popup::ComponentPicker { entries, .. }) = h.app.popup.as_ref() else {
+            panic!("component picker should open");
+        };
+        assert!(entries.iter().any(|entry| entry.label == "Health"));
+        assert_eq!(h.app.focus.as_deref(), Some("component_picker_search"));
     }
 
     #[test]
@@ -11229,6 +12940,34 @@ mod tests {
     }
 
     #[test]
+    fn document_tabs_close_with_middle_click() {
+        let mut h = Harness::new(Scene::default());
+        let mut second = Scene::default();
+        second.name = "Second".into();
+        let path = h.app.project_root.join("second.neoscene");
+        h.app.add_document(path, second, DocumentKind::Scene);
+        assert_eq!(h.app.documents.len(), 2);
+        assert_eq!(h.app.active_document, 1);
+
+        h.frame(FrameInput {
+            mouse_x: 35.0,
+            mouse_y: h.h as f32 - STATUS_H + 10.0,
+            middle_pressed: true,
+            middle_down: true,
+            ..Default::default()
+        });
+        assert_eq!(h.app.documents.len(), 1);
+        assert_eq!(h.app.scene.name, "Second");
+    }
+
+    #[test]
+    fn project_settings_dialog_focuses_its_first_textbox() {
+        let mut h = Harness::new(Scene::default());
+        h.app.perform(Action::OpenProjectWindowSettings);
+        assert_eq!(h.app.focus.as_deref(), Some("project_start_scene"));
+    }
+
+    #[test]
     fn opening_prefab_uses_isolated_prefab_tab() {
         let mut h = Harness::new(Scene::default());
         let path = h.app.project_root.join("button.neoprefab");
@@ -11272,11 +13011,14 @@ mod tests {
     }
 
     #[test]
-    fn ui_widget_components_not_offered() {
-        // The crash-prone UI widgets must not appear in the picker lists.
-        for c in ["Button", "Dropdown", "TextInput", "Frame", "ScrollList"] {
-            assert!(!CORE_COMPONENTS.contains(&c), "{c} still offered");
-            assert!(!ADVANCED_COMPONENTS.contains(&c), "{c} still advanced");
+    fn ui_widgets_are_offered_but_legacy_ones_are_not() {
+        for c in ["TextInput", "Panel", "Button", "Slider", "Dropdown"] {
+            assert!(CORE_COMPONENTS.contains(&c), "{c} not offered");
+        }
+        // `Frame` is a hidden alias for `Panel`; `ScrollList` is not exposed yet.
+        for c in ["Frame", "ScrollList"] {
+            assert!(!CORE_COMPONENTS.contains(&c), "{c} unexpectedly offered");
+            assert!(!ADVANCED_COMPONENTS.contains(&c), "{c} unexpectedly advanced");
         }
     }
 
@@ -11426,8 +13168,9 @@ mod tests {
         h.app.save_prefab(id);
         let path = h.app.bin_dir.join("hero.neoprefab");
         assert!(path.exists(), "prefab file not written");
-        let text = std::fs::read_to_string(&path).expect("read prefab");
-        assert!(text.contains("\"Hero\""));
+        let entities = load_prefab_file(&path).expect("read prefab");
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, "Hero");
         let _ = std::fs::remove_file(path);
     }
 

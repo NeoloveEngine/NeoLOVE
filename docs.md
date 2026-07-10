@@ -29,6 +29,8 @@ blocking startup and asks before launching the updater.
 
 `neolove build --webasm` creates an HTML5 bundle in `dist/webasm/` and a zip at `dist/<project-name>-webasm.zip`. Serve web builds over `http://` or `https://`; browsers will not reliably load the bundle from `file://`.
 
+`neolove build --windows` builds a Windows desktop executable from Linux when the `x86_64-pc-windows-gnu` Rust target and MinGW-w64 linker are available. The MinGW C/C++ runtimes are linked statically so the `.exe` does not need a separately distributed `libstdc++-6.dll`. `neolove build --linux` builds a Linux desktop executable from Windows when a Linux GNU cross linker is available.
+
 `neolove build --android` creates a signed arm64 APK at `dist/<project-name>-android-arm64.apk`. `--apk` is accepted as an alias. The first Android build may install the Android Rust target plus a local JDK, SDK, build-tools, and NDK under `~/.neolove/toolchains/`.
 
 `neolove build --ios` creates an iOS simulator `.app` at `dist/<project-name>-ios-simulator.app`. It requires macOS with Xcode installed.
@@ -127,11 +129,13 @@ Editor files:
 - `*.neoprefab`: JSON prefab files saved from editor entities.
 - `*.neoanim`: JSON animation clips authored by the animation editor.
 
-Toolbar actions:
+The top bar keeps frequent actions visible: active-scene rename, Save, Run,
+Add Entity, transform tools, snap/grid controls, and panel/view menus. The
+folder button opens the compact scene menu for lower-frequency actions:
 
-- **New** creates a new scene in its own tab.
+- **New Scene** creates a new scene in its own tab.
 - **Save** writes the current scene to its `.neoscene` file.
-- **Load** reloads the current `.neoscene` file.
+- **Reload Scene** reloads the current `.neoscene` file.
 - **Export** writes a runnable `main.luau`.
 - **Run** exports `main.luau` and launches a live preview. If the preview exits
   with an error, the editor shows a dismissible **Runtime Error** dialog with the
@@ -142,12 +146,12 @@ Toolbar actions:
   runtime `mobile` global.
 - **Build** exports `main.luau`, asks which platform to build, and packages the
   project into `dist/` without blocking the editor UI.
-- **Entity** adds an entity to the scene.
+- **Add Entity** remains directly available in the top bar.
 
-The toolbar also has move, scale, and rotate scene tools, a Window dropdown,
-an editor Settings button, a reset-camera button, snap and grid-visibility
-toggles, a grid-size field, and a scene-rename field; renaming a scene also
-renames its `.neoscene` file.
+Editor Settings includes named presets, an editable custom palette with live
+preview, a **Browse** button for `.ttf`/`.otf` editor fonts, and workflow
+preferences. Custom colors are retained when switching to a preset, and font
+changes apply without restarting the editor.
 
 ## Editing Scenes
 
@@ -168,7 +172,7 @@ public variables. The editor's built-in component menu is backed by the real
 engine component names:
 
 - Common: `Rect2D`, `Shape2D`, `ParticleSystem2D`, `AnimationController`,
-  `SpatialSound2D`, `TextBox`, `TextLabel`, `Sprite2D`, `Image2D`,
+  `SpatialSound2D`, `TextBox`, `TextLabel`, `TextInput`, `Sprite2D`, `SpriteSheet2D`, `Image2D`,
   `NineSliceSprite2D`, `Tilemap2D`, `TileTexture2D`, `EntityScaler`,
   `Collider2D`, and `Rigidbody2D`.
 - Advanced: `Spritebox2D`, `Bolt2D`, `Rope2D`, `LegacyBolt2D`, `String2D`,
@@ -211,9 +215,17 @@ then drop the component onto the destination field without releasing the mouse.
 
 Components can be reordered by removing and re-adding them. Each component
 header has a copy button, and the **Add Component** menu offers **Paste** to
-apply a copied component to another entity. Color properties (and the scene
-background) open a picker that toggles between an HSV square with a hue strip
-and plain RGBA sliders; the choice is remembered in the global editor config.
+apply a copied component to another entity. The **Add Component** picker opens
+with a focused search box: typing filters the list, and pressing Enter adds the
+top match. Behaviour scripts that call `IComponentPicker(Behaviour)` appear in
+the picker too (see [Custom Picker Components](#custom-picker-components)). Color
+properties show inline **R, G, B, and A** fields — the `A` (alpha) field sets
+transparency, where `0` is fully transparent and `255` is opaque. The swatch
+(and the scene background) opens a picker that toggles between an HSV square with
+a hue strip and plain RGBA sliders — both include an alpha slider — and the
+choice is remembered in the global editor config. Interactive UI components
+(Button, TextInput, Slider, Dropdown) expose every state colour, including the
+`hover` variants, under the inspector's **Advanced** section.
 Selecting an entity with a `Collider2D` previews the collider's shape and size
 as a green outline, since it can differ from the entity bounds.
 
@@ -793,13 +805,31 @@ Edges:
 Global: `servers`
 
 ```luau
-local hosted = servers.host("server.luau", 9000)
-local client = servers.connect(hosted.url)
-client:addCallback(function(payload)
-    local message = servers.deserializeTable(payload)
-end)
-client:send(servers.serializeTable({ hello = "world" }))
+local Chat = servers.define({
+    onConnect = function(self, client)
+        client:emit("welcome", { id = client.key })
+    end,
+    onMessage = function(self, client, event, data)
+        if event == "chat" then
+            self.host:emit("chat", { from = client.key, text = data.text })
+        end
+    end,
+    onStart = function(self, host)
+        self.host = host
+    end,
+})
+
+local hosted = Chat:host(9000)
+local client = Chat:connect(hosted.url)
+client:on("welcome", function(data) print(data.id) end)
+client:emit("chat", { text = "hello" })
 ```
+
+`servers.define(table)` (also `service`, `createService`, and `create_service`)
+turns an ordinary table into an in-process service class. It accepts optional
+`onStart`, `onConnect`, `onMessage`, and `onDisconnect` methods. Messages use
+named events and automatically serialize Luau data; a separate server Luau file
+is not needed.
 
 Server helpers:
 
@@ -813,13 +843,21 @@ Server helpers:
 - `servers.sha128(value)`
 
 Hosted server handles expose `client`, `port`, `url`, `stop()`, `getPort()`, and `getUrl()`.
+They also expose `send(clientKey, payload)`, `broadcast(payload)`, `getClients()`,
+`getClientCount()`, and, for class services, `emit(event, data)` and
+`sendEvent(clientKey, event, data)`.
 
 Client handles expose `key`, `is_host`, `send(payload)`, `addCallback(callback)`, `disconnect()`, `isConnected()`, `getKey()`, `isHost()`, and `getKickReason()`.
 
 Edges:
 
 - Payloads are Luau `buffer` values.
+- The original `servers.host(scriptPath, port, options?)` buffer API remains
+  available for low-level or isolated server runtimes.
 - TLS host options support `certPath`/`keyPath` and `cert_path`/`key_path`.
+- Hosts bind to `127.0.0.1` by default. For LAN clients, use
+  `{ host = "0.0.0.0" }` and connect them to the machine's real IP address,
+  for example `Chat:connect("http://192.168.1.20:9000")`.
 - `_poll()` is internal and normally called by the engine.
 
 <!-- page: shaders | Shaders -->
@@ -1016,8 +1054,12 @@ component:GetEntity()
 Edges:
 
 - `ecs.addComponent` deep-copies the component prototype.
-- Component `awake` is optional. When present, it runs before the component is
-  pushed into `entity.components`.
+- Custom component `awake` is optional. When present, it is queued for the first
+  frame after attachment so scene-exported Inspector assignments are already on
+  the component instance. Read Inspector-edited values from the `component`
+  argument (often named `self`), not from the shared module prototype table.
+- Core engine components may still run their internal setup immediately during
+  attachment.
 - Component `destroy` runs when removed; `onDestroy` is used as a fallback.
 - Component prototypes must be tables.
 - Runtime errors in callbacks are reported with component context.
@@ -1049,6 +1091,7 @@ Globals: `transform`, `transforms`
 ```luau
 local x, y = transform.getWorldPosition(entity)
 local r = transform.getWorldRotation(entity)
+local facing = transform.lookAt(x, y, targetX, targetY)
 local entities = transform.GetEntitiesInFront(mouse.x, mouse.y, 0)
 local hit = transform.raycast(0, 0, 1, 0, 500, { ignore = player })
 local overlapping = transform.doTheyOverlap({ a, b, c })
@@ -1072,6 +1115,10 @@ local topEntity = underMouse[1]
 ```
 
 `transform.getEntitiesInFront` is a lower-camel alias.
+
+`transform.lookAt(fromX, fromY, toX, toY)` returns the world-space rotation in
+radians required for the first position to face the second. Zero radians faces
+right; positive rotation turns toward positive Y. `look_at` is an alias.
 
 Transform rules:
 
@@ -1125,11 +1172,13 @@ end)
 connection:Disconnect()
 ```
 
-Event fields include `kind`, `type`, `button`, `x`, `y`, `mouseX`, `mouseY`, `wheelX`, `wheelY`, and `amount`.
+Event fields include `kind`, `type`, `button`, `x`, `y`, `mouseX`, `mouseY`,
+`localX`, `localY` (plus snake-case aliases), `wheelX`, `wheelY`, and `amount`.
 
 Edges:
 
-- Listener hit testing uses entity bounds.
+- Listener hit testing and local coordinates follow the complete world transform,
+  including entity rotation, custom rotation pivots, parent rotation, and scale.
 - Listener connections support `Disconnect`, `disconnect`, `IsConnected`, and `isConnected`.
 - Deleting entities disconnects their listeners.
 
@@ -1185,6 +1234,41 @@ All drawable components share:
 - `color`
 - `shader`
 - `visible`
+
+## Component Reference
+
+Every built-in component available through the `core` module, and what it does.
+Names joined by `/` are aliases for the same component. UI components (Panel,
+Button, TextInput, Slider, Dropdown) default to a Visual Studio Code **Dark+**
+colour scheme, and every state colour — including hover — is configurable.
+
+| Component | Category | What it does |
+| --- | --- | --- |
+| `core.Rect2D` | Rendering | Draws a solid rectangle filling the entity bounds. |
+| `core.Shape2D` | Rendering | Draws a primitive: box, circle, triangle, or right-triangle. |
+| `core.ParticleSystem2D` | Rendering | Emits bounded particles as tinted circles or a sampled image. |
+| `core.TextBox` / `core.TextLabel` / `core.RudimentaryTextLabel` | Text | Bounded or content-sized rich text with formatting and auto-fit. |
+| `core.TextInput` | UI | Editable single-line field with caret, placeholder, focus, and submit/change callbacks. |
+| `core.Panel` / `core.Frame` | UI | Container with background, border, rounded corners, and optional 9-slice image. |
+| `core.Button` | UI | Clickable button with hover/pressed/disabled states, an optional icon, and click callbacks. |
+| `core.Slider` | UI | Draggable value slider (horizontal or vertical) with a track, filled range, thumb, and `onChanged`. |
+| `core.Dropdown` | UI | Selectable list with a scrollable popup menu and per-item styling. |
+| `core.Sprite2D` / `core.Image2D` | Rendering | Draws an image scaled to the entity bounds, with an optional source rectangle. |
+| `core.SpriteSheet2D` | Rendering | Draws and animates frames from a regular sprite atlas. |
+| `core.NineSliceSprite2D` / `core["9SliceSprite2D"]` | Rendering | Nine-slice sprite: fixed corners and edges, stretched center. |
+| `core.Spritebox2D` | Rendering | Sprite renderer that hit-tests against opaque pixels using `alpha_threshold`. |
+| `core.TileTexture2D` | Rendering | Tiles an image across the entity bounds. |
+| `core.Tilemap2D` | Rendering | Draws a grid of tiles sampled from an atlas. |
+| `core.AnimationController` | Animation | Plays and blends a keyframe clip on the entity. |
+| `core.EntityScaler` | Layout | Scales the entity to a target size, in pixels or as a fraction of the screen. |
+| `core.Collider2D` | Physics | 2D collision shape for overlap and physics queries. |
+| `core.Rigidbody2D` | Physics | Gives the entity velocity, forces, and physics integration. |
+| `core.Bolt2D` / `core.LegacyBolt2D` | Physics | Rigid joint constraining two bodies together. |
+| `core.Rope2D` / `core.String2D` | Physics | Distance joint with min/max length, stiffness, and damping. |
+| `core.SpatialSound2D` | Audio | Positional audio emitter attached to the entity transform. |
+
+Scripted behaviour modules can also appear in the editor's **Add Component**
+picker — see [Custom Picker Components](#custom-picker-components).
 
 ## `core.Rect2D`
 
@@ -1277,6 +1361,126 @@ Edges:
 - Text can auto-fit within entity bounds using `text_scale`.
 - Content-sized text is not culled before layout.
 
+## `core.TextInput`
+
+An editable `TextBox`-style field with a caret, placeholder, focus, locking,
+font and alignment controls, rich-text formatting, password masking, and
+submit/change callbacks.
+
+```luau
+local input = ecs.addComponent(entity, core.TextInput)
+input.placeholder = "Player name"
+input.font = "assets/fonts/ui.ttf"
+input.align_x = "center"
+input.onSubmit = function(entity, text) print(text) end
+```
+
+Set `locked = true` (or `enabled = false`) to prevent interaction. `focus()` and
+`blur()` control focus from code. `onChanged`, `onSubmit`, `onFocus`, and
+`onBlur` are optional callbacks. TextInput supports the same rich-text methods
+as `TextBox`.
+
+Colours default to the VS Code Dark+ input palette
+(`background_color = Color4(60, 60, 60)`, `focus_border_color = Color4(0, 127, 212)`).
+
+## `core.Panel` and `core.Frame`
+
+A UI container: a filled rectangle with a border, rounded corners, and an
+optional 9-slice background image. `core.Frame` is a backwards-compatible alias.
+
+```luau
+local panel = ecs.addComponent(entity, core.Panel)
+panel.background_color = Color4(37, 37, 38) -- VS Code Dark+ sidebar
+panel.border_color = Color4(69, 69, 69)
+panel.corner_radius = 6
+```
+
+Fields: `background_color`, `border_color`, `border_width`, `corner_radius`,
+`background_image`, and `slice_left`/`slice_right`/`slice_top`/`slice_bottom`.
+
+## `core.Button`
+
+An interactive button that renders a `Panel`-style background plus centered text
+and an optional inline icon. It tracks hover and pressed state and exposes click
+callbacks.
+
+```luau
+local button = ecs.addComponent(entity, core.Button)
+button.text = "Play"
+button.hover_background_color = Color4(17, 119, 187)
+button.onClick = function(entity) print("clicked") end
+```
+
+Each state colour is configurable and defaults to the VS Code Dark+ button
+palette (`background_color = Color4(14, 99, 156)`, hover `Color4(17, 119, 187)`):
+`background_color`, `hover_background_color`, `pressed_background_color`,
+`disabled_background_color`, and the matching `*_border_color` / `*_text_color`
+fields. Callbacks: `onClick`, `onPress`, `onRelease`, `onHoverEnter`,
+`onHoverLeave`. Set `enabled = false` to disable it.
+
+## `core.Slider`
+
+A draggable value slider with a track, a filled range, and a thumb. Works
+horizontally or vertically and reports changes through `onChanged`.
+
+```luau
+local slider = ecs.addComponent(entity, core.Slider)
+slider.min = 0
+slider.max = 100
+slider.value = 50
+slider.onChanged = function(entity, value) print(value) end
+```
+
+Fields: `min`, `max`, `value`, `fraction` (read-only 0..1), `step` (0 = continuous),
+`orientation` (`"horizontal"` or `"vertical"`), `thumb_size`, `track_thickness`,
+`corner_radius`, and `thumb_corner_radius`. Colours default to the VS Code Dark+
+palette and each has a configurable hover variant: `background_color` /
+`hover_background_color` (track), `fill_color` / `hover_fill_color`, and
+`thumb_color` / `hover_thumb_color`. `setValue(value)` sets the value from code
+(clamped, without firing `onChanged`).
+
+## `core.Dropdown`
+
+A closed control that opens a scrollable popup menu of options. Each `options`
+entry may be a string, or a table with `text`, `value`, and `image` fields.
+
+```luau
+local dropdown = ecs.addComponent(entity, core.Dropdown)
+dropdown.options = { "Easy", "Normal", "Hard" }
+dropdown.onChanged = function(entity, index, value) print(index, value) end
+```
+
+Fields: `options`, `selected_index` (1-based), `selected_text`, `selected_value`,
+`placeholder`, `item_height`, `max_visible_items`, and `open_upwards`. Closed-state
+colours (`background_color`, `hover_background_color`, `open_background_color`),
+menu colours (`menu_background_color`, `menu_border_color`), and per-item colours
+(`item_background_color`, `item_hover_background_color`,
+`item_selected_background_color`, plus their `*_text_color` counterparts) are all
+configurable and default to the VS Code Dark+ dropdown/list palette
+(selection `Color4(9, 71, 113)`, hover `Color4(42, 45, 46)`).
+
+## Custom Picker Components
+
+Behaviour scripts can register themselves in the editor's **Add Component**
+picker by calling `IComponentPicker(Behaviour)` at module scope. The script then
+appears in the picker's search results alongside the core components and can be
+attached to entities like any other component.
+
+```luau
+local Behaviour = {
+    speed = Inspector(100),
+}
+
+function Behaviour.awake(entity, self) end
+function Behaviour.update(entity, self, dt) end
+
+IComponentPicker(Behaviour)
+return Behaviour
+```
+
+The picker's search box is focused as soon as it opens; typing filters the list,
+and pressing Enter adds the top match to the selected entity.
+
 ## `core.Sprite2D` and `core.Image2D`
 
 Draws an image scaled to the entity bounds. `Image2D` is kept as an alias-compatible sprite renderer.
@@ -1299,6 +1503,26 @@ Edges:
 - Source rectangles use image pixel coordinates.
 - If no source rectangle is supplied, the whole image is drawn.
 - Rendering is skipped when `image` is nil or unloaded.
+
+## `core.SpriteSheet2D`
+
+Draws and animates frames from a regular sprite atlas.
+
+```luau
+local sprite = ecs.addComponent(entity, core.SpriteSheet2D)
+sprite.image = assets.loadImage("assets/player-sheet.png")
+sprite.frame_width = 32
+sprite.frame_height = 32
+sprite.frame_count = 8
+sprite.spacing = 1 -- optional atlas padding between frames
+sprite.fps = 12
+sprite:play()
+```
+
+`columns = 0` and `frame_count = 0` automatically derive both values from the
+image dimensions. Frames are zero-based. Use `play()`, `pause()`, `stop()`, or
+`setFrame(frame)`; `looping` controls whether playback wraps or stops on the
+last frame. The visual editor previews the selected `frame` directly.
 
 ## `core.NineSliceSprite2D` and `core["9SliceSprite2D"]`
 
@@ -1339,8 +1563,8 @@ Fields:
 Edges:
 
 - `tile_width` and `tile_height` default to the image size when `0`.
-- Non-rotated tile layers are culled to the viewport before queueing tiles.
-- Rotated tile layers preserve full-entity iteration for correctness.
+- Tile layers are culled in local space before queueing tiles, including when
+  the entity is rotated.
 
 ## `core.Tilemap2D`
 
@@ -1349,7 +1573,8 @@ and `tile_height`. `tiles` is a flat numeric array or a comma/whitespace-separat
 string. Tile `0` is the first atlas cell and `-1` is empty. `spacing` and
 `margin` support packed atlases. In the visual editor, select a `Tilemap2D`
 component and use Paint mode in the Inspector to edit `tiles` directly inside
-the entity bounds.
+the entity bounds. Large maps cull off-screen cell ranges in tilemap-local
+space, including rotated maps.
 
 <!-- page: spritebox2d | Spritebox2D -->
 # Spritebox2D

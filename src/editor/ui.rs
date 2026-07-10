@@ -9,7 +9,9 @@
 //! another. It has no external GUI dependency, keeping the editor self-contained
 //! within the engine crate.
 
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use fontdue::Font;
@@ -60,6 +62,7 @@ pub mod icon {
     pub const ARTICLE: char = '\u{ef42}';
     pub const PALETTE: char = '\u{e40a}';
     pub const SEARCH: char = '\u{e8b6}';
+    pub const HISTORY: char = '\u{e889}';
     pub const VISIBILITY: char = '\u{e8f4}';
     pub const VISIBILITY_OFF: char = '\u{e8f5}';
     pub const RESTART_ALT: char = '\u{f053}';
@@ -83,6 +86,7 @@ pub mod icon {
     pub const TRANSFORM: char = '\u{e428}';
     pub const PHONE_ANDROID: char = '\u{e324}';
     pub const SCREEN_ROTATION: char = '\u{e1c1}';
+    pub const CLOSE: char = '\u{e5cd}';
 }
 
 /// An RGBA color in `[r, g, b, a]` byte order.
@@ -127,7 +131,7 @@ impl Rect {
 /// The editor color palette. Serializable so it can be loaded from and written
 /// to `editor_theme.json`; the [`Default`] is a Visual Studio Code "Dark+"
 /// inspired scheme.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Theme {
     /// Side panel background.
@@ -826,6 +830,8 @@ pub struct FrameInput {
     pub right_pressed: bool,
     /// Middle button is currently held (pans the viewport).
     pub middle_down: bool,
+    /// Middle button transitioned to pressed this frame.
+    pub middle_pressed: bool,
     /// Back (mouse 4) pressed this frame.
     pub back_pressed: bool,
     /// Forward (mouse 5) pressed this frame.
@@ -839,9 +845,14 @@ pub struct FrameInput {
     pub escape: bool,
     /// The Delete key was pressed (used to remove the selection).
     pub delete: bool,
+    pub left: bool,
+    pub right: bool,
+    pub home: bool,
+    pub end: bool,
     /// Ctrl/Cmd shortcut requests for this frame.
     pub copy: bool,
     pub paste: bool,
+    pub cut: bool,
     pub save: bool,
     pub duplicate: bool,
     pub undo: bool,
@@ -888,6 +899,12 @@ pub struct Ui<'a> {
     pub theme: Theme,
     focus: Option<String>,
     edit_buffer: String,
+    edit_cursor: usize,
+    edit_selection_anchor: Option<usize>,
+    /// The control which owns the current left-button drag. Keeping this across
+    /// frames lets sliders, colour pickers, and text selection keep responding
+    /// after the pointer leaves their bounds.
+    pointer_capture: Option<String>,
     /// When set, pointer interactions only register inside this rectangle. Used
     /// so widgets scrolled out of a clipped panel cannot be clicked.
     input_clip: Option<Rect>,
@@ -904,13 +921,24 @@ impl<'a> Ui<'a> {
         theme: Theme,
         focus: Option<String>,
         edit_buffer: String,
+        edit_cursor: usize,
+        edit_selection_anchor: Option<usize>,
+        pointer_capture: Option<String>,
     ) -> Self {
+        let pointer_capture = if input.mouse_down {
+            pointer_capture
+        } else {
+            None
+        };
         Self {
             painter,
             input,
             theme,
             focus,
             edit_buffer,
+            edit_cursor,
+            edit_selection_anchor,
+            pointer_capture,
             input_clip: None,
             pending_tooltip: None,
             wants_redraw: false,
@@ -918,8 +946,16 @@ impl<'a> Ui<'a> {
     }
 
     /// Pull the retained focus state back out at the end of a frame.
-    pub fn into_focus_state(self) -> (Option<String>, String) {
-        (self.focus, self.edit_buffer)
+    pub fn into_focus_state(
+        self,
+    ) -> (Option<String>, String, usize, Option<usize>, Option<String>) {
+        (
+            self.focus,
+            self.edit_buffer,
+            self.edit_cursor,
+            self.edit_selection_anchor,
+            self.pointer_capture,
+        )
     }
 
     pub fn has_focus(&self) -> bool {
@@ -931,6 +967,18 @@ impl<'a> Ui<'a> {
     pub fn clear_focus(&mut self) {
         self.focus = None;
         self.edit_buffer.clear();
+        self.edit_cursor = 0;
+        self.edit_selection_anchor = None;
+    }
+
+    /// Focus a text field from a dialog or interaction that opens during the
+    /// current frame, with the caret placed at the end of its initial value.
+    pub fn focus_text(&mut self, id: &str, value: &str) {
+        self.focus = Some(id.to_string());
+        self.edit_buffer = value.to_string();
+        self.edit_cursor = char_len(value);
+        self.edit_selection_anchor = None;
+        self.wants_redraw = true;
     }
 
     /// The current edit buffer (the text of whatever field is/was focused this
@@ -955,6 +1003,33 @@ impl<'a> Ui<'a> {
             }
         }
         rect.contains(self.input.mouse_x, self.input.mouse_y)
+    }
+
+    /// Capture a pointer drag that began inside `rect`. Once captured, the
+    /// control remains active until release even if the cursor crosses a panel,
+    /// window, or widget boundary. Callers should clamp the resulting value.
+    pub fn pointer_drag(&mut self, id: &str, rect: Rect) -> bool {
+        // `mouse_down` also covers a control which appears under an already
+        // held pointer (for example, opening a colour picker by pressing its
+        // swatch). With no existing owner it is safe for that new control to
+        // claim the drag immediately.
+        if self.pointer_capture.is_none()
+            && self.input.mouse_down
+            && self.hovered(rect)
+        {
+            self.pointer_capture = Some(id.to_string());
+        }
+        if !self.input.mouse_down {
+            if self.pointer_capture.as_deref() == Some(id) {
+                self.pointer_capture = None;
+            }
+            return false;
+        }
+        let active = self.pointer_capture.as_deref() == Some(id);
+        if active {
+            self.wants_redraw = true;
+        }
+        active
     }
 
     /// Draw a clickable button. Returns true on the frame it is pressed.
@@ -1121,9 +1196,15 @@ impl<'a> Ui<'a> {
         );
         self.painter
             .fill_round_rect(Rect::new(knob_x - 5.0, rect.y + rect.h / 2.0 - 6.0, 10.0, 12.0), 5.0, self.theme.text);
-        if self.hovered(rect) && self.input.mouse_down {
+        let drag_id = format!(
+            "slider:{:08x}:{:08x}:{:08x}:{:08x}",
+            rect.x.to_bits(),
+            rect.y.to_bits(),
+            rect.w.to_bits(),
+            rect.h.to_bits()
+        );
+        if self.pointer_drag(&drag_id, rect) {
             let nt = ((self.input.mouse_x - rect.x) / rect.w.max(1.0)).clamp(0.0, 1.0);
-            self.wants_redraw = true;
             Some(min + nt * (max - min))
         } else {
             None
@@ -1132,8 +1213,26 @@ impl<'a> Ui<'a> {
 
     /// A clickable color swatch (opens a picker). Returns true when clicked.
     pub fn swatch_button(&mut self, rect: Rect, color: Rgba) -> bool {
-        self.painter
-            .fill_round_rect(rect, 3.0, [color[0], color[1], color[2], 255]);
+        // Checkerboard backdrop so partial alpha (transparency) is visible: the
+        // colour is drawn with its real alpha on top, letting the pattern show
+        // through translucent swatches.
+        let prev = self.painter.push_clip(rect);
+        self.painter.fill_round_rect(rect, 3.0, [255, 255, 255, 255]);
+        let cell = (rect.h * 0.5).max(3.0);
+        let cols = (rect.w / cell).ceil() as i32;
+        let rows = (rect.h / cell).ceil() as i32;
+        for r in 0..rows {
+            for c in 0..cols {
+                if (r + c) % 2 == 1 {
+                    self.painter.fill_rect(
+                        Rect::new(rect.x + c as f32 * cell, rect.y + r as f32 * cell, cell, cell),
+                        [176, 176, 176, 255],
+                    );
+                }
+            }
+        }
+        self.painter.set_clip_raw(prev);
+        self.painter.fill_round_rect(rect, 3.0, color);
         let border = if self.hovered(rect) {
             self.theme.accent
         } else {
@@ -1241,14 +1340,40 @@ impl<'a> Ui<'a> {
     /// An editable single-line text field identified by a stable `id`. The
     /// caller passes the current `value`; the response reports the edited text.
     pub fn text_field(&mut self, id: &str, rect: Rect, value: &str) -> TextFieldResponse {
+        let size = 14.0;
+        let text_x = rect.x + 6.0;
         let focused = self.focus.as_deref() == Some(id);
         let hovered = self.hovered(rect);
+        let drag_id = format!("text:{id}");
+        let dragging = self.pointer_drag(&drag_id, rect);
 
         if self.input.mouse_pressed {
             if hovered {
+                let was_focused = focused;
                 if !focused {
                     self.focus = Some(id.to_string());
                     self.edit_buffer = value.to_string();
+                    self.edit_cursor = char_len(&self.edit_buffer);
+                    self.edit_selection_anchor = None;
+                }
+                let clicked = cursor_index_at_x(
+                    &self.painter,
+                    &self.edit_buffer,
+                    size,
+                    text_x,
+                    self.input.mouse_x,
+                );
+                if self.input.double_click {
+                    self.edit_selection_anchor = Some(0);
+                    self.edit_cursor = char_len(&self.edit_buffer);
+                } else if self.input.shift && was_focused {
+                    if self.edit_selection_anchor.is_none() {
+                        self.edit_selection_anchor = Some(self.edit_cursor);
+                    }
+                    self.edit_cursor = clicked;
+                } else {
+                    self.edit_cursor = clicked;
+                    self.edit_selection_anchor = None;
                 }
             } else if focused {
                 self.focus = None;
@@ -1260,15 +1385,128 @@ impl<'a> Ui<'a> {
 
         if focused {
             self.wants_redraw = true;
+            clamp_edit_state(
+                &self.edit_buffer,
+                &mut self.edit_cursor,
+                &mut self.edit_selection_anchor,
+            );
+
+            if dragging && !self.input.mouse_pressed {
+                if self.edit_selection_anchor.is_none() {
+                    self.edit_selection_anchor = Some(self.edit_cursor);
+                }
+                self.edit_cursor = cursor_index_at_x(
+                    &self.painter,
+                    &self.edit_buffer,
+                    size,
+                    text_x,
+                    self.input.mouse_x,
+                );
+                clamp_empty_selection(&mut self.edit_selection_anchor, self.edit_cursor);
+            }
+
+            if self.input.select_all {
+                self.edit_selection_anchor = Some(0);
+                self.edit_cursor = char_len(&self.edit_buffer);
+            }
+            if self.input.copy
+                && let Some((start, end)) =
+                    selection_range(self.edit_cursor, self.edit_selection_anchor)
+            {
+                let selected = slice_char_range(&self.edit_buffer, start, end);
+                write_clipboard(&selected);
+            }
+            if self.input.cut
+                && let Some((start, end)) =
+                    selection_range(self.edit_cursor, self.edit_selection_anchor)
+            {
+                let selected = slice_char_range(&self.edit_buffer, start, end);
+                write_clipboard(&selected);
+                replace_char_range(&mut self.edit_buffer, start, end, "");
+                self.edit_cursor = start;
+                self.edit_selection_anchor = None;
+                changed = true;
+            }
+            if self.input.paste && let Some(text) = read_clipboard() {
+                let pasted = normalize_pasted_text(&text);
+                if !pasted.is_empty() {
+                    insert_text_at_cursor(
+                        &mut self.edit_buffer,
+                        &mut self.edit_cursor,
+                        &mut self.edit_selection_anchor,
+                        &pasted,
+                    );
+                    changed = true;
+                }
+            }
+
+            let len = char_len(&self.edit_buffer);
+            let extend_selection = self.input.shift;
+            let move_cursor = |next: usize,
+                               cursor: &mut usize,
+                               selection_anchor: &mut Option<usize>| {
+                if extend_selection {
+                    if selection_anchor.is_none() {
+                        *selection_anchor = Some(*cursor);
+                    }
+                } else {
+                    *selection_anchor = None;
+                }
+                *cursor = next.min(len);
+                clamp_empty_selection(selection_anchor, *cursor);
+            };
+            if self.input.home {
+                move_cursor(0, &mut self.edit_cursor, &mut self.edit_selection_anchor);
+            }
+            if self.input.end {
+                move_cursor(len, &mut self.edit_cursor, &mut self.edit_selection_anchor);
+            }
+            if self.input.left {
+                move_cursor(
+                    self.edit_cursor.saturating_sub(1),
+                    &mut self.edit_cursor,
+                    &mut self.edit_selection_anchor,
+                );
+            }
+            if self.input.right {
+                move_cursor(
+                    (self.edit_cursor + 1).min(len),
+                    &mut self.edit_cursor,
+                    &mut self.edit_selection_anchor,
+                );
+            }
+
             for ch in self.input.typed.chars() {
-                if !ch.is_control() {
-                    self.edit_buffer.push(ch);
+                if !self.input.ctrl && !ch.is_control() {
+                    let mut text = [0; 4];
+                    insert_text_at_cursor(
+                        &mut self.edit_buffer,
+                        &mut self.edit_cursor,
+                        &mut self.edit_selection_anchor,
+                        ch.encode_utf8(&mut text),
+                    );
                     changed = true;
                 }
             }
             if self.input.backspace {
-                self.edit_buffer.pop();
-                changed = true;
+                if delete_selection_or_range(
+                    &mut self.edit_buffer,
+                    &mut self.edit_cursor,
+                    &mut self.edit_selection_anchor,
+                    true,
+                ) {
+                    changed = true;
+                }
+            }
+            if self.input.delete {
+                if delete_selection_or_range(
+                    &mut self.edit_buffer,
+                    &mut self.edit_cursor,
+                    &mut self.edit_selection_anchor,
+                    false,
+                ) {
+                    changed = true;
+                }
             }
             if self.input.escape {
                 self.focus = None;
@@ -1298,16 +1536,42 @@ impl<'a> Ui<'a> {
         };
         self.painter.stroke_round_rect(rect, radius, border);
 
-        let size = 14.0;
         let ty = rect.y + (rect.h - size) / 2.0;
         let text_color = self.theme.text;
-        self.painter
-            .text_clipped(rect.x + 6.0, ty, &display, size, text_color, rect.w - 12.0);
         if focused {
-            let caret_x = (rect.x + 6.0 + self.painter.text_width(&display, size))
-                .min(rect.right() - 4.0);
+            let clip = Rect::new(rect.x + 4.0, rect.y + 1.0, (rect.w - 8.0).max(0.0), rect.h - 2.0);
+            let previous_clip = self.painter.push_clip(clip);
+            if let Some((start, end)) =
+                selection_range(self.edit_cursor, self.edit_selection_anchor)
+            {
+                let start_x = text_x + text_prefix_width(&self.painter, &display, size, start);
+                let end_x = text_x + text_prefix_width(&self.painter, &display, size, end);
+                let selection_rect = Rect::new(
+                    start_x,
+                    rect.y + 3.0,
+                    (end_x - start_x).max(1.0),
+                    rect.h - 6.0,
+                );
+                self.painter.fill_rect(
+                    selection_rect,
+                    [
+                        self.theme.accent[0],
+                        self.theme.accent[1],
+                        self.theme.accent[2],
+                        110,
+                    ],
+                );
+            }
+            self.painter.text(text_x, ty, &display, size, text_color);
+            let caret_x = (text_x + text_prefix_width(&self.painter, &display, size, self.edit_cursor))
+                .min(rect.right() - 4.0)
+                .max(rect.x + 4.0);
             self.painter
                 .fill_rect(Rect::new(caret_x, rect.y + 4.0, 1.0, rect.h - 8.0), text_color);
+            self.painter.set_clip_raw(previous_clip);
+        } else {
+            self.painter
+                .text_clipped(text_x, ty, &display, size, text_color, rect.w - 12.0);
         }
 
         TextFieldResponse {
@@ -1319,6 +1583,240 @@ impl<'a> Ui<'a> {
             changed,
         }
     }
+}
+
+fn char_len(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn byte_index_for_char(text: &str, char_index: usize) -> usize {
+    if char_index == 0 {
+        return 0;
+    }
+    text.char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
+}
+
+fn clamp_edit_state(text: &str, cursor: &mut usize, selection_anchor: &mut Option<usize>) {
+    let len = char_len(text);
+    *cursor = (*cursor).min(len);
+    if let Some(anchor) = selection_anchor.as_mut() {
+        *anchor = (*anchor).min(len);
+    }
+    clamp_empty_selection(selection_anchor, *cursor);
+}
+
+fn clamp_empty_selection(selection_anchor: &mut Option<usize>, cursor: usize) {
+    if selection_anchor.is_some_and(|anchor| anchor == cursor) {
+        *selection_anchor = None;
+    }
+}
+
+fn selection_range(cursor: usize, selection_anchor: Option<usize>) -> Option<(usize, usize)> {
+    let anchor = selection_anchor?;
+    if anchor == cursor {
+        return None;
+    }
+    Some((anchor.min(cursor), anchor.max(cursor)))
+}
+
+fn slice_char_range(text: &str, start: usize, end: usize) -> String {
+    let start = byte_index_for_char(text, start);
+    let end = byte_index_for_char(text, end);
+    text[start..end].to_string()
+}
+
+fn replace_char_range(text: &mut String, start: usize, end: usize, replacement: &str) {
+    let start = byte_index_for_char(text, start);
+    let end = byte_index_for_char(text, end);
+    text.replace_range(start..end, replacement);
+}
+
+fn insert_text_at_cursor(
+    text: &mut String,
+    cursor: &mut usize,
+    selection_anchor: &mut Option<usize>,
+    inserted: &str,
+) {
+    let (start, end) = selection_range(*cursor, *selection_anchor).unwrap_or((*cursor, *cursor));
+    replace_char_range(text, start, end, inserted);
+    *cursor = start + char_len(inserted);
+    *selection_anchor = None;
+}
+
+fn delete_selection_or_range(
+    text: &mut String,
+    cursor: &mut usize,
+    selection_anchor: &mut Option<usize>,
+    backspace: bool,
+) -> bool {
+    if let Some((start, end)) = selection_range(*cursor, *selection_anchor) {
+        replace_char_range(text, start, end, "");
+        *cursor = start;
+        *selection_anchor = None;
+        return true;
+    }
+    if backspace {
+        if *cursor == 0 {
+            return false;
+        }
+        replace_char_range(text, *cursor - 1, *cursor, "");
+        *cursor -= 1;
+        return true;
+    }
+    if *cursor >= char_len(text) {
+        return false;
+    }
+    replace_char_range(text, *cursor, *cursor + 1, "");
+    true
+}
+
+fn text_prefix_width(painter: &Painter<'_>, text: &str, size: f32, char_count: usize) -> f32 {
+    let end = byte_index_for_char(text, char_count);
+    painter.text_width(&text[..end], size)
+}
+
+fn cursor_index_at_x(painter: &Painter<'_>, text: &str, size: f32, start_x: f32, x: f32) -> usize {
+    if x <= start_x {
+        return 0;
+    }
+    let mut pen = start_x;
+    for (index, ch) in text.chars().enumerate() {
+        let width = painter.text_width(&ch.to_string(), size);
+        if x < pen + width * 0.5 {
+            return index;
+        }
+        pen += width;
+        if x < pen {
+            return index + 1;
+        }
+    }
+    char_len(text)
+}
+
+fn normalize_pasted_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| if matches!(ch, '\r' | '\n') { ' ' } else { ch })
+        .collect::<String>()
+}
+
+fn read_clipboard() -> Option<String> {
+    if let Some(text) = read_native_clipboard() {
+        return Some(text);
+    }
+    read_clipboard_with_helper()
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn read_native_clipboard() -> Option<String> {
+    arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+#[cfg(not(all(not(target_arch = "wasm32"), not(target_os = "android"))))]
+fn read_native_clipboard() -> Option<String> {
+    None
+}
+
+fn read_clipboard_with_helper() -> Option<String> {
+    read_clipboard_with_platform_helper()
+}
+
+#[cfg(target_os = "macos")]
+fn read_clipboard_with_platform_helper() -> Option<String> {
+    try_read_clipboard_command("pbpaste", &[])
+}
+
+#[cfg(windows)]
+fn read_clipboard_with_platform_helper() -> Option<String> {
+    const READ: &str =
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Raw";
+    try_read_clipboard_command("powershell", &["-NoProfile", "-Command", READ]).or_else(|| {
+        try_read_clipboard_command("powershell.exe", &["-NoProfile", "-Command", READ])
+    })
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn read_clipboard_with_platform_helper() -> Option<String> {
+    try_read_clipboard_command("wl-paste", &["--no-newline"])
+        .or_else(|| try_read_clipboard_command("xclip", &["-selection", "clipboard", "-o"]))
+        .or_else(|| try_read_clipboard_command("xsel", &["--clipboard", "--output"]))
+}
+
+fn try_read_clipboard_command(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if output.status.success() {
+        String::from_utf8(output.stdout).ok()
+    } else {
+        None
+    }
+}
+
+fn write_clipboard(text: &str) -> bool {
+    if write_native_clipboard(text) {
+        return true;
+    }
+    write_clipboard_with_helper(text)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn write_native_clipboard(text: &str) -> bool {
+    arboard::Clipboard::new()
+        .and_then(|mut clipboard| clipboard.set_text(text.to_string()))
+        .is_ok()
+}
+
+#[cfg(not(all(not(target_arch = "wasm32"), not(target_os = "android"))))]
+fn write_native_clipboard(_text: &str) -> bool {
+    false
+}
+
+fn write_clipboard_with_helper(text: &str) -> bool {
+    write_clipboard_with_platform_helper(text)
+}
+
+#[cfg(target_os = "macos")]
+fn write_clipboard_with_platform_helper(text: &str) -> bool {
+    try_write_clipboard_command("pbcopy", &[], text)
+}
+
+#[cfg(windows)]
+fn write_clipboard_with_platform_helper(text: &str) -> bool {
+    const WRITE: &str = "Set-Clipboard -Value ([Console]::In.ReadToEnd())";
+    try_write_clipboard_command("powershell", &["-NoProfile", "-Command", WRITE], text)
+        || try_write_clipboard_command("powershell.exe", &["-NoProfile", "-Command", WRITE], text)
+        || try_write_clipboard_command("clip", &[], text)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn write_clipboard_with_platform_helper(text: &str) -> bool {
+    try_write_clipboard_command("wl-copy", &[], text)
+        || try_write_clipboard_command("xclip", &["-selection", "clipboard"], text)
+        || try_write_clipboard_command("xsel", &["--clipboard", "--input"], text)
+}
+
+fn try_write_clipboard_command(program: &str, args: &[&str], text: &str) -> bool {
+    let mut child = match Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let mut wrote = true;
+    if let Some(stdin) = child.stdin.as_mut() {
+        wrote = stdin.write_all(text.as_bytes()).is_ok();
+    }
+    wrote && child.wait().is_ok_and(|status| status.success())
 }
 
 /// Lighten a color toward white by `t` in `[0, 1]`, preserving alpha.
@@ -1474,5 +1972,125 @@ mod tests {
         assert_eq!(buf[0], 0xffffff);
         assert_eq!(buf[3], 0); // top-right, outside clip
         assert_eq!(buf[12], 0); // bottom-left, outside clip
+    }
+
+    #[test]
+    fn slider_keeps_pointer_capture_and_clamps_outside_its_bounds() {
+        let fonts = load_fonts().expect("load fonts");
+        let rect = Rect::new(20.0, 20.0, 100.0, 20.0);
+        let mut capture = None;
+
+        let mut buffer = vec![0u32; 200 * 60];
+        let painter = Painter::new(&mut buffer, 200, 60, fonts.clone());
+        let mut ui = Ui::new(
+            painter,
+            FrameInput {
+                mouse_x: 70.0,
+                mouse_y: 30.0,
+                mouse_pressed: true,
+                mouse_down: true,
+                ..Default::default()
+            },
+            Theme::default(),
+            None,
+            String::new(),
+            0,
+            None,
+            capture,
+        );
+        assert_eq!(ui.slider(rect, 0.0, 0.0, 1.0), Some(0.5));
+        let (_, _, _, _, next_capture) = ui.into_focus_state();
+        capture = next_capture;
+
+        let mut buffer = vec![0u32; 200 * 60];
+        let painter = Painter::new(&mut buffer, 200, 60, fonts.clone());
+        let mut ui = Ui::new(
+            painter,
+            FrameInput {
+                mouse_x: 180.0,
+                mouse_y: 50.0,
+                mouse_down: true,
+                ..Default::default()
+            },
+            Theme::default(),
+            None,
+            String::new(),
+            0,
+            None,
+            capture,
+        );
+        assert_eq!(ui.slider(rect, 0.5, 0.0, 1.0), Some(1.0));
+        let (_, _, _, _, capture) = ui.into_focus_state();
+        assert!(capture.is_some());
+
+        let mut buffer = vec![0u32; 200 * 60];
+        let painter = Painter::new(&mut buffer, 200, 60, fonts);
+        let mut ui = Ui::new(
+            painter,
+            FrameInput {
+                mouse_x: 180.0,
+                mouse_y: 50.0,
+                ..Default::default()
+            },
+            Theme::default(),
+            None,
+            String::new(),
+            0,
+            None,
+            capture,
+        );
+        assert_eq!(ui.slider(rect, 1.0, 0.0, 1.0), None);
+        let (_, _, _, _, capture) = ui.into_focus_state();
+        assert!(capture.is_none());
+    }
+
+    #[test]
+    fn text_selection_continues_to_nearest_character_outside_field() {
+        let fonts = load_fonts().expect("load fonts");
+        let rect = Rect::new(20.0, 20.0, 100.0, 24.0);
+        let value = "abcdef";
+        let mut buffer = vec![0u32; 220 * 64];
+        let painter = Painter::new(&mut buffer, 220, 64, fonts.clone());
+        let mut ui = Ui::new(
+            painter,
+            FrameInput {
+                mouse_x: 42.0,
+                mouse_y: 30.0,
+                mouse_pressed: true,
+                mouse_down: true,
+                ..Default::default()
+            },
+            Theme::default(),
+            None,
+            String::new(),
+            0,
+            None,
+            None,
+        );
+        ui.text_field("field", rect, value);
+        let (focus, edit, cursor, anchor, capture) = ui.into_focus_state();
+
+        let mut buffer = vec![0u32; 220 * 64];
+        let painter = Painter::new(&mut buffer, 220, 64, fonts);
+        let mut ui = Ui::new(
+            painter,
+            FrameInput {
+                mouse_x: 210.0,
+                mouse_y: 55.0,
+                mouse_down: true,
+                ..Default::default()
+            },
+            Theme::default(),
+            focus,
+            edit,
+            cursor,
+            anchor,
+            capture,
+        );
+        ui.text_field("field", rect, value);
+        let (_, _, cursor, anchor, capture) = ui.into_focus_state();
+        assert_eq!(cursor, value.chars().count());
+        assert!(anchor.is_some());
+        assert!(capture.is_some());
     }
 }

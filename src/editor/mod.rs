@@ -13,14 +13,16 @@
 //! Studio Code "Dark+" palette.
 
 mod app;
+mod hub;
 mod inspector;
 mod logger;
 mod ui;
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use winit::dpi::LogicalSize;
 use winit::event::{
     ElementState, Event, KeyboardInput, MouseButton, MouseScrollDelta, VirtualKeyCode, WindowEvent,
@@ -35,18 +37,108 @@ use ui::{FrameInput, Fonts, Painter, Theme, Ui};
 
 const DEFAULT_SCENE_FILE: &str = "scene.neoscene";
 const CONFIG_FILE: &str = "editor.json";
+const RECENTS_FILE: &str = "recent_projects.json";
 const WINDOW_W: f64 = 1280.0;
 const WINDOW_H: f64 = 760.0;
 const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_RECENT_PROJECTS: usize = 12;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RecentProject {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) last_opened: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct RecentProjectsFile {
+    projects: Vec<RecentProject>,
+}
+
+fn recent_projects_path() -> PathBuf {
+    let mut path = app::global_config_path();
+    path.set_file_name(RECENTS_FILE);
+    path
+}
+
+fn project_recent_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Untitled Project")
+        .to_string()
+}
+
+fn normalize_recent_project_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+pub(crate) fn load_recent_projects() -> Vec<RecentProject> {
+    let path = recent_projects_path();
+    let mut recents = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<RecentProjectsFile>(&text)
+            .map(|file| file.projects)
+            .unwrap_or_else(|error| {
+                eprintln!("warning: failed to parse {}: {error}", path.display());
+                Vec::new()
+            }),
+        Err(_) => Vec::new(),
+    };
+    recents.retain(|project| {
+        project.path.is_dir() && project.path.join("main.luau").is_file()
+    });
+    recents.sort_by(|a, b| b.last_opened.cmp(&a.last_opened));
+    recents.truncate(MAX_RECENT_PROJECTS);
+    recents
+}
+
+pub(crate) fn record_recent_project(project_root: &Path) -> Result<(), String> {
+    let project_root = normalize_recent_project_path(project_root);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let mut recents = load_recent_projects();
+    recents.retain(|project| project.path != project_root);
+    recents.insert(
+        0,
+        RecentProject {
+            name: project_recent_name(&project_root),
+            path: project_root,
+            last_opened: timestamp,
+        },
+    );
+    recents.truncate(MAX_RECENT_PROJECTS);
+
+    let path = recent_projects_path();
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(&RecentProjectsFile { projects: recents })
+        .map_err(|error| format!("failed to serialize recent projects: {error}"))?;
+    std::fs::write(&path, text)
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+/// Launch the project Hub. The Hub is the GUI entrypoint used by Start Menu /
+/// application launcher shortcuts.
+pub fn run_hub() -> Result<(), String> {
+    hub::run_hub()
+}
 
 /// Launch the visual editor for the project rooted at `project_root`.
 ///
-/// A `scene.neoscene` file in the project is loaded if present; otherwise a
+/// The project's configured start scene is loaded if present; otherwise a
 /// starter scene is created. Editor appearance and dock layout are read from a
 /// user-wide `editor.json`, with older project-local files used as a migration
 /// fallback. Saving and exporting write back into the project directory.
 pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
-    let scene_path = project_root.join(DEFAULT_SCENE_FILE);
+    if let Err(error) = record_recent_project(&project_root) {
+        eprintln!("warning: failed to update recent projects: {error}");
+    }
+
+    let scene_path = app::configured_start_scene_path(&project_root);
     let legacy_config_path = project_root.join(CONFIG_FILE);
     let config_path = app::global_config_path();
 
@@ -65,7 +157,7 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
     } else {
         Some(PathBuf::from(configured_font))
     };
-    let fonts = match font_path.as_deref() {
+    let mut fonts = match font_path.as_deref() {
         Some(path) => ui::load_fonts_from_path(Some(path)).or_else(|error| {
             eprintln!("warning: {error}; falling back to bundled editor font");
             ui::load_fonts()
@@ -213,7 +305,12 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                                 input.right_pressed = true;
                             }
                         }
-                        MouseButton::Middle => input.middle_down = pressed,
+                        MouseButton::Middle => {
+                            input.middle_down = pressed;
+                            if pressed {
+                                input.middle_pressed = true;
+                            }
+                        }
                         // Side buttons report different codes across mice and
                         // platforms; accept the common back/forward values.
                         MouseButton::Other(1 | 8) => {
@@ -259,6 +356,7 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                         VirtualKeyCode::Escape => input.escape = true,
                         VirtualKeyCode::C if input.ctrl => input.copy = true,
                         VirtualKeyCode::V if input.ctrl => input.paste = true,
+                        VirtualKeyCode::X if input.ctrl => input.cut = true,
                         VirtualKeyCode::S if input.ctrl => input.save = true,
                         VirtualKeyCode::D if input.ctrl => input.duplicate = true,
                         VirtualKeyCode::Y if input.ctrl => input.redo = true,
@@ -272,15 +370,25 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                         VirtualKeyCode::H => input.hide_selection = true,
                         VirtualKeyCode::L if input.shift => input.unlock_all = true,
                         VirtualKeyCode::L => input.lock_selection = true,
-                        VirtualKeyCode::Home => input.frame_all = true,
+                        VirtualKeyCode::Home => {
+                            input.home = true;
+                            input.frame_all = true;
+                        }
+                        VirtualKeyCode::End => input.end = true,
                         VirtualKeyCode::Space if input.shift => input.maximize_view = true,
                         VirtualKeyCode::G => input.toggle_grid = true,
                         VirtualKeyCode::S if input.shift => input.toggle_snap = true,
                         VirtualKeyCode::F2 => input.rename = true,
                         VirtualKeyCode::F => input.focus_selection = true,
                         VirtualKeyCode::Key0 | VirtualKeyCode::Numpad0 => input.reset_view = true,
-                        VirtualKeyCode::Left => input.nudge_x = -1.0,
-                        VirtualKeyCode::Right => input.nudge_x = 1.0,
+                        VirtualKeyCode::Left => {
+                            input.left = true;
+                            input.nudge_x = -1.0;
+                        }
+                        VirtualKeyCode::Right => {
+                            input.right = true;
+                            input.nudge_x = 1.0;
+                        }
                         VirtualKeyCode::Up => input.nudge_y = -1.0,
                         VirtualKeyCode::Down => input.nudge_y = 1.0,
                         _ => {}
@@ -334,6 +442,28 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                     *control_flow = ControlFlow::Exit;
                     return;
                 }
+                if let Some(path) = editor.take_font_reload_request() {
+                    let next_fonts = if path.is_empty() {
+                        ui::load_fonts()
+                    } else {
+                        ui::load_fonts_from_path(Some(Path::new(&path)))
+                    };
+                    match next_fonts {
+                        Ok(next_fonts) => {
+                            fonts = next_fonts;
+                            window.request_redraw();
+                            for widget in &detached_widgets {
+                                if widget.visible {
+                                    widget.window.request_redraw();
+                                }
+                            }
+                            if logger_visible {
+                                logger_window.request_redraw();
+                            }
+                        }
+                        Err(error) => eprintln!("warning: editor font reload failed: {error}"),
+                    }
+                }
                 editor.flush_config();
                 if editor.should_quit() {
                     editor.flush_config();
@@ -374,6 +504,7 @@ struct PendingInput {
     mouse_down: bool,
     mouse_pressed: bool,
     middle_down: bool,
+    middle_pressed: bool,
     right_pressed: bool,
     back_pressed: bool,
     forward_pressed: bool,
@@ -384,10 +515,15 @@ struct PendingInput {
     enter: bool,
     escape: bool,
     delete: bool,
+    left: bool,
+    right: bool,
+    home: bool,
+    end: bool,
     ctrl: bool,
     shift: bool,
     copy: bool,
     paste: bool,
+    cut: bool,
     save: bool,
     duplicate: bool,
     undo: bool,
@@ -422,6 +558,7 @@ impl Default for PendingInput {
             mouse_down: false,
             mouse_pressed: false,
             middle_down: false,
+            middle_pressed: false,
             right_pressed: false,
             back_pressed: false,
             forward_pressed: false,
@@ -432,10 +569,15 @@ impl Default for PendingInput {
             enter: false,
             escape: false,
             delete: false,
+            left: false,
+            right: false,
+            home: false,
+            end: false,
             ctrl: false,
             shift: false,
             copy: false,
             paste: false,
+            cut: false,
             save: false,
             duplicate: false,
             undo: false,
@@ -475,6 +617,7 @@ impl PendingInput {
             double_click: self.double_click,
             right_pressed: self.right_pressed,
             middle_down: self.middle_down,
+            middle_pressed: self.middle_pressed,
             back_pressed: self.back_pressed,
             forward_pressed: self.forward_pressed,
             scroll: self.scroll,
@@ -483,8 +626,13 @@ impl PendingInput {
             enter: self.enter,
             escape: self.escape,
             delete: self.delete,
+            left: self.left,
+            right: self.right,
+            home: self.home,
+            end: self.end,
             copy: self.copy,
             paste: self.paste,
+            cut: self.cut,
             save: self.save,
             duplicate: self.duplicate,
             undo: self.undo,
@@ -511,6 +659,7 @@ impl PendingInput {
             nudge_big: self.shift,
         };
         self.mouse_pressed = false;
+        self.middle_pressed = false;
         self.right_pressed = false;
         self.back_pressed = false;
         self.forward_pressed = false;
@@ -520,8 +669,13 @@ impl PendingInput {
         self.enter = false;
         self.escape = false;
         self.delete = false;
+        self.left = false;
+        self.right = false;
+        self.home = false;
+        self.end = false;
         self.copy = false;
         self.paste = false;
+        self.cut = false;
         self.save = false;
         self.duplicate = false;
         self.undo = false;
@@ -628,7 +782,12 @@ fn handle_detached_widget_event(
                         widget.input.right_pressed = true;
                     }
                 }
-                MouseButton::Middle => widget.input.middle_down = pressed,
+                MouseButton::Middle => {
+                    widget.input.middle_down = pressed;
+                    if pressed {
+                        widget.input.middle_pressed = true;
+                    }
+                }
                 _ => {}
             }
             widget.window.request_redraw();
@@ -660,6 +819,14 @@ fn handle_detached_widget_event(
                 VirtualKeyCode::Delete => widget.input.delete = true,
                 VirtualKeyCode::Return | VirtualKeyCode::NumpadEnter => widget.input.enter = true,
                 VirtualKeyCode::Escape => widget.input.escape = true,
+                VirtualKeyCode::C if widget.input.ctrl => widget.input.copy = true,
+                VirtualKeyCode::V if widget.input.ctrl => widget.input.paste = true,
+                VirtualKeyCode::X if widget.input.ctrl => widget.input.cut = true,
+                VirtualKeyCode::A if widget.input.ctrl => widget.input.select_all = true,
+                VirtualKeyCode::Left => widget.input.left = true,
+                VirtualKeyCode::Right => widget.input.right = true,
+                VirtualKeyCode::Home => widget.input.home = true,
+                VirtualKeyCode::End => widget.input.end = true,
                 _ => {}
             }
             widget.window.request_redraw();
@@ -696,11 +863,21 @@ fn redraw_detached_widget(
         editor.theme(),
         editor.take_focus(),
         editor.take_edit_buffer(),
+        editor.take_edit_cursor(),
+        editor.take_edit_selection_anchor(),
+        editor.take_pointer_capture(),
     );
     editor.frame_detached_widget(&mut ctx, widget.widget);
     let wants_redraw = ctx.wants_redraw;
-    let (focus, edit_buffer) = ctx.into_focus_state();
-    editor.set_focus(focus, edit_buffer);
+    let (focus, edit_buffer, edit_cursor, edit_selection_anchor, pointer_capture) =
+        ctx.into_focus_state();
+    editor.set_focus(
+        focus,
+        edit_buffer,
+        edit_cursor,
+        edit_selection_anchor,
+        pointer_capture,
+    );
     buffer
         .present()
         .map_err(|e| format!("failed to present detached widget surface: {e}"))?;
@@ -778,7 +955,16 @@ fn redraw_logger(
 
     let painter = Painter::new(&mut buffer, width as usize, height as usize, fonts.clone());
     let frame_input = input.take_frame();
-    let mut ctx = Ui::new(painter, frame_input, theme, None, String::new());
+    let mut ctx = Ui::new(
+        painter,
+        frame_input,
+        theme,
+        None,
+        String::new(),
+        0,
+        None,
+        None,
+    );
     logger.frame(&mut ctx);
 
     buffer
@@ -819,11 +1005,21 @@ fn redraw(
         theme,
         editor.take_focus(),
         editor.take_edit_buffer(),
+        editor.take_edit_cursor(),
+        editor.take_edit_selection_anchor(),
+        editor.take_pointer_capture(),
     );
     editor.frame(&mut ctx);
     let wants_redraw = ctx.wants_redraw;
-    let (focus, edit_buffer) = ctx.into_focus_state();
-    editor.set_focus(focus, edit_buffer);
+    let (focus, edit_buffer, edit_cursor, edit_selection_anchor, pointer_capture) =
+        ctx.into_focus_state();
+    editor.set_focus(
+        focus,
+        edit_buffer,
+        edit_cursor,
+        edit_selection_anchor,
+        pointer_capture,
+    );
 
     if let Some(path) = screenshot {
         save_screenshot(&buffer, width, height, path);

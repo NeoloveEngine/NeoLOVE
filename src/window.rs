@@ -35,6 +35,7 @@ pub struct Runtime {
     hovered_entity_ids: Rc<RefCell<HashSet<usize>>>,
     entity_hover_initialized: Rc<Cell<bool>>,
     systems: Rc<RefCell<Vec<RegistryKey>>>,
+    pending_component_awakes: Rc<RefCell<Vec<PendingComponentAwake>>>,
     environment: PathBuf,
     data_root: PathBuf,
     lua: Lua,
@@ -57,6 +58,11 @@ pub struct Runtime {
     /// Optional sink that mirrors `print`/error output to an external observer
     /// (the editor's live logger window). `None` for a normal standalone run.
     log_sink: Rc<RefCell<Option<std::sync::mpsc::Sender<RuntimeLogLine>>>>,
+}
+
+struct PendingComponentAwake {
+    entity: Table,
+    component: Table,
 }
 
 /// A single line of runtime output, forwarded to the editor's logger window.
@@ -264,6 +270,47 @@ fn disconnect_entity_listeners_for_entities(
     Ok(())
 }
 
+fn clear_scene_entities(
+    lua: &Lua,
+    entities: &Rc<RefCell<HashMap<hierarchy::EntityId, hierarchy::Entity>>>,
+    entity_listeners: &Rc<RefCell<HashMap<u64, EntityListener>>>,
+    pending_component_awakes: &Rc<RefCell<Vec<PendingComponentAwake>>>,
+    hovered_entity_ids: &Rc<RefCell<HashSet<usize>>>,
+    entity_hover_initialized: &Rc<Cell<bool>>,
+    root_table: &Table,
+) -> mlua::Result<()> {
+    let ids_to_remove: Vec<usize> = {
+        let entities = entities.try_borrow().map_err(|_| {
+            mlua::Error::external("cannot clear scene while the entity registry is being changed")
+        })?;
+        entities.keys().copied().filter(|id| *id != 0).collect()
+    };
+    let removed_ids: HashSet<usize> = ids_to_remove.iter().copied().collect();
+
+    {
+        let mut entities = entities.try_borrow_mut().map_err(|_| {
+            mlua::Error::external("cannot clear scene while the entity registry is being read")
+        })?;
+        for id in &ids_to_remove {
+            entities.remove(id);
+        }
+    }
+
+    disconnect_entity_listeners_for_entities(lua, entity_listeners, &ids_to_remove)?;
+
+    pending_component_awakes.borrow_mut().retain(|pending| {
+        pending
+            .entity
+            .get::<usize>("id")
+            .is_ok_and(|id| !removed_ids.contains(&id))
+    });
+    hovered_entity_ids.borrow_mut().clear();
+    entity_hover_initialized.set(false);
+    root_table.set("children", lua.create_table()?)?;
+
+    Ok(())
+}
+
 fn create_entity_listener_connection(
     lua: &Lua,
     listeners: Rc<RefCell<HashMap<u64, EntityListener>>>,
@@ -303,6 +350,8 @@ fn create_entity_listener_event(
     event: EntityListenEvent,
     mouse_x: f32,
     mouse_y: f32,
+    local_x: f32,
+    local_y: f32,
     wheel_x: f32,
     wheel_y: f32,
 ) -> mlua::Result<Table> {
@@ -313,6 +362,10 @@ fn create_entity_listener_event(
     payload.set("y", mouse_y)?;
     payload.set("mouseX", mouse_x)?;
     payload.set("mouseY", mouse_y)?;
+    payload.set("localX", local_x)?;
+    payload.set("localY", local_y)?;
+    payload.set("local_x", local_x)?;
+    payload.set("local_y", local_y)?;
     payload.set("wheelX", wheel_x)?;
     payload.set("wheelY", wheel_y)?;
 
@@ -355,6 +408,27 @@ fn describe_component_name(component: &Table, entity: Option<&Table>) -> String 
         (None, Some(entity)) => format!("anonymous component on entity '{entity}'"),
         (None, None) => "anonymous component".to_string(),
     }
+}
+
+fn component_is_attached_to_entity(entity: &Table, component: &Table) -> bool {
+    let Ok(owner) = component.raw_get::<Table>("entity") else {
+        return false;
+    };
+    if owner != entity.clone() {
+        return false;
+    }
+    let Ok(components) = entity.raw_get::<Table>("components") else {
+        return false;
+    };
+    for index in 1..=components.raw_len() {
+        if components
+            .raw_get::<Table>(index)
+            .is_ok_and(|attached| attached == component.clone())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(target_os = "emscripten")]
@@ -557,6 +631,16 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+fn resolve_project_path(root: &Path, input: &str) -> PathBuf {
+    let path = PathBuf::from(input);
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    normalize_path(&candidate)
+}
+
 fn resolve_existing_softrequire_path(root: &Path, input: &str) -> Result<Option<PathBuf>, String> {
     let path = PathBuf::from(input);
     let candidate = if path.is_absolute() {
@@ -695,6 +779,10 @@ fn collect_ignored_ids(value: Value, ignored_ids: &mut HashSet<usize>) -> mlua::
     }
 
     Ok(())
+}
+
+fn look_at_rotation(from_x: f32, from_y: f32, to_x: f32, to_y: f32) -> f32 {
+    (to_y - from_y).atan2(to_x - from_x)
 }
 
 fn raycast_aabb(
@@ -961,59 +1049,30 @@ pub fn get_global_rotation_pivot(entity: &Table) -> mlua::Result<(f32, f32)> {
     Ok((x + rx, y + ry))
 }
 
-fn get_listener_rotation_pivot(entity: &Table) -> mlua::Result<(f32, f32)> {
-    let (x, y, rotation) = get_global_transform(entity)?;
-    let (width, height) = get_global_size(entity)?;
-    let pivot_x = read_optional_f32(entity, "rotation_pivot_x", "rotationPivotX")
-        .or_else(|| read_optional_f32(entity, "pivot_x", "pivotX"))
-        .unwrap_or(if uses_middle_rotation_pivot(entity) {
-            0.5
-        } else {
-            0.0
-        });
-    let pivot_y = read_optional_f32(entity, "rotation_pivot_y", "rotationPivotY")
-        .or_else(|| read_optional_f32(entity, "pivot_y", "pivotY"))
-        .unwrap_or(if uses_middle_rotation_pivot(entity) {
-            0.5
-        } else {
-            0.0
-        });
-    let (offset_x, offset_y) = rotate_point(width * pivot_x, height * pivot_y, rotation);
-    Ok((x + offset_x, y + offset_y))
+/// Convert a world-space point into the entity's rendered local rectangle.
+///
+/// `get_global_transform` already returns the transformed top-left corner after
+/// position and rotation-pivot compensation. Inverting the accumulated world
+/// rotation around that corner therefore mirrors the renderer exactly, while
+/// also covering custom pivots and rotated parent chains without rebuilding a
+/// second (and subtly divergent) pivot transform just for pointer listeners.
+fn entity_local_point(entity: &Table, point_x: f32, point_y: f32) -> mlua::Result<(f32, f32)> {
+    let (origin_x, origin_y, rotation) = get_global_transform(entity)?;
+    Ok(rotate_point(
+        point_x - origin_x,
+        point_y - origin_y,
+        -rotation,
+    ))
 }
 
 fn point_hits_entity(entity: &Table, point_x: f32, point_y: f32) -> mlua::Result<bool> {
-    let (_, _, rotation) = get_global_transform(entity)?;
     let (width, height) = get_global_size(entity)?;
     if width <= 0.0 || height <= 0.0 {
         return Ok(false);
     }
 
-    let pivot_x_fraction = read_optional_f32(entity, "rotation_pivot_x", "rotationPivotX")
-        .or_else(|| read_optional_f32(entity, "pivot_x", "pivotX"))
-        .unwrap_or(if uses_middle_rotation_pivot(entity) {
-            0.5
-        } else {
-            0.0
-        });
-    let pivot_y_fraction = read_optional_f32(entity, "rotation_pivot_y", "rotationPivotY")
-        .or_else(|| read_optional_f32(entity, "pivot_y", "pivotY"))
-        .unwrap_or(if uses_middle_rotation_pivot(entity) {
-            0.5
-        } else {
-            0.0
-        });
-    let (pivot_x, pivot_y) = get_listener_rotation_pivot(entity)?;
-    let bounds_x = pivot_x - width * pivot_x_fraction;
-    let bounds_y = pivot_y - height * pivot_y_fraction;
-    let (rotated_x, rotated_y) = rotate_point(point_x - pivot_x, point_y - pivot_y, -rotation);
-    let sample_x = pivot_x + rotated_x;
-    let sample_y = pivot_y + rotated_y;
-
-    Ok(sample_x >= bounds_x
-        && sample_x <= bounds_x + width
-        && sample_y >= bounds_y
-        && sample_y <= bounds_y + height)
+    let (local_x, local_y) = entity_local_point(entity, point_x, point_y)?;
+    Ok(local_x >= 0.0 && local_x <= width && local_y >= 0.0 && local_y <= height)
 }
 
 fn compare_entity_order(a_z: f64, a_id: usize, b_z: f64, b_id: usize) -> std::cmp::Ordering {
@@ -1461,6 +1520,7 @@ impl Runtime {
             hovered_entity_ids: Rc::new(RefCell::new(HashSet::new())),
             entity_hover_initialized: Rc::new(Cell::new(false)),
             systems: Rc::new(RefCell::new(Vec::new())),
+            pending_component_awakes: Rc::new(RefCell::new(Vec::new())),
             environment: env,
             data_root,
             lua: Lua::new(),
@@ -1945,6 +2005,33 @@ impl Runtime {
         *newly_queued = remaining;
     }
 
+    fn has_pending_component_awakes(&self) -> bool {
+        !self.pending_component_awakes.borrow().is_empty()
+    }
+
+    fn drain_pending_component_awakes(&self) -> mlua::Result<()> {
+        loop {
+            let pending = std::mem::take(&mut *self.pending_component_awakes.borrow_mut());
+            if pending.is_empty() {
+                return Ok(());
+            }
+
+            for PendingComponentAwake { entity, component } in pending {
+                if !component_is_attached_to_entity(&entity, &component) {
+                    continue;
+                }
+                let Ok(awake) = component.get::<Function>("awake") else {
+                    continue;
+                };
+                let component_name = describe_component_name(&component, Some(&entity));
+                protect_lua_call(
+                    &format!("running component awake callback ({component_name})"),
+                    || awake.call::<()>((&entity, &component)),
+                )?;
+            }
+        }
+    }
+
     /// Replace `print` with one that still writes to stdout but also mirrors
     /// each line to the optional log sink (the editor's logger window).
     fn install_log_forwarder(&self) -> mlua::Result<()> {
@@ -2300,6 +2387,11 @@ impl Runtime {
                 let rotation = get_global_rotation(&entity)?;
                 Ok(rotation)
             })?;
+            let look_at = self.lua.create_function(
+                move |_lua, (from_x, from_y, to_x, to_y): (f32, f32, f32, f32)| {
+                    Ok(look_at_rotation(from_x, from_y, to_x, to_y))
+                },
+            )?;
 
             let do_they_overlap = self.lua.create_function(move |_lua, entities: Table| {
                 // Collect the Lua entity tables once before comparing them. Re-entering
@@ -2474,6 +2566,8 @@ impl Runtime {
 
             transforms.set("getWorldPosition", get_world_position)?;
             transforms.set("getWorldRotation", get_world_rotation)?;
+            transforms.set("lookAt", look_at.clone())?;
+            transforms.set("look_at", look_at)?;
 
             transforms.set("doTheyOverlap", do_they_overlap)?;
             transforms.set("GetEntitiesInFront", get_entities_in_front.clone())?;
@@ -2679,6 +2773,7 @@ impl Runtime {
 
             let table_remove: Function = self.lua.globals().get::<Table>("table")?.get("remove")?;
 
+            let pending_component_awakes = self.pending_component_awakes.clone();
             let add_component =
                 self.lua
                     .create_function(move |lua, (entity, component): (Table, Value)| {
@@ -2702,7 +2797,11 @@ impl Runtime {
                         comp.set("entity", &entity)?;
                         attach_component_methods(lua, &comp)?;
                         let component_name = describe_component_name(&comp, Some(&entity));
-                        if let Ok(Value::Function(awake)) = comp.get::<Value>("awake") {
+                        let is_core_component =
+                            comp.raw_get::<bool>("__neolove_core_component").unwrap_or(false);
+                        if is_core_component
+                            && let Ok(Value::Function(awake)) = comp.get::<Value>("awake")
+                        {
                             protect_lua_call(
                                 &format!("running component awake callback ({component_name})"),
                                 || awake.call::<()>((&entity, &comp)),
@@ -2720,6 +2819,12 @@ impl Runtime {
                             }
                         }
                         components.push(&comp)?;
+                        if !is_core_component && comp.get::<Function>("awake").is_ok() {
+                            pending_component_awakes.borrow_mut().push(PendingComponentAwake {
+                                entity: entity.clone(),
+                                component: comp.clone(),
+                            });
+                        }
                         Ok(comp)
                     })?;
 
@@ -2803,14 +2908,37 @@ impl Runtime {
         // editor's exact Luau code generation, so what you build in the editor
         // and what `loadScene` produces are guaranteed to match.
         {
-            let load_scene = self.lua.create_function(|lua, path: String| {
-                let json = std::fs::read_to_string(&path).map_err(|e| {
-                    mlua::Error::RuntimeError(format!("loadScene: failed to read '{path}': {e}"))
+            let load_scene_root = env_root.clone();
+            let load_scene_chunk_name = format!("@{}", env_root.join("main").display());
+            let load_scene_entities = self.entities.clone();
+            let load_scene_entity_listeners = self.entity_listeners.clone();
+            let load_scene_pending_awakes = self.pending_component_awakes.clone();
+            let load_scene_hovered_entities = self.hovered_entity_ids.clone();
+            let load_scene_hover_initialized = self.entity_hover_initialized.clone();
+            let load_scene = self.lua.create_function(move |lua, path: String| {
+                let scene_path = resolve_project_path(&load_scene_root, &path);
+                let bytes = std::fs::read(&scene_path).map_err(|e| {
+                    mlua::Error::RuntimeError(format!(
+                        "loadScene: failed to read '{}' (resolved to '{}'): {e}",
+                        path,
+                        scene_path.display()
+                    ))
                 })?;
-                let scene = crate::scene::Scene::from_json(&json)
+                let scene = crate::scene::Scene::from_bytes(&bytes)
                     .map_err(|e| mlua::Error::RuntimeError(format!("loadScene: {e}")))?;
-                lua.load(scene.to_luau())
-                    .set_name(format!("@{path}"))
+                let ecs: Table = lua.globals().get("ecs")?;
+                let root_table: Table = ecs.get("root")?;
+                clear_scene_entities(
+                    lua,
+                    &load_scene_entities,
+                    &load_scene_entity_listeners,
+                    &load_scene_pending_awakes,
+                    &load_scene_hovered_entities,
+                    &load_scene_hover_initialized,
+                    &root_table,
+                )?;
+                lua.load(scene.to_luau_runtime())
+                    .set_name(load_scene_chunk_name.clone())
                     .exec()
             })?;
             ecs.set("loadScene", load_scene)?;
@@ -3002,11 +3130,26 @@ impl Runtime {
                             continue;
                         }
 
-                        let callback = match self.lua.registry_value::<Function>(&listener.callback) {
+                        let callback = match self.lua.registry_value::<Function>(&listener.callback)
+                        {
                             Ok(callback) => callback,
                             Err(error) => {
                                 eprintln!(
                                     "\x1b[31mLua Error:\x1b[0m Failed to resolve entity listener callback: {}",
+                                    error
+                                );
+                                continue;
+                            }
+                        };
+                        let (local_x, local_y) = match entity_local_point(
+                            &entity,
+                            mouse.x,
+                            mouse.y,
+                        ) {
+                            Ok(point) => point,
+                            Err(error) => {
+                                eprintln!(
+                                    "\x1b[31mLua Error:\x1b[0m Failed to transform entity listener pointer: {}",
                                     error
                                 );
                                 continue;
@@ -3017,6 +3160,8 @@ impl Runtime {
                             event,
                             mouse.x,
                             mouse.y,
+                            local_x,
+                            local_y,
                             input.wheel_x,
                             input.wheel_y,
                         ) {
@@ -4218,6 +4363,10 @@ impl Runtime {
         panic_stage.set("poll_async_tasks");
         self.poll_async_tasks();
 
+        panic_stage.set("component awake callbacks");
+        self.drain_pending_component_awakes()
+            .map_err(|error| format!("component awake failed:\n{}", describe_lua_error(&error)))?;
+
         panic_stage.set("update_tweening");
         if let Some(trace) = web_trace {
             web_debug_log(&format!("runtime.update {trace}: before update_tweening"));
@@ -4359,6 +4508,10 @@ impl Runtime {
             ));
         }
 
+        panic_stage.set("component awake callbacks");
+        self.drain_pending_component_awakes()
+            .map_err(|error| format!("component awake failed:\n{}", describe_lua_error(&error)))?;
+
         let mut ordered_entities: Vec<(usize, f64, usize)> = Vec::new();
 
         {
@@ -4440,6 +4593,12 @@ impl Runtime {
 
             let mut component_index = 0usize;
             for component in components.sequence_values::<Table>() {
+                if self.has_pending_component_awakes() {
+                    panic_stage.set("component awake callbacks");
+                    self.drain_pending_component_awakes().map_err(|error| {
+                        format!("component awake failed:\n{}", describe_lua_error(&error))
+                    })?;
+                }
                 component_index += 1;
                 let component: Table = match component {
                     Ok(v) => v,
@@ -4486,6 +4645,13 @@ impl Runtime {
             web_debug_log(&format!(
                 "runtime.update {trace}: after component scan rendering_count={rendering_component_count}"
             ));
+        }
+
+        if self.has_pending_component_awakes() {
+            panic_stage.set("component awake callbacks");
+            self.drain_pending_component_awakes().map_err(|error| {
+                format!("component awake failed:\n{}", describe_lua_error(&error))
+            })?;
         }
 
         panic_stage.set("simulate_rapier_physics");
@@ -4584,6 +4750,263 @@ mod tests {
         runtime.set_platform_window_state(640.0, 480.0);
         runtime.start()?;
         Ok((runtime, root))
+    }
+
+    #[test]
+    fn look_at_uses_world_space_radians() {
+        assert_close(look_at_rotation(10.0, 20.0, 30.0, 20.0), 0.0);
+        assert_close(
+            look_at_rotation(10.0, 20.0, 10.0, 30.0),
+            std::f32::consts::FRAC_PI_2,
+        );
+        assert_close(
+            look_at_rotation(10.0, 20.0, 0.0, 20.0).abs(),
+            std::f32::consts::PI,
+        );
+        assert_close(
+            look_at_rotation(10.0, 20.0, 10.0, 10.0),
+            -std::f32::consts::FRAC_PI_2,
+        );
+    }
+
+    #[test]
+    fn text_input_and_sprite_sheet_are_runtime_components() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("text_input_sprite_sheet")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                local inputEntity = ecs.newEntity("Input", nil, 0, 0)
+                inputEntity.size_x = 180
+                inputEntity.size_y = 40
+                testInput = ecs.addComponent(inputEntity, core.TextInput)
+                assert(testInput.placeholder == "Type here")
+                assert(testInput.enabled == true and testInput.locked == false)
+                testInput:setBold(0, 1)
+                assert(#testInput.__rich_text_ranges == 1)
+                testInput.locked = true
+                testInput:focus()
+                assert(testInput.focused == false)
+                testInput.locked = false
+
+                local spriteEntity = ecs.newEntity("Sheet", nil, 0, 0)
+                testSheet = ecs.addComponent(spriteEntity, core.SpriteSheet2D)
+                assert(testSheet.frame_width == 32 and testSheet.frame_height == 32)
+                testSheet:setFrame(3)
+                assert(testSheet.frame == 3)
+                testSheet:stop()
+                assert(testSheet.frame == 0 and testSheet.playing == false)
+                "#,
+            )
+            .exec()?;
+        runtime.set_platform_mouse_state(20.0, 20.0);
+        runtime
+            .platform
+            .lock()
+            .expect("platform mutex should not be poisoned during test")
+            .input_mut()
+            .mouse_pressed
+            .insert("left".to_string());
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        {
+            let mut platform = runtime
+                .platform
+                .lock()
+                .expect("platform mutex should not be poisoned during test");
+            platform.begin_frame();
+            platform.input_mut().char_pressed = Some("A".to_string());
+        }
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        let input: Table = runtime.lua.globals().get("testInput")?;
+        assert_eq!(input.get::<String>("text")?, "A");
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn ui_widgets_register_with_vscode_dark_defaults() -> mlua::Result<()> {
+        let (runtime, root) = start_test_runtime("ui_widgets")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                local function rgba(c)
+                    return { c.r, c.g, c.b, c.a }
+                end
+                local function same(a, b)
+                    return a[1] == b[1] and a[2] == b[2] and a[3] == b[3] and a[4] == b[4]
+                end
+
+                local panelEntity = ecs.newEntity("Panel", nil, 0, 0)
+                local panel = ecs.addComponent(panelEntity, core.Panel)
+                assert(panel.__neolove_component == "Panel")
+                assert(same(rgba(panel.background_color), {37, 37, 38, 255}))
+                -- Frame is a backwards-compatible alias of Panel.
+                local frame = ecs.addComponent(ecs.newEntity("Frame", nil, 0, 0), core.Frame)
+                assert(frame.__neolove_component == "Panel")
+
+                local button = ecs.addComponent(ecs.newEntity("Button", nil, 0, 0), core.Button)
+                assert(button.__neolove_component == "Button")
+                assert(same(rgba(button.background_color), {14, 99, 156, 255}))
+                assert(same(rgba(button.hover_background_color), {17, 119, 187, 255}))
+
+                local dropdown = ecs.addComponent(ecs.newEntity("Dropdown", nil, 0, 0), core.Dropdown)
+                assert(dropdown.__neolove_component == "Dropdown")
+                assert(same(rgba(dropdown.item_selected_background_color), {9, 71, 113, 255}))
+
+                testSlider = ecs.addComponent(ecs.newEntity("Slider", nil, 0, 0), core.Slider)
+                assert(testSlider.__neolove_component == "Slider")
+                assert(testSlider.min == 0 and testSlider.max == 100 and testSlider.value == 0)
+                assert(same(rgba(testSlider.fill_color), {0, 122, 204, 255}))
+                testSlider:setValue(25)
+                assert(testSlider.value == 25 and math.abs(testSlider.fraction - 0.25) < 0.001)
+                "#,
+            )
+            .exec()?;
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn slider_drag_updates_value_and_fires_callback() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("slider_drag")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                local entity = ecs.newEntity("Slider", nil, 100, 100)
+                entity.size_x = 200
+                entity.size_y = 24
+                testSlider = ecs.addComponent(entity, core.Slider)
+                testSlider.min = 0
+                testSlider.max = 100
+                ChangedValue = nil
+                function testSlider.onChanged(_entity, _self, value)
+                    ChangedValue = value
+                end
+                "#,
+            )
+            .exec()?;
+        // Press near the right end of the track and hold to drag the thumb there.
+        runtime.set_platform_mouse_state(292.0, 112.0);
+        {
+            let mut platform = runtime
+                .platform
+                .lock()
+                .expect("platform mutex should not be poisoned during test");
+            platform.input_mut().mouse_pressed.insert("left".to_string());
+            platform.input_mut().mouse_down.insert("left".to_string());
+        }
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        let slider: Table = runtime.lua.globals().get("testSlider")?;
+        let value = slider.get::<f32>("value")?;
+        assert!(value > 80.0, "slider value should track the pointer, was {value}");
+        let changed: Option<f32> = runtime.lua.globals().get("ChangedValue")?;
+        assert!(changed.is_some(), "onChanged should fire when the value moves");
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn behaviour_awake_is_deferred_until_first_frame() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("deferred_awake")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                local entity = ecs.newEntity("thing", ecs.root)
+                local Behaviour = { value = 0 }
+
+                function Behaviour.awake(_entity, self)
+                    AwakeCount = (AwakeCount or 0) + 1
+                    AwakeValue = self.value
+                    self.awoken = true
+                end
+
+                function Behaviour.update(_entity, self, _dt)
+                    UpdateCount = (UpdateCount or 0) + 1
+                    if self.awoken then
+                        UpdateSawAwake = (UpdateSawAwake or 0) + 1
+                    end
+                end
+
+                local component = entity:AddComponent(Behaviour)
+                component.value = 42
+                AwakeImmediately = AwakeCount
+                "#,
+            )
+            .exec()?;
+
+        let globals = runtime.lua.globals();
+        assert!(globals.get::<Option<i64>>("AwakeImmediately")?.is_none());
+        assert!(globals.get::<Option<i64>>("AwakeCount")?.is_none());
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+
+        let globals = runtime.lua.globals();
+        assert_eq!(globals.get::<i64>("AwakeCount")?, 1);
+        assert_eq!(globals.get::<i64>("AwakeValue")?, 42);
+        assert_eq!(globals.get::<i64>("UpdateCount")?, 1);
+        assert_eq!(globals.get::<i64>("UpdateSawAwake")?, 1);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn behaviour_created_by_system_awakes_before_first_component_update() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("system_created_awake")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                local entity = ecs.newEntity("thing", ecs.root)
+                local Behaviour = { value = 0 }
+
+                function Behaviour.awake(_entity, self)
+                    AwakeFromSystem = (AwakeFromSystem or 0) + 1
+                    AwakeFromSystemValue = self.value
+                    self.awoken = true
+                end
+
+                function Behaviour.update(_entity, self, _dt)
+                    BehaviourUpdateCount = (BehaviourUpdateCount or 0) + 1
+                    if self.awoken then
+                        BehaviourUpdateSawAwake = (BehaviourUpdateSawAwake or 0) + 1
+                    end
+                end
+
+                local system = { added = false }
+                function system.update(self, _dt)
+                    if self.added then
+                        return
+                    end
+                    self.added = true
+                    local component = entity:AddComponent(Behaviour)
+                    component.value = 7
+                    AwakeDuringSystemAdd = AwakeFromSystem
+                end
+
+                ecs.addSystem(system)
+                "#,
+            )
+            .exec()?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+
+        let globals = runtime.lua.globals();
+        assert!(
+            globals
+                .get::<Option<i64>>("AwakeDuringSystemAdd")?
+                .is_none()
+        );
+        assert_eq!(globals.get::<i64>("AwakeFromSystem")?, 1);
+        assert_eq!(globals.get::<i64>("AwakeFromSystemValue")?, 7);
+        assert_eq!(globals.get::<i64>("BehaviourUpdateCount")?, 1);
+        assert_eq!(globals.get::<i64>("BehaviourUpdateSawAwake")?, 1);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
     }
 
     #[test]
@@ -4765,7 +5188,16 @@ mod tests {
         entity.set("rotation", std::f32::consts::FRAC_PI_2)?;
 
         assert!(point_hits_entity(&entity, 50.0, 25.0)?);
+        // Inside the rendered 90-degree rectangle but outside its original
+        // axis-aligned bounds.
+        assert!(point_hits_entity(&entity, 50.0, 70.0)?);
+        // Inside the original bounds but outside the rendered rectangle.
+        assert!(!point_hits_entity(&entity, 10.0, 25.0)?);
         assert!(!point_hits_entity(&entity, 5.0, 5.0)?);
+
+        let (local_x, local_y) = entity_local_point(&entity, 50.0, 70.0)?;
+        assert_close(local_x, 95.0);
+        assert_close(local_y, 25.0);
         Ok(())
     }
 
@@ -5391,6 +5823,259 @@ mod tests {
     }
 
     #[test]
+    fn load_scene_resolves_paths_from_project_root() -> mlua::Result<()> {
+        use crate::scene::{Component, Scene};
+
+        let root = temp_project_root("load_scene_project_root");
+        std::fs::create_dir_all(&root).map_err(mlua::Error::external)?;
+        std::fs::write(
+            root.join("main.luau"),
+            r#"
+                ecs.newEntity("StaleRootChild", ecs.root)
+                ecs.newEntity("StaleOrphan", nil)
+                ecs.loadScene("scene.neoscene")
+            "#,
+        )
+        .map_err(mlua::Error::external)?;
+
+        let mut scene = Scene::default();
+        let entity_id = scene.entities[0].id;
+        {
+            let entity = scene.entity_mut(entity_id).expect("default entity");
+            entity.name = "LoadedFromScene".into();
+            entity.x = 24.0;
+            entity.y = 36.0;
+            entity.components.push(Component::core("Rect2D"));
+        }
+        scene
+            .save(&root.join("scene.neoscene"))
+            .map_err(mlua::Error::external)?;
+
+        let mut runtime = Runtime::new(root.clone());
+        runtime.start()?;
+
+        let ecs: Table = runtime.lua.globals().get("ecs")?;
+        let root_entity: Table = ecs.get("root")?;
+        let children: Table = root_entity.get("children")?;
+        assert_eq!(children.raw_len(), 1);
+        let loaded: Table = children.get(1)?;
+        assert_eq!(loaded.get::<String>("name")?, "LoadedFromScene");
+        assert_eq!(loaded.get::<f32>("x")?, 24.0);
+        assert_eq!(loaded.get::<f32>("y")?, 36.0);
+        assert_eq!(loaded.get::<Table>("components")?.raw_len(), 1);
+        let names: Vec<String> = runtime
+            .snapshot_entities()
+            .into_iter()
+            .map(|entity| entity.name)
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"root".to_string()));
+        assert!(names.contains(&"LoadedFromScene".to_string()));
+        assert!(!names.contains(&"StaleRootChild".to_string()));
+        assert!(!names.contains(&"StaleOrphan".to_string()));
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn load_scene_replaces_existing_scene_entities() -> mlua::Result<()> {
+        use crate::scene::Scene;
+
+        let root = temp_project_root("load_scene_replaces_entities");
+        std::fs::create_dir_all(&root).map_err(mlua::Error::external)?;
+        std::fs::write(
+            root.join("main.luau"),
+            r#"
+                ecs.loadScene("first.neoscene")
+                ecs.loadScene("second.neoscene")
+            "#,
+        )
+        .map_err(mlua::Error::external)?;
+
+        let mut first = Scene::default();
+        let first_id = first.entities[0].id;
+        first.entity_mut(first_id).expect("first").name = "FirstScene".into();
+        let first_child = first.add_entity("FirstSceneChild", 1.0, 2.0).id;
+        first.entity_mut(first_child).expect("child").parent = Some(first_id);
+        first
+            .save(&root.join("first.neoscene"))
+            .map_err(mlua::Error::external)?;
+
+        let mut second = Scene::default();
+        let second_id = second.entities[0].id;
+        second.entity_mut(second_id).expect("second").name = "SecondScene".into();
+        second
+            .save(&root.join("second.neoscene"))
+            .map_err(mlua::Error::external)?;
+
+        let mut runtime = Runtime::new(root.clone());
+        runtime.start()?;
+
+        let ecs: Table = runtime.lua.globals().get("ecs")?;
+        let root_entity: Table = ecs.get("root")?;
+        let children: Table = root_entity.get("children")?;
+        assert_eq!(children.raw_len(), 1);
+        assert_eq!(
+            children.get::<Table>(1)?.get::<String>("name")?,
+            "SecondScene"
+        );
+        let names: Vec<String> = runtime
+            .snapshot_entities()
+            .into_iter()
+            .map(|entity| entity.name)
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"root".to_string()));
+        assert!(names.contains(&"SecondScene".to_string()));
+        assert!(!names.contains(&"FirstScene".to_string()));
+        assert!(!names.contains(&"FirstSceneChild".to_string()));
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn load_scene_loads_images_absent_from_exported_start_scene() -> mlua::Result<()> {
+        use crate::scene::{Component, PropValue, Scene};
+
+        // Regression: a scene loaded at runtime references images that the
+        // exported start scene never wrote into `./images`. Here the project has
+        // no `images.luau` at all, so the loaded scene must inline its own image
+        // cache — otherwise `require("./images")` aborts the whole scene chunk
+        // and none of its entities (images or sounds) appear.
+        let root = temp_project_root("load_scene_images");
+        std::fs::create_dir_all(root.join("assets")).map_err(mlua::Error::external)?;
+
+        // A real 1x1 PNG so `assets.loadImage` succeeds.
+        let png = {
+            let mut image = image::RgbaImage::new(1, 1);
+            image.put_pixel(0, 0, image::Rgba([10, 20, 30, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(image)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageOutputFormat::Png,
+                )
+                .map_err(mlua::Error::external)?;
+            bytes
+        };
+        std::fs::write(root.join("assets/sprite.png"), png).map_err(mlua::Error::external)?;
+
+        std::fs::write(
+            root.join("main.luau"),
+            r#"ecs.loadScene("level.neoscene")"#,
+        )
+        .map_err(mlua::Error::external)?;
+
+        let mut scene = Scene::default();
+        let sprite_id = scene.entities[0].id;
+        scene.entity_mut(sprite_id).expect("sprite").name = "ImageSprite".into();
+        let mut sprite = Component::core("Sprite2D");
+        if let Component::Core { props, .. } = &mut sprite {
+            for prop in props.iter_mut() {
+                if let PropValue::Image(path) = &mut prop.value {
+                    *path = "assets/sprite.png".into();
+                }
+            }
+        }
+        scene
+            .entity_mut(sprite_id)
+            .expect("sprite")
+            .components
+            .push(sprite);
+        scene
+            .save(&root.join("level.neoscene"))
+            .map_err(mlua::Error::external)?;
+
+        // Before the fix this errored on `require("./images")`.
+        let mut runtime = Runtime::new(root.clone());
+        runtime.start()?;
+
+        let names: Vec<String> = runtime
+            .snapshot_entities()
+            .into_iter()
+            .map(|entity| entity.name)
+            .collect();
+        assert!(names.contains(&"ImageSprite".to_string()));
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn load_scene_still_reads_legacy_json_scene_files() -> mlua::Result<()> {
+        use crate::scene::Scene;
+
+        let root = temp_project_root("load_legacy_json_scene");
+        std::fs::create_dir_all(&root).map_err(mlua::Error::external)?;
+        std::fs::write(root.join("main.luau"), "ecs.loadScene(\"scene.neoscene\")")
+            .map_err(mlua::Error::external)?;
+
+        let mut scene = Scene::default();
+        scene.entities[0].name = "LegacyJsonScene".into();
+        std::fs::write(root.join("scene.neoscene"), scene.to_json().map_err(mlua::Error::external)?)
+            .map_err(mlua::Error::external)?;
+
+        let mut runtime = Runtime::new(root.clone());
+        runtime.start()?;
+
+        let ecs: Table = runtime.lua.globals().get("ecs")?;
+        let root_entity: Table = ecs.get("root")?;
+        let loaded: Table = root_entity.get::<Table>("children")?.get(1)?;
+        assert_eq!(loaded.get::<String>("name")?, "LegacyJsonScene");
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn load_scene_resolves_script_requires_from_project_root() -> mlua::Result<()> {
+        use crate::scene::{Component, Scene};
+
+        let root = temp_project_root("load_scene_script_require");
+        std::fs::create_dir_all(root.join("levels")).map_err(mlua::Error::external)?;
+        std::fs::create_dir_all(root.join("scripts")).map_err(mlua::Error::external)?;
+        std::fs::write(
+            root.join("main.luau"),
+            "ecs.loadScene(\"levels/title.neoscene\")",
+        )
+        .map_err(mlua::Error::external)?;
+        std::fs::write(
+            root.join("scripts/SceneMarker.luau"),
+            "return { __neolove_component = \"SceneMarker\", update = function() end }\n",
+        )
+        .map_err(mlua::Error::external)?;
+
+        let mut scene = Scene::default();
+        let entity_id = scene.entities[0].id;
+        {
+            let entity = scene.entity_mut(entity_id).expect("default entity");
+            entity.name = "ScriptedSceneEntity".into();
+            entity.components.push(Component::Script {
+                path: "scripts/SceneMarker.luau".into(),
+                variables: Vec::new(),
+            });
+        }
+        scene
+            .save(&root.join("levels/title.neoscene"))
+            .map_err(mlua::Error::external)?;
+
+        let mut runtime = Runtime::new(root.clone());
+        runtime.start()?;
+
+        let ecs: Table = runtime.lua.globals().get("ecs")?;
+        let root_entity: Table = ecs.get("root")?;
+        let loaded: Table = root_entity.get::<Table>("children")?.get(1)?;
+        let component: Table = loaded.get::<Table>("components")?.get(1)?;
+        assert_eq!(loaded.get::<String>("name")?, "ScriptedSceneEntity");
+        assert_eq!(component.get::<String>("__neolove_component")?, "SceneMarker");
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
     fn runtime_loads_and_instantiates_editor_neoprefab_files() -> mlua::Result<()> {
         use crate::scene::{Component, Scene};
 
@@ -5432,6 +6117,33 @@ mod tests {
             "LoadedChild"
         );
         let components: Table = instance.get("components")?;
+        assert_eq!(components.len()?, 1);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_loads_compressed_editor_neoprefab_files() -> mlua::Result<()> {
+        use crate::scene::{self, Component, Scene};
+
+        let (runtime, root) = start_test_runtime("load_binary_neoprefab")?;
+        let mut prefab_scene = Scene::default();
+        let root_id = prefab_scene.entities[0].id;
+        {
+            let entity = prefab_scene.entity_mut(root_id).expect("prefab root");
+            entity.name = "CompressedRoot".into();
+            entity.components.push(Component::core("Rect2D"));
+        }
+        let entities = prefab_scene.subtree(root_id);
+        scene::save_prefab(&root.join("compressed.neoprefab"), &entities)
+            .map_err(mlua::Error::external)?;
+
+        let prefabs: Table = runtime.lua.globals().get("prefabs")?;
+        let load: Function = prefabs.get("load")?;
+        let template: Table = load.call("compressed.neoprefab")?;
+        assert_eq!(template.get::<String>("name")?, "CompressedRoot");
+        let components: Table = template.get("components")?;
         assert_eq!(components.len()?, 1);
 
         std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
@@ -5705,6 +6417,51 @@ mod tests {
     }
 
     #[test]
+    fn sprite_sheet_queues_the_selected_atlas_frame() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("sprite_sheet_frame")?;
+        let pixels = image::RgbaImage::from_pixel(8, 4, image::Rgba([255, 255, 255, 255]));
+        let image = runtime
+            .lua
+            .create_userdata(crate::assets::ImageHandle::from_rgba_image(pixels))?;
+        let ecs: Table = runtime.lua.globals().get("ecs")?;
+        let core: Table = runtime.lua.globals().get("core")?;
+        let entity: Table = ecs.get::<Function>("newEntity")?.call((
+            "sheet".to_string(),
+            None::<Table>,
+            Some(0.0),
+            Some(0.0),
+        ))?;
+        entity.set("size_x", 16.0)?;
+        entity.set("size_y", 16.0)?;
+        let sheet: Table = ecs
+            .get::<Function>("addComponent")?
+            .call((entity, core.get::<Table>("SpriteSheet2D")?))?;
+        sheet.set("image", image)?;
+        sheet.set("frame_width", 2.0)?;
+        sheet.set("frame_height", 2.0)?;
+        sheet.set("frame", 5)?;
+        sheet.set("playing", false)?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        let commands = crate::renderer::drain_commands(&runtime.render_state())
+            .map_err(mlua::Error::external)?;
+        let source = commands.iter().find_map(|command| match command {
+            crate::renderer::DrawCommand::Image {
+                source: Some(source),
+                ..
+            } => Some(*source),
+            _ => None,
+        });
+        let source = source.expect("sprite sheet should queue a source rectangle");
+        assert_close(source.x, 2.0);
+        assert_close(source.y, 2.0);
+        assert_close(source.w, 2.0);
+        assert_close(source.h, 2.0);
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
     fn set_window_table_uses_cached_root_table_when_entity_root_key_is_invalid() -> mlua::Result<()>
     {
         let (mut runtime, root) = start_test_runtime("window_root_registry_recovery")?;
@@ -5800,6 +6557,53 @@ mod tests {
     }
 
     #[test]
+    fn entity_listener_hit_test_and_local_pointer_follow_rotation() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("rotated_entity_listener")?;
+
+        let ecs: Table = runtime.lua.globals().get("ecs")?;
+        let new_entity: Function = ecs.get("newEntity")?;
+        let entity: Table =
+            new_entity.call(("rotated button".to_string(), None::<Table>, Some(200.0), Some(100.0)))?;
+        entity.set("size_x", 120.0)?;
+        entity.set("size_y", 80.0)?;
+        entity.set("rotation", std::f32::consts::FRAC_PI_2)?;
+
+        let received_local = Rc::new(RefCell::new(None::<(f32, f32)>));
+        let received_local_writer = received_local.clone();
+        let callback = runtime.lua.create_function(
+            move |_lua, (_entity, event): (Table, Table)| {
+                *received_local_writer.borrow_mut() =
+                    Some((event.get::<f32>("localX")?, event.get::<f32>("localY")?));
+                Ok(())
+            },
+        )?;
+        let listen: Function = entity.get("listen")?;
+        let _connection: Table =
+            listen.call((entity.clone(), "leftClick".to_string(), callback))?;
+
+        // This is inside the visibly rotated entity (local 50, 40), but lies
+        // left of the entity's original axis-aligned x range.
+        runtime.set_platform_mouse_state(160.0, 150.0);
+        runtime
+            .platform
+            .lock()
+            .expect("platform mutex should not be poisoned during test")
+            .input_mut()
+            .mouse_pressed
+            .insert("left".to_string());
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        let (local_x, local_y) = received_local
+            .borrow()
+            .expect("rotated listener should receive the click");
+        assert_close(local_x, 50.0);
+        assert_close(local_y, 40.0);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
     fn entity_listener_dispatches_mouse_entered_and_exited_edges() -> mlua::Result<()> {
         let (mut runtime, root) = start_test_runtime("entity_listener_hover")?;
 
@@ -5816,17 +6620,14 @@ mod tests {
             runtime
                 .lua
                 .create_function(move |_lua, (_entity, event): (Table, Table)| {
-                    seen_writer
-                        .borrow_mut()
-                        .push(event.get::<String>("kind")?);
+                    seen_writer.borrow_mut().push(event.get::<String>("kind")?);
                     Ok(())
                 })?;
 
         let listen: Function = entity.get("listen")?;
         let _entered: Table =
             listen.call((entity.clone(), "MouseEntered".to_string(), callback.clone()))?;
-        let _exited: Table =
-            listen.call((entity.clone(), "MouseExited".to_string(), callback))?;
+        let _exited: Table = listen.call((entity.clone(), "MouseExited".to_string(), callback))?;
 
         runtime.set_platform_mouse_state(0.0, 0.0);
         runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
