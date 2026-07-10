@@ -9728,30 +9728,25 @@ impl EditorApp {
                 return false;
             }
         };
+        // The generated `main.luau` loads the start scene at runtime, so its
+        // `.neoscene` must exist and be current on disk regardless of the
+        // autosave setting. Persist it before writing the loader.
+        if let Err(e) = scene.save(&scene_path) {
+            self.status = format!("Export failed (start scene): {e}");
+            return false;
+        }
+        let rel = project_relative_path(&self.project_root, &scene_path);
         let path = self.project_root.join("main.luau");
-        if let Err(e) = std::fs::write(&path, scene.to_luau()) {
+        if let Err(e) = std::fs::write(&path, scene.to_luau_loader(&rel)) {
             self.status = format!("Export failed: {e}");
             return false;
         }
-        // Write (or clean up) the shared image-cache module alongside main.luau.
-        let images_path = self.project_root.join("images.luau");
-        match scene.to_images_luau() {
-            Some(content) => {
-                if let Err(e) = std::fs::write(&images_path, content) {
-                    self.status = format!("Export failed (images.luau): {e}");
-                    return false;
-                }
-            }
-            None => remove_generated_file(&images_path),
-        }
-        // Migrate projects produced by older editor builds. Hand-authored
-        // assets.luau files are preserved by remove_generated_file.
+        // `loadScene` inlines its own image handles at runtime, so the shared
+        // image-cache module is no longer referenced. Clean up any stale copy
+        // (and the older assets.luau) left by previous editor builds.
+        remove_generated_file(&self.project_root.join("images.luau"));
         remove_generated_file(&self.project_root.join("assets.luau"));
-        self.status = format!(
-            "Exported {} from {}",
-            path.display(),
-            project_relative_path(&self.project_root, &scene_path)
-        );
+        self.status = format!("Exported {} (loads {rel})", path.display());
         true
     }
 
@@ -12000,9 +11995,13 @@ mod tests {
             EditorConfig::default(),
         );
         assert!(app.export_luau());
+        // main.luau is now a loader that points at the configured start scene,
+        // not the active scene, and inlines no entity construction.
         let luau = std::fs::read_to_string(dir.join("main.luau")).expect("read exported main");
-        assert!(luau.contains("ConfiguredStartEntity"));
+        assert!(luau.contains("ecs.loadScene(\"levels/title.neoscene\")"));
+        assert!(!luau.contains("ConfiguredStartEntity"));
         assert!(!luau.contains("ActiveSceneEntity"));
+        assert!(!luau.contains("AddComponent"));
 
         let _ = std::fs::remove_dir_all(dir);
     }
