@@ -172,6 +172,7 @@ mod tests {
                 rotation: 0.0,
                 scale: 1.0,
                 enabled: true,
+                fields: vec![("size_x".into(), "32".into())],
                 components: vec![ComponentSnapshot {
                     name: "Sprite2D".into(),
                     fields: vec![("visible".into(), "true".into())],

@@ -24,6 +24,10 @@ fn main() {
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
+    if target_os == "macos" {
+        embed_macos_privacy_plist();
+    }
+
     if target_arch == "wasm32" && target_os == "emscripten" {
         let compiler = emscripten_compiler().unwrap_or_else(|| {
             panic!(
@@ -53,6 +57,38 @@ fn main() {
         );
         println!("cargo:rustc-link-lib=static=neolove_web_bridge");
     }
+}
+
+/// Bare command-line Mach-O executables do not have an app-bundle plist for
+/// TCC to inspect. Embed the required capture purpose strings in the binary's
+/// `__TEXT,__info_plist` section so both `neolove run` and single-file packaged
+/// games can request camera/microphone permission without macOS terminating
+/// the process.
+fn embed_macos_privacy_plist() {
+    let out_dir = std::path::PathBuf::from(
+        std::env::var_os("OUT_DIR").expect("Cargo build scripts always receive OUT_DIR"),
+    );
+    let plist_path = out_dir.join("NeoLOVE-Privacy-Info.plist");
+    let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>org.neolove.runtime</string>
+  <key>CFBundleName</key>
+  <string>NeoLOVE</string>
+  <key>NSCameraUsageDescription</key>
+  <string>This game can request camera access for developer-defined gameplay features.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>This game can request microphone access for developer-defined gameplay features.</string>
+</dict>
+</plist>
+"#;
+    std::fs::write(&plist_path, plist).expect("failed to write embedded macOS privacy plist");
+    println!(
+        "cargo:rustc-link-arg-bin=neolove=-Wl,-sectcreate,__TEXT,__info_plist,{}",
+        plist_path.display()
+    );
 }
 
 fn emit_git_revision() {

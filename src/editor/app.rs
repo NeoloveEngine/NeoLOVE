@@ -23,9 +23,10 @@ use crate::renderer::{
     TextRenderRequest, TextScaleMode, TextWrapMode, Vec2 as RenderVec2,
 };
 use crate::scene::{
-    load_prefab as load_prefab_file, save_prefab as save_prefab_file, ColorKeypoint, Component,
-    ComponentReference, DictionaryEntry, Entity, NumberKeypoint, Prop, PropValue, Scene, ScriptVar,
-    VarControl, VarKey, VarValue, ADVANCED_COMPONENTS, CORE_COMPONENTS,
+    load_prefab as load_prefab_file, save_prefab as save_prefab_file, AttachedValue,
+    ColorKeypoint, Component, ComponentReference, DictionaryEntry, Entity, NumberKeypoint, Prop,
+    PropValue, Scene, ScriptVar, VarControl, VarKey, VarValue, ADVANCED_COMPONENTS,
+    CORE_COMPONENTS,
 };
 use crate::update::AvailableUpdate;
 
@@ -315,6 +316,7 @@ pub struct EditorSettings {
     pub show_tooltips: bool,
     pub show_window_bounds: bool,
     pub show_transform_hud: bool,
+    pub preview_lighting: bool,
     pub autosave_before_run: bool,
     pub autosave_before_build: bool,
     pub mobile_emulator: bool,
@@ -332,6 +334,7 @@ impl Default for EditorSettings {
             show_tooltips: true,
             show_window_bounds: true,
             show_transform_hud: true,
+            preview_lighting: true,
             autosave_before_run: true,
             autosave_before_build: true,
             mobile_emulator: false,
@@ -387,6 +390,11 @@ enum ColorTarget {
         entity: u64,
         comp: usize,
         var: usize,
+        path: Vec<VarPathPart>,
+    },
+    AttachedValue {
+        entity: u64,
+        value: usize,
         path: Vec<VarPathPart>,
     },
 }
@@ -450,6 +458,12 @@ enum Action {
         component: usize,
         prop: usize,
         value: String,
+    },
+    SetAttachedValueType {
+        entity: u64,
+        value: usize,
+        path: Vec<VarPathPart>,
+        kind: AttachedValueType,
     },
     SelectAll,
     InvertSelection,
@@ -706,6 +720,109 @@ impl AssetKind {
     }
 }
 
+/// Types available for values authored directly on an entity. The editor uses
+/// explicit, readable names rather than exposing the serialized enum spelling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachedValueType {
+    Number,
+    String,
+    Boolean,
+    Color,
+    Entity,
+    Component,
+    Image,
+    Sound,
+    Shader,
+    Animation,
+    List,
+    Table,
+}
+
+impl AttachedValueType {
+    const ALL: [Self; 12] = [
+        Self::Number,
+        Self::String,
+        Self::Boolean,
+        Self::Color,
+        Self::Entity,
+        Self::Component,
+        Self::Image,
+        Self::Sound,
+        Self::Shader,
+        Self::Animation,
+        Self::List,
+        Self::Table,
+    ];
+
+    fn from_value(value: &VarValue) -> Self {
+        match value {
+            VarValue::Number(_) => Self::Number,
+            VarValue::Text(_) => Self::String,
+            VarValue::Bool(_) => Self::Boolean,
+            VarValue::Color(_) => Self::Color,
+            VarValue::Entity(_) => Self::Entity,
+            VarValue::Component(_) => Self::Component,
+            VarValue::Image(_) => Self::Image,
+            VarValue::Audio(_) => Self::Sound,
+            VarValue::Shader(_) => Self::Shader,
+            VarValue::Animation(_) => Self::Animation,
+            VarValue::List(_) => Self::List,
+            VarValue::Dictionary(_) => Self::Table,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Number => "Number",
+            Self::String => "String",
+            Self::Boolean => "Boolean",
+            Self::Color => "Color",
+            Self::Entity => "Entity",
+            Self::Component => "Component",
+            Self::Image => "Image",
+            Self::Sound => "Sound",
+            Self::Shader => "Shader",
+            Self::Animation => "Animation",
+            Self::List => "List",
+            Self::Table => "Table",
+        }
+    }
+
+    fn glyph(self) -> char {
+        match self {
+            Self::Number => icon::NUMBERS,
+            Self::String => icon::TEXT_FIELDS,
+            Self::Boolean => icon::CHECK_BOX,
+            Self::Color => icon::PALETTE,
+            Self::Entity => icon::VIEW_IN_AR,
+            Self::Component => icon::EXTENSION,
+            Self::Image => icon::IMAGE,
+            Self::Sound => icon::AUDIOTRACK,
+            Self::Shader => icon::DATA_OBJECT,
+            Self::Animation => icon::PLAY,
+            Self::List => icon::FORMAT_LIST_BULLETED,
+            Self::Table => icon::TABLE_ROWS,
+        }
+    }
+
+    fn default_value(self) -> VarValue {
+        match self {
+            Self::Number => VarValue::Number(0.0),
+            Self::String => VarValue::Text(String::new()),
+            Self::Boolean => VarValue::Bool(false),
+            Self::Color => VarValue::Color([255, 255, 255, 255]),
+            Self::Entity => VarValue::Entity(None),
+            Self::Component => VarValue::Component(None),
+            Self::Image => VarValue::Image(String::new()),
+            Self::Sound => VarValue::Audio(String::new()),
+            Self::Shader => VarValue::Shader(String::new()),
+            Self::Animation => VarValue::Animation(String::new()),
+            Self::List => VarValue::List(Vec::new()),
+            Self::Table => VarValue::Dictionary(Vec::new()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum SequenceKind {
     Color,
@@ -744,6 +861,66 @@ enum AssetTarget {
         var: usize,
         path: Vec<VarPathPart>,
     },
+    AttachedValue {
+        entity: u64,
+        value: usize,
+        path: Vec<VarPathPart>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ValueOwner {
+    ScriptVar {
+        entity: u64,
+        component: usize,
+        var: usize,
+    },
+    AttachedValue {
+        entity: u64,
+        value: usize,
+    },
+}
+
+impl ValueOwner {
+    fn asset_target(self, path: &[VarPathPart]) -> AssetTarget {
+        match self {
+            Self::ScriptVar {
+                entity,
+                component,
+                var,
+            } => AssetTarget::ScriptVar {
+                entity,
+                component,
+                var,
+                path: path.to_vec(),
+            },
+            Self::AttachedValue { entity, value } => AssetTarget::AttachedValue {
+                entity,
+                value,
+                path: path.to_vec(),
+            },
+        }
+    }
+
+    fn color_target(self, path: &[VarPathPart]) -> ColorTarget {
+        match self {
+            Self::ScriptVar {
+                entity,
+                component,
+                var,
+            } => ColorTarget::Var {
+                entity,
+                comp: component,
+                var,
+                path: path.to_vec(),
+            },
+            Self::AttachedValue { entity, value } => ColorTarget::AttachedValue {
+                entity,
+                value,
+                path: path.to_vec(),
+            },
+        }
+    }
 }
 
 /// An overlay drawn above everything, with input precedence.
@@ -817,6 +994,7 @@ enum Popup {
         show_tooltips: bool,
         show_window_bounds: bool,
         show_transform_hud: bool,
+        preview_lighting: bool,
         autosave_before_run: bool,
         autosave_before_build: bool,
     },
@@ -910,6 +1088,10 @@ pub struct EditorApp {
     /// World transforms are requested repeatedly by drawing, selection,
     /// gizmos, and collider previews. Cache each hierarchy walk once per frame.
     world_transform_cache: RefCell<HashMap<u64, EditorWorldTransform>>,
+    /// Cached viewport light grid. The editor redraws continuously, so this
+    /// avoids re-tracing shadow rays every frame while the camera and lighting
+    /// inputs are unchanged (see [`EditorApp::composite_preview_lighting`]).
+    preview_light_cache: RefCell<Option<PreviewLightGrid>>,
     /// Parsed Inspector schemas cached by source path and modification time.
     script_schema_cache: ScriptSchemaCache,
     /// Receiver for the outcome of a launched `Run` (None when finished).
@@ -1017,6 +1199,7 @@ impl EditorApp {
             waveform_cache: RefCell::new(HashMap::new()),
             project_directory_cache: RefCell::new(HashMap::new()),
             world_transform_cache: RefCell::new(HashMap::new()),
+            preview_light_cache: RefCell::new(None),
             script_schema_cache: HashMap::new(),
             run_rx: None,
             build_rx: None,
@@ -2544,7 +2727,7 @@ impl EditorApp {
                     self.config.theme.accent,
                 );
             }
-            ui.painter.text(
+            ui.painter.text_clipped(
                 tab.x + 12.0,
                 tab.y + (tab.h - 13.0) * 0.5,
                 &label,
@@ -2554,6 +2737,7 @@ impl EditorApp {
                 } else {
                     self.config.theme.text_dim
                 },
+                (tab.w - 42.0).max(0.0),
             );
             let close_rect = Rect::new(tab.right() - 25.0, tab.y, 24.0, tab.h);
             if active || hovered {
@@ -2629,7 +2813,14 @@ impl EditorApp {
             Panel::Inspector => self.config.layout.undock_inspector,
         };
         ui.icon(area.x + 16.0, area.y + HEADER_H / 2.0, glyph, 16.0, self.config.theme.text);
-        ui.label(area.x + 30.0, area.y + (HEADER_H - 14.0) / 2.0, title, self.config.theme.text);
+        ui.painter.text_clipped(
+            area.x + 30.0,
+            area.y + (HEADER_H - 14.0) / 2.0,
+            title,
+            14.0,
+            self.config.theme.text,
+            (area.w - 110.0).max(0.0),
+        );
         let close = Rect::new(area.right() - 26.0, area.y + 3.0, 20.0, HEADER_H - 6.0);
         ui.tooltip(close, "Close panel");
         if ui.icon_toggle(close, icon::DELETE, false, self.config.theme.text_dim) {
@@ -2734,8 +2925,22 @@ impl EditorApp {
         let query = self.hierarchy_filter.trim().to_lowercase();
 
         if self.scene.entities.is_empty() {
-            ui.label(area.x + PAD, y, "No entities.", self.config.theme.text_dim);
-            ui.label(area.x + PAD, y + 18.0, "Right-click or use + Entity.", self.config.theme.text_dim);
+            ui.painter.text_clipped(
+                area.x + PAD,
+                y,
+                "No entities.",
+                14.0,
+                self.config.theme.text_dim,
+                (area.w - PAD * 2.0).max(0.0),
+            );
+            ui.painter.text_clipped(
+                area.x + PAD,
+                y + 18.0,
+                "Right-click or use + Entity.",
+                14.0,
+                self.config.theme.text_dim,
+                (area.w - PAD * 2.0).max(0.0),
+            );
             if area.contains(ui.input.mouse_x, ui.input.mouse_y) && ui.input.right_pressed {
                 self.open_hierarchy_empty_menu(ui.input.mouse_x, ui.input.mouse_y);
             }
@@ -2752,7 +2957,14 @@ impl EditorApp {
                 .map(|e| e.id)
                 .collect();
             if ids.is_empty() {
-                ui.label(area.x + PAD, y, "No matches.", self.config.theme.text_dim);
+                ui.painter.text_clipped(
+                    area.x + PAD,
+                    y,
+                    "No matches.",
+                    14.0,
+                    self.config.theme.text_dim,
+                    (area.w - PAD * 2.0).max(0.0),
+                );
                 return y + 24.0;
             }
             for id in ids {
@@ -2967,9 +3179,12 @@ impl EditorApp {
 
         let z = self.cam_zoom;
 
-        // Build the scene's lighting once so each entity can be tinted by the
-        // light reaching it — a live, per-object preview rather than a flat veil.
-        let preview_lighting = self.preview_scene_lighting();
+        // Gather the scene's lighting, then composite it over the finished scene
+        // per pixel — exactly as the runtime multiplies its framebuffer by the
+        // light map. This reveals falloff, colored light pools, and occluder
+        // shadows across the background and every object, instead of laying a
+        // flat tint on each object's primary color.
+        let scene_lighting = self.gather_scene_lighting();
 
         // Draw entities sorted by z (lower first).
         let mut entity_order = (0..self.scene.entities.len()).collect::<Vec<_>>();
@@ -2979,7 +3194,7 @@ impl EditorApp {
                 &self.scene.entities[*right],
             )
         });
-        for index in entity_order {
+        for &index in &entity_order {
             let entity = &self.scene.entities[index];
             if self.hidden_ids.contains(&entity.id) {
                 continue;
@@ -2988,50 +3203,65 @@ impl EditorApp {
                 continue;
             };
             let active = self.scene.is_active_in_tree(entity.id);
-            self.draw_entity(ui, entity, rect, z, preview_lighting.as_ref());
+            self.draw_entity(ui, entity, rect, z);
             if !active {
                 // Dim inactive entities, like Unity greys out disabled objects.
                 ui.painter.fill_rect(rect, [30, 30, 30, 150]);
             }
-            if self.is_selected(entity.id) {
-                let angle = self.entity_world_rotation(entity);
-                // Outline and collider preview rotate with the entity.
-                let prev_rot = ui.painter.push_rotation(rect.x, rect.y, angle);
-                ui.painter.stroke_rect(rect.shrink(-1.0), self.config.theme.selection);
-                let world_scale = self
-                    .entity_world_transform(entity.id)
-                    .map(|transform| transform.scale)
-                    .unwrap_or_else(|| editor_entity_scale(entity));
-                self.draw_collider_preview(ui, entity, rect, z, world_scale);
-                ui.painter.set_rotation_raw(prev_rot);
+        }
 
-                if self.selected != Some(entity.id) || self.locked_ids.contains(&entity.id) {
-                    continue;
+        // Light the scene now that the background and all objects are drawn, so
+        // the composite matches the runtime's deferred pass. Selection gizmos,
+        // handles, and the HUD stay above it — editor chrome the game never sees.
+        if let Some((config, lights, occluders)) = scene_lighting.as_ref() {
+            self.composite_preview_lighting(ui, area, config, lights, occluders);
+        }
+
+        for &index in &entity_order {
+            let entity = &self.scene.entities[index];
+            if self.hidden_ids.contains(&entity.id) || !self.is_selected(entity.id) {
+                continue;
+            }
+            let Some(rect) = self.entity_screen_rect(entity, area) else {
+                continue;
+            };
+            let angle = self.entity_world_rotation(entity);
+            // Outline and collider preview rotate with the entity.
+            let prev_rot = ui.painter.push_rotation(rect.x, rect.y, angle);
+            ui.painter.stroke_rect(rect.shrink(-1.0), self.config.theme.selection);
+            let world_scale = self
+                .entity_world_transform(entity.id)
+                .map(|transform| transform.scale)
+                .unwrap_or_else(|| editor_entity_scale(entity));
+            self.draw_collider_preview(ui, entity, rect, z, world_scale);
+            ui.painter.set_rotation_raw(prev_rot);
+
+            if self.selected != Some(entity.id) || self.locked_ids.contains(&entity.id) {
+                continue;
+            }
+
+            let (mx, my) = (ui.input.mouse_x, ui.input.mouse_y);
+            match self.config.layout.view_tool {
+                ViewTool::Move => {
+                    self.draw_move_handle(ui, rect, angle, mx, my);
                 }
-
-                let (mx, my) = (ui.input.mouse_x, ui.input.mouse_y);
-                match self.config.layout.view_tool {
-                    ViewTool::Move => {
-                        self.draw_move_handle(ui, rect, angle, mx, my);
-                    }
-                    ViewTool::Scale => {
-                        self.draw_scale_handles(ui, rect, angle, mx, my);
-                    }
-                    ViewTool::Rotate => {
-                        let (kx, ky) = self.rotate_handle_knob(rect, angle);
-                        let rot_hot = self.rotating.map(|r| r.id) == Some(entity.id)
-                            || ((mx - kx).abs() <= 8.0 && (my - ky).abs() <= 8.0);
-                        self.draw_rotate_handle(ui, rect, angle, rot_hot);
-                    }
-                    ViewTool::Transform => {
-                        // Combined gizmo: scale corners plus the rotate knob. No
-                        // move handle — the body itself stays draggable.
-                        self.draw_scale_handles(ui, rect, angle, mx, my);
-                        let (kx, ky) = self.rotate_handle_knob(rect, angle);
-                        let rot_hot = self.rotating.map(|r| r.id) == Some(entity.id)
-                            || ((mx - kx).abs() <= 8.0 && (my - ky).abs() <= 8.0);
-                        self.draw_rotate_handle(ui, rect, angle, rot_hot);
-                    }
+                ViewTool::Scale => {
+                    self.draw_scale_handles(ui, rect, angle, mx, my);
+                }
+                ViewTool::Rotate => {
+                    let (kx, ky) = self.rotate_handle_knob(rect, angle);
+                    let rot_hot = self.rotating.map(|r| r.id) == Some(entity.id)
+                        || ((mx - kx).abs() <= 8.0 && (my - ky).abs() <= 8.0);
+                    self.draw_rotate_handle(ui, rect, angle, rot_hot);
+                }
+                ViewTool::Transform => {
+                    // Combined gizmo: scale corners plus the rotate knob. No
+                    // move handle — the body itself stays draggable.
+                    self.draw_scale_handles(ui, rect, angle, mx, my);
+                    let (kx, ky) = self.rotate_handle_knob(rect, angle);
+                    let rot_hot = self.rotating.map(|r| r.id) == Some(entity.id)
+                        || ((mx - kx).abs() <= 8.0 && (my - ky).abs() <= 8.0);
+                    self.draw_rotate_handle(ui, rect, angle, rot_hot);
                 }
             }
         }
@@ -3238,8 +3468,21 @@ impl EditorApp {
     }
 
     /// Gather the scene's lighting (config + lights + occluders in world space)
-    /// for the viewport preview, or `None` when the scene has lighting disabled.
-    fn preview_scene_lighting(&self) -> Option<PreviewLighting> {
+    /// for the viewport preview, or `None` when the preview is off or the scene
+    /// has lighting disabled. This is the cheap per-frame entity walk; the
+    /// expensive light grid it feeds is cached in
+    /// [`Self::composite_preview_lighting`].
+    #[allow(clippy::type_complexity)]
+    fn gather_scene_lighting(
+        &self,
+    ) -> Option<(
+        crate::lighting::LightConfig,
+        Vec<crate::lighting::Light>,
+        Vec<crate::lighting::Occluder>,
+    )> {
+        if !self.config.settings.preview_lighting {
+            return None;
+        }
         let s = &self.scene.lighting;
         if !s.enabled {
             return None;
@@ -3348,11 +3591,131 @@ impl EditorApp {
             }
         }
 
-        Some(PreviewLighting {
-            config,
-            lights,
-            occluders,
-        })
+        Some((config, lights, occluders))
+    }
+
+    /// Composite the scene lighting over the viewport, mirroring the runtime's
+    /// per-pixel `scene × light` multiply (plus bloom, clamped). The light is
+    /// evaluated on a coarse world-space grid and bilinearly upsampled — the
+    /// same downsample-and-interpolate the runtime's own light map uses.
+    ///
+    /// The editor redraws continuously, so the grid (which traces shadow rays
+    /// per light) is cached and only rebuilt when the camera, viewport, or
+    /// lighting inputs change. The per-pixel composite still runs every frame —
+    /// the scene beneath it is freshly rasterized — but it is threaded and cheap.
+    fn composite_preview_lighting(
+        &self,
+        ui: &mut Ui,
+        area: Rect,
+        config: &crate::lighting::LightConfig,
+        lights: &[crate::lighting::Light],
+        occluders: &[crate::lighting::Occluder],
+    ) {
+        // Sample the light on a grid a few screen-pixels apart; lighting is
+        // low-frequency, so bilinear upsampling is visually indistinguishable
+        // from a per-pixel evaluation while doing a fraction of the work.
+        const STEP: f32 = 4.0;
+        let gx0 = area.x;
+        let gy0 = area.y;
+        let gw = (area.w / STEP).ceil() as usize + 2;
+        let gh = (area.h / STEP).ceil() as usize + 2;
+
+        // Rebuild the cached grid only when an input changed; otherwise every
+        // continuous redraw would re-trace the same shadow rays.
+        {
+            let mut cache = self.preview_light_cache.borrow_mut();
+            let fresh = cache.as_ref().is_some_and(|c| {
+                c.cam_x == self.cam_x
+                    && c.cam_y == self.cam_y
+                    && c.cam_zoom == self.cam_zoom
+                    && c.gx0 == gx0
+                    && c.gy0 == gy0
+                    && c.gw == gw
+                    && c.gh == gh
+                    && c.config == *config
+                    && c.lights.as_slice() == lights
+                    && c.occluders.as_slice() == occluders
+            });
+            if !fresh {
+                // Screen-to-world: a world point sits at `area.xy + cam + world * zoom`.
+                let z = self.cam_zoom.max(1e-3);
+                let ox = area.x + self.cam_x;
+                let oy = area.y + self.cam_y;
+                let sampler = crate::lighting::LightSampler::new(config, lights, occluders);
+                let mut grid = vec![(0.0f32, 0.0f32, 0.0f32); gw * gh];
+                // Sampling casts shadow rays per light, so spread the grid across
+                // worker threads (each row band is independent).
+                let fill_rows = |chunk: &mut [(f32, f32, f32)], row_start: usize| {
+                    let rows = chunk.len() / gw;
+                    for local in 0..rows {
+                        let wy = (gy0 + (row_start + local) as f32 * STEP - oy) / z;
+                        for gx in 0..gw {
+                            let wx = (gx0 + gx as f32 * STEP - ox) / z;
+                            chunk[local * gw + gx] = sampler.sample(wx, wy);
+                        }
+                    }
+                };
+                let workers = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .clamp(1, 16)
+                    .min(gh.max(1));
+                if workers <= 1 || gw * gh < 4096 {
+                    fill_rows(&mut grid, 0);
+                } else {
+                    let rows_per = gh.div_ceil(workers).max(1);
+                    let band = rows_per * gw;
+                    let fill_rows = &fill_rows;
+                    std::thread::scope(|scope| {
+                        for (index, chunk) in grid.chunks_mut(band).enumerate() {
+                            scope.spawn(move || fill_rows(chunk, index * rows_per));
+                        }
+                    });
+                }
+                *cache = Some(PreviewLightGrid {
+                    cam_x: self.cam_x,
+                    cam_y: self.cam_y,
+                    cam_zoom: self.cam_zoom,
+                    gx0,
+                    gy0,
+                    gw,
+                    gh,
+                    config: *config,
+                    lights: lights.to_vec(),
+                    occluders: occluders.to_vec(),
+                    grid,
+                });
+            }
+        }
+
+        // Composite the cached grid over the scene background region (inside the
+        // 1px viewport frame); exposure is already folded into the sampled values.
+        let cache = self.preview_light_cache.borrow();
+        let cached = cache.as_ref().expect("grid was built above");
+        let grid = &cached.grid;
+        let sample = |px: f32, py: f32| {
+            let fx = ((px - gx0) / STEP).clamp(0.0, (gw - 1) as f32);
+            let fy = ((py - gy0) / STEP).clamp(0.0, (gh - 1) as f32);
+            let x0 = fx.floor() as usize;
+            let y0 = fy.floor() as usize;
+            let x1 = (x0 + 1).min(gw - 1);
+            let y1 = (y0 + 1).min(gh - 1);
+            let tx = fx - x0 as f32;
+            let ty = fy - y0 as f32;
+            let at = |x: usize, y: usize| grid[y * gw + x];
+            let lerp = |a: (f32, f32, f32), b: (f32, f32, f32), t: f32| {
+                (
+                    a.0 + (b.0 - a.0) * t,
+                    a.1 + (b.1 - a.1) * t,
+                    a.2 + (b.2 - a.2) * t,
+                )
+            };
+            let top = lerp(at(x0, y0), at(x1, y0), tx);
+            let bottom = lerp(at(x0, y1), at(x1, y1), tx);
+            lerp(top, bottom, ty)
+        };
+        ui.painter
+            .composite_light(area.shrink(1.0), config.bloom, sample);
     }
 
     /// Accumulated world rotation (radians) for an entity, matching what the
@@ -3429,34 +3792,13 @@ impl EditorApp {
         }
     }
 
-    fn draw_entity(
-        &self,
-        ui: &mut Ui,
-        entity: &Entity,
-        rect: Rect,
-        zoom: f32,
-        lighting: Option<&PreviewLighting>,
-    ) {
+    fn draw_entity(&self, ui: &mut Ui, entity: &Entity, rect: Rect, zoom: f32) {
         // Rotate the whole entity about its origin (its top-left, which is the
         // runtime's default rotation pivot). All the component draw paths below
-        // go through the painter, so they inherit the rotation for free.
+        // go through the painter, so they inherit the rotation for free. Entities
+        // are drawn at their true colors; scene lighting is composited over the
+        // whole viewport afterward (see [`Self::composite_preview_lighting`]).
         let angle = self.entity_world_rotation(entity);
-        // Light multiplier at this entity's position, sampled once. Multiplying
-        // each component color by it makes lights reveal/darken objects the way
-        // the runtime does, instead of laying a translucent overlay on top.
-        let light_factor = lighting.map(|preview| {
-            // Sample at the entity's world center so large objects read as lit by
-            // the nearest light rather than by whatever reaches their corner.
-            let (wx, wy) = match self.entity_world_transform(entity.id) {
-                Some(t) => {
-                    let (sx, sy) =
-                        editor_entity_size(&self.scene, entity, self.preview_root_size());
-                    (t.x + sx * t.scale * 0.5, t.y + sy * t.scale * 0.5)
-                }
-                None => (rect.x, rect.y),
-            };
-            crate::lighting::sample_light_at(wx, wy, &preview.config, &preview.lights, &preview.occluders)
-        });
         let prev_rot = ui.painter.push_rotation(rect.x, rect.y, angle);
         let world_scale = self
             .entity_world_transform(entity.id)
@@ -3465,10 +3807,7 @@ impl EditorApp {
         let mut drew = false;
         for component in &entity.components {
             if let Component::Core { name, props } = component {
-                let color = apply_light_factor(
-                    prop_color(props, "color").unwrap_or([200, 200, 200, 255]),
-                    light_factor,
-                );
+                let color = prop_color(props, "color").unwrap_or([200, 200, 200, 255]);
                 let prop_num = |n: &str, d: f32| {
                     props.iter().find(|p| p.name == n).and_then(|p| match p.value {
                         PropValue::Number(v) => Some(v),
@@ -3877,7 +4216,14 @@ impl EditorApp {
         }
         if !drew {
             ui.painter.stroke_rect(rect, self.config.theme.text_dim);
-            ui.painter.text(rect.x + 4.0, rect.y + 4.0, &entity.name, 12.0, self.config.theme.text_dim);
+            ui.painter.text_clipped(
+                rect.x + 4.0,
+                rect.y + 4.0,
+                &entity.name,
+                12.0,
+                self.config.theme.text_dim,
+                (rect.w - 8.0).max(0.0),
+            );
         }
         ui.painter.set_rotation_raw(prev_rot);
     }
@@ -4150,25 +4496,34 @@ impl EditorApp {
             let name = path.file_name().map(|name| name.to_string_lossy()).unwrap_or_default();
             let label = format!("{} → {}", name, target.and_then(|id| self.scene.entity(id))
                 .map(|entity| entity.name.as_str()).unwrap_or("entity"));
-            let width = ui.painter.text_width(&label, 13.0) + 34.0;
+            let width = (ui.painter.text_width(&label, 13.0) + 34.0)
+                .min((area.w - 8.0).max(0.0));
+            let bubble_x = (mx + 8.0)
+                .min(area.right() - width - 4.0)
+                .max(area.x + 4.0);
+            let bubble_y = (my + 8.0)
+                .min(area.bottom() - 26.0)
+                .max(area.y + 4.0);
+            let bubble = Rect::new(bubble_x, bubble_y, width, 22.0);
             ui.painter.fill_round_rect(
-                Rect::new(mx + 8.0, my + 8.0, width, 22.0),
+                bubble,
                 4.0,
                 [0, 0, 0, 210],
             );
             ui.painter.icon_centered(
-                mx + 20.0,
-                my + 19.0,
+                bubble.x + 12.0,
+                bubble.y + 11.0,
                 icon::CODE,
                 13.0,
                 self.config.theme.accent,
             );
-            ui.painter.text(
-                mx + 30.0,
-                my + 12.0,
+            ui.painter.text_clipped(
+                bubble.x + 22.0,
+                bubble.y + 4.0,
                 &label,
                 13.0,
                 self.config.theme.text,
+                (bubble.w - 28.0).max(0.0),
             );
             ui.wants_redraw = true;
         } else {
@@ -5068,6 +5423,17 @@ impl EditorApp {
             // 2D lighting: a per-scene toggle exported as `lighting.*` and
             // previewed live in the viewport.
             y = self.section_header(ui, x, width, y, icon::PALETTE, "Lighting");
+            if !self.config.settings.preview_lighting {
+                ui.painter.text_clipped(
+                    x + 4.0,
+                    y,
+                    "Viewport preview is off in Editor Settings.",
+                    12.0,
+                    self.config.theme.text_dim,
+                    (width - 8.0).max(0.0),
+                );
+                y += 20.0;
+            }
             self.inspector_label(ui, x, y + 4.0, "Enabled", LABEL_W - 6.0);
             if let Some(nv) =
                 ui.checkbox(Rect::new(x + LABEL_W, y, FIELD_H, FIELD_H), self.scene.lighting.enabled)
@@ -5297,6 +5663,8 @@ impl EditorApp {
         }
         y += 6.0;
 
+        y = self.attached_values(ui, id, &mut entity.values, x, width, y, &mut dirty);
+
         y = self.section_header(ui, x, width, y, icon::VIEW_QUILT, "Components");
         let mut remove_component: Option<usize> = None;
         for index in 0..entity.components.len() {
@@ -5446,7 +5814,12 @@ impl EditorApp {
         let mut dirty = false;
         let fx = x + LABEL_W;
         let fw = (width - LABEL_W).max(30.0);
-        self.inspector_label(ui, x, *y + 4.0, &prop.label, LABEL_W - 6.0);
+        // Collection properties own the whole row and provide their own
+        // disclosure header. Scalar properties retain the compact label/field
+        // layout used throughout the inspector.
+        if !matches!(&prop.value, PropValue::StringList(_)) {
+            self.inspector_label(ui, x, *y + 4.0, &prop.label, LABEL_W - 6.0);
+        }
         match &mut prop.value {
             PropValue::Number(n) => {
                 let r = ui.text_field(&id, Rect::new(fx, *y, fw, FIELD_H), &format_num(*n));
@@ -5503,6 +5876,147 @@ impl EditorApp {
                     );
                 }
                 *y += FIELD_H + 6.0;
+            }
+            PropValue::StringList(options) => {
+                let collapse_key = format!("{id}_string_list");
+                let expanded = !self.collapsed.contains(&collapse_key);
+                let header = Rect::new(x, *y, width, ROW_H);
+                let next = ui.collapsing_header(
+                    header,
+                    &format!(
+                        "{}  [{} option{}]",
+                        prop.label,
+                        options.len(),
+                        if options.len() == 1 { "" } else { "s" }
+                    ),
+                    expanded,
+                );
+                self.set_collapsed(&collapse_key, !next);
+                *y += ROW_H + 3.0;
+
+                if next {
+                    if options.is_empty() {
+                        ui.painter.text_clipped(
+                            x + 12.0,
+                            *y + 3.0,
+                            "No options yet.",
+                            13.0,
+                            self.config.theme.text_dim,
+                            (width - 24.0).max(0.0),
+                        );
+                        *y += 22.0;
+                    }
+
+                    let mut remove = None;
+                    let mut move_option = None;
+                    for index in 0..options.len() {
+                        let row_x = x + 10.0;
+                        let row_right = x + width;
+                        let index_w = 24.0;
+                        let controls_w = 68.0;
+                        ui.painter.text_clipped(
+                            row_x,
+                            *y + 4.0,
+                            &(index + 1).to_string(),
+                            12.0,
+                            self.config.theme.text_dim,
+                            index_w - 4.0,
+                        );
+                        let field_x = row_x + index_w;
+                        let field_w = (row_right - controls_w - field_x).max(30.0);
+                        let response = ui.text_field(
+                            &format!("{id}_option_{index}"),
+                            Rect::new(field_x, *y, field_w, FIELD_H),
+                            &options[index],
+                        );
+                        if response.changed {
+                            options[index] = response.text;
+                            dirty = true;
+                        }
+
+                        let up = Rect::new(row_right - 66.0, *y, 20.0, FIELD_H);
+                        let down = Rect::new(row_right - 44.0, *y, 20.0, FIELD_H);
+                        let delete = Rect::new(row_right - 22.0, *y, 20.0, FIELD_H);
+                        if index > 0 {
+                            if ui.icon_toggle(
+                                up,
+                                icon::ARROW_UPWARD,
+                                false,
+                                self.config.theme.text_dim,
+                            ) {
+                                move_option = Some((index, index - 1));
+                            }
+                            ui.tooltip(up, "Move option up");
+                        } else {
+                            ui.icon(
+                                up.x + up.w * 0.5,
+                                up.y + up.h * 0.5,
+                                icon::ARROW_UPWARD,
+                                15.0,
+                                [
+                                    self.config.theme.text_dim[0],
+                                    self.config.theme.text_dim[1],
+                                    self.config.theme.text_dim[2],
+                                    80,
+                                ],
+                            );
+                        }
+                        if index + 1 < options.len() {
+                            if ui.icon_toggle(
+                                down,
+                                icon::ARROW_DOWNWARD,
+                                false,
+                                self.config.theme.text_dim,
+                            ) {
+                                move_option = Some((index, index + 1));
+                            }
+                            ui.tooltip(down, "Move option down");
+                        } else {
+                            ui.icon(
+                                down.x + down.w * 0.5,
+                                down.y + down.h * 0.5,
+                                icon::ARROW_DOWNWARD,
+                                15.0,
+                                [
+                                    self.config.theme.text_dim[0],
+                                    self.config.theme.text_dim[1],
+                                    self.config.theme.text_dim[2],
+                                    80,
+                                ],
+                            );
+                        }
+                        if ui.icon_toggle(
+                            delete,
+                            icon::DELETE,
+                            false,
+                            self.config.theme.danger,
+                        ) {
+                            remove = Some(index);
+                        }
+                        ui.tooltip(delete, "Delete option");
+                        *y += FIELD_H + 3.0;
+                    }
+
+                    if let Some(index) = remove {
+                        options.remove(index);
+                        ui.clear_focus();
+                        dirty = true;
+                    } else if let Some((from, to)) = move_option {
+                        options.swap(from, to);
+                        ui.clear_focus();
+                        dirty = true;
+                    }
+
+                    let add = Rect::new(x + 10.0, *y, (width - 10.0).max(30.0), FIELD_H);
+                    if ui.icon_button(add, icon::ADD_CIRCLE, "Add Option") {
+                        let next_index = options.len();
+                        options.push(String::new());
+                        ui.focus_text(&format!("{id}_option_{next_index}"), "");
+                        dirty = true;
+                    }
+                    ui.tooltip(add, "Append a new dropdown option");
+                    *y += FIELD_H + 6.0;
+                }
             }
             PropValue::Color(c) => {
                 let mut col = *c;
@@ -5689,14 +6203,23 @@ impl EditorApp {
         dirty: &mut bool,
     ) -> f32 {
         ui.icon(x + 8.0, y + 8.0, icon::PLAYLIST_ADD, 14.0, self.config.theme.text_dim);
-        ui.label(x + 20.0, y, "Inspector Variables", self.config.theme.text_dim);
+        ui.painter.text_clipped(
+            x + 20.0,
+            y,
+            "Inspector Variables",
+            14.0,
+            self.config.theme.text_dim,
+            (width - 20.0).max(0.0),
+        );
         y += 22.0;
         if variables.is_empty() {
-            ui.label(
+            ui.painter.text_clipped(
                 x + 8.0,
                 y,
                 "No Inspector(...) declarations.",
+                14.0,
                 self.config.theme.text_dim,
+                (width - 16.0).max(0.0),
             );
             return y + 22.0;
         }
@@ -5710,9 +6233,11 @@ impl EditorApp {
                 &label,
                 &mut variable.value,
                 &variable.control,
-                entity,
-                comp,
-                index,
+                ValueOwner::ScriptVar {
+                    entity,
+                    component: comp,
+                    var: index,
+                },
                 &mut Vec::new(),
                 x,
                 width,
@@ -5722,6 +6247,131 @@ impl EditorApp {
             y += 4.0;
         }
         y + 2.0
+    }
+
+    fn attached_values(
+        &mut self,
+        ui: &mut Ui,
+        entity: u64,
+        values: &mut Vec<AttachedValue>,
+        x: f32,
+        width: f32,
+        mut y: f32,
+        dirty: &mut bool,
+    ) -> f32 {
+        y = self.section_header(ui, x, width, y, icon::DATA_OBJECT, "Attached Values");
+        if values.is_empty() {
+            ui.painter.text_wrapped(
+                Rect::new(x + 8.0, y, (width - 16.0).max(0.0), 34.0),
+                "Add fields directly to this entity table—no component script required.",
+                12.0,
+                15.0,
+                self.config.theme.text_dim,
+            );
+            y += 38.0;
+        }
+
+        let mut remove = None;
+        for index in 0..values.len() {
+            let base = format!("attached_{entity}_{index}");
+            let panel_x = x + 4.0;
+            let panel_w = (width - 4.0).max(40.0);
+            ui.painter.fill_round_rect(
+                Rect::new(panel_x, y, panel_w, FIELD_H + 4.0),
+                3.0,
+                self.config.theme.panel_alt,
+            );
+            ui.icon(
+                panel_x + 12.0,
+                y + (FIELD_H + 4.0) * 0.5,
+                AttachedValueType::from_value(&values[index].value).glyph(),
+                14.0,
+                self.config.theme.accent,
+            );
+            let delete_w = 22.0;
+            let name_x = panel_x + 24.0;
+            let name_w = (panel_w - 24.0 - delete_w - 4.0).max(36.0);
+            let name = ui.text_field(
+                &format!("{base}_name"),
+                Rect::new(name_x, y + 2.0, name_w, FIELD_H),
+                &values[index].name,
+            );
+            if name.changed {
+                values[index].name = name.text;
+                *dirty = true;
+            }
+            let delete = Rect::new(panel_x + panel_w - delete_w, y + 2.0, delete_w, FIELD_H);
+            if ui.icon_toggle(delete, icon::DELETE, false, self.config.theme.danger) {
+                remove = Some(index);
+            }
+            ui.tooltip(delete, "Remove attached value");
+            y += FIELD_H + 8.0;
+
+            self.inspector_label(ui, x + 12.0, y + 4.0, "Type", LABEL_W - 18.0);
+            let type_button = Rect::new(
+                x + LABEL_W,
+                y,
+                (width - LABEL_W - 8.0).max(44.0),
+                FIELD_H,
+            );
+            let current = AttachedValueType::from_value(&values[index].value);
+            if ui.dropdown_button(type_button, current.label()) {
+                self.open_attached_value_type_menu(
+                    entity,
+                    index,
+                    Vec::new(),
+                    current,
+                    type_button.x,
+                    type_button.bottom() + 2.0,
+                );
+            }
+            ui.tooltip(type_button, "Changing type resets this value");
+            y += FIELD_H + 6.0;
+
+            self.script_value_editor(
+                ui,
+                &base,
+                "Value",
+                &mut values[index].value,
+                &VarControl::Field,
+                ValueOwner::AttachedValue {
+                    entity,
+                    value: index,
+                },
+                &mut Vec::new(),
+                x + 8.0,
+                width - 8.0,
+                &mut y,
+                dirty,
+            );
+            y += 5.0;
+        }
+        if let Some(index) = remove {
+            values.remove(index);
+            *dirty = true;
+        }
+
+        let add = Rect::new(x + 4.0, y, width - 4.0, FIELD_H + 2.0);
+        if ui.icon_button(add, icon::ADD_CIRCLE, "Add Value") {
+            let mut suffix = values.len() + 1;
+            let name = loop {
+                let candidate = if suffix == 1 {
+                    "value".to_string()
+                } else {
+                    format!("value{suffix}")
+                };
+                if !values.iter().any(|value| value.name == candidate) {
+                    break candidate;
+                }
+                suffix += 1;
+            };
+            values.push(AttachedValue {
+                name,
+                value: VarValue::Number(0.0),
+            });
+            *dirty = true;
+        }
+        y + FIELD_H + 10.0
     }
 
     fn entity_reference_label(&self, reference: Option<u64>) -> String {
@@ -5756,9 +6406,7 @@ impl EditorApp {
         label: &str,
         value: &mut VarValue,
         control: &VarControl,
-        entity: u64,
-        comp: usize,
-        var: usize,
+        owner: ValueOwner,
         path: &mut Vec<VarPathPart>,
         x: f32,
         width: f32,
@@ -5828,12 +6476,7 @@ impl EditorApp {
                     base,
                     asset_path,
                     AssetKind::Image,
-                    AssetTarget::ScriptVar {
-                        entity,
-                        component: comp,
-                        var,
-                        path: path.clone(),
-                    },
+                    owner.asset_target(path),
                     x + LABEL_W,
                     (width - LABEL_W).max(30.0),
                     *y,
@@ -5849,12 +6492,7 @@ impl EditorApp {
                     base,
                     asset_path,
                     AssetKind::Sound,
-                    AssetTarget::ScriptVar {
-                        entity,
-                        component: comp,
-                        var,
-                        path: path.clone(),
-                    },
+                    owner.asset_target(path),
                     x + LABEL_W,
                     (width - LABEL_W).max(30.0),
                     *y,
@@ -5870,12 +6508,7 @@ impl EditorApp {
                     base,
                     asset_path,
                     AssetKind::Shader,
-                    AssetTarget::ScriptVar {
-                        entity,
-                        component: comp,
-                        var,
-                        path: path.clone(),
-                    },
+                    owner.asset_target(path),
                     x + LABEL_W,
                     (width - LABEL_W).max(30.0),
                     *y,
@@ -5891,12 +6524,7 @@ impl EditorApp {
                     base,
                     asset_path,
                     AssetKind::Animation,
-                    AssetTarget::ScriptVar {
-                        entity,
-                        component: comp,
-                        var,
-                        path: path.clone(),
-                    },
+                    owner.asset_target(path),
                     x + LABEL_W,
                     (width - LABEL_W).max(30.0),
                     *y,
@@ -5916,12 +6544,7 @@ impl EditorApp {
                     (x + width) - fx,
                     *y,
                     &mut next,
-                    ColorTarget::Var {
-                        entity,
-                        comp,
-                        var,
-                        path: path.clone(),
-                    },
+                    owner.color_target(path),
                 ) {
                     *color = next;
                     *dirty = true;
@@ -6061,15 +6684,38 @@ impl EditorApp {
                     for index in 0..values.len() {
                         let item_y = *y;
                         path.push(VarPathPart::List(index));
+                        if let ValueOwner::AttachedValue {
+                            entity,
+                            value: root_value,
+                        } = owner
+                        {
+                            let current = AttachedValueType::from_value(&values[index]);
+                            let type_rect = Rect::new(
+                                x + 12.0,
+                                *y,
+                                (width - 48.0).max(38.0),
+                                FIELD_H,
+                            );
+                            if ui.dropdown_button(type_rect, current.label()) {
+                                self.open_attached_value_type_menu(
+                                    entity,
+                                    root_value,
+                                    path.clone(),
+                                    current,
+                                    type_rect.x,
+                                    type_rect.bottom() + 2.0,
+                                );
+                            }
+                            ui.tooltip(type_rect, "Change this list item's type");
+                            *y += FIELD_H + 3.0;
+                        }
                         self.script_value_editor(
                             ui,
                             &format!("{base}_{index}"),
                             &format!("{}", index + 1),
                             &mut values[index],
                             &VarControl::Field,
-                            entity,
-                            comp,
-                            var,
+                            owner,
                             path,
                             x + 12.0,
                             width - 36.0,
@@ -6116,7 +6762,21 @@ impl EditorApp {
                     let mut remove = None;
                     for index in 0..entries.len() {
                         let entry = &mut entries[index];
-                        ui.label(x + 12.0, *y + 4.0, "Key", self.config.theme.text_dim);
+                        let key_kind = match &entry.key {
+                            VarKey::Number(_) => "#",
+                            VarKey::Bool(_) => "Bool",
+                            VarKey::Text(_) => "Text",
+                        };
+                        let key_type = Rect::new(x + 12.0, *y, 48.0, FIELD_H);
+                        if ui.button(key_type, key_kind) {
+                            entry.key = match &entry.key {
+                                VarKey::Text(_) => VarKey::Number(0.0),
+                                VarKey::Number(_) => VarKey::Bool(false),
+                                VarKey::Bool(_) => VarKey::Text(String::new()),
+                            };
+                            *dirty = true;
+                        }
+                        ui.tooltip(key_type, "Cycle table key type: text, number, boolean");
                         let key_x = x + LABEL_W;
                         match &mut entry.key {
                             VarKey::Number(key) => {
@@ -6162,15 +6822,38 @@ impl EditorApp {
                         }
                         *y += FIELD_H + 3.0;
                         path.push(VarPathPart::Dictionary(index));
+                        if let ValueOwner::AttachedValue {
+                            entity,
+                            value: root_value,
+                        } = owner
+                        {
+                            let current = AttachedValueType::from_value(&entry.value);
+                            let type_rect = Rect::new(
+                                x + 12.0,
+                                *y,
+                                (width - 24.0).max(38.0),
+                                FIELD_H,
+                            );
+                            if ui.dropdown_button(type_rect, current.label()) {
+                                self.open_attached_value_type_menu(
+                                    entity,
+                                    root_value,
+                                    path.clone(),
+                                    current,
+                                    type_rect.x,
+                                    type_rect.bottom() + 2.0,
+                                );
+                            }
+                            ui.tooltip(type_rect, "Change this table value's type");
+                            *y += FIELD_H + 3.0;
+                        }
                         self.script_value_editor(
                             ui,
                             &format!("{base}_{index}_value"),
                             "Value",
                             &mut entry.value,
                             &VarControl::Field,
-                            entity,
-                            comp,
-                            var,
+                            owner,
                             path,
                             x + 12.0,
                             width - 12.0,
@@ -6215,7 +6898,14 @@ impl EditorApp {
         ui.painter.fill_rect(Rect::new(x, y, width, 1.0), self.config.theme.border);
         let y = y + 6.0;
         ui.icon(x + 8.0, y + 8.0, glyph, 15.0, self.config.theme.text_dim);
-        ui.label(x + 20.0, y, title, self.config.theme.text_dim);
+        ui.painter.text_clipped(
+            x + 20.0,
+            y,
+            title,
+            14.0,
+            self.config.theme.text_dim,
+            (width - 24.0).max(0.0),
+        );
         y + 22.0
     }
 
@@ -6480,7 +7170,14 @@ impl EditorApp {
         let header = Rect::new(area.x, area.y, area.w, HEADER_H);
         ui.painter.fill_rect(header, self.config.theme.header);
         ui.icon(area.x + 16.0, area.y + HEADER_H / 2.0, icon::FOLDER_OPEN, 16.0, self.config.theme.text);
-        ui.label(area.x + 30.0, area.y + (HEADER_H - 14.0) / 2.0, "Project", self.config.theme.text);
+        ui.painter.text_clipped(
+            area.x + 30.0,
+            area.y + (HEADER_H - 14.0) / 2.0,
+            "Project",
+            14.0,
+            self.config.theme.text,
+            (area.w - 38.0).min(54.0).max(0.0),
+        );
 
         let rel = self.bin_rel();
         ui.painter.text_clipped(area.x + 92.0, area.y + (HEADER_H - 13.0) / 2.0, &format!("/{rel}"), 13.0, self.config.theme.text_dim, area.w - 320.0);
@@ -6537,7 +7234,14 @@ impl EditorApp {
             if area.contains(ui.input.mouse_x, ui.input.mouse_y) {
                 ui.painter.stroke_round_rect(area.shrink(2.0), 4.0, self.config.theme.accent);
                 let name = self.scene.entity(drag).map(|e| e.name.clone()).unwrap_or_default();
-                ui.painter.text(area.x + 210.0, area.y + 6.0, &format!("Drop to save \"{name}\" as a prefab"), 13.0, self.config.theme.accent);
+                ui.painter.text_clipped(
+                    area.x + 210.0,
+                    area.y + 6.0,
+                    &format!("Drop to save \"{name}\" as a prefab"),
+                    13.0,
+                    self.config.theme.accent,
+                    (area.w - 220.0).max(0.0),
+                );
                 if !ui.input.mouse_down {
                     self.save_prefab(drag);
                     self.reparent_drag = None;
@@ -6623,7 +7327,14 @@ impl EditorApp {
             self.script_drag = Some(path);
         }
         if dirs.is_empty() && files.is_empty() {
-            ui.label(content.x + 10.0, content.y + 8.0, "Empty folder.", self.config.theme.text_dim);
+            ui.painter.text_clipped(
+                content.x + 10.0,
+                content.y + 8.0,
+                "Empty folder.",
+                14.0,
+                self.config.theme.text_dim,
+                (content.w - 20.0).max(0.0),
+            );
             yy += row_h;
         }
         ui.reset_input_clip();
@@ -6734,7 +7445,7 @@ impl EditorApp {
         ui.painter.fill_rect(bar, self.config.theme.toolbar);
         ui.painter.stroke_rect(bar, self.config.theme.border);
         let snap = if self.config.layout.snap { "snap" } else { "free" };
-        ui.painter.text(
+        ui.painter.text_clipped(
             8.0,
             h - STATUS_H + 5.0,
             &format!(
@@ -6747,6 +7458,7 @@ impl EditorApp {
             ),
             13.0,
             self.config.theme.text_dim,
+            (w - 16.0).max(0.0),
         );
     }
 
@@ -7096,6 +7808,36 @@ impl EditorApp {
         self.popup = Some(Popup::Menu { x, y, items });
     }
 
+    fn open_attached_value_type_menu(
+        &mut self,
+        entity: u64,
+        value: usize,
+        path: Vec<VarPathPart>,
+        current: AttachedValueType,
+        x: f32,
+        y: f32,
+    ) {
+        let items = AttachedValueType::ALL
+            .into_iter()
+            .map(|kind| MenuItem {
+                action: Action::SetAttachedValueType {
+                    entity,
+                    value,
+                    path: path.clone(),
+                    kind,
+                },
+                glyph: if kind == current {
+                    icon::CHECK
+                } else {
+                    kind.glyph()
+                },
+                label: kind.label().to_string(),
+                danger: false,
+            })
+            .collect();
+        self.popup = Some(Popup::Menu { x, y, items });
+    }
+
     fn open_hierarchy_empty_menu(&mut self, x: f32, y: f32) {
         let items = vec![
             MenuItem { action: Action::AddEntity(None), glyph: icon::ADD, label: "Add Entity".into(), danger: false },
@@ -7166,6 +7908,7 @@ impl EditorApp {
             show_tooltips: self.config.settings.show_tooltips,
             show_window_bounds: self.config.settings.show_window_bounds,
             show_transform_hud: self.config.settings.show_transform_hud,
+            preview_lighting: self.config.settings.preview_lighting,
             autosave_before_run: self.config.settings.autosave_before_run,
             autosave_before_build: self.config.settings.autosave_before_build,
         });
@@ -7252,6 +7995,7 @@ impl EditorApp {
                 show_tooltips,
                 show_window_bounds,
                 show_transform_hud,
+                preview_lighting,
                 autosave_before_run,
                 autosave_before_build,
             } => self.draw_editor_settings(
@@ -7263,6 +8007,7 @@ impl EditorApp {
                 show_tooltips,
                 show_window_bounds,
                 show_transform_hud,
+                preview_lighting,
                 autosave_before_run,
                 autosave_before_build,
                 w,
@@ -7780,12 +8525,13 @@ impl EditorApp {
         }
 
         if paths.is_empty() {
-            ui.painter.text(
+            ui.painter.text_clipped(
                 list.x + 32.0,
                 list.y + row_h + 8.0,
                 "No matching assets in this project.",
                 13.0,
                 self.config.theme.text_dim,
+                (list.w - 40.0).max(0.0),
             );
         }
         if max_scroll > 0.0 {
@@ -7993,6 +8739,39 @@ impl EditorApp {
                     _ => return,
                 }
                 humanize_identifier(&variable.name)
+            }
+            AssetTarget::AttachedValue {
+                entity,
+                value,
+                path: value_path,
+            } => {
+                let Some(entity) = self.scene.entity_mut(entity) else {
+                    return;
+                };
+                let Some(attached) = entity.values.get_mut(value) else {
+                    return;
+                };
+                let Some(value) = var_value_at_path_mut(&mut attached.value, &value_path) else {
+                    return;
+                };
+                let matches_kind = matches!(
+                    (&*value, kind),
+                    (VarValue::Image(_), AssetKind::Image)
+                        | (VarValue::Audio(_), AssetKind::Sound)
+                        | (VarValue::Shader(_), AssetKind::Shader)
+                        | (VarValue::Animation(_), AssetKind::Animation)
+                );
+                if !matches_kind {
+                    return;
+                }
+                match value {
+                    VarValue::Image(value)
+                    | VarValue::Audio(value)
+                    | VarValue::Shader(value)
+                    | VarValue::Animation(value) => *value = path.clone(),
+                    _ => return,
+                }
+                attached.name.clone()
             }
         };
         self.mark_dirty();
@@ -8304,12 +9083,13 @@ impl EditorApp {
         ui.painter.set_clip_raw(prev_clip);
 
         if filtered.is_empty() {
-            ui.painter.text(
+            ui.painter.text_clipped(
                 list.x + 8.0,
                 list.y + 6.0,
                 "No matching components",
                 13.0,
                 self.config.theme.text_dim,
+                (list.w - 16.0).max(0.0),
             );
         }
 
@@ -8479,7 +9259,13 @@ impl EditorApp {
         let rect = Rect::new(px, py, width, height);
         ui.painter.fill_round_rect(rect, 6.0, self.config.theme.panel);
         ui.painter.stroke_round_rect(rect, 6.0, self.config.theme.accent);
-        ui.painter.text(px + 16.0, py + 18.0, &message, 15.0, self.config.theme.text);
+        ui.painter.text_wrapped(
+            Rect::new(px + 16.0, py + 14.0, width - 32.0, 52.0),
+            &message,
+            15.0,
+            18.0,
+            self.config.theme.text,
+        );
 
         let yes = Rect::new(px + width - 200.0, py + height - 36.0, 90.0, 26.0);
         let no = Rect::new(px + width - 104.0, py + height - 36.0, 90.0, 26.0);
@@ -8502,7 +9288,14 @@ impl EditorApp {
         let rect = Rect::new(px, py, width, height);
         ui.painter.fill_round_rect(rect, 6.0, self.config.theme.panel);
         ui.painter.stroke_round_rect(rect, 6.0, self.config.theme.accent);
-        ui.painter.text(px + 16.0, py + 16.0, &title, 15.0, self.config.theme.text);
+        ui.painter.text_clipped(
+            px + 16.0,
+            py + 16.0,
+            &title,
+            15.0,
+            self.config.theme.text,
+            width - 32.0,
+        );
 
         let field = Rect::new(px + 16.0, py + 44.0, width - 32.0, 26.0);
         let _ = ui.text_field("prompt_field", field, "");
@@ -8540,6 +9333,7 @@ impl EditorApp {
         mut show_tooltips: bool,
         mut show_window_bounds: bool,
         mut show_transform_hud: bool,
+        mut preview_lighting: bool,
         mut autosave_before_run: bool,
         mut autosave_before_build: bool,
         w: f32,
@@ -8647,12 +9441,13 @@ impl EditorApp {
         } else {
             let notice = Rect::new(px + 16.0, y, width - 32.0, 32.0);
             ui.painter.fill_round_rect(notice, 4.0, self.config.theme.panel_alt);
-            ui.painter.text(
+            ui.painter.text_clipped(
                 notice.x + 10.0,
                 notice.y + 8.0,
                 "Choose Custom to edit and preview your own palette.",
                 12.0,
                 self.config.theme.text_dim,
+                (notice.w - 20.0).max(0.0),
             );
             y += 42.0;
         }
@@ -8664,6 +9459,7 @@ impl EditorApp {
             ("Show tooltips", &mut show_tooltips),
             ("Show default window bounds", &mut show_window_bounds),
             ("Show Scene transform HUD", &mut show_transform_hud),
+            ("Preview scene lighting", &mut preview_lighting),
             ("Autosave before Run", &mut autosave_before_run),
             ("Autosave before Build", &mut autosave_before_build),
         ]
@@ -8674,7 +9470,14 @@ impl EditorApp {
             let row = index / 2;
             let item_x = px + 16.0 + column as f32 * preference_width;
             let item_y = y + row as f32 * 25.0;
-            ui.painter.text(item_x + 28.0, item_y + 4.0, label, 12.0, self.config.theme.text);
+            ui.painter.text_clipped(
+                item_x + 28.0,
+                item_y + 4.0,
+                label,
+                12.0,
+                self.config.theme.text,
+                (preference_width - 36.0).max(0.0),
+            );
             if let Some(next) = ui.checkbox(Rect::new(item_x, item_y, FIELD_H, FIELD_H), *value) {
                 *value = next;
             }
@@ -8701,6 +9504,7 @@ impl EditorApp {
                     show_tooltips,
                     show_window_bounds,
                     show_transform_hud,
+                    preview_lighting,
                     autosave_before_run,
                     autosave_before_build,
                 });
@@ -8712,6 +9516,7 @@ impl EditorApp {
             self.config.settings.show_tooltips = show_tooltips;
             self.config.settings.show_window_bounds = show_window_bounds;
             self.config.settings.show_transform_hud = show_transform_hud;
+            self.config.settings.preview_lighting = preview_lighting;
             self.config.settings.autosave_before_run = autosave_before_run;
             self.config.settings.autosave_before_build = autosave_before_build;
             self.config.custom_theme = custom_theme.clone();
@@ -8736,6 +9541,7 @@ impl EditorApp {
                 show_tooltips,
                 show_window_bounds,
                 show_transform_hud,
+                preview_lighting,
                 autosave_before_run,
                 autosave_before_build,
             });
@@ -8749,7 +9555,14 @@ impl EditorApp {
         color: &mut [u8; 4],
         rect: Rect,
     ) -> bool {
-        ui.painter.text(rect.x, rect.y + 4.0, label, 12.0, ui.theme.text_dim);
+        ui.painter.text_clipped(
+            rect.x,
+            rect.y + 4.0,
+            label,
+            12.0,
+            ui.theme.text_dim,
+            (rect.w - 110.0).max(0.0),
+        );
         let swatch = Rect::new(rect.right() - 104.0, rect.y + 1.0, 22.0, rect.h - 2.0);
         ui.painter.fill_round_rect(swatch, 3.0, *color);
         ui.painter.stroke_round_rect(swatch, 3.0, ui.theme.border);
@@ -9315,6 +10128,28 @@ impl EditorApp {
                     self.mark_dirty();
                 }
             }
+            Action::SetAttachedValueType {
+                entity,
+                value,
+                path,
+                kind,
+            } => {
+                let mut changed = false;
+                if let Some(entity) = self.scene.entity_mut(entity) {
+                    if let Some(attached) = entity.values.get_mut(value) {
+                        if let Some(current) = var_value_at_path_mut(&mut attached.value, &path) {
+                            if AttachedValueType::from_value(current) != kind {
+                                *current = kind.default_value();
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if changed {
+                    self.mark_dirty();
+                    self.status = format!("Changed attached value type to {}", kind.label());
+                }
+            }
             Action::SelectAll => self.select_all(),
             Action::InvertSelection => self.invert_selection(),
             Action::SelectChildren => self.select_children(),
@@ -9538,6 +10373,19 @@ impl EditorApp {
                             if let Some(value) = var_value_at_path_mut(&mut v.value, path) {
                                 *value = VarValue::Color(color);
                             }
+                        }
+                    }
+                }
+            }
+            ColorTarget::AttachedValue {
+                entity,
+                value,
+                path,
+            } => {
+                if let Some(entity) = self.scene.entity_mut(*entity) {
+                    if let Some(attached) = entity.values.get_mut(*value) {
+                        if let Some(value) = var_value_at_path_mut(&mut attached.value, path) {
+                            *value = VarValue::Color(color);
                         }
                     }
                 }
@@ -10304,23 +11152,24 @@ impl EditorApp {
     }
 }
 
-/// Lighting gathered from the current scene for the viewport preview.
-struct PreviewLighting {
+/// Cached viewport light grid plus the inputs it was built from. The editor
+/// redraws continuously; while the camera, viewport, and lighting inputs are
+/// unchanged the grid (and its shadow rays) is reused instead of recomputed.
+struct PreviewLightGrid {
+    cam_x: f32,
+    cam_y: f32,
+    cam_zoom: f32,
+    /// Grid origin in screen space and its dimensions/step footprint.
+    gx0: f32,
+    gy0: f32,
+    gw: usize,
+    gh: usize,
     config: crate::lighting::LightConfig,
     lights: Vec<crate::lighting::Light>,
     occluders: Vec<crate::lighting::Occluder>,
-}
-
-/// Multiply an editor draw color by a sampled light factor (rgb, each `>= 0`),
-/// clamping to bytes. `None` leaves the color unchanged (lighting disabled).
-fn apply_light_factor(color: [u8; 4], factor: Option<(f32, f32, f32)>) -> [u8; 4] {
-    match factor {
-        None => color,
-        Some((lr, lg, lb)) => {
-            let ch = |c: u8, l: f32| ((c as f32 * l).clamp(0.0, 255.0)) as u8;
-            [ch(color[0], lr), ch(color[1], lg), ch(color[2], lb), color[3]]
-        }
-    }
+    /// Bilinearly upsampled by the composite: one `(r, g, b)` light multiplier
+    /// per grid node, row-major over `gw × gh`.
+    grid: Vec<(f32, f32, f32)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -10666,11 +11515,16 @@ fn scene_world_transform_cached(
     let (size_x, size_y) = editor_entity_size(scene, entity, root_size);
     let (pivot_offset_x, pivot_offset_y) =
         editor_pivot_origin_compensation(size_x, size_y, local, entity.rotation);
+    // The local origin offset is expressed in the parent's unrotated frame, so
+    // rotate it by the parent's world rotation before adding it. This mirrors
+    // the runtime's `get_global_transform` and makes children orbit a rotated
+    // parent instead of drifting away from its rotation pivot.
+    let offset_x = (anchor_x + local.x + pivot_offset_x) * parent_transform.scale;
+    let offset_y = (anchor_y + local.y + pivot_offset_y) * parent_transform.scale;
+    let (offset_x, offset_y) = rotate_vector(offset_x, offset_y, parent_transform.rotation);
     let transform = EditorWorldTransform {
-        x: parent_transform.x
-            + (anchor_x + local.x + pivot_offset_x) * parent_transform.scale,
-        y: parent_transform.y
-            + (anchor_y + local.y + pivot_offset_y) * parent_transform.scale,
+        x: parent_transform.x + offset_x,
+        y: parent_transform.y + offset_y,
         scale: parent_transform.scale * local.scale,
         rotation: parent_transform.rotation + entity.rotation,
     };
@@ -10706,9 +11560,16 @@ fn scene_world_origin_to_local_position(
     let (size_x, size_y) = editor_entity_size(scene, entity, root_size);
     let (pivot_offset_x, pivot_offset_y) =
         editor_pivot_origin_compensation(size_x, size_y, local, entity.rotation);
+    // Invert the parent-rotation applied in `scene_world_transform_cached`
+    // before removing the scale, anchor and pivot compensation.
+    let (unrotated_x, unrotated_y) = rotate_vector(
+        world_x - parent_transform.x,
+        world_y - parent_transform.y,
+        -parent_transform.rotation,
+    );
     Some((
-        (world_x - parent_transform.x) / parent_scale - anchor_x - pivot_offset_x,
-        (world_y - parent_transform.y) / parent_scale - anchor_y - pivot_offset_y,
+        unrotated_x / parent_scale - anchor_x - pivot_offset_x,
+        unrotated_y / parent_scale - anchor_y - pivot_offset_y,
     ))
 }
 
@@ -10947,7 +11808,10 @@ fn prop_string_like(props: &[Prop], names: &[&str]) -> Option<String> {
         PropValue::Number(value) => Some(format_num(*value)),
         PropValue::Int(value) => Some(value.to_string()),
         PropValue::Bool(value) => Some(value.to_string()),
-        PropValue::Color(_) | PropValue::ColorSequence(_) | PropValue::NumberSequence(_) => None,
+        PropValue::Color(_)
+        | PropValue::StringList(_)
+        | PropValue::ColorSequence(_)
+        | PropValue::NumberSequence(_) => None,
     })
 }
 
@@ -11470,6 +12334,7 @@ fn core_icon(name: &str) -> char {
         "Sprite2D" | "SpriteSheet2D" | "Image2D" | "NineSliceSprite2D" | "TileTexture2D" | "Tilemap2D" | "Spritebox2D" => icon::IMAGE,
         "Collider2D" => icon::BORDER_ALL,
         "Rigidbody2D" => icon::VIEW_IN_AR,
+        "Camera" => icon::VIDEOCAM,
         "EntityScaler" | "Bolt2D" | "Rope2D" | "LegacyBolt2D" | "String2D" => icon::TUNE,
         "Frame" | "Panel" | "ScrollList" => icon::VIEW_QUILT,
         "Button" => icon::ADD_CIRCLE,
@@ -12201,6 +13066,32 @@ mod tests {
             self.frame(FrameInput { mouse_x: x, mouse_y: y, mouse_pressed: true, mouse_down: true, ..Default::default() });
             self.frame(FrameInput { mouse_x: x, mouse_y: y, ..Default::default() });
         }
+        fn prop_row_frame(
+            &mut self,
+            prop: &mut Prop,
+            input: FrameInput,
+            x: f32,
+            width: f32,
+            start_y: f32,
+        ) -> (bool, f32) {
+            let painter = Painter::new(&mut self.buffer, self.w, self.h, self.fonts.clone());
+            let theme = self.app.theme();
+            let mut ui = Ui::new(
+                painter,
+                input,
+                theme,
+                self.app.take_focus(),
+                self.app.take_edit_buffer(),
+                self.app.take_edit_cursor(),
+                self.app.take_edit_selection_anchor(),
+                self.app.take_pointer_capture(),
+            );
+            let mut y = start_y;
+            let dirty = self.app.prop_row(&mut ui, 1, 0, 0, prop, x, width, &mut y);
+            let (focus, edit, cursor, anchor, pointer) = ui.into_focus_state();
+            self.app.set_focus(focus, edit, cursor, anchor, pointer);
+            (dirty, y)
+        }
     }
 
     fn unique_test_path(label: &str) -> PathBuf {
@@ -12232,36 +13123,92 @@ mod tests {
         let id = torch.id;
         scene.replace_entity(id, torch);
 
-        let h = Harness::new(scene);
-        let preview = h
+        let mut h = Harness::new(scene);
+        let (config, lights, occluders) = h
             .app
-            .preview_scene_lighting()
+            .gather_scene_lighting()
             .expect("lighting is enabled");
-        assert_eq!(preview.lights.len(), 1, "one Light2D should be gathered");
-
+        let sampler = crate::lighting::LightSampler::new(&config, &lights, &occluders);
         // The light illuminates its own position but not points beyond its reach.
-        let (near, _, _) = crate::lighting::sample_light_at(
-            200.0,
-            150.0,
-            &preview.config,
-            &preview.lights,
-            &preview.occluders,
-        );
+        let (near, _, _) = sampler.sample(200.0, 150.0);
         assert!(near > 0.5, "light should brighten its position, got {near}");
-        let (far, _, _) = crate::lighting::sample_light_at(
-            200.0 + 5000.0,
-            150.0,
-            &preview.config,
-            &preview.lights,
-            &preview.occluders,
-        );
+        let (far, _, _) = sampler.sample(200.0 + 5000.0, 150.0);
         assert!(far < 0.01, "beyond the radius should stay dark, got {far}");
+
+        // The editor preference suppresses only the viewport preview; it does
+        // not mutate the scene's authored lighting settings.
+        h.app.config.settings.preview_lighting = false;
+        assert!(h.app.gather_scene_lighting().is_none());
+        assert!(h.app.scene.lighting.enabled);
 
         // A scene with lighting disabled produces no preview at all.
         let mut off = Scene::default();
         off.lighting.enabled = false;
         let h2 = Harness::new(off);
-        assert!(h2.app.preview_scene_lighting().is_none());
+        assert!(h2.app.gather_scene_lighting().is_none());
+    }
+
+    #[test]
+    fn preview_light_grid_caches_and_tracks_camera() {
+        let mut scene = Scene::default();
+        scene.lighting.enabled = true;
+        scene.lighting.ambient = [0, 0, 0, 255];
+        scene.lighting.ambient_intensity = 0.0;
+        let mut torch = scene.add_entity("Torch", 200.0, 150.0);
+        torch.components.push(Component::core("Light2D"));
+        let id = torch.id;
+        scene.replace_entity(id, torch);
+
+        let mut h = Harness::new(scene);
+        h.frame(FrameInput::default());
+        {
+            let cache = h.app.preview_light_cache.borrow();
+            let cached = cache.as_ref().expect("grid cached after a lit frame");
+            assert!(!cached.grid.is_empty(), "grid should be populated");
+            assert_eq!(cached.cam_zoom, h.app.cam_zoom);
+        }
+
+        // Zooming must invalidate the cached grid, or the preview would show
+        // lighting at the wrong scale. The key tracks the live camera zoom.
+        h.app.cam_zoom += 0.5;
+        h.frame(FrameInput::default());
+        let cache = h.app.preview_light_cache.borrow();
+        let cached = cache.as_ref().expect("grid rebuilt after zoom");
+        assert_eq!(cached.cam_zoom, h.app.cam_zoom, "cache tracks current zoom");
+    }
+
+    #[test]
+    fn attached_value_types_can_be_changed_at_the_root_and_inside_tables() {
+        let mut scene = Scene::default();
+        let entity = scene.entities[0].id;
+        scene.entity_mut(entity).expect("entity").values = vec![AttachedValue {
+            name: "payload".into(),
+            value: VarValue::List(vec![VarValue::Number(7.0)]),
+        }];
+        let mut h = Harness::new(scene);
+
+        h.app.perform(Action::SetAttachedValueType {
+            entity,
+            value: 0,
+            path: vec![VarPathPart::List(0)],
+            kind: AttachedValueType::String,
+        });
+        assert!(matches!(
+            &h.app.scene.entity(entity).expect("entity").values[0].value,
+            VarValue::List(values) if values == &vec![VarValue::Text(String::new())]
+        ));
+
+        h.app.perform(Action::SetAttachedValueType {
+            entity,
+            value: 0,
+            path: Vec::new(),
+            kind: AttachedValueType::Table,
+        });
+        assert!(matches!(
+            h.app.scene.entity(entity).expect("entity").values[0].value,
+            VarValue::Dictionary(ref entries) if entries.is_empty()
+        ));
+        assert!(h.app.scene_dirty);
     }
 
     #[test]
@@ -12448,6 +13395,118 @@ mod tests {
     }
 
     #[test]
+    fn dropdown_option_editor_adds_edits_reorders_and_deletes_items() {
+        let mut harness = Harness::new(Scene::default());
+        let mut prop = Prop {
+            name: "options".into(),
+            label: "Options".into(),
+            value: PropValue::StringList(Vec::new()),
+            advanced: false,
+            optional: false,
+        };
+        let x = 20.0;
+        let width = 280.0;
+        let start_y = 20.0;
+
+        // Empty state: header (24), gap (3), message (22), then Add Option.
+        let (dirty, _) = harness.prop_row_frame(
+            &mut prop,
+            FrameInput {
+                mouse_x: 100.0,
+                mouse_y: 80.0,
+                mouse_pressed: true,
+                mouse_down: true,
+                ..Default::default()
+            },
+            x,
+            width,
+            start_y,
+        );
+        assert!(dirty);
+        assert!(matches!(
+            &prop.value,
+            PropValue::StringList(values)
+                if values.iter().map(String::as_str).eq([""].into_iter())
+        ));
+
+        // The newly appended field is focused automatically.
+        let (dirty, _) = harness.prop_row_frame(
+            &mut prop,
+            FrameInput {
+                typed: "Play".into(),
+                ..Default::default()
+            },
+            x,
+            width,
+            start_y,
+        );
+        assert!(dirty);
+
+        // With one item, Add Option starts at y=72.
+        harness.prop_row_frame(
+            &mut prop,
+            FrameInput {
+                mouse_x: 100.0,
+                mouse_y: 82.0,
+                mouse_pressed: true,
+                mouse_down: true,
+                ..Default::default()
+            },
+            x,
+            width,
+            start_y,
+        );
+        harness.prop_row_frame(
+            &mut prop,
+            FrameInput {
+                typed: "Quit".into(),
+                ..Default::default()
+            },
+            x,
+            width,
+            start_y,
+        );
+
+        // Move the second item up, then delete the first item.
+        harness.prop_row_frame(
+            &mut prop,
+            FrameInput {
+                mouse_x: 244.0,
+                mouse_y: 82.0,
+                mouse_pressed: true,
+                mouse_down: true,
+                ..Default::default()
+            },
+            x,
+            width,
+            start_y,
+        );
+        assert!(matches!(
+            &prop.value,
+            PropValue::StringList(values)
+                if values.iter().map(String::as_str).eq(["Quit", "Play"].into_iter())
+        ));
+        harness.prop_row_frame(
+            &mut prop,
+            FrameInput {
+                mouse_x: 288.0,
+                mouse_y: 58.0,
+                mouse_pressed: true,
+                mouse_down: true,
+                ..Default::default()
+            },
+            x,
+            width,
+            start_y,
+        );
+        assert!(matches!(
+            &prop.value,
+            PropValue::StringList(values)
+                if values.iter().map(String::as_str).eq(["Play"].into_iter())
+        ));
+    }
+
+    #[test]
     fn inspector_identifiers_are_humanized() {
         assert_eq!(humanize_identifier("per_second"), "Per Second");
         assert_eq!(humanize_identifier("isEnabled"), "Is Enabled");
@@ -12469,6 +13528,16 @@ mod tests {
             .expect("entity")
             .components
             .push(Component::core("SpatialSound2D"));
+        scene.entity_mut(id).expect("entity").values = vec![
+            AttachedValue {
+                name: "gallery".into(),
+                value: VarValue::List(vec![VarValue::Image(String::new())]),
+            },
+            AttachedValue {
+                name: "accent".into(),
+                value: VarValue::Color([0, 0, 0, 255]),
+            },
+        ];
         let mut harness = Harness::new(scene);
         harness.app.assign_asset(
             AssetTarget::Prop {
@@ -12483,6 +13552,33 @@ mod tests {
             unreachable!()
         };
         assert_eq!(props[0].value, PropValue::Sound("assets/effect.wav".into()));
+
+        harness.app.assign_asset(
+            AssetTarget::AttachedValue {
+                entity: id,
+                value: 0,
+                path: vec![VarPathPart::List(0)],
+            },
+            AssetKind::Image,
+            "assets/portrait.png".into(),
+        );
+        assert!(matches!(
+            &harness.app.scene.entity(id).expect("entity").values[0].value,
+            VarValue::List(values)
+                if values == &vec![VarValue::Image("assets/portrait.png".into())]
+        ));
+        harness.app.set_target_color(
+            &ColorTarget::AttachedValue {
+                entity: id,
+                value: 1,
+                path: Vec::new(),
+            },
+            [12, 34, 56, 78],
+        );
+        assert_eq!(
+            harness.app.scene.entity(id).expect("entity").values[1].value,
+            VarValue::Color([12, 34, 56, 78])
+        );
         assert!(harness.app.scene_dirty);
     }
 
@@ -12594,9 +13690,11 @@ mod tests {
                 "Entity",
                 &mut entity_value,
                 &VarControl::Field,
-                owner,
-                0,
-                0,
+                ValueOwner::ScriptVar {
+                    entity: owner,
+                    component: 0,
+                    var: 0,
+                },
                 &mut Vec::new(),
                 x,
                 width,
@@ -12638,9 +13736,11 @@ mod tests {
                 "Component",
                 &mut component_value,
                 &VarControl::Field,
-                owner,
-                0,
-                0,
+                ValueOwner::ScriptVar {
+                    entity: owner,
+                    component: 0,
+                    var: 0,
+                },
                 &mut Vec::new(),
                 x,
                 width,
@@ -12920,6 +14020,49 @@ mod tests {
                 .expect("local position");
         assert!((local_x - 0.0).abs() < 0.001, "local x was {}", local_x);
         assert!((local_y - 0.0).abs() < 0.001, "local y was {}", local_y);
+    }
+
+    #[test]
+    fn editor_world_transform_orbits_children_about_rotated_parent() {
+        // Mirror the runtime's `get_global_transform`: a child's local offset
+        // must be rotated by the parent's world rotation so children orbit the
+        // parent's rotation pivot instead of staying axis-aligned.
+        let mut scene = Scene::default();
+        let parent_id = scene.entities[0].id;
+        {
+            let parent = scene.entity_mut(parent_id).expect("parent");
+            parent.x = 100.0;
+            parent.y = 100.0;
+            parent.size_x = 100.0;
+            parent.size_y = 100.0;
+            parent.rotation_pivot = "center".to_string();
+            parent.rotation = std::f32::consts::FRAC_PI_2;
+        }
+        let child_id = scene.add_entity("Child", 30.0, 0.0).id;
+        {
+            let child = scene.entity_mut(child_id).expect("child");
+            child.parent = Some(parent_id);
+            child.size_x = 20.0;
+            child.size_y = 20.0;
+        }
+
+        let transform =
+            scene_world_transform(&scene, child_id, (1280.0, 720.0)).expect("child transform");
+        // Parent centre is (150,150); child origin (130,100) is (-20,-50) from it,
+        // which rotates by +90deg to (50,-20), giving world (200,130).
+        assert!((transform.x - 200.0).abs() < 0.01, "x was {}", transform.x);
+        assert!((transform.y - 130.0).abs() < 0.01, "y was {}", transform.y);
+
+        let (local_x, local_y) = scene_world_origin_to_local_position(
+            &scene,
+            child_id,
+            transform.x,
+            transform.y,
+            (1280.0, 720.0),
+        )
+        .expect("local round-trip");
+        assert!((local_x - 30.0).abs() < 0.01, "local x was {}", local_x);
+        assert!((local_y - 0.0).abs() < 0.01, "local y was {}", local_y);
     }
 
     #[test]
@@ -13375,7 +14518,7 @@ mod tests {
 
     #[test]
     fn ui_widgets_are_offered_but_legacy_ones_are_not() {
-        for c in ["TextInput", "Panel", "Button", "Slider", "Dropdown"] {
+        for c in ["TextInput", "Panel", "Button", "Slider", "Dropdown", "Camera"] {
             assert!(CORE_COMPONENTS.contains(&c), "{c} not offered");
         }
         // `Frame` is a hidden alias for `Panel`; `ScrollList` is not exposed yet.

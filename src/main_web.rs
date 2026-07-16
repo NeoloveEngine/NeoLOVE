@@ -12,6 +12,7 @@ mod lua_error;
 mod rng;
 mod mobile_emulation;
 mod mobile_module;
+mod media;
 mod platform;
 mod prefabs;
 mod renderer;

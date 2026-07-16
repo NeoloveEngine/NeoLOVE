@@ -43,14 +43,32 @@ install_macos_dependencies() {
     done
 }
 
+libclang_is_available() {
+    if pkg-config --exists libclang 2>/dev/null; then
+        return 0
+    fi
+    if command -v ldconfig >/dev/null 2>&1 &&
+        ldconfig -p 2>/dev/null | grep 'libclang\.so' >/dev/null; then
+        return 0
+    fi
+    [[ -n "$(find /usr/lib /usr/lib64 -maxdepth 4 -name 'libclang.so*' -print -quit 2>/dev/null)" ]]
+}
+
+v4l2_headers_are_available() {
+    printf '#include <linux/videodev2.h>\n' | cc -E -x c - >/dev/null 2>&1
+}
+
 install_linux_dependencies() {
     if command -v git >/dev/null 2>&1 &&
         command -v curl >/dev/null 2>&1 &&
         command -v cc >/dev/null 2>&1 &&
         command -v c++ >/dev/null 2>&1 &&
+        command -v clang >/dev/null 2>&1 &&
         command -v make >/dev/null 2>&1 &&
         command -v pkg-config >/dev/null 2>&1 &&
         pkg-config --exists alsa &&
+        libclang_is_available &&
+        v4l2_headers_are_available &&
         command -v vulkaninfo >/dev/null 2>&1; then
         log "Linux build dependencies already installed"
         return
@@ -59,19 +77,19 @@ install_linux_dependencies() {
     log "Installing Git and native build dependencies"
     if command -v apt-get >/dev/null 2>&1; then
         as_root apt-get update
-        as_root apt-get install -y git curl build-essential pkg-config libasound2-dev vulkan-tools
+        as_root apt-get install -y git curl build-essential clang libclang-dev linux-libc-dev pkg-config libasound2-dev vulkan-tools
     elif command -v dnf >/dev/null 2>&1; then
-        as_root dnf install -y git curl gcc gcc-c++ make pkgconf-pkg-config alsa-lib-devel vulkan-tools
+        as_root dnf install -y git curl gcc gcc-c++ make clang clang-devel kernel-headers pkgconf-pkg-config alsa-lib-devel vulkan-tools
     elif command -v yum >/dev/null 2>&1; then
-        as_root yum install -y git curl gcc gcc-c++ make pkgconfig alsa-lib-devel vulkan-tools
+        as_root yum install -y git curl gcc gcc-c++ make clang clang-devel kernel-headers pkgconfig alsa-lib-devel vulkan-tools
     elif command -v pacman >/dev/null 2>&1; then
-        as_root pacman -Syu --needed --noconfirm git curl base-devel pkgconf alsa-lib vulkan-tools
+        as_root pacman -Syu --needed --noconfirm git curl base-devel clang linux-api-headers pkgconf alsa-lib vulkan-tools
     elif command -v zypper >/dev/null 2>&1; then
-        as_root zypper --non-interactive install git curl gcc gcc-c++ make pkg-config alsa-devel vulkan-tools
+        as_root zypper --non-interactive install git curl gcc gcc-c++ make clang clang-devel linux-glibc-devel pkg-config alsa-devel vulkan-tools
     elif command -v apk >/dev/null 2>&1; then
-        as_root apk add git curl build-base pkgconf alsa-lib-dev vulkan-tools
+        as_root apk add git curl build-base clang clang-dev llvm-dev linux-headers pkgconf alsa-lib-dev vulkan-tools
     else
-        fail "Unsupported Linux package manager. Install Git, curl, a C/C++ toolchain, pkg-config, ALSA development headers, and vulkaninfo, then re-run this script."
+        fail "Unsupported Linux package manager. Install Git, curl, C/C++ and Clang toolchains (including libclang), Linux V4L2 headers, pkg-config, ALSA development headers, and vulkaninfo, then re-run this script."
     fi
 }
 

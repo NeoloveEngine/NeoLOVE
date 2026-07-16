@@ -84,10 +84,14 @@ pub struct EntitySnapshot {
     pub rotation: f32,
     pub scale: f32,
     pub enabled: bool,
+    /// Every public field on the live entity table, excluding hierarchy and
+    /// component containers which have dedicated snapshot representations.
+    #[serde(default)]
+    pub fields: Vec<(String, String)>,
     pub components: Vec<ComponentSnapshot>,
 }
 
-/// One component on a snapshotted entity, with its scalar public fields
+/// One component on a snapshotted entity, with its public fields
 /// pre-stringified for display.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ComponentSnapshot {
@@ -408,6 +412,53 @@ fn describe_component_name(component: &Table, entity: Option<&Table>) -> String 
         (None, Some(entity)) => format!("anonymous component on entity '{entity}'"),
         (None, None) => "anonymous component".to_string(),
     }
+}
+
+/// Best-effort source location (`file:line`) for a component table.
+///
+/// Component tables don't record where they were authored, but any Luau
+/// function they define does. We inspect the component's fields for a function
+/// and read its debug info, preferring `update` itself when present, otherwise
+/// falling back to the first function we find (a sibling callback that lives in
+/// the same source file). Luau debug info only tracks line numbers, not
+/// columns, so no character offset is available.
+fn describe_component_source(component: &Table) -> Option<String> {
+    fn format_info(func: &Function) -> Option<String> {
+        let info = func.info();
+        if info.what != "Lua" {
+            // C functions (engine built-ins) have no useful source location.
+            return None;
+        }
+        let source = info.short_src.or_else(|| {
+            info.source
+                .map(|s| s.trim_start_matches(['@', '=']).to_string())
+        })?;
+        let source = source.trim();
+        if source.is_empty() {
+            return None;
+        }
+        Some(match info.line_defined {
+            Some(line) => format!("{source}:{line}"),
+            None => source.to_string(),
+        })
+    }
+
+    if let Ok(Value::Function(update)) = component.get::<Value>("update") {
+        if let Some(location) = format_info(&update) {
+            return Some(location);
+        }
+    }
+
+    for pair in component.pairs::<Value, Value>() {
+        let Ok((_, Value::Function(func))) = pair else {
+            continue;
+        };
+        if let Some(location) = format_info(&func) {
+            return Some(location);
+        }
+    }
+
+    None
 }
 
 fn component_is_attached_to_entity(entity: &Table, component: &Table) -> bool {
@@ -1125,6 +1176,11 @@ struct RapierBodySync {
     size_x: f32,
     size_y: f32,
     is_static: bool,
+    // Entity pose (local x, y, rotation) that physics last wrote back to the
+    // entity. Compared against the entity's current pose at the start of the
+    // next step so a script that manually assigns `entity.x/y/rotation` on a
+    // dynamic body teleports the physics body instead of being overwritten.
+    last_sync_pose: Cell<Option<(f32, f32, f32)>>,
 }
 
 struct RapierColliderSync {
@@ -1217,11 +1273,94 @@ fn extract_physics_components(
     Ok((rigidbody, collider, ropes, bolts, legacy_bolts))
 }
 
-/// Collect a component's scalar public fields (numbers, booleans, strings) for
-/// the logger's inspector, skipping internal `__` markers and non-scalars.
-fn snapshot_component_fields(component: &Table) -> Vec<(String, String)> {
+fn snapshot_value(
+    lua: &Lua,
+    value: Value,
+    depth: usize,
+    seen: &mut HashSet<usize>,
+) -> Option<String> {
+    match value {
+        Value::Nil => Some("nil".to_string()),
+        Value::Boolean(value) => Some(value.to_string()),
+        Value::Integer(value) => Some(value.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::String(value) => Some(value.to_string_lossy()),
+        Value::Function(_) | Value::Thread(_) => None,
+        Value::Table(table) => {
+            if let (Ok(id), Ok(_)) = (
+                table.raw_get::<usize>("id"),
+                table.raw_get::<Table>("components"),
+            ) {
+                let name = table.raw_get::<String>("name").unwrap_or_default();
+                return Some(if name.is_empty() {
+                    format!("Entity({id})")
+                } else {
+                    format!("Entity(\"{name}\", {id})")
+                });
+            }
+            if let Ok(name) = table.raw_get::<String>("__neolove_component") {
+                return Some(format!("Component(\"{name}\")"));
+            }
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                table.raw_get::<f64>("r"),
+                table.raw_get::<f64>("g"),
+                table.raw_get::<f64>("b"),
+            ) {
+                let a = table.raw_get::<f64>("a").unwrap_or(255.0);
+                return Some(format!("Color4({r}, {g}, {b}, {a})"));
+            }
+            if depth >= 2 {
+                return Some("{...}".to_string());
+            }
+            let pointer = table.to_pointer() as usize;
+            if !seen.insert(pointer) {
+                return Some("<cycle>".to_string());
+            }
+            let mut entries = Vec::new();
+            for pair in table.pairs::<Value, Value>() {
+                let Ok((key, value)) = pair else { continue };
+                let key = match key {
+                    Value::String(key) => {
+                        let key = key.to_string_lossy();
+                        if key.starts_with("__") {
+                            continue;
+                        }
+                        key
+                    }
+                    Value::Integer(key) => key.to_string(),
+                    Value::Number(key) => key.to_string(),
+                    Value::Boolean(key) => key.to_string(),
+                    _ => continue,
+                };
+                if let Some(value) = snapshot_value(lua, value, depth + 1, seen) {
+                    entries.push((key, value));
+                }
+            }
+            seen.remove(&pointer);
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let truncated = entries.len() > 16;
+            entries.truncate(16);
+            let mut rendered = entries
+                .into_iter()
+                .map(|(key, value)| format!("{key} = {value}"))
+                .collect::<Vec<_>>();
+            if truncated {
+                rendered.push("...".to_string());
+            }
+            Some(format!("{{{}}}", rendered.join(", ")))
+        }
+        other => {
+            let tostring = lua.globals().get::<Function>("tostring").ok()?;
+            tostring.call::<String>(other).ok()
+        }
+    }
+}
+
+/// Collect public fields for the logger's inspector, skipping internal markers,
+/// methods and fields represented separately by the snapshot schema.
+fn snapshot_table_fields(lua: &Lua, table: &Table, excluded: &[&str]) -> Vec<(String, String)> {
     let mut fields = Vec::new();
-    for pair in component.pairs::<Value, Value>() {
+    for pair in table.pairs::<Value, Value>() {
         let Ok((key, value)) = pair else {
             continue;
         };
@@ -1229,23 +1368,29 @@ fn snapshot_component_fields(component: &Table) -> Vec<(String, String)> {
             continue;
         };
         let name = name.to_string_lossy();
-        if name.starts_with("__") {
+        if name.starts_with("__") || excluded.contains(&name.as_str()) {
             continue;
         }
-        let rendered = match value {
-            Value::Boolean(b) => b.to_string(),
-            Value::Integer(i) => i.to_string(),
-            Value::Number(n) => n.to_string(),
-            Value::String(s) => s.to_string_lossy(),
-            _ => continue,
+        let Some(rendered) = snapshot_value(lua, value, 0, &mut HashSet::new()) else {
+            continue;
         };
         fields.push((name, rendered));
-        if fields.len() >= 64 {
+        if fields.len() >= 256 {
             break;
         }
     }
     fields.sort_by(|a, b| a.0.cmp(&b.0));
     fields
+}
+
+fn snapshot_component_name(component: &Table) -> String {
+    component
+        .raw_get::<String>("__neolove_component")
+        .ok()
+        .or_else(|| component.raw_get::<String>("name").ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Script Component".to_string())
 }
 
 pub(crate) fn is_physics_component_name(name: &str) -> bool {
@@ -1566,8 +1711,8 @@ impl Runtime {
     }
 
     /// Walk the live entity tree into a serializable snapshot for the editor's
-    /// logger window. Reads each entity's Lua table and its components' scalar
-    /// public fields. Best-effort: anything unreadable is skipped.
+    /// logger window. Reads the authoritative live Lua entity/component tables.
+    /// Best-effort: anything unreadable is skipped.
     pub fn snapshot_entities(&self) -> Vec<EntitySnapshot> {
         let entities = self.entities.borrow();
         let mut out = Vec::with_capacity(entities.len());
@@ -1582,18 +1727,37 @@ impl Runtime {
                     .filter(|v| v.is_finite())
                     .unwrap_or(0.0)
             };
-            let components = entity
-                .components
-                .iter()
-                .map(|component| ComponentSnapshot {
-                    name: component.name.clone(),
-                    fields: snapshot_component_fields(&component.this),
+            let components = table
+                .raw_get::<Table>("components")
+                .ok()
+                .map(|components| {
+                    components
+                        .sequence_values::<Table>()
+                        .filter_map(Result::ok)
+                        .map(|component| ComponentSnapshot {
+                            name: snapshot_component_name(&component),
+                            fields: snapshot_table_fields(&self.lua, &component, &["entity"]),
+                        })
+                        .collect()
                 })
-                .collect();
+                .unwrap_or_default();
+            let parent = table
+                .raw_get::<Table>("parent")
+                .ok()
+                .and_then(|parent| parent.raw_get::<usize>("id").ok());
+            let mut fields = snapshot_table_fields(
+                &self.lua,
+                &table,
+                &["id", "name", "parent", "children", "components"],
+            );
+            if !fields.iter().any(|(name, _)| name == "enabled") {
+                fields.push(("enabled".to_string(), "true".to_string()));
+                fields.sort_by(|a, b| a.0.cmp(&b.0));
+            }
             out.push(EntitySnapshot {
                 id: entity.id,
                 name: table.get::<String>("name").unwrap_or_default(),
-                parent: entity.parent,
+                parent,
                 x: read_f32("x"),
                 y: read_f32("y"),
                 rotation: read_f32("rotation"),
@@ -1603,6 +1767,7 @@ impl Runtime {
                     .filter(|v| v.is_finite())
                     .unwrap_or(1.0),
                 enabled: table.get::<bool>("enabled").unwrap_or(true),
+                fields,
                 components,
             });
         }
@@ -2284,6 +2449,7 @@ impl Runtime {
         crate::fs_module::add_fs_module_with_data_root(&self.lua, env_root.clone(), data_root)?;
         crate::android_module::add_android_module(&self.lua)?;
         crate::mobile_module::add_mobile_module(&self.lua, self.platform.clone())?;
+        crate::media::add_media_module(&self.lua)?;
         crate::http::add_http_module(&self.lua)?;
         crate::servers::add_servers_module(&self.lua, env_root.clone())?;
         crate::commands::add_commands_module(&self.lua, env_root.clone())?;
@@ -2989,6 +3155,24 @@ impl Runtime {
         }
     }
 
+    fn poll_media_callbacks(&self) {
+        let globals = self.lua.globals();
+        let media = match globals.get::<Table>("media") {
+            Ok(table) => table,
+            Err(_) => return,
+        };
+        let poll = match media.get::<Function>("_poll") {
+            Ok(function) => function,
+            Err(_) => return,
+        };
+        if let Err(error) = protect_lua_call("polling media callbacks", || poll.call::<()>(())) {
+            eprintln!(
+                "\x1b[31mLua Error:\x1b[0m Failed to poll media callbacks\n{}",
+                describe_lua_error(&error)
+            );
+        }
+    }
+
     fn poll_server_callbacks(&self) {
         #[cfg(not(target_os = "emscripten"))]
         {
@@ -3015,6 +3199,13 @@ impl Runtime {
             let platform = lock_platform_state(&self.platform);
             (platform.mouse(), platform.input().clone())
         };
+        let camera = self
+            .render_state
+            .lock()
+            .map(|state| state.camera_offset())
+            .unwrap_or_default();
+        let world_mouse_x = mouse.x - camera.x;
+        let world_mouse_y = mouse.y - camera.y;
 
         let mut pointer_events = Vec::<EntityListenEvent>::new();
         if input.mouse_pressed.contains("left") {
@@ -3055,7 +3246,7 @@ impl Runtime {
                     Ok(entity) => entity,
                     Err(_) => continue,
                 };
-                match point_hits_entity(&entity, mouse.x, mouse.y) {
+                match point_hits_entity(&entity, world_mouse_x, world_mouse_y) {
                     Ok(true) => {
                         let z = entity.get::<f64>("z").unwrap_or(0.0);
                         let entity_id = entity.get::<usize>("id").unwrap_or(0);
@@ -3143,8 +3334,8 @@ impl Runtime {
                         };
                         let (local_x, local_y) = match entity_local_point(
                             &entity,
-                            mouse.x,
-                            mouse.y,
+                            world_mouse_x,
+                            world_mouse_y,
                         ) {
                             Ok(point) => point,
                             Err(error) => {
@@ -3282,6 +3473,7 @@ impl Runtime {
                 size_x: entity_w,
                 size_y: entity_h,
                 is_static,
+                last_sync_pose: Cell::new(None),
             });
 
             if let Some(collider_component) = collider {
@@ -3600,6 +3792,25 @@ impl Runtime {
                     physics_body_pose_from_entity(&sync.entity, sync.size_x, sync.size_y)?;
                 body.set_translation(vector![body_x, body_y], true);
                 body.set_rotation(nalgebra::UnitComplex::new(entity_rotation), true);
+            } else if let Some((last_x, last_y, last_rotation)) = sync.last_sync_pose.get() {
+                // Dynamic body: if a script assigned the entity's position or
+                // rotation since the last step, teleport the physics body to
+                // match. Otherwise the simulation would keep integrating from
+                // its own internal pose and overwrite the script's value on
+                // write-back. Velocities are still applied below.
+                const POSE_EPSILON: f32 = 1e-4;
+                let entity_x = sync.entity.get::<f32>("x").unwrap_or(last_x);
+                let entity_y = sync.entity.get::<f32>("y").unwrap_or(last_y);
+                let entity_rotation = sync.entity.get::<f32>("rotation").unwrap_or(last_rotation);
+                if (entity_x - last_x).abs() > POSE_EPSILON
+                    || (entity_y - last_y).abs() > POSE_EPSILON
+                    || (entity_rotation - last_rotation).abs() > POSE_EPSILON
+                {
+                    let (body_x, body_y, global_rotation, _, _) =
+                        physics_body_pose_from_entity(&sync.entity, sync.size_x, sync.size_y)?;
+                    body.set_translation(vector![body_x, body_y], true);
+                    body.set_rotation(nalgebra::UnitComplex::new(global_rotation), true);
+                }
             }
 
             if let Some(rb) = sync.rigidbody.as_ref() {
@@ -4238,6 +4449,9 @@ impl Runtime {
             sync.entity.set("x", x)?;
             sync.entity.set("y", y)?;
             sync.entity.set("rotation", rotation)?;
+            // Remember the pose we just wrote so next step can detect a
+            // script-driven position/rotation change and teleport the body.
+            sync.last_sync_pose.set(Some((x, y, rotation)));
         }
 
         for rope in rope_sync {
@@ -4346,6 +4560,9 @@ impl Runtime {
                 "runtime.update {trace}: after poll_http_callbacks"
             ));
         }
+
+        panic_stage.set("poll_media_callbacks");
+        self.poll_media_callbacks();
 
         panic_stage.set("poll_server_callbacks");
         if let Some(trace) = web_trace {
@@ -4611,10 +4828,32 @@ impl Runtime {
                     }
                 };
                 let component_name = describe_component_name(&component, Some(&ent));
-                let update: Function = match component.get("update") {
-                    Ok(u) => u,
+                let update: Function = match component.get::<Value>("update") {
+                    Ok(Value::Function(update)) => update,
+                    Ok(other) => {
+                        let location = describe_component_source(&component)
+                            .map(|loc| format!(" (defined in {loc})"))
+                            .unwrap_or_default();
+                        if other.is_nil() {
+                            eprintln!(
+                                "\x1b[31mLua Error:\x1b[0m {component_name} is missing an 'update' function{location}"
+                            );
+                        } else {
+                            eprintln!(
+                                "\x1b[31mLua Error:\x1b[0m {component_name} has an 'update' field that is a {}, not a function{location}",
+                                other.type_name()
+                            );
+                        }
+                        continue;
+                    }
                     Err(e) => {
-                        eprintln!("\x1b[31mLua Error:\x1b[0m Component missing update: {}", e);
+                        let location = describe_component_source(&component)
+                            .map(|loc| format!(" (defined in {loc})"))
+                            .unwrap_or_default();
+                        eprintln!(
+                            "\x1b[31mLua Error:\x1b[0m Failed to read 'update' on {component_name}{location}: {}",
+                            e
+                        );
                         continue;
                     }
                 };
@@ -4672,6 +4911,41 @@ impl Runtime {
                 "runtime.update {trace}: after simulate_rapier_physics"
             ));
         }
+
+        // Resolve cameras after physics has written final entity transforms but
+        // before any drawable component performs culling, input hit-testing, or
+        // queues commands. Commands themselves remain in world space until the
+        // renderer drains the frame, so one camera offset applies atomically.
+        let (camera_components, rendering_components): (Vec<_>, Vec<_>) = rendering_components
+            .into_iter()
+            .partition(|(_, _, _, component, _)| {
+                component.get::<bool>("NEOLOVE_CAMERA").unwrap_or(false)
+            });
+        {
+            let mut state = self
+                .render_state
+                .lock()
+                .map_err(|_| "render state lock poisoned while beginning camera frame")?;
+            state.begin_camera_frame();
+        }
+        panic_stage.set("camera pre-pass");
+        for (_entity_id, _component_index, ent, component, update) in camera_components {
+            let component_name = describe_component_name(&component, Some(&ent));
+            protect_lua_call(
+                &format!("running camera component update callback ({component_name})"),
+                || update.call::<()>((ent.clone(), component, dt)),
+            )
+            .map_err(|error| {
+                format!(
+                    "camera component update failed:\n{}",
+                    describe_lua_error(&error)
+                )
+            })?;
+        }
+        self.render_state
+            .lock()
+            .map_err(|_| "render state lock poisoned while finishing camera frame")?
+            .finish_camera_frame();
 
         panic_stage.set("rendering pass");
         if let Some(trace) = web_trace {
@@ -4767,6 +5041,111 @@ mod tests {
             look_at_rotation(10.0, 20.0, 10.0, 10.0),
             -std::f32::consts::FRAC_PI_2,
         );
+    }
+
+    #[test]
+    fn camera_component_centers_scene_switches_and_falls_back_to_origin() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("camera_component")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                cameraEntity = ecs.newEntity("Camera A", nil, 100, 50)
+                cameraA = cameraEntity:AddComponent(core.Camera)
+
+                target = ecs.newEntity("Target", nil, 100, 50)
+                target.size_x = 20
+                target.size_y = 10
+                target:AddComponent(core.Rect2D)
+                "#,
+            )
+            .exec()?;
+
+        let rendered_rect_position = |runtime: &Runtime| -> mlua::Result<(f32, f32)> {
+            let commands = crate::renderer::drain_commands(&runtime.render_state())
+                .map_err(mlua::Error::external)?;
+            commands
+                .into_iter()
+                .find_map(|command| match command {
+                    crate::renderer::DrawCommand::Rect { x, y, .. } => Some((x, y)),
+                    _ => None,
+                })
+                .ok_or_else(|| mlua::Error::external("camera test rect was not rendered"))
+        };
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        let (x, y) = rendered_rect_position(&runtime)?;
+        assert_close(x, 320.0);
+        assert_close(y, 240.0);
+
+        runtime
+            .lua
+            .load(
+                r#"
+                cameraEntityB = ecs.newEntity("Camera B", nil, 0, 0)
+                cameraB = cameraEntityB:AddComponent(core.Camera)
+                assert(cameraB:SetActive() == true)
+                assert(cameraB:IsActive() == true)
+                "#,
+            )
+            .exec()?;
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        let (x, y) = rendered_rect_position(&runtime)?;
+        assert_close(x, 420.0);
+        assert_close(y, 290.0);
+
+        runtime
+            .lua
+            .load("cameraA.enabled = false; cameraB.enabled = false")
+            .exec()?;
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        let (x, y) = rendered_rect_position(&runtime)?;
+        assert_close(x, 100.0);
+        assert_close(y, 50.0);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rect2d_middle_rotation_pivot_keeps_rect_centered_on_pivot() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("rect2d_middle_pivot")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                entity = ecs.newEntity("Rect", nil, 100, 50)
+                entity.size_x = 20
+                entity.size_y = 10
+                entity.rotation_pivot = "middle"
+                entity:AddComponent(core.Rect2D)
+                "#,
+            )
+            .exec()?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        let command = crate::renderer::drain_commands(&runtime.render_state())
+            .map_err(mlua::Error::external)?
+            .into_iter()
+            .find_map(|command| match command {
+                crate::renderer::DrawCommand::Rect {
+                    x, y, w, h, offset, ..
+                } => Some((x, y, w, h, offset)),
+                _ => None,
+            })
+            .ok_or_else(|| mlua::Error::external("rect was not rendered"))?;
+
+        let (x, y, w, h, offset) = command;
+        // The unrotated top-left corner must stay at the entity origin so the
+        // rect is not shifted by half its size, and the pivot fraction must land
+        // exactly on the entity center.
+        assert_close(x, 100.0);
+        assert_close(y, 50.0);
+        assert_close(x + w * offset.x, 110.0);
+        assert_close(y + h * offset.y, 55.0);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
     }
 
     #[test]
@@ -4894,15 +5273,24 @@ mod tests {
                 .platform
                 .lock()
                 .expect("platform mutex should not be poisoned during test");
-            platform.input_mut().mouse_pressed.insert("left".to_string());
+            platform
+                .input_mut()
+                .mouse_pressed
+                .insert("left".to_string());
             platform.input_mut().mouse_down.insert("left".to_string());
         }
         runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
         let slider: Table = runtime.lua.globals().get("testSlider")?;
         let value = slider.get::<f32>("value")?;
-        assert!(value > 80.0, "slider value should track the pointer, was {value}");
+        assert!(
+            value > 80.0,
+            "slider value should track the pointer, was {value}"
+        );
         let changed: Option<f32> = runtime.lua.globals().get("ChangedValue")?;
-        assert!(changed.is_some(), "onChanged should fire when the value moves");
+        assert!(
+            changed.is_some(),
+            "onChanged should fire when the value moves"
+        );
         std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())
     }
@@ -5561,6 +5949,62 @@ mod tests {
     }
 
     #[test]
+    fn logger_snapshot_includes_live_hierarchy_components_and_public_properties() -> mlua::Result<()>
+    {
+        let (runtime, root) = start_test_runtime("logger_snapshot")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                local group = ecs.newEntity("Group", ecs.root, 4, 5)
+                local child = ecs.newEntity("Inspectable", group, 10, 20)
+                child.custom = { label = "ready", count = 3 }
+                local Probe = {
+                    __neolove_component = "RuntimeProbe",
+                    enabled = true,
+                    tint = Color4(10, 20, 30, 40),
+                    settings = { speed = 12, mode = "fast" },
+                }
+                function Probe.update(_entity, _self, _dt) end
+                child:AddComponent(Probe)
+                "#,
+            )
+            .exec()?;
+
+        let snapshots = runtime.snapshot_entities();
+        let group = snapshots
+            .iter()
+            .find(|entity| entity.name == "Group")
+            .expect("group snapshot");
+        let child = snapshots
+            .iter()
+            .find(|entity| entity.name == "Inspectable")
+            .expect("child snapshot");
+        assert_eq!(child.parent, Some(group.id));
+        assert!(child.fields.iter().any(|(name, _)| name == "size_x"));
+        assert!(child.fields.iter().any(|(name, value)| {
+            name == "custom" && value.contains("label = ready") && value.contains("count = 3")
+        }));
+
+        let component = child
+            .components
+            .first()
+            .expect("runtime component snapshot");
+        assert_eq!(component.name, "RuntimeProbe");
+        assert!(component.fields.iter().any(|(name, value)| {
+            name == "tint" && value == "Color4(10, 20, 30, 40)"
+        }));
+        assert!(component.fields.iter().any(|(name, value)| {
+            name == "settings" && value.contains("mode = fast") && value.contains("speed = 12")
+        }));
+        assert!(!component.fields.iter().any(|(name, _)| name == "entity"));
+        assert!(!component.fields.iter().any(|(name, _)| name == "update"));
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
     fn particle_system_emits_bounded_drawable_particles_and_controls_playback() -> mlua::Result<()>
     {
         let (mut runtime, root) = start_test_runtime("particle_system")?;
@@ -5702,6 +6146,87 @@ mod tests {
         let root_entity: Table = ecs.get("root")?;
         let children: Table = root_entity.get("children")?;
         assert_eq!(children.raw_len(), 2);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn script_set_position_and_rotation_move_dynamic_rigidbody() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("rigidbody_script_teleport")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                body = ecs.newEntity("body", ecs.root, 100, 100)
+                body.size_x = 20
+                body.size_y = 20
+                local rb = body:AddComponent(core.Rigidbody2D)
+                rb.gravity_scale = 0
+                "#,
+            )
+            .set_name("@rigidbody_script_teleport.luau")
+            .exec()?;
+
+        // First frame builds the physics world and records the body's pose.
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+
+        let body: Table = runtime.lua.globals().get("body")?;
+        // With no gravity and no velocity the body stays put after one step.
+        assert_close(body.get::<f32>("x")?, 100.0);
+        assert_close(body.get::<f32>("y")?, 100.0);
+        assert_close(body.get::<f32>("rotation")?, 0.0);
+
+        // A script assigns a new position and rotation directly on the entity.
+        runtime
+            .lua
+            .load(
+                r#"
+                body.x = 250
+                body.y = 175
+                body.rotation = 1.2
+                "#,
+            )
+            .exec()?;
+
+        // Next frame must teleport the dynamic body instead of overwriting the
+        // script's values with the simulation's own (unchanged) pose.
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+
+        assert_close(body.get::<f32>("x")?, 250.0);
+        assert_close(body.get::<f32>("y")?, 175.0);
+        assert_close(body.get::<f32>("rotation")?, 1.2);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn script_set_velocity_still_integrates_dynamic_rigidbody() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("rigidbody_script_velocity")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                body = ecs.newEntity("body", ecs.root, 100, 100)
+                body.size_x = 20
+                body.size_y = 20
+                local rb = body:AddComponent(core.Rigidbody2D)
+                rb.gravity_scale = 0
+                rb.velocity_x = 600
+                "#,
+            )
+            .set_name("@rigidbody_script_velocity.luau")
+            .exec()?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+
+        // Setting velocity still moves the body (the teleport detection must not
+        // clobber velocity-driven motion): +600px/s over 1/60s ≈ +10px.
+        let body: Table = runtime.lua.globals().get("body")?;
+        let x = body.get::<f32>("x")?;
+        assert!(x > 105.0, "expected velocity to advance x past 105, got {x}");
+        assert_close(body.get::<f32>("y")?, 100.0);
 
         std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())
@@ -5962,11 +6487,8 @@ mod tests {
         };
         std::fs::write(root.join("assets/sprite.png"), png).map_err(mlua::Error::external)?;
 
-        std::fs::write(
-            root.join("main.luau"),
-            r#"ecs.loadScene("level.neoscene")"#,
-        )
-        .map_err(mlua::Error::external)?;
+        std::fs::write(root.join("main.luau"), r#"ecs.loadScene("level.neoscene")"#)
+            .map_err(mlua::Error::external)?;
 
         let mut scene = Scene::default();
         let sprite_id = scene.entities[0].id;
@@ -6014,8 +6536,11 @@ mod tests {
 
         let mut scene = Scene::default();
         scene.entities[0].name = "LegacyJsonScene".into();
-        std::fs::write(root.join("scene.neoscene"), scene.to_json().map_err(mlua::Error::external)?)
-            .map_err(mlua::Error::external)?;
+        std::fs::write(
+            root.join("scene.neoscene"),
+            scene.to_json().map_err(mlua::Error::external)?,
+        )
+        .map_err(mlua::Error::external)?;
 
         let mut runtime = Runtime::new(root.clone());
         runtime.start()?;
@@ -6069,7 +6594,10 @@ mod tests {
         let loaded: Table = root_entity.get::<Table>("children")?.get(1)?;
         let component: Table = loaded.get::<Table>("components")?.get(1)?;
         assert_eq!(loaded.get::<String>("name")?, "ScriptedSceneEntity");
-        assert_eq!(component.get::<String>("__neolove_component")?, "SceneMarker");
+        assert_eq!(
+            component.get::<String>("__neolove_component")?,
+            "SceneMarker"
+        );
 
         std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())
@@ -6077,7 +6605,10 @@ mod tests {
 
     #[test]
     fn runtime_loads_and_instantiates_editor_neoprefab_files() -> mlua::Result<()> {
-        use crate::scene::{Component, Scene};
+        use crate::scene::{
+            AttachedValue, Component, ComponentReference, DictionaryEntry, Scene, VarKey,
+            VarValue,
+        };
 
         let (runtime, root) = start_test_runtime("load_neoprefab")?;
         let mut prefab_scene = Scene::default();
@@ -6089,6 +6620,12 @@ mod tests {
             entity.y = 18.0;
             entity.size_x = 96.0;
             entity.size_y = 48.0;
+            entity.position_pivot = "center".into();
+            entity.pivot_x = Some(0.25);
+            entity.pivot_y = Some(0.75);
+            entity.rotation_pivot = "middle".into();
+            entity.rotation_pivot_x = Some(0.6);
+            entity.rotation_pivot_y = Some(0.4);
             entity.components.push(Component::core("Rect2D"));
         }
         let child_id = prefab_scene.add_entity("LoadedChild", 7.0, 9.0).id;
@@ -6096,6 +6633,34 @@ mod tests {
             .entity_mut(child_id)
             .expect("prefab child")
             .parent = Some(root_id);
+        prefab_scene.entity_mut(root_id).expect("prefab root").values = vec![
+            AttachedValue {
+                name: "score".into(),
+                value: VarValue::Number(42.0),
+            },
+            AttachedValue {
+                name: "title".into(),
+                value: VarValue::Text("Boss".into()),
+            },
+            AttachedValue {
+                name: "childRef".into(),
+                value: VarValue::Entity(Some(child_id)),
+            },
+            AttachedValue {
+                name: "renderer".into(),
+                value: VarValue::Component(Some(ComponentReference {
+                    entity: root_id,
+                    component: 0,
+                })),
+            },
+            AttachedValue {
+                name: "settings".into(),
+                value: VarValue::Dictionary(vec![DictionaryEntry {
+                    key: VarKey::Text("aggressive".into()),
+                    value: VarValue::Bool(true),
+                }]),
+            },
+        ];
         let json = serde_json::to_string_pretty(&prefab_scene.subtree(root_id))
             .map_err(mlua::Error::external)?;
         std::fs::write(root.join("enemy.neoprefab"), json).map_err(mlua::Error::external)?;
@@ -6104,6 +6669,14 @@ mod tests {
         let load: Function = prefabs.get("load")?;
         let template: Table = load.call("enemy.neoprefab")?;
         assert_eq!(template.get::<String>("name")?, "LoadedRoot");
+        assert_eq!(template.get::<f64>("score")?, 42.0);
+        assert_eq!(template.get::<String>("title")?, "Boss");
+        assert_eq!(template.get::<String>("position_pivot")?, "center");
+        assert_eq!(template.get::<f32>("pivot_x")?, 0.25);
+        assert_eq!(template.get::<f32>("pivot_y")?, 0.75);
+        assert_eq!(template.get::<String>("rotation_pivot")?, "middle");
+        assert_eq!(template.get::<f32>("rotation_pivot_x")?, 0.6);
+        assert_eq!(template.get::<f32>("rotation_pivot_y")?, 0.4);
 
         let instantiate: Function = prefabs.get("instantiate")?;
         let ecs: Table = runtime.lua.globals().get("ecs")?;
@@ -6111,13 +6684,23 @@ mod tests {
         assert_eq!(instance.get::<String>("name")?, "LoadedRoot");
         assert_eq!(instance.get::<f32>("x")?, 12.0);
         assert_eq!(instance.get::<f32>("size_x")?, 96.0);
+        assert_eq!(instance.get::<String>("position_pivot")?, "center");
+        assert_eq!(instance.get::<f32>("pivot_x")?, 0.25);
+        assert_eq!(instance.get::<f32>("pivot_y")?, 0.75);
+        assert_eq!(instance.get::<String>("rotation_pivot")?, "middle");
+        assert_eq!(instance.get::<f32>("rotation_pivot_x")?, 0.6);
+        assert_eq!(instance.get::<f32>("rotation_pivot_y")?, 0.4);
         let children: Table = instance.get("children")?;
-        assert_eq!(
-            children.get::<Table>(1)?.get::<String>("name")?,
-            "LoadedChild"
-        );
+        let child: Table = children.get(1)?;
+        assert_eq!(child.get::<String>("name")?, "LoadedChild");
         let components: Table = instance.get("components")?;
         assert_eq!(components.len()?, 1);
+        let child_ref: Table = instance.get("childRef")?;
+        assert_eq!(child_ref.to_pointer(), child.to_pointer());
+        let renderer: Table = instance.get("renderer")?;
+        assert_eq!(renderer.to_pointer(), components.get::<Table>(1)?.to_pointer());
+        let settings: Table = instance.get("settings")?;
+        assert!(settings.get::<bool>("aggressive")?);
 
         std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())
@@ -6562,21 +7145,26 @@ mod tests {
 
         let ecs: Table = runtime.lua.globals().get("ecs")?;
         let new_entity: Function = ecs.get("newEntity")?;
-        let entity: Table =
-            new_entity.call(("rotated button".to_string(), None::<Table>, Some(200.0), Some(100.0)))?;
+        let entity: Table = new_entity.call((
+            "rotated button".to_string(),
+            None::<Table>,
+            Some(200.0),
+            Some(100.0),
+        ))?;
         entity.set("size_x", 120.0)?;
         entity.set("size_y", 80.0)?;
         entity.set("rotation", std::f32::consts::FRAC_PI_2)?;
 
         let received_local = Rc::new(RefCell::new(None::<(f32, f32)>));
         let received_local_writer = received_local.clone();
-        let callback = runtime.lua.create_function(
-            move |_lua, (_entity, event): (Table, Table)| {
-                *received_local_writer.borrow_mut() =
-                    Some((event.get::<f32>("localX")?, event.get::<f32>("localY")?));
-                Ok(())
-            },
-        )?;
+        let callback =
+            runtime
+                .lua
+                .create_function(move |_lua, (_entity, event): (Table, Table)| {
+                    *received_local_writer.borrow_mut() =
+                        Some((event.get::<f32>("localX")?, event.get::<f32>("localY")?));
+                    Ok(())
+                })?;
         let listen: Function = entity.get("listen")?;
         let _connection: Table =
             listen.call((entity.clone(), "leftClick".to_string(), callback))?;

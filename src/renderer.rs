@@ -176,6 +176,13 @@ pub(crate) struct RenderState {
     // lit image (it re-renders from `last_frame_commands`).
     last_frame_lights: Vec<crate::lighting::Light>,
     last_frame_occluders: Vec<crate::lighting::Occluder>,
+    // Camera selection persists across frames, while the offset is resolved
+    // afresh by the camera pre-pass. Scene commands stay in world space until
+    // they are drained; editor/debug overlays are intentionally screen-space.
+    active_camera: Option<usize>,
+    camera_seen_this_frame: bool,
+    fallback_camera: Option<(usize, Vec2)>,
+    camera_offset: Vec2,
 }
 
 pub(crate) type SharedRenderState = Arc<Mutex<RenderState>>;
@@ -253,7 +260,16 @@ impl RenderState {
 
     fn drain_without_remembering(&mut self) -> Vec<DrawCommand> {
         let mut out = Vec::with_capacity(self.commands.len() + self.overlay_commands.len());
-        out.append(&mut self.commands);
+        let commands = std::mem::take(&mut self.commands);
+        if self.camera_offset.x == 0.0 && self.camera_offset.y == 0.0 {
+            out.extend(commands);
+        } else {
+            out.extend(translate_commands(
+                commands,
+                self.camera_offset.x,
+                self.camera_offset.y,
+            ));
+        }
         out.append(&mut self.overlay_commands);
         out
     }
@@ -268,6 +284,71 @@ impl RenderState {
 
     pub(crate) fn queue_occluder(&mut self, occluder: crate::lighting::Occluder) {
         self.occluders.push(occluder);
+    }
+
+    /// Start resolving the camera for a new rendered frame. The last resolved
+    /// offset remains available until this point so input dispatched earlier in
+    /// the frame still matches the image the player can currently see.
+    pub(crate) fn begin_camera_frame(&mut self) {
+        self.camera_seen_this_frame = false;
+        self.fallback_camera = None;
+        self.camera_offset = Vec2::default();
+    }
+
+    /// Offer an enabled Camera component to the camera pre-pass. The explicitly
+    /// active camera wins; the first available camera is retained as a safe
+    /// fallback when a scene unload removed the previously active component.
+    pub(crate) fn submit_camera(&mut self, id: usize, offset: Vec2) {
+        if self.fallback_camera.is_none() {
+            self.fallback_camera = Some((id, offset));
+        }
+        if self.active_camera == Some(id) {
+            self.camera_offset = offset;
+            self.camera_seen_this_frame = true;
+        }
+    }
+
+    /// Make a camera active immediately. This also resolves its transform for
+    /// the current frame, which makes SetActive reliable from any update order.
+    pub(crate) fn activate_camera(&mut self, id: usize, offset: Vec2) {
+        self.active_camera = Some(id);
+        self.camera_offset = offset;
+        self.camera_seen_this_frame = true;
+    }
+
+    pub(crate) fn clear_camera(&mut self, id: usize) {
+        if self.active_camera == Some(id) {
+            self.active_camera = None;
+            self.camera_offset = Vec2::default();
+            self.camera_seen_this_frame = false;
+        }
+        if self.fallback_camera.is_some_and(|(candidate, _)| candidate == id) {
+            self.fallback_camera = None;
+        }
+    }
+
+    pub(crate) fn is_camera_active(&self, id: usize) -> bool {
+        self.active_camera == Some(id)
+    }
+
+    /// Complete camera selection. With no enabled Camera component, the offset
+    /// is exactly (0, 0), preserving NeoLOVE's original screen-space rendering.
+    pub(crate) fn finish_camera_frame(&mut self) {
+        if self.camera_seen_this_frame {
+            return;
+        }
+        if let Some((id, offset)) = self.fallback_camera {
+            self.active_camera = Some(id);
+            self.camera_offset = offset;
+            self.camera_seen_this_frame = true;
+        } else {
+            self.active_camera = None;
+            self.camera_offset = Vec2::default();
+        }
+    }
+
+    pub(crate) fn camera_offset(&self) -> Vec2 {
+        self.camera_offset
     }
 
     pub(crate) fn lighting_config(&self) -> crate::lighting::LightConfig {
@@ -294,8 +375,18 @@ impl RenderState {
         Vec<crate::lighting::Light>,
         Vec<crate::lighting::Occluder>,
     ) {
-        let lights = std::mem::take(&mut self.lights);
-        let occluders = std::mem::take(&mut self.occluders);
+        let mut lights = std::mem::take(&mut self.lights);
+        let mut occluders = std::mem::take(&mut self.occluders);
+        if self.camera_offset.x != 0.0 || self.camera_offset.y != 0.0 {
+            for light in &mut lights {
+                light.x += self.camera_offset.x;
+                light.y += self.camera_offset.y;
+            }
+            for occluder in &mut occluders {
+                occluder.cx += self.camera_offset.x;
+                occluder.cy += self.camera_offset.y;
+            }
+        }
         self.last_frame_lights = lights.clone();
         self.last_frame_occluders = occluders.clone();
         (self.lighting, lights, occluders)
@@ -1682,6 +1773,7 @@ pub(crate) struct SoftwareRenderer {
     height: u32,
     pixels: Vec<u8>,
     antialiasing: Antialiasing,
+    light_cache: crate::lighting::LightMapCache,
 }
 
 impl SoftwareRenderer {
@@ -1691,6 +1783,7 @@ impl SoftwareRenderer {
             height: height.max(1),
             pixels: vec![0; width.max(1) as usize * height.max(1) as usize * 4],
             antialiasing: Antialiasing::High,
+            light_cache: crate::lighting::LightMapCache::default(),
         }
     }
 
@@ -1699,6 +1792,7 @@ impl SoftwareRenderer {
         self.height = height.max(1);
         self.pixels
             .resize(self.width as usize * self.height as usize * 4, 0);
+        self.light_cache = crate::lighting::LightMapCache::default();
     }
 
     pub(crate) fn pixels(&self) -> &[u8] {
@@ -1739,13 +1833,14 @@ impl SoftwareRenderer {
         lights: &[crate::lighting::Light],
         occluders: &[crate::lighting::Occluder],
     ) {
-        crate::lighting::apply_lighting(
+        crate::lighting::apply_lighting_cached(
             &mut self.pixels,
             self.width,
             self.height,
             config,
             lights,
             occluders,
+            &mut self.light_cache,
         );
     }
 
@@ -2323,6 +2418,79 @@ fn modulate(sample: Color, tint: Color) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_rect(x: f32, y: f32) -> DrawCommand {
+        DrawCommand::Rect {
+            x,
+            y,
+            w: 10.0,
+            h: 10.0,
+            rotation: 0.0,
+            offset: Vec2::default(),
+            color: Color::WHITE,
+            shader: None,
+        }
+    }
+
+    #[test]
+    fn camera_translates_scene_commands_but_not_overlays_and_falls_back_to_origin() {
+        let mut state = RenderState::default();
+        state.begin_camera_frame();
+        state.submit_camera(41, Vec2 { x: 100.0, y: -25.0 });
+        state.finish_camera_frame();
+        assert!(state.is_camera_active(41));
+        state.queue(test_rect(5.0, 9.0));
+        state.extend_overlay(vec![test_rect(7.0, 11.0)]);
+
+        let commands = state.drain_without_remembering();
+        let DrawCommand::Rect { x, y, .. } = commands[0] else {
+            panic!("scene rect missing");
+        };
+        assert_eq!((x, y), (105.0, -16.0));
+        let DrawCommand::Rect { x, y, .. } = commands[1] else {
+            panic!("overlay rect missing");
+        };
+        assert_eq!((x, y), (7.0, 11.0));
+
+        state.queue_light(crate::lighting::Light {
+            x: 5.0,
+            y: 9.0,
+            ..crate::lighting::Light::default()
+        });
+        state.queue_occluder(crate::lighting::Occluder {
+            cx: 7.0,
+            cy: 11.0,
+            half_w: 2.0,
+            half_h: 3.0,
+            rotation: 0.0,
+            shape: crate::lighting::OccluderShape::Box,
+        });
+        let (_, lights, occluders) = state.take_lighting();
+        assert_eq!((lights[0].x, lights[0].y), (105.0, -16.0));
+        assert_eq!((occluders[0].cx, occluders[0].cy), (107.0, -14.0));
+
+        state.begin_camera_frame();
+        state.finish_camera_frame();
+        state.queue(test_rect(5.0, 9.0));
+        let commands = state.drain_without_remembering();
+        let DrawCommand::Rect { x, y, .. } = commands[0] else {
+            panic!("fallback rect missing");
+        };
+        assert_eq!((x, y), (5.0, 9.0));
+    }
+
+    #[test]
+    fn explicitly_activated_camera_wins_over_automatic_fallback() {
+        let mut state = RenderState::default();
+        state.activate_camera(2, Vec2 { x: 1.0, y: 2.0 });
+        state.begin_camera_frame();
+        state.submit_camera(1, Vec2 { x: 10.0, y: 20.0 });
+        state.submit_camera(2, Vec2 { x: 30.0, y: 40.0 });
+        state.finish_camera_frame();
+        assert!(state.is_camera_active(2));
+        assert_eq!(state.camera_offset().x, 30.0);
+        assert_eq!(state.camera_offset().y, 40.0);
+    }
 
     #[test]
     fn content_sized_text_is_not_culled_before_layout() {

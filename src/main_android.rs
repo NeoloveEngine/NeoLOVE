@@ -25,6 +25,8 @@ mod mobile_emulation;
 #[cfg(target_os = "android")]
 mod mobile_module;
 #[cfg(target_os = "android")]
+mod media;
+#[cfg(target_os = "android")]
 mod platform;
 #[cfg(target_os = "android")]
 mod prefabs;

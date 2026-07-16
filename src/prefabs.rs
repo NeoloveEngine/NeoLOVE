@@ -802,6 +802,46 @@ fn editor_variable_to_lua(
                 channel(3)?,
             )?))
         }
+        "Image" => {
+            let asset_path = payload
+                .as_str()
+                .ok_or_else(|| prefab_json_error(path, "invalid image variable"))?;
+            if asset_path.is_empty() {
+                return Ok(Value::Nil);
+            }
+            let assets: Table = lua.globals().get("assets")?;
+            assets.get::<Function>("loadImage")?.call(asset_path)
+        }
+        "Audio" => {
+            let asset_path = payload
+                .as_str()
+                .ok_or_else(|| prefab_json_error(path, "invalid sound variable"))?;
+            if asset_path.is_empty() {
+                return Ok(Value::Nil);
+            }
+            let assets: Table = lua.globals().get("assets")?;
+            assets.get::<Function>("loadSound")?.call(asset_path)
+        }
+        "Shader" => {
+            let asset_path = payload
+                .as_str()
+                .ok_or_else(|| prefab_json_error(path, "invalid shader variable"))?;
+            if asset_path.is_empty() {
+                return Ok(Value::Nil);
+            }
+            let shaders: Table = lua.globals().get("shaders")?;
+            shaders.get::<Function>("loadFragment")?.call(asset_path)
+        }
+        "Animation" => {
+            let asset_path = payload
+                .as_str()
+                .ok_or_else(|| prefab_json_error(path, "invalid animation variable"))?;
+            if asset_path.is_empty() {
+                return Ok(Value::Nil);
+            }
+            let animation: Table = lua.globals().get("animation")?;
+            animation.get::<Function>("load")?.call(asset_path)
+        }
         "Entity" => Ok(payload
             .as_u64()
             .and_then(|id| entities.get(&id).cloned())
@@ -973,6 +1013,48 @@ fn load_neoprefab(
         template.set("scale", json_number(source, "scale", 1.0))?;
         template.set("anchor_x", json_number(source, "anchor_x", 0.0))?;
         template.set("anchor_y", json_number(source, "anchor_y", 0.0))?;
+        if let Some(position_pivot) = source
+            .get("position_pivot")
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            template.set("position_pivot", position_pivot)?;
+        }
+        if let Some(pivot_x) = source
+            .get("pivot_x")
+            .and_then(JsonValue::as_f64)
+            .filter(|value| value.is_finite())
+        {
+            template.set("pivot_x", pivot_x)?;
+        }
+        if let Some(pivot_y) = source
+            .get("pivot_y")
+            .and_then(JsonValue::as_f64)
+            .filter(|value| value.is_finite())
+        {
+            template.set("pivot_y", pivot_y)?;
+        }
+        if let Some(rotation_pivot) = source
+            .get("rotation_pivot")
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            template.set("rotation_pivot", rotation_pivot)?;
+        }
+        if let Some(pivot_x) = source
+            .get("rotation_pivot_x")
+            .and_then(JsonValue::as_f64)
+            .filter(|value| value.is_finite())
+        {
+            template.set("rotation_pivot_x", pivot_x)?;
+        }
+        if let Some(pivot_y) = source
+            .get("rotation_pivot_y")
+            .and_then(JsonValue::as_f64)
+            .filter(|value| value.is_finite())
+        {
+            template.set("rotation_pivot_y", pivot_y)?;
+        }
         template.set(
             "enabled",
             source.get("enabled").and_then(JsonValue::as_bool).unwrap_or(true),
@@ -1007,6 +1089,30 @@ fn load_neoprefab(
             .get("id")
             .and_then(JsonValue::as_u64)
             .ok_or_else(|| prefab_json_error(path, "entity is missing a valid 'id'"))?;
+        let entity = templates
+            .get(&id)
+            .ok_or_else(|| prefab_json_error(path, "missing entity template"))?;
+        if let Some(values) = source.get("values").and_then(JsonValue::as_array) {
+            for attached in values {
+                let name = json_string(attached, "name", path)?;
+                if name.is_empty() {
+                    continue;
+                }
+                let value = attached
+                    .get("value")
+                    .ok_or_else(|| prefab_json_error(path, "attached value is missing 'value'"))?;
+                entity.raw_set(
+                    name,
+                    editor_variable_to_lua(
+                        lua,
+                        value,
+                        path,
+                        &templates,
+                        &component_templates,
+                    )?,
+                )?;
+            }
+        }
         for (component_index, component_source) in source
             .get("components")
             .and_then(JsonValue::as_array)

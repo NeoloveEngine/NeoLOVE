@@ -247,7 +247,7 @@ pub(crate) fn create_module(lua: &Lua) -> mlua::Result<Table> {
             // Drop the table itself (the `self` passed for a `Rng(...)` call).
             let _ = args.pop_front();
             let seed = match args.pop_front() {
-                Some(Value::Integer(n)) => Some(n),
+                Some(Value::Integer(n)) => Some(n as i64),
                 Some(Value::Number(n)) => Some(n as i64),
                 _ => None,
             };

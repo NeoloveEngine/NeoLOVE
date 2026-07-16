@@ -19,7 +19,7 @@ optional `neolove.toml` configuration file.
 - Entities, hierarchy, components, systems, linked prefabs, tweening, and keyframe animation controllers
 - Shapes, text, sprites, nine-slice sprites, particle images, tilemaps, tile textures, and custom shaders
 - Rigidbody, collider, rope, raycasting, and pixel-shaped sprite queries
-- Keyboard, mouse, audio, image, file system, HTTP, and server APIs
+- Keyboard, mouse, microphone, camera, audio, image, file system, HTTP, and server APIs
 - A built-in visual scene editor inspired by Unity and Godot
 - Standalone desktop executables with embedded game assets
 - Signed Android APK builds with embedded game assets
@@ -32,12 +32,13 @@ optional `neolove.toml` configuration file.
 ## Requirements
 
 - A current stable [Rust toolchain](https://www.rust-lang.org/tools/install)
-- Linux builds require ALSA and `pkg-config` development packages
+- Linux builds require ALSA development files, `pkg-config`, Clang/libclang,
+  and Linux V4L2 headers for microphone and camera capture
 
 On Debian or Ubuntu:
 
 ```bash
-sudo apt-get install pkg-config libasound2-dev
+sudo apt-get install pkg-config libasound2-dev clang libclang-dev linux-libc-dev
 ```
 
 ## Install
@@ -144,16 +145,24 @@ The editor opens a window with a dockable or detachable **Hierarchy**, a 2D
 
 - Build scenes from entities and the real engine components — `Rect2D`,
   `Shape2D`, `ParticleSystem2D`, `AnimationController`, `SpatialSound2D`,
-  `TextBox`, `TextInput`, `Sprite2D`, `SpriteSheet2D`, `NineSliceSprite2D`, `Tilemap2D`, `TileTexture2D`,
-  `Collider2D`, `Rigidbody2D`, `Bolt2D`, `Rope2D` — added from a dropdown,
-  each with its inspector-editable properties (advanced fields collapse away).
+  `TextBox`, `TextInput`, `Dropdown`, `Sprite2D`, `SpriteSheet2D`,
+  `NineSliceSprite2D`, `Tilemap2D`, `TileTexture2D`, `Collider2D`,
+  `Rigidbody2D`, `Bolt2D`, `Rope2D`, `Light2D`, `LightOccluder2D`, and
+  `Camera` — added from a dropdown, each with its inspector-editable properties
+  (advanced fields collapse away).
 - Nest entities into a hierarchy by dragging rows; set per-entity `z` order and
   `scale`; reorder, duplicate, copy/paste and rename via right-click menus.
 - Attach a `Script` component to expose **public variables** edited in the
   inspector — including `IImage`, `IAudio`, `IShader`, and `IAnimation` asset
   handles for custom scripts.
+- Add arbitrary typed values directly to an entity—numbers, strings, booleans,
+  colors, nested lists/tables, entities, components, images, sounds, shaders,
+  and animations—so editor-authored fields are read as `entity.foo` in code.
+- Add, rename, reorder, or remove `Dropdown` options directly in the Inspector.
 - Edit the scene background (`app.bg`) with a color picker; it previews live in
-  the viewport. The viewport shows the configured default game-window bounds.
+  the viewport. Scene lighting also previews live and can be disabled only for
+  the editor viewport in Editor Settings. The viewport shows the configured
+  default game-window bounds.
 - Use move, scale, and rotate scene tools with explicit handles. Holding `Ctrl`
   while moving a parent keeps descendants in their world positions.
 - Dock, undock, close, and restore the Hierarchy, Inspector, and Project
@@ -182,8 +191,9 @@ Scenes can also be loaded at runtime from Luau:
 ecs.loadScene("scene.neoscene")
 ```
 
-Scenes are saved as `scene.neoscene` (JSON). **Export main.luau** generates a
-runnable entry point from the scene, **Run** launches a live preview, and
+Scenes are saved as compressed `scene.neoscene` documents (legacy JSON remains
+readable). **Export main.luau** generates a runnable entry point from the scene,
+**Run** launches a live preview, and
 **Build** exports then asks whether to package for desktop, WebAssembly,
 Android, or iOS. The **Mobile** control runs previews in a locked phone-sized
 viewport with portrait/landscape rotation and Wi-Fi/cellular/low-power toggles.
@@ -205,8 +215,9 @@ Global editor preferences are stored in your user config directory
 `$XDG_CONFIG_HOME/neolove/editor.json` / `~/.config/neolove/editor.json` on
 Linux). The compact scene menu opens editor-wide settings with live theme
 previews, an editable persistent custom palette, and a native font-file picker;
-font changes apply immediately. Tooltip, overlay, and autosave preferences live
-there too. Older project-local `editor.json` files are still read as a fallback.
+font changes apply immediately. Tooltip, overlay, lighting-preview, and autosave
+preferences live there too. Older project-local `editor.json` files are still
+read as a fallback.
 
 ## CLI
 
@@ -241,11 +252,11 @@ NeoLOVE exposes its APIs as Luau globals:
 | --- | --- |
 | Application and input | `app`, `input`, `userInput`, `mouse`, `window` |
 | Entities and transforms | `ecs`, `core`, `transform`, `transforms` |
-| Assets and audio | `assets`, `audio` |
+| Assets, audio, and capture | `assets`, `audio`, `media`, `microphone` |
 | Files, platform, and processes | `fs`, `android`, `mobile`, `commands`, `command` |
 | Networking | `http`, `servers` |
 | Gameplay helpers | `prefabs`, `prefab`, `tweening`, `tween`, `animation`, `animations` |
-| Rendering | `shaders` |
+| Rendering | `shaders`, `lighting` |
 
 Servers can be declared in-process as class-like services; no separate server
 script is needed:

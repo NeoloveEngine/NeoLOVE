@@ -36,6 +36,12 @@ pub mod icon {
     pub const GRID_OFF: char = '\u{e3eb}';
     pub const CROP_SQUARE: char = '\u{e3c6}';
     pub const TITLE: char = '\u{e264}';
+    pub const TEXT_FIELDS: char = '\u{e262}';
+    pub const NUMBERS: char = '\u{eac7}';
+    pub const CHECK_BOX: char = '\u{e834}';
+    pub const EXTENSION: char = '\u{e87b}';
+    pub const FORMAT_LIST_BULLETED: char = '\u{e241}';
+    pub const TABLE_ROWS: char = '\u{f101}';
     pub const IMAGE: char = '\u{e3f4}';
     pub const DATA_OBJECT: char = '\u{ead3}';
     pub const TUNE: char = '\u{e429}';
@@ -56,6 +62,7 @@ pub mod icon {
     pub const OPEN_IN_NEW: char = '\u{e89e}';
     pub const FOLDER: char = '\u{e2c7}';
     pub const ARROW_UPWARD: char = '\u{e5d8}';
+    pub const ARROW_DOWNWARD: char = '\u{e5db}';
     pub const INSERT_DRIVE_FILE: char = '\u{e24d}';
     pub const AUDIOTRACK: char = '\u{e3a1}';
     pub const FONT_DOWNLOAD: char = '\u{e167}';
@@ -85,6 +92,7 @@ pub mod icon {
     pub const ROTATE_RIGHT: char = '\u{e419}';
     pub const TRANSFORM: char = '\u{e428}';
     pub const PHONE_ANDROID: char = '\u{e324}';
+    pub const VIDEOCAM: char = '\u{e04b}';
     pub const SCREEN_ROTATION: char = '\u{e1c1}';
     pub const CLOSE: char = '\u{e5cd}';
 }
@@ -528,6 +536,90 @@ impl<'a> Painter<'a> {
         self.put(x.floor() as i64, y.floor() as i64, color);
     }
 
+    /// Multiply the scene already rasterized within `rect` by a per-pixel light
+    /// color, mirroring the runtime's deferred light composite: `scene × light`
+    /// (`light` already scaled by exposure), plus bloom on over-bright light,
+    /// clamped to `[0, 1]`. `sample` receives pixel centres in screen space and
+    /// returns the light multiplier `(r, g, b)`. The editor's lighting preview
+    /// uses this so lights reveal the scene's true colors — background, gradients
+    /// across objects, and occluder shadows alike — exactly as the game will,
+    /// rather than laying a flat tint on each object.
+    ///
+    /// The composite covers every viewport pixel regardless of light count, so
+    /// it is split across worker threads (like the runtime's own composite) to
+    /// keep pans and zooms responsive.
+    pub fn composite_light(
+        &mut self,
+        rect: Rect,
+        bloom: f32,
+        sample: impl Fn(f32, f32) -> (f32, f32, f32) + Sync,
+    ) {
+        let width = self.width;
+        let height = self.height;
+        let x0 = (rect.x.floor() as i64).max(self.clip[0]).max(0);
+        let y0 = (rect.y.floor() as i64).max(self.clip[1]).max(0);
+        let x1 = (rect.right().ceil() as i64).min(self.clip[2]).min(width as i64);
+        let y1 = (rect.bottom().ceil() as i64).min(self.clip[3]).min(height as i64);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let (x0, y0, x1, y1) = (x0 as usize, y0 as usize, x1 as usize, y1 as usize);
+
+        let sample = &sample;
+        // Composite one band of framebuffer rows (`row_start` is the global row
+        // index of the band's first row). Rows/columns outside the lit rect are
+        // skipped so only the viewport is touched.
+        let composite_band = move |chunk: &mut [u32], row_start: usize| {
+            let rows = chunk.len() / width;
+            for local in 0..rows {
+                let py = row_start + local;
+                if py < y0 || py >= y1 {
+                    continue;
+                }
+                let base = local * width;
+                for px in x0..x1 {
+                    let (lr, lg, lb) = sample(px as f32 + 0.5, py as f32 + 0.5);
+                    let idx = base + px;
+                    let dst = chunk[idx];
+                    let sr = ((dst >> 16) & 0xff) as f32 / 255.0;
+                    let sg = ((dst >> 8) & 0xff) as f32 / 255.0;
+                    let sb = (dst & 0xff) as f32 / 255.0;
+                    let mut or = sr * lr;
+                    let mut og = sg * lg;
+                    let mut ob = sb * lb;
+                    if bloom > 0.0 {
+                        or += (lr - 1.0).max(0.0) * bloom * sr;
+                        og += (lg - 1.0).max(0.0) * bloom * sg;
+                        ob += (lb - 1.0).max(0.0) * bloom * sb;
+                    }
+                    let r = (or.clamp(0.0, 1.0) * 255.0).round() as u32;
+                    let g = (og.clamp(0.0, 1.0) * 255.0).round() as u32;
+                    let b = (ob.clamp(0.0, 1.0) * 255.0).round() as u32;
+                    chunk[idx] = b | (g << 8) | (r << 16);
+                }
+            }
+        };
+
+        let buffer: &mut [u32] = &mut *self.buffer;
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 16)
+            .min((y1 - y0).max(1));
+        if workers <= 1 || (x1 - x0) * (y1 - y0) < 16_384 {
+            composite_band(buffer, 0);
+        } else {
+            let rows_per = height.div_ceil(workers).max(1);
+            let band = rows_per * width;
+            let composite_band = &composite_band;
+            std::thread::scope(|scope| {
+                for (index, chunk) in buffer.chunks_mut(band).enumerate() {
+                    scope.spawn(move || composite_band(chunk, index * rows_per));
+                }
+            });
+        }
+    }
+
     /// Draw an image into `dest`, sampling the optional `src` sub-rectangle
     /// (in image pixels) with nearest-neighbour, multiplied by `tint`. Clipped
     /// and alpha-blended. Used for accurate sprite/9-slice/tile previews.
@@ -743,11 +835,23 @@ impl<'a> Painter<'a> {
         color: Rgba,
         max_width: f32,
     ) {
+        if !max_width.is_finite() || max_width <= 0.0 {
+            return;
+        }
+        // Advance widths do not include every glyph's raster overhang. Keep a
+        // real clip in addition to choosing a fitting string so italics,
+        // custom fonts and the ellipsis can never bleed into adjacent widgets.
+        let previous_clip = self.push_clip(Rect::new(x, 0.0, max_width, self.height as f32));
         if self.text_width(text, size) <= max_width {
             self.text(x, y, text, size, color);
+            self.set_clip_raw(previous_clip);
             return;
         }
         let ell_w = self.text_width("…", size);
+        if ell_w > max_width {
+            self.set_clip_raw(previous_clip);
+            return;
+        }
         let mut truncated = String::new();
         let mut width = 0.0;
         for ch in text.chars() {
@@ -760,6 +864,47 @@ impl<'a> Painter<'a> {
         }
         truncated.push('…');
         self.text(x, y, &truncated, size, color);
+        self.set_clip_raw(previous_clip);
+    }
+
+    /// Draw text word-wrapped inside `rect`, hard-breaking a single overlong
+    /// word and adding an ellipsis when the available height is exhausted.
+    pub fn text_wrapped(
+        &mut self,
+        rect: Rect,
+        text: &str,
+        size: f32,
+        line_height: f32,
+        color: Rgba,
+    ) {
+        if rect.w <= 0.0 || rect.h <= 0.0 || line_height <= 0.0 {
+            return;
+        }
+        let max_lines = (rect.h / line_height).floor() as usize;
+        if max_lines == 0 {
+            return;
+        }
+        let mut lines = wrap_text_lines(self, text, size, rect.w);
+        let vertically_truncated = lines.len() > max_lines;
+        lines.truncate(max_lines);
+        if vertically_truncated {
+            if let Some(last) = lines.last_mut() {
+                last.push('…');
+            }
+        }
+
+        let previous_clip = self.push_clip(rect);
+        for (index, line) in lines.iter().enumerate() {
+            self.text_clipped(
+                rect.x,
+                rect.y + index as f32 * line_height,
+                line,
+                size,
+                color,
+                rect.w,
+            );
+        }
+        self.set_clip_raw(previous_clip);
     }
 
     /// Draw a Material Icons glyph, with its box centered on `(cx, cy)`.
@@ -813,6 +958,63 @@ impl<'a> Painter<'a> {
             }
         }
     }
+}
+
+/// Wrap text to measured pixel width. Whitespace between words is normalized
+/// for display, while explicit line breaks are preserved. A word wider than
+/// the available width is split at Unicode scalar boundaries.
+fn wrap_text_lines(painter: &Painter<'_>, text: &str, size: f32, max_width: f32) -> Vec<String> {
+    if max_width <= 0.0 || !max_width.is_finite() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        if paragraph.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            let candidate = if current.is_empty() {
+                word.to_string()
+            } else {
+                format!("{current} {word}")
+            };
+            if painter.text_width(&candidate, size) <= max_width {
+                current = candidate;
+                continue;
+            }
+
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            if painter.text_width(word, size) <= max_width {
+                current.push_str(word);
+                continue;
+            }
+
+            // Hard-break a path, identifier, or other unspaced token.
+            let mut part = String::new();
+            for character in word.chars() {
+                let mut next = part.clone();
+                next.push(character);
+                if !part.is_empty() && painter.text_width(&next, size) > max_width {
+                    lines.push(std::mem::take(&mut part));
+                }
+                part.push(character);
+            }
+            current = part;
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 /// Per-frame input gathered from winit events before the UI runs.
@@ -1102,8 +1304,15 @@ impl<'a> Ui<'a> {
         let start = rect.x + (rect.w - group_w).max(0.0) / 2.0 + 8.0;
         self.painter
             .icon_centered(start, cy, glyph, icon_size, text_color);
-        self.painter
-            .text(start + icon_size / 2.0 + 4.0, cy - 7.0, label, 14.0, text_color);
+        let label_x = start + icon_size / 2.0 + 4.0;
+        self.painter.text_clipped(
+            label_x,
+            cy - 7.0,
+            label,
+            14.0,
+            text_color,
+            (rect.right() - label_x - 6.0).max(0.0),
+        );
         hovered && self.input.mouse_pressed
     }
 
@@ -1146,12 +1355,13 @@ impl<'a> Ui<'a> {
         let tri = if expanded { icon::EXPAND_MORE } else { icon::CHEVRON_RIGHT };
         self.painter
             .icon_centered(rect.x + 12.0, rect.y + rect.h / 2.0, tri, 16.0, self.theme.text);
-        self.painter.text(
+        self.painter.text_clipped(
             rect.x + 24.0,
             rect.y + (rect.h - 14.0) / 2.0,
             label,
             14.0,
             self.theme.text,
+            (rect.w - 32.0).max(0.0),
         );
         if hovered && self.input.mouse_pressed {
             !expanded
@@ -1174,8 +1384,14 @@ impl<'a> Ui<'a> {
                 .icon_centered(rect.x + 14.0, rect.y + rect.h / 2.0, glyph, 15.0, color);
             tx = rect.x + 28.0;
         }
-        self.painter
-            .text(tx, rect.y + (rect.h - 14.0) / 2.0, label, 14.0, color);
+        self.painter.text_clipped(
+            tx,
+            rect.y + (rect.h - 14.0) / 2.0,
+            label,
+            14.0,
+            color,
+            (rect.right() - tx - 8.0).max(0.0),
+        );
         hovered && self.input.mouse_pressed
     }
 
@@ -1256,24 +1472,48 @@ impl<'a> Ui<'a> {
             return;
         };
         let size = 13.0;
-        let pad = 6.0;
-        let tw = self.painter.text_width(&text, size);
-        let w = tw + pad * 2.0;
-        let h = size + pad * 2.0;
+        let line_height = 16.0;
+        let pad = 7.0;
+        let viewport_w = self.painter.width();
+        let viewport_h = self.painter.height();
+        let max_w = (viewport_w - 8.0).min(360.0);
+        let max_h = viewport_h - 8.0;
+        if max_w <= pad * 2.0 || max_h <= pad * 2.0 {
+            return;
+        }
+        let lines = wrap_text_lines(&self.painter, &text, size, max_w - pad * 2.0);
+        let visible_lines = lines
+            .len()
+            .min(((max_h - pad * 2.0) / line_height).floor().max(1.0) as usize);
+        let content_w = lines
+            .iter()
+            .take(visible_lines)
+            .map(|line| self.painter.text_width(line, size))
+            .fold(0.0_f32, f32::max)
+            .min(max_w - pad * 2.0);
+        let w = (content_w + pad * 2.0).max(40.0).min(max_w);
+        let h = (visible_lines as f32 * line_height + pad * 2.0).min(max_h);
         // Position below-right of the cursor, nudged on-screen.
         let mut x = self.input.mouse_x + 14.0;
         let mut y = self.input.mouse_y + 18.0;
-        if x + w > self.painter.width() {
-            x = self.painter.width() - w - 2.0;
+        if x + w > viewport_w {
+            x = viewport_w - w - 2.0;
         }
-        if y + h > self.painter.height() {
+        if y + h > viewport_h {
             y = self.input.mouse_y - h - 6.0;
         }
+        x = x.max(2.0);
+        y = y.clamp(2.0, (viewport_h - h - 2.0).max(2.0));
         let rect = Rect::new(x, y, w, h);
         self.painter.fill_round_rect(rect, 4.0, [20, 20, 22, 240]);
         self.painter.stroke_round_rect(rect, 4.0, self.theme.accent);
-        self.painter
-            .text(x + pad, y + pad, &text, size, self.theme.text);
+        self.painter.text_wrapped(
+            Rect::new(x + pad, y + pad, w - pad * 2.0, h - pad * 2.0),
+            &text,
+            size,
+            line_height,
+            self.theme.text,
+        );
     }
 
     /// A selectable list row. Returns true when clicked.
@@ -1950,6 +2190,21 @@ mod tests {
     }
 
     #[test]
+    fn composite_light_multiplies_scene_by_light() {
+        let mut buf = vec![0u32; 4 * 4];
+        let fonts = load_fonts().expect("load fonts");
+        let mut painter = Painter::new(&mut buf, 4, 4, fonts);
+        // Fill mid-gray, then light: left half fully dark, right half over-bright.
+        painter.fill_rect(Rect::new(0.0, 0.0, 4.0, 4.0), [128, 128, 128, 255]);
+        painter.composite_light(Rect::new(0.0, 0.0, 4.0, 4.0), 0.0, |px, _py| {
+            if px < 2.0 { (0.0, 0.0, 0.0) } else { (4.0, 4.0, 4.0) }
+        });
+        // Dark side is multiplied to black; bright side clamps to full white.
+        assert_eq!(buf[0] & 0xff, 0, "unlit background is darkened, not left bright");
+        assert_eq!(buf[3] & 0xff, 0xff, "over-bright light clamps to full");
+    }
+
+    #[test]
     fn rotation_moves_painted_pixels() {
         let mut buf = vec![0u32; 5 * 5];
         let fonts = load_fonts().expect("load fonts");
@@ -1972,6 +2227,78 @@ mod tests {
         assert_eq!(buf[0], 0xffffff);
         assert_eq!(buf[3], 0); // top-right, outside clip
         assert_eq!(buf[12], 0); // bottom-left, outside clip
+    }
+
+    #[test]
+    fn clipped_text_with_no_room_draws_nothing() {
+        let mut buffer = vec![0u32; 80 * 24];
+        let fonts = load_fonts().expect("load fonts");
+        let mut painter = Painter::new(&mut buffer, 80, 24, fonts);
+        painter.text_clipped(
+            10.0,
+            4.0,
+            "This must not leak",
+            14.0,
+            [255, 255, 255, 255],
+            0.0,
+        );
+        assert!(buffer.iter().all(|pixel| *pixel == 0));
+    }
+
+    #[test]
+    fn wrapping_hard_breaks_long_tokens_to_the_available_width() {
+        let mut buffer = vec![0u32; 100 * 24];
+        let fonts = load_fonts().expect("load fonts");
+        let painter = Painter::new(&mut buffer, 100, 24, fonts);
+        let max_width = 42.0;
+        let lines = wrap_text_lines(
+            &painter,
+            "short words and/a/very/long/unbroken/path",
+            13.0,
+            max_width,
+        );
+        assert!(lines.len() > 2);
+        assert!(
+            lines
+                .iter()
+                .all(|line| painter.text_width(line, 13.0) <= max_width + 0.01),
+            "wrapped lines exceeded {max_width}px: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn icon_button_clips_an_overlong_label_to_its_bounds() {
+        let width = 150usize;
+        let height = 40usize;
+        let mut buffer = vec![0u32; width * height];
+        let fonts = load_fonts().expect("load fonts");
+        let painter = Painter::new(&mut buffer, width, height, fonts);
+        let mut ui = Ui::new(
+            painter,
+            FrameInput::default(),
+            Theme::default(),
+            None,
+            String::new(),
+            0,
+            None,
+            None,
+        );
+        let rect = Rect::new(10.0, 8.0, 62.0, 24.0);
+        ui.icon_button(
+            rect,
+            icon::ADD,
+            "An extremely long button label that used to overflow",
+        );
+        drop(ui);
+
+        for y in 0..height {
+            assert!(
+                buffer[y * width + 72..(y + 1) * width]
+                    .iter()
+                    .all(|pixel| *pixel == 0),
+                "button painted beyond its right edge on row {y}"
+            );
+        }
     }
 
     #[test]

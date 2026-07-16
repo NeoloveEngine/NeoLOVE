@@ -1,3 +1,9 @@
+// Shared Lua/panic error-formatting toolkit. Each platform entry point
+// (`main_desktop`, `main_android`, `main_web`) and the Android `cdylib` lib
+// target compiles this module but exercises a different subset of its helpers,
+// so some are unused per target.
+#![allow(dead_code)]
+
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 

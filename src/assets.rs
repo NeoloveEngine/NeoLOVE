@@ -277,6 +277,26 @@ impl ImageHandle {
         })))
     }
 
+    /// Replace the pixels behind a live image without changing its asset ID.
+    /// Dynamic producers (for example a camera stream) use this to keep the
+    /// renderer's texture cache bounded while revisions still trigger upload.
+    pub(crate) fn replace_rgba_image(&self, replacement: RgbaImage) -> mlua::Result<()> {
+        let mut image = self
+            .0
+            .lock()
+            .map_err(|_| mlua::Error::external("image lock poisoned"))?;
+        image.image = replacement;
+        image.unloaded = false;
+        image.revision = image.revision.wrapping_add(1);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_identity_revision(&self) -> (usize, u64) {
+        let image = self.0.lock().expect("image lock");
+        (image.id, image.revision)
+    }
+
     #[cfg(any(target_os = "emscripten", feature = "vulkan"))]
     pub(crate) fn id(&self) -> mlua::Result<usize> {
         let image = self

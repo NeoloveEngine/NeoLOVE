@@ -18,6 +18,7 @@ mod lua_error;
 mod rng;
 mod mobile_emulation;
 mod mobile_module;
+mod media;
 mod platform;
 mod prefabs;
 mod renderer;
@@ -450,6 +451,10 @@ fn ensure_start_menu_entry(exe: &Path) -> Result<bool, String> {
   <string>APPL</string>
   <key>LSMinimumSystemVersion</key>
   <string>10.13</string>
+  <key>NSCameraUsageDescription</key>
+  <string>NeoLOVE games can request camera access for developer-defined gameplay features.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>NeoLOVE games can request microphone access for developer-defined gameplay features.</string>
 </dict>
 </plist>
 "#;
@@ -2886,6 +2891,10 @@ fn ios_info_plist(project_root: &Path, product_name: &str, bundle_id: &str) -> S
         <key>NSAllowsLocalNetworking</key>
         <true/>
     </dict>
+    <key>NSCameraUsageDescription</key>
+    <string>This game can request camera access for gameplay features.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>This game can request microphone access for gameplay features.</string>
     <key>UIRequiresFullScreen</key>
     <true/>
     <key>UISupportedInterfaceOrientations</key>
@@ -2928,7 +2937,7 @@ fn ios_view_controller_source() -> &'static str {
     r#"import UIKit
 import WebKit
 
-final class ViewController: UIViewController {
+final class ViewController: UIViewController, WKUIDelegate {
     private var webView: WKWebView!
     private var server: LocalWebServer?
 
@@ -2948,6 +2957,7 @@ final class ViewController: UIViewController {
         webView.backgroundColor = .black
         view.addSubview(webView)
         self.webView = webView
+        webView.uiDelegate = self
 
         do {
             guard let root = Bundle.main.resourceURL?.appendingPathComponent("webasm", isDirectory: true) else {
@@ -2965,6 +2975,18 @@ final class ViewController: UIViewController {
             let message = "<html><body style='font: -apple-system-body; padding: 24px'><h1>NeoLOVE failed to start</h1><p>\(escaped)</p></body></html>"
             webView.loadHTMLString(message, baseURL: nil)
         }
+    }
+
+    @available(iOS 15.0, *)
+    func webView(
+        _ webView: WKWebView,
+        requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+        initiatedByFrame frame: WKFrameInfo,
+        type: WKMediaCaptureType,
+        decisionHandler: @escaping (WKPermissionDecision) -> Void
+    ) {
+        // Keep the OS/browser prompt in control; never silently grant access.
+        decisionHandler(.prompt)
     }
 }
 "#

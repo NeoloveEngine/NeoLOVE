@@ -87,12 +87,14 @@ impl LoggerWindow {
         } else {
             ("Waiting for game…", ui.theme.text_dim)
         };
-        ui.label(PAD, 8.0, status, color);
-        ui.label(
+        ui.painter.text_clipped(PAD, 8.0, status, TEXT, color, 130.0);
+        ui.painter.text_clipped(
             150.0,
             8.0,
             &format!("{count} entities"),
+            TEXT,
             ui.theme.text_dim,
+            (w - 250.0).max(0.0),
         );
 
         let clear = Rect::new(w - 90.0, 5.0, 80.0, HEADER_H - 10.0);
@@ -157,11 +159,13 @@ impl LoggerWindow {
             .selected
             .and_then(|id| entities.iter().find(|e| e.id == id))
         else {
-            ui.label(
+            ui.painter.text_clipped(
                 body.x + PAD,
                 body.y + 6.0,
                 "Select an entity to inspect.",
+                TEXT,
                 ui.theme.text_dim,
+                (body.w - PAD * 2.0).max(0.0),
             );
             return;
         };
@@ -176,12 +180,19 @@ impl LoggerWindow {
             },
             true,
         ));
-        lines.push((format!("x = {:.2}    y = {:.2}", entity.x, entity.y), false));
-        lines.push((
-            format!("rotation = {:.3}    scale = {:.3}", entity.rotation, entity.scale),
-            false,
-        ));
-        lines.push((format!("enabled = {}", entity.enabled), false));
+        if entity.fields.is_empty() {
+            // Compatibility with snapshots produced by older runtimes.
+            lines.push((format!("x = {:.2}    y = {:.2}", entity.x, entity.y), false));
+            lines.push((
+                format!("rotation = {:.3}    scale = {:.3}", entity.rotation, entity.scale),
+                false,
+            ));
+            lines.push((format!("enabled = {}", entity.enabled), false));
+        } else {
+            for (key, value) in &entity.fields {
+                lines.push((format!("{key} = {value}"), false));
+            }
+        }
         for component in &entity.components {
             lines.push((String::new(), false));
             lines.push((component.name.clone(), true));

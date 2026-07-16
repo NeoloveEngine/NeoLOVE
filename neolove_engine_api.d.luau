@@ -230,6 +230,129 @@ export type AudioModule = {
 	setListenerPosition: (x: number, y: number) -> (),
 }
 
+export type MediaPermissionStatus = "prompt" | "granted" | "denied" | "unavailable"
+export type MediaDeviceKind = "microphone" | "camera"
+export type MediaEnumerationKind = MediaDeviceKind | "all" | "both"
+
+export type MediaDevice = {
+	id: string,
+	kind: MediaDeviceKind,
+	label: string,
+	isDefault: boolean,
+}
+
+export type MediaAudioConstraints = {
+	deviceId: string?,
+	sampleRate: number?,
+	channels: number?,
+	echoCancellation: boolean?,
+	noiseSuppression: boolean?,
+	autoGainControl: boolean?,
+}
+
+export type MediaVideoConstraints = {
+	deviceId: string?,
+	width: number?,
+	height: number?,
+	frameRate: number?,
+	facingMode: ("user" | "environment" | "left" | "right")?,
+}
+
+export type MediaRequestOptions = {
+	audio: (boolean | MediaAudioConstraints)?,
+	video: (boolean | MediaVideoConstraints)?,
+	microphone: (boolean | MediaAudioConstraints)?,
+	camera: (boolean | MediaVideoConstraints)?,
+}
+
+export type MediaAudioFormat = {
+	sampleRate: number,
+	channels: number,
+}
+
+export type MediaVideoFormat = {
+	width: number,
+	height: number,
+	frameRate: number,
+}
+
+export type MediaAudioSamples = MediaAudioFormat & {
+	frameCount: number,
+	droppedSamples: number,
+	format: "f32le",
+	samples: { number },
+}
+
+export type MediaAudioBytes = MediaAudioFormat & {
+	frameCount: number,
+	droppedSamples: number,
+	format: "f32le",
+	data: string,
+}
+
+export type MediaVideoFrame = {
+	-- This is a live image reused by its stream. A later readVideoFrame call
+	-- updates the pixels of previously held frame images instead of snapshotting.
+	image: ImageHandle,
+	width: number,
+	height: number,
+	timestamp: number,
+	droppedFrames: number,
+}
+
+export type MediaStream = {
+	stop: (self: MediaStream) -> (),
+	isActive: (self: MediaStream) -> boolean,
+	hasAudio: (self: MediaStream) -> boolean,
+	hasVideo: (self: MediaStream) -> boolean,
+	getAudioFormat: (self: MediaStream) -> MediaAudioFormat?,
+	getVideoFormat: (self: MediaStream) -> MediaVideoFormat?,
+	readAudio: (self: MediaStream, maxFrames: number?) -> MediaAudioSamples?,
+	readAudioBytes: (self: MediaStream, maxFrames: number?) -> MediaAudioBytes?,
+	readVideoFrame: (self: MediaStream) -> MediaVideoFrame?,
+	getLastError: (self: MediaStream) -> string?,
+}
+
+export type MediaDeviceResult = {
+	ok: boolean,
+	devices: { MediaDevice }?,
+	code: string?,
+	error: string?,
+}
+
+export type MediaAccessResult = {
+	ok: boolean,
+	stream: MediaStream?,
+	code: string?,
+	error: string?,
+}
+
+export type MicrophoneModule = {
+	listDevices: (callback: (result: MediaDeviceResult) -> ()) -> number,
+	enumerateDevices: (callback: (result: MediaDeviceResult) -> ()) -> number,
+	requestAccess: (((result: MediaAccessResult) -> ()) -> number)
+		& ((constraints: MediaAudioConstraints, callback: (result: MediaAccessResult) -> ()) -> number)
+		& ((deviceId: string, callback: (result: MediaAccessResult) -> ()) -> number),
+	requestDevice: (deviceId: string, callback: (result: MediaAccessResult) -> ()) -> number,
+	cancelRequest: (requestId: number) -> boolean,
+	getPermissionStatus: () -> MediaPermissionStatus,
+	isSupported: () -> boolean,
+}
+
+export type MediaModule = {
+	enumerateDevices: (((result: MediaDeviceResult) -> ()) -> number) & ((kind: MediaEnumerationKind, callback: (result: MediaDeviceResult) -> ()) -> number),
+	requestAccess: (options: MediaRequestOptions, callback: (result: MediaAccessResult) -> ()) -> number,
+	cancelRequest: (requestId: number) -> boolean,
+	getPermissionStatus: (kind: MediaDeviceKind) -> MediaPermissionStatus,
+	permissions: () -> { microphone: MediaPermissionStatus, camera: MediaPermissionStatus },
+	-- Reports platform/backend capability, not whether hardware is currently attached.
+	-- "all"/"both" is true only when microphone and camera capture are both supported.
+	isSupported: (kind: MediaEnumerationKind) -> boolean,
+	stopAll: () -> number,
+	_poll: () -> (),
+	microphone: MicrophoneModule,
+}
+
 export type FsWalkEntry = {
 	path: string,
 	name: string,
@@ -661,6 +784,18 @@ export type EntityScaler = ComponentInstance & {
 	pivot_y: number,
 	pivotX: number?,
 	pivotY: number?,
+}
+
+-- Centers the rendered scene on its entity. The first enabled Camera is used
+-- automatically; call SetActive when a scene has more than one camera.
+export type Camera = ComponentInstance & {
+	__neolove_component: "Camera",
+	enabled: boolean,
+	-- Returns false only when the component is disabled or detached.
+	SetActive: (self: Camera) -> boolean,
+	setActive: (self: Camera) -> boolean,
+	IsActive: (self: Camera) -> boolean,
+	isActive: (self: Camera) -> boolean,
 }
 
 export type Shape2DShape = "box" | "circle" | "triangle" | "right_triangle" | "righttriangle" | "rightangledtriangle"
@@ -1254,6 +1389,7 @@ export type CoreModule = {
 	Light2D: Light2D,
 	LightOccluder2D: LightOccluder2D,
 	EntityScaler: EntityScaler,
+	Camera: Camera,
 	Shape2D: Shape2D,
 	ParticleSystem2D: ParticleSystem2D,
 	AnimationController: AnimationController,
@@ -1335,6 +1471,8 @@ declare input: InputModule
 declare userInput: InputModule
 declare assets: AssetsModule
 declare audio: AudioModule
+declare media: MediaModule
+declare microphone: MicrophoneModule
 declare fs: FsModule
 declare android: AndroidModule
 declare mobile: MobileModule

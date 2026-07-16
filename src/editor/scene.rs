@@ -104,6 +104,9 @@ pub enum PropValue {
         value: String,
         options: Vec<String>,
     },
+    /// An ordered list of strings. Used by controls such as `Dropdown` whose
+    /// runtime property is a Luau array rather than a scalar value.
+    StringList(Vec<String>),
     /// An image asset path. Exported as `assets.loadImage("...")` so the
     /// runtime receives an ImageHandle rather than a bare string.
     Image(String),
@@ -139,6 +142,14 @@ impl PropValue {
                 }
             }
             PropValue::Enum { value, .. } => format!("\"{}\"", escape_luau(value)),
+            PropValue::StringList(values) => format!(
+                "{{{}}}",
+                values
+                    .iter()
+                    .map(|value| format!("\"{}\"", escape_luau(value)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             PropValue::Image(s) => format!("assets.loadImage(\"{}\")", escape_luau(s)),
             PropValue::Font(s) => format!("\"{}\"", escape_luau(s)),
             PropValue::Sound(s) => format!("assets.loadSound(\"{}\")", escape_luau(s)),
@@ -227,6 +238,14 @@ impl Prop {
     }
     fn int(name: &str, label: &str, v: i32) -> Self {
         Self::new(name, label, PropValue::Int(v), false)
+    }
+    fn string_list(name: &str, label: &str, values: &[&str]) -> Self {
+        Self::new(
+            name,
+            label,
+            PropValue::StringList(values.iter().map(|value| (*value).to_string()).collect()),
+            false,
+        )
     }
     fn image(name: &str, label: &str, v: &str) -> Self {
         Self::new(name, label, PropValue::Image(v.to_string()), false)
@@ -543,6 +562,16 @@ pub struct ScriptVar {
     pub control: VarControl,
 }
 
+/// A user-authored field assigned directly to an entity by scene export.
+/// Unlike `ScriptVar`, it does not depend on a component or an Inspector(...)
+/// declaration: `AttachedValue { name: "foo", ... }` becomes `entity.foo` at
+/// runtime (bracket syntax is used during export so every string key survives).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AttachedValue {
+    pub name: String,
+    pub value: VarValue,
+}
+
 /// A component attached to an entity.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind")]
@@ -672,7 +701,14 @@ fn normalize_core_component(component: &mut Component) {
     // defaults; unknown/forward-compatible fields are preserved at the end.
     if matches!(
         name.as_str(),
-        "EntityScaler" | "Panel" | "Frame" | "Button" | "Slider" | "Dropdown" | "TextInput"
+        "EntityScaler"
+            | "Camera"
+            | "Panel"
+            | "Frame"
+            | "Button"
+            | "Slider"
+            | "Dropdown"
+            | "TextInput"
     ) {
         let mut existing = std::mem::take(props);
         let mut normalized = Vec::new();
@@ -712,6 +748,7 @@ pub const CORE_COMPONENTS: &[&str] = &[
     "TileTexture2D",
     "AnimationController",
     "EntityScaler",
+    "Camera",
     "Collider2D",
     "Rigidbody2D",
     "Light2D",
@@ -741,6 +778,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
     };
     match name {
         "Rect2D" => drawable(),
+        "Camera" => vec![Prop::boolean("enabled", "Enabled", true)],
         "Light2D" => vec![
             Prop::enumv(
                 "kind",
@@ -1170,6 +1208,10 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::num_adv("letter_spacing", "Letter Space", 0.0),
         ],
         "Dropdown" => vec![
+            // Dropdown options are an ordered runtime array. Keep them as a
+            // structured editor value so commas, quotes and duplicate labels
+            // remain lossless (a comma-separated text field cannot do that).
+            Prop::string_list("options", "Options", &[]),
             Prop::color("background_color", "Background", [60, 60, 60, 255]),
             Prop::color("hover_background_color", "Bg Hover", [74, 74, 74, 255]),
             Prop::color("text_color", "Text Color", [240, 240, 240, 255]),
@@ -1262,6 +1304,9 @@ pub struct Entity {
     /// on export and dimmed in the viewport (like Unity's GameObject checkbox).
     #[serde(default = "tru")]
     pub enabled: bool,
+    /// Arbitrary typed values assigned directly to the runtime entity table.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<AttachedValue>,
     pub components: Vec<Component>,
 }
 
@@ -1296,6 +1341,7 @@ impl Entity {
             rotation_pivot_y: None,
             parent: None,
             enabled: true,
+            values: Vec::new(),
             components: Vec::new(),
         }
     }
@@ -1419,7 +1465,8 @@ impl Default for Scene {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ImageEmitMode {
     /// `require("./images")` — the exported start scene's cache module written
-    /// next to `main.luau`.
+    /// next to `main.luau`. Reached through [`Scene::to_luau`].
+    #[allow(dead_code)]
     SharedModule,
     /// Inline `assets.loadImage(...)` calls, so the scene is self-contained.
     Inline,
@@ -1496,6 +1543,9 @@ impl Scene {
         }
         self.entities.retain(|e| e.id != id);
         for entity in &mut self.entities {
+            for attached in &mut entity.values {
+                attached.value.remove_entity_reference(id);
+            }
             for component in &mut entity.components {
                 if let Component::Script { variables, .. } = component {
                     for variable in variables {
@@ -1510,6 +1560,9 @@ impl Scene {
     /// components on the same entity so they continue to point at their target.
     pub fn adjust_component_references(&mut self, entity: u64, removed: usize) {
         for owner in &mut self.entities {
+            for attached in &mut owner.values {
+                attached.value.remove_component_reference(entity, removed);
+            }
             for component in &mut owner.components {
                 if let Component::Script { variables, .. } = component {
                     for variable in variables {
@@ -1551,6 +1604,9 @@ impl Scene {
                 root = Some(nid);
             }
             e.id = nid;
+            for attached in &mut e.values {
+                attached.value.remap_entity_references(&map);
+            }
             for component in &mut e.components {
                 normalize_core_component(component);
                 if let Component::Script { variables, .. } = component {
@@ -1612,6 +1668,9 @@ impl Scene {
                     .parent
                     .and_then(|parent| id_map.get(&parent).copied());
                 entity.prefab_source = None;
+                for attached in &mut entity.values {
+                    attached.value.remap_entity_references(&id_map);
+                }
                 for component in &mut entity.components {
                     normalize_core_component(component);
                     if let Component::Script { variables, .. } = component {
@@ -1704,6 +1763,7 @@ impl Scene {
     /// Generate a runnable `main.luau` reconstructing this scene. The image
     /// cache is pulled from the shared `./images` module written alongside
     /// `main.luau`, so the exported start scene loads each image once.
+    #[allow(dead_code)] // Project-export path; exercised by the scene tests.
     pub fn to_luau(&self) -> String {
         self.to_luau_with_image_mode(ImageEmitMode::SharedModule)
     }
@@ -1910,6 +1970,28 @@ impl Scene {
                 out.push_str(&format!("{var}.rotation_pivot_y = {}\n", fmt_num(pivot_y)));
             }
 
+            for attached in &entity.values {
+                if attached.name.is_empty() {
+                    continue;
+                }
+                let expression = if attached.value.contains_reference() {
+                    attached
+                        .value
+                        .to_luau_with_references(&var_of, &component_vars)
+                } else {
+                    attached.value.to_luau()
+                };
+                let assignment = format!(
+                    "{var}[\"{}\"] = {expression}\n",
+                    escape_luau(&attached.name)
+                );
+                if attached.value.contains_reference() {
+                    deferred_reference_assignments.push(assignment);
+                } else {
+                    out.push_str(&assignment);
+                }
+            }
+
             for (ci, component) in entity.components.iter().enumerate() {
                 let cvar = format!("{var}_c{ci}");
                 match component {
@@ -1993,7 +2075,7 @@ impl Scene {
             out.push('\n');
         }
         if !deferred_reference_assignments.is_empty() {
-            out.push_str("-- Inspector scene references\n");
+            out.push_str("-- Attached values and Inspector scene references\n");
             for assignment in deferred_reference_assignments {
                 out.push_str(&assignment);
             }
@@ -2040,6 +2122,7 @@ impl Scene {
 
     /// Generate `images.luau`, loading each unique image exactly once. Script
     /// modules are required at the top of `main.luau` instead.
+    #[allow(dead_code)] // Project-export path; exercised by the scene tests.
     pub fn to_images_luau(&self) -> Option<String> {
         let (images, _) = self.collect_assets();
         if images.is_empty() {
@@ -2095,6 +2178,7 @@ impl Scene {
     }
 }
 
+#[allow(dead_code)] // Prefab-export helper; exercised by the scene tests.
 pub fn prefab_to_json(entities: &[Entity]) -> Result<String, String> {
     serde_json::to_string_pretty(entities).map_err(|e| format!("failed to serialize prefab: {e}"))
 }
@@ -2951,6 +3035,153 @@ mod tests {
         assert!(luau.contains(".size_x_percent = 0"));
         assert!(luau.contains(".size_y_percent = 0"));
         assert!(luau.contains(".pivot_x = 0"));
+    }
+
+    #[test]
+    fn camera_has_editor_schema_and_exports_runtime_component() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        let camera = Component::core("Camera");
+        let Component::Core { props, .. } = &camera else {
+            unreachable!()
+        };
+        assert_eq!(props.len(), 1);
+        assert!(matches!(
+            props.first(),
+            Some(Prop {
+                name,
+                value: PropValue::Bool(true),
+                ..
+            }) if name == "enabled"
+        ));
+        scene.entity_mut(id).expect("entity").components.push(camera);
+
+        let luau = scene.to_luau();
+        assert!(luau.contains("AddComponent(core.Camera)"));
+        assert!(luau.contains(".enabled = true"));
+    }
+
+    #[test]
+    fn attached_entity_values_round_trip_export_and_track_references() {
+        let mut scene = Scene::default();
+        let owner = scene.entities[0].id;
+        let target = scene.add_entity("Target", 40.0, 20.0).id;
+        scene
+            .entity_mut(target)
+            .expect("target")
+            .components
+            .push(Component::core("Rect2D"));
+        scene.entity_mut(owner).expect("owner").values = vec![
+            AttachedValue {
+                name: "health".into(),
+                value: VarValue::Number(100.0),
+            },
+            AttachedValue {
+                name: "display name".into(),
+                value: VarValue::Text("Hero".into()),
+            },
+            AttachedValue {
+                name: "target".into(),
+                value: VarValue::Entity(Some(target)),
+            },
+            AttachedValue {
+                name: "renderer".into(),
+                value: VarValue::Component(Some(ComponentReference {
+                    entity: target,
+                    component: 0,
+                })),
+            },
+            AttachedValue {
+                name: "inventory".into(),
+                value: VarValue::Dictionary(vec![DictionaryEntry {
+                    key: VarKey::Text("icon".into()),
+                    value: VarValue::Image("assets/item.png".into()),
+                }]),
+            },
+        ];
+
+        let restored = Scene::from_json(&scene.to_json().expect("serialize")).expect("restore");
+        assert_eq!(restored.entity(owner).expect("owner").values.len(), 5);
+        let luau = restored.to_luau_runtime();
+        assert!(luau.contains("ent_0[\"health\"] = 100"));
+        assert!(luau.contains("ent_0[\"display name\"] = \"Hero\""));
+        assert!(luau.contains("ent_0[\"inventory\"] = {[\"icon\"] = assets.loadImage(\"assets/item.png\")}"));
+        assert!(luau.contains("ent_0[\"target\"] = ent_1"));
+        assert!(luau.contains("ent_0[\"renderer\"] = ent_1_c0"));
+
+        let mut removed = restored;
+        removed.remove_entity(target);
+        assert!(matches!(
+            removed.entity(owner).expect("owner").values[2].value,
+            VarValue::Entity(None)
+        ));
+        assert!(matches!(
+            removed.entity(owner).expect("owner").values[3].value,
+            VarValue::Component(None)
+        ));
+    }
+
+    #[test]
+    fn dropdown_options_round_trip_and_export_as_an_ordered_luau_array() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        let mut dropdown = Component::core("Dropdown");
+        let Component::Core { props, .. } = &mut dropdown else {
+            unreachable!()
+        };
+        let options = props
+            .iter_mut()
+            .find(|prop| prop.name == "options")
+            .expect("dropdown options");
+        options.value = PropValue::StringList(vec![
+            "Solo".into(),
+            "Team \"Blue\"".into(),
+            "Solo".into(),
+        ]);
+        scene
+            .entity_mut(id)
+            .expect("entity")
+            .components
+            .push(dropdown);
+
+        let restored = Scene::from_json(&scene.to_json().expect("serialize")).expect("restore");
+        let Component::Core { props, .. } = &restored.entities[0].components[0] else {
+            unreachable!()
+        };
+        assert!(matches!(
+            props.iter().find(|prop| prop.name == "options").map(|prop| &prop.value),
+            Some(PropValue::StringList(values))
+                if values.iter().map(String::as_str).collect::<Vec<_>>()
+                    == vec!["Solo", "Team \"Blue\"", "Solo"]
+        ));
+        assert!(restored
+            .to_luau()
+            .contains(".options = {\"Solo\", \"Team \\\"Blue\\\"\", \"Solo\"}"));
+    }
+
+    #[test]
+    fn old_dropdowns_gain_an_editable_options_list_on_load() {
+        let mut scene = Scene::default();
+        let id = scene.entities[0].id;
+        let mut dropdown = Component::core("Dropdown");
+        let Component::Core { props, .. } = &mut dropdown else {
+            unreachable!()
+        };
+        props.retain(|prop| prop.name != "options");
+        scene
+            .entity_mut(id)
+            .expect("entity")
+            .components
+            .push(dropdown);
+
+        let restored = Scene::from_json(&scene.to_json().expect("serialize")).expect("restore");
+        let Component::Core { props, .. } = &restored.entities[0].components[0] else {
+            unreachable!()
+        };
+        assert!(matches!(
+            props.iter().find(|prop| prop.name == "options").map(|prop| &prop.value),
+            Some(PropValue::StringList(values)) if values.is_empty()
+        ));
     }
 
     #[test]

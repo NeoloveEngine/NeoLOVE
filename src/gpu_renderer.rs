@@ -108,11 +108,25 @@ struct CachedTexture {
 /// A prepared light-map composite: the multiply pipeline, the uploaded light-map
 /// texture descriptor, and a fullscreen quad. Drawn last, it multiplies the
 /// light over the finished scene.
+#[derive(Clone)]
 struct LightComposite {
     pipeline: Arc<GraphicsPipeline>,
     descriptor: Arc<PersistentDescriptorSet>,
     vertex_buffer: vulkano::buffer::Subbuffer<[GpuVertex]>,
 }
+
+struct CachedLightComposite {
+    generation: u64,
+    composite: LightComposite,
+}
+
+// Generated images (camera frames, procedural images, and rasterized text)
+// must not pin Vulkan textures forever after their Luau handles disappear.
+// Keep a generous working set, but retire entries that have not participated
+// in a frame for several seconds.
+const GPU_TEXTURE_IDLE_FRAMES: u64 = 300;
+const GPU_IMAGE_CACHE_LIMIT: usize = 256;
+const GPU_TEXT_CACHE_LIMIT: usize = 256;
 
 /// Log a GPU-composite failure once. Lighting then falls back to unlit rather
 /// than failing the frame.
@@ -165,6 +179,8 @@ pub(crate) struct VulkanPresenter {
     pipeline: Arc<GraphicsPipeline>,
     /// Lazily-created multiply-blend pipeline for the light-map composite.
     composite_pipeline: Option<Arc<GraphicsPipeline>>,
+    light_map_cache: crate::lighting::LightMapCache,
+    light_composite_cache: Option<CachedLightComposite>,
     recreate_swapchain: bool,
     nearest_sampler: Arc<Sampler>,
     linear_sampler: Arc<Sampler>,
@@ -173,7 +189,10 @@ pub(crate) struct VulkanPresenter {
     texture_cache: HashMap<TextureKey, CachedTexture>,
     shader_cache: HashMap<u64, Arc<GraphicsPipeline>>,
     image_cache_keys: HashMap<usize, TextureKey>,
+    image_cache_last_used: HashMap<usize, u64>,
     text_cache: HashMap<u64, TextureKey>,
+    text_cache_last_used: HashMap<u64, u64>,
+    frame_serial: u64,
     next_texture_key: u64,
 }
 
@@ -383,6 +402,8 @@ impl VulkanPresenter {
             framebuffers,
             pipeline,
             composite_pipeline: None,
+            light_map_cache: crate::lighting::LightMapCache::default(),
+            light_composite_cache: None,
             recreate_swapchain: false,
             nearest_sampler,
             linear_sampler,
@@ -391,7 +412,10 @@ impl VulkanPresenter {
             texture_cache: HashMap::new(),
             shader_cache: HashMap::new(),
             image_cache_keys: HashMap::new(),
+            image_cache_last_used: HashMap::new(),
             text_cache: HashMap::new(),
+            text_cache_last_used: HashMap::new(),
+            frame_serial: 0,
             next_texture_key: 1,
         };
         presenter.init_white_texture()?;
@@ -767,6 +791,7 @@ impl VulkanPresenter {
         )?;
         self.shader_cache.clear();
         self.composite_pipeline = None;
+        self.light_composite_cache = None;
         self.recreate_swapchain = false;
         Ok(())
     }
@@ -786,6 +811,8 @@ impl VulkanPresenter {
             self.recreate(width, height)?;
         }
 
+        self.frame_serial = self.frame_serial.wrapping_add(1);
+
         let commands = renderer::drain_commands_without_remembering(render_state)?;
         let clear_color = lock_platform_state(platform).clear_color();
         let (config, lights, occluders) = render_state
@@ -793,25 +820,45 @@ impl VulkanPresenter {
             .map_err(|_| "render state lock poisoned".to_string())?
             .take_lighting();
         let batches = self.build_batches(&commands, width.max(1), height.max(1))?;
+        self.prune_dynamic_texture_caches();
         renderer::remember_last_frame_commands(render_state, commands)?;
 
         // Build the per-pixel light map and prepare its GPU composite. Any
         // failure here is non-fatal: the scene simply renders unlit rather than
         // taking down the frame.
-        let light_composite = crate::lighting::render_light_map(
+        let light_map = crate::lighting::render_light_map_cached(
             width.max(1),
             height.max(1),
             &config,
             &lights,
             &occluders,
-        )
-        .and_then(|map| match self.prepare_light_composite(&map) {
-            Ok(composite) => Some(composite),
-            Err(error) => {
-                warn_light_composite_once(&error);
-                None
+            &mut self.light_map_cache,
+        );
+        let light_composite = if let Some((generation, map)) = light_map {
+            if let Some(cached) = self
+                .light_composite_cache
+                .as_ref()
+                .filter(|cached| cached.generation == generation)
+            {
+                Some(cached.composite.clone())
+            } else {
+                match self.prepare_light_composite(&map) {
+                    Ok(composite) => {
+                        self.light_composite_cache = Some(CachedLightComposite {
+                            generation,
+                            composite: composite.clone(),
+                        });
+                        Some(composite)
+                    }
+                    Err(error) => {
+                        warn_light_composite_once(&error);
+                        None
+                    }
+                }
             }
-        });
+        } else {
+            None
+        };
 
         let (image_index, suboptimal, acquire_future) =
             match swapchain::acquire_next_image(self.swapchain.clone(), None)
@@ -1382,6 +1429,7 @@ impl VulkanPresenter {
 
     fn texture_for_image(&mut self, image: &ImageHandle) -> Result<TextureKey, String> {
         let id = image.id().map_err(|e| e.to_string())?;
+        self.image_cache_last_used.insert(id, self.frame_serial);
         let revision = image.revision().map_err(|e| e.to_string())?;
         if let Some(key) = self.image_cache_keys.get(&id).copied()
             && let Some(cached) = self.texture_cache.get(&key)
@@ -1407,6 +1455,7 @@ impl VulkanPresenter {
         rgba: &RgbaImage,
     ) -> Result<TextureKey, String> {
         let hash = renderer::text_render_request_cache_id(request);
+        self.text_cache_last_used.insert(hash, self.frame_serial);
         if let Some(key) = self.text_cache.get(&hash).copied() {
             return Ok(key);
         }
@@ -1414,6 +1463,78 @@ impl VulkanPresenter {
         let key = self.upload_rgba_texture(key, 0, rgba)?;
         self.text_cache.insert(hash, key);
         Ok(key)
+    }
+
+    fn prune_dynamic_texture_caches(&mut self) {
+        let frame = self.frame_serial;
+
+        let mut stale_images: Vec<(usize, u64)> = self
+            .image_cache_last_used
+            .iter()
+            .filter_map(|(&id, &last_used)| {
+                (frame.wrapping_sub(last_used) > GPU_TEXTURE_IDLE_FRAMES)
+                    .then_some((id, last_used))
+            })
+            .collect();
+        if self.image_cache_keys.len().saturating_sub(stale_images.len()) > GPU_IMAGE_CACHE_LIMIT {
+            let mut remaining: Vec<(usize, u64)> = self
+                .image_cache_last_used
+                .iter()
+                .filter_map(|(&id, &last_used)| {
+                    (last_used != frame
+                        && !stale_images.iter().any(|(stale_id, _)| *stale_id == id))
+                    .then_some((id, last_used))
+                })
+                .collect();
+            remaining.sort_unstable_by_key(|(_, last_used)| *last_used);
+            let excess = self
+                .image_cache_keys
+                .len()
+                .saturating_sub(stale_images.len())
+                .saturating_sub(GPU_IMAGE_CACHE_LIMIT);
+            stale_images.extend(remaining.into_iter().take(excess));
+        }
+        for (id, _) in stale_images {
+            self.image_cache_last_used.remove(&id);
+            if let Some(key) = self.image_cache_keys.remove(&id) {
+                self.texture_cache.remove(&key);
+            }
+        }
+
+        let mut stale_text: Vec<(u64, u64)> = self
+            .text_cache_last_used
+            .iter()
+            .filter_map(|(&hash, &last_used)| {
+                (frame.wrapping_sub(last_used) > GPU_TEXTURE_IDLE_FRAMES)
+                    .then_some((hash, last_used))
+            })
+            .collect();
+        if self.text_cache.len().saturating_sub(stale_text.len()) > GPU_TEXT_CACHE_LIMIT {
+            let mut remaining: Vec<(u64, u64)> = self
+                .text_cache_last_used
+                .iter()
+                .filter_map(|(&hash, &last_used)| {
+                    (last_used != frame
+                        && !stale_text
+                            .iter()
+                            .any(|(stale_hash, _)| *stale_hash == hash))
+                    .then_some((hash, last_used))
+                })
+                .collect();
+            remaining.sort_unstable_by_key(|(_, last_used)| *last_used);
+            let excess = self
+                .text_cache
+                .len()
+                .saturating_sub(stale_text.len())
+                .saturating_sub(GPU_TEXT_CACHE_LIMIT);
+            stale_text.extend(remaining.into_iter().take(excess));
+        }
+        for (hash, _) in stale_text {
+            self.text_cache_last_used.remove(&hash);
+            if let Some(key) = self.text_cache.remove(&hash) {
+                self.texture_cache.remove(&key);
+            }
+        }
     }
 
     fn allocate_texture_key(&mut self) -> TextureKey {

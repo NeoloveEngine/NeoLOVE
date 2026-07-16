@@ -149,8 +149,7 @@ fn visible_tile_cells(
         (viewport_width, viewport_height),
         (0.0, viewport_height),
     ] {
-        let (local_x, local_y) =
-            rotate_local(screen_x - pivot.x, screen_y - pivot.y, -rotation);
+        let (local_x, local_y) = rotate_local(screen_x - pivot.x, screen_y - pivot.y, -rotation);
         let x = pivot.x + local_x;
         let y = pivot.y + local_y;
         left = left.min(x);
@@ -169,14 +168,14 @@ fn visible_tile_cells(
 
     let cell_width = width / columns as f32;
     let cell_height = height / rows as f32;
-    let column_start = (((left - base_x) / cell_width).floor() as isize)
-        .clamp(0, columns as isize) as usize;
-    let column_end = (((right - base_x) / cell_width).ceil() as isize)
-        .clamp(0, columns as isize) as usize;
-    let row_start = (((top - base_y) / cell_height).floor() as isize)
-        .clamp(0, rows as isize) as usize;
-    let row_end = (((bottom - base_y) / cell_height).ceil() as isize)
-        .clamp(0, rows as isize) as usize;
+    let column_start =
+        (((left - base_x) / cell_width).floor() as isize).clamp(0, columns as isize) as usize;
+    let column_end =
+        (((right - base_x) / cell_width).ceil() as isize).clamp(0, columns as isize) as usize;
+    let row_start =
+        (((top - base_y) / cell_height).floor() as isize).clamp(0, rows as isize) as usize;
+    let row_end =
+        (((bottom - base_y) / cell_height).ceil() as isize).clamp(0, rows as isize) as usize;
 
     (column_start < column_end && row_start < row_end).then_some(VisibleTileCells {
         column_start,
@@ -541,16 +540,37 @@ pub(crate) fn begin_ui_frame() {
     }
 }
 
-fn current_input_snapshot(platform: &SharedPlatformState) -> mlua::Result<UiInputSnapshot> {
-    let platform = lock_platform_state(platform);
-    let mouse = platform.mouse();
-    Ok(UiInputSnapshot {
-        mouse: Vec2 {
-            x: mouse.x,
-            y: mouse.y,
-        },
-        input: platform.input().clone(),
-        window: platform.window(),
+fn current_input_snapshot(
+    platform: &SharedPlatformState,
+    render_state: &SharedRenderState,
+) -> mlua::Result<UiInputSnapshot> {
+    let mut snapshot = {
+        let platform = lock_platform_state(platform);
+        let mouse = platform.mouse();
+        UiInputSnapshot {
+            mouse: Vec2 {
+                x: mouse.x,
+                y: mouse.y,
+            },
+            input: platform.input().clone(),
+            window: platform.window(),
+        }
+    };
+    let camera = render_state
+        .lock()
+        .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+        .camera_offset();
+    snapshot.mouse.x -= camera.x;
+    snapshot.mouse.y -= camera.y;
+    Ok(snapshot)
+}
+
+fn camera_offset_for_entity(entity: &Table, platform: &SharedPlatformState) -> mlua::Result<Vec2> {
+    let (camera_x, camera_y) = crate::window::get_global_position(entity)?;
+    let window = lock_platform_state(platform).window();
+    Ok(Vec2 {
+        x: window.width * 0.5 - camera_x,
+        y: window.height * 0.5 - camera_y,
     })
 }
 
@@ -2805,6 +2825,84 @@ pub fn add_core_components(
         core_components.set("EntityScaler", entity_scaler)?;
     }
 
+    // Camera
+    // Centers the scene viewport on the owning entity. Camera components run
+    // in a dedicated pre-pass after physics and before drawable components so
+    // every command and light in a frame observes one atomic camera transform.
+    {
+        let camera = lua.create_table()?;
+        camera.set("__neolove_component", "Camera")?;
+        camera.set("NEOLOVE_RENDERING", true)?;
+        camera.set("NEOLOVE_CAMERA", true)?;
+        camera.set(
+            "awake",
+            lua.create_function(|_lua, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "Camera")?;
+                component.set("enabled", true)
+            })?,
+        )?;
+
+        let active_platform = platform.clone();
+        let active_render_state = render_state.clone();
+        let set_active = lua.create_function(move |_lua, component: Table| {
+            if !component.get::<bool>("enabled").unwrap_or(true) {
+                return Ok(false);
+            }
+            let Some(entity) = component.get::<Option<Table>>("entity")? else {
+                return Ok(false);
+            };
+            let offset = camera_offset_for_entity(&entity, &active_platform)?;
+            active_render_state
+                .lock()
+                .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                .activate_camera(component.to_pointer() as usize, offset);
+            Ok(true)
+        })?;
+        camera.set("SetActive", set_active.clone())?;
+        camera.set("setActive", set_active)?;
+
+        let query_render_state = render_state.clone();
+        let is_active = lua.create_function(move |_lua, component: Table| {
+            Ok(query_render_state
+                .lock()
+                .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                .is_camera_active(component.to_pointer() as usize))
+        })?;
+        camera.set("IsActive", is_active.clone())?;
+        camera.set("isActive", is_active)?;
+
+        let update_platform = platform.clone();
+        let update_render_state = render_state.clone();
+        camera.set(
+            "update",
+            lua.create_function(move |_lua, (entity, component, _dt): (Table, Table, f32)| {
+                if !component.get::<bool>("enabled").unwrap_or(true) {
+                    return Ok(());
+                }
+                let offset = camera_offset_for_entity(&entity, &update_platform)?;
+                update_render_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .submit_camera(component.to_pointer() as usize, offset);
+                Ok(())
+            })?,
+        )?;
+
+        let destroy_render_state = render_state.clone();
+        camera.set(
+            "destroy",
+            lua.create_function(move |_lua, (_entity, component): (Table, Table)| {
+                destroy_render_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .clear_camera(component.to_pointer() as usize);
+                Ok(())
+            })?,
+        )?;
+
+        core_components.set("Camera", camera)?;
+    }
+
     // SpatialSound2D
     // Plays a sound at the owning entity's world position and keeps the
     // emitter position synchronized while it is active.
@@ -2915,7 +3013,11 @@ pub fn add_core_components(
                 let use_middle_pivot = crate::window::uses_middle_pivot(&entity);
                 let (draw_x, draw_y, offset) = if use_middle_pivot {
                     let (px, py) = crate::window::get_global_rotation_pivot(&entity)?;
-                    (px, py, Vec2 { x: 0.5, y: 0.5 })
+                    // `DrawCommand::Rect` treats (x, y) as the unrotated top-left
+                    // corner and `offset` as the pivot fraction within the rect,
+                    // so the top-left must be the pivot minus half the size for
+                    // the 0.5/0.5 offset to land exactly on the center pivot.
+                    (px - w * 0.5, py - h * 0.5, Vec2 { x: 0.5, y: 0.5 })
                 } else {
                     (x, y, Vec2 { x: 0.0, y: 0.0 })
                 };
@@ -3049,12 +3151,15 @@ pub fn add_core_components(
         )?;
         lighting.set(
             "setShadows",
-            edit_config!((Option<bool>, Option<f32>), |config, (enabled, softness)| {
-                config.shadows_enabled = enabled.unwrap_or(true);
-                if let Some(softness) = softness {
-                    config.soft_shadows = softness.max(0.0);
+            edit_config!(
+                (Option<bool>, Option<f32>),
+                |config, (enabled, softness)| {
+                    config.shadows_enabled = enabled.unwrap_or(true);
+                    if let Some(softness) = softness {
+                        config.soft_shadows = softness.max(0.0);
+                    }
                 }
-            }),
+            ),
         )?;
         lighting.set(
             "setBloom",
@@ -3139,8 +3244,7 @@ pub fn add_core_components(
     // Rng
     // seedable random-number generators as first-class objects
     {
-        lua.globals()
-            .set("Rng", crate::rng::create_module(lua)?)?;
+        lua.globals().set("Rng", crate::rng::create_module(lua)?)?;
     }
 
     // Light2D
@@ -3187,7 +3291,10 @@ pub fn add_core_components(
                     Ok(table) => color4_to_color(table)?,
                     Err(_) => Color::WHITE,
                 };
-                let angle_offset = component.get::<f32>("angleOffset").unwrap_or(0.0).to_radians();
+                let angle_offset = component
+                    .get::<f32>("angleOffset")
+                    .unwrap_or(0.0)
+                    .to_radians();
                 let cone_deg = component.get::<f32>("coneAngle").unwrap_or(60.0).max(0.0);
                 let light = Light {
                     kind,
@@ -4158,7 +4265,7 @@ pub fn add_core_components(
                     }
 
                     let draw = get_entity_draw_context(&entity)?;
-                    let snapshot = current_input_snapshot(&button_platform)?;
+                    let snapshot = current_input_snapshot(&button_platform, &render_state)?;
                     let owner_key = component_owner_key(&entity, &component);
                     let enabled = component.get::<bool>("enabled").unwrap_or(true);
                     let hovered = enabled
@@ -4406,7 +4513,7 @@ pub fn add_core_components(
                     }
 
                     let draw = get_entity_draw_context(&entity)?;
-                    let snapshot = current_input_snapshot(&input_platform)?;
+                    let snapshot = current_input_snapshot(&input_platform, &render_state)?;
                     let owner_key = component_owner_key(&entity, &component);
                     let enabled = component.get::<bool>("enabled").unwrap_or(true)
                         && !component.get::<bool>("locked").unwrap_or(false);
@@ -4446,11 +4553,7 @@ pub fn add_core_components(
                     // Place the caret at the closest character when focus was
                     // acquired by clicking, including on rotated inputs.
                     if left_pressed && hovered {
-                        let local = world_point_to_local(
-                            snapshot.mouse,
-                            draw.pivot,
-                            draw.rotation,
-                        );
+                        let local = world_point_to_local(snapshot.mouse, draw.pivot, draw.rotation);
                         let border = component.get::<f32>("border_width").unwrap_or(1.0).max(0.0);
                         let padding = component.get::<f32>("padding").unwrap_or(8.0).max(0.0);
                         let padding_x = component
@@ -4723,14 +4826,10 @@ pub fn add_core_components(
                             measure_inline_text(&text_root, &component, &caret_prefix, None);
                         let visible_width =
                             measure_inline_text(&text_root, &component, &visible_text, None);
-                        let caret_origin = match get_string_field(
-                            &component,
-                            "align_x",
-                            "alignX",
-                        )
-                        .as_deref()
-                        .map(parse_align_x)
-                        .unwrap_or(TextAlignX::Left)
+                        let caret_origin = match get_string_field(&component, "align_x", "alignX")
+                            .as_deref()
+                            .map(parse_align_x)
+                            .unwrap_or(TextAlignX::Left)
                         {
                             TextAlignX::Center => {
                                 text_bounds.x + (text_bounds.w - visible_width).max(0.0) * 0.5
@@ -4822,10 +4921,7 @@ pub fn add_core_components(
                     component.set("menu_background_color", color4(ctx, 37, 37, 38, 255)?)?;
                     component.set("menu_border_color", color4(ctx, 69, 69, 69, 255)?)?;
                     component.set("item_background_color", color4(ctx, 37, 37, 38, 0)?)?;
-                    component.set(
-                        "item_hover_background_color",
-                        color4(ctx, 42, 45, 46, 255)?,
-                    )?;
+                    component.set("item_hover_background_color", color4(ctx, 42, 45, 46, 255)?)?;
                     component.set(
                         "item_selected_background_color",
                         color4(ctx, 9, 71, 113, 255)?,
@@ -4860,7 +4956,7 @@ pub fn add_core_components(
                     }
 
                     let draw = get_entity_draw_context(&entity)?;
-                    let snapshot = current_input_snapshot(&dropdown_platform)?;
+                    let snapshot = current_input_snapshot(&dropdown_platform, &render_state)?;
                     let owner_key = component_owner_key(&entity, &component);
                     let enabled = component.get::<bool>("enabled").unwrap_or(true);
                     let items = read_ui_list_items(
@@ -5299,23 +5395,21 @@ pub fn add_core_components(
                 })?,
             )?;
 
-            let set_value = lua.create_function(
-                |_ctx, (component, value): (Table, f32)| {
-                    let min = component.get::<f32>("min").unwrap_or(0.0);
-                    let max = component.get::<f32>("max").unwrap_or(100.0);
-                    let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
-                    let clamped = value.clamp(lo, hi);
-                    component.set("value", clamped)?;
-                    let range = hi - lo;
-                    let fraction = if range.abs() > f32::EPSILON {
-                        ((clamped - min) / (max - min)).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    component.set("fraction", fraction)?;
-                    Ok(())
-                },
-            )?;
+            let set_value = lua.create_function(|_ctx, (component, value): (Table, f32)| {
+                let min = component.get::<f32>("min").unwrap_or(0.0);
+                let max = component.get::<f32>("max").unwrap_or(100.0);
+                let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
+                let clamped = value.clamp(lo, hi);
+                component.set("value", clamped)?;
+                let range = hi - lo;
+                let fraction = if range.abs() > f32::EPSILON {
+                    ((clamped - min) / (max - min)).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                component.set("fraction", fraction)?;
+                Ok(())
+            })?;
             slider.set("setValue", set_value.clone())?;
             slider.set("SetValue", set_value)?;
 
@@ -5329,7 +5423,7 @@ pub fn add_core_components(
                     }
 
                     let draw = get_entity_draw_context(&entity)?;
-                    let snapshot = current_input_snapshot(&slider_platform)?;
+                    let snapshot = current_input_snapshot(&slider_platform, &render_state)?;
                     let owner_key = component_owner_key(&entity, &component);
                     let enabled = component.get::<bool>("enabled").unwrap_or(true);
 
@@ -5368,8 +5462,7 @@ pub fn add_core_components(
 
                     let mut changed = false;
                     if dragging && enabled {
-                        let local =
-                            world_point_to_local(snapshot.mouse, draw.pivot, draw.rotation);
+                        let local = world_point_to_local(snapshot.mouse, draw.pivot, draw.rotation);
                         let fraction = if track_len <= 0.0 {
                             0.0
                         } else if vertical {
@@ -5446,8 +5539,10 @@ pub fn add_core_components(
                         .get::<f32>("track_thickness")
                         .unwrap_or(6.0)
                         .max(0.0);
-                    let corner_radius =
-                        component.get::<f32>("corner_radius").unwrap_or(3.0).max(0.0);
+                    let corner_radius = component
+                        .get::<f32>("corner_radius")
+                        .unwrap_or(3.0)
+                        .max(0.0);
                     let thumb_corner_radius = component
                         .get::<f32>("thumb_corner_radius")
                         .unwrap_or(thumb_size * 0.5)
@@ -5643,7 +5738,7 @@ pub fn add_core_components(
                     }
 
                     let draw = get_entity_draw_context(&entity)?;
-                    let snapshot = current_input_snapshot(&scroll_list_platform)?;
+                    let snapshot = current_input_snapshot(&scroll_list_platform, &render_state)?;
                     let owner_key = component_owner_key(&entity, &component);
                     let enabled = component.get::<bool>("enabled").unwrap_or(true);
                     let hovered = enabled
@@ -6326,120 +6421,113 @@ pub fn add_core_components(
         let sprite_sheet_render_state = render_state.clone();
         sprite_sheet.set(
             "update",
-            lua.create_function(
-                move |ctx, (entity, component, dt): (Table, Table, f32)| {
-                    if !component.get::<bool>("visible").unwrap_or(true) {
-                        return Ok(());
-                    }
-                    let Some(image) = component.get::<Option<AnyUserData>>("image")? else {
-                        return Ok(());
-                    };
-                    let image = image.borrow::<crate::assets::ImageHandle>()?;
-                    image.ensure_uploaded()?;
-                    let (image_w, image_h) = image.dimensions()?;
-                    let frame_w = component
-                        .get::<f32>("frame_width")
-                        .unwrap_or(32.0)
-                        .max(1.0)
-                        .min(image_w as f32);
-                    let frame_h = component
-                        .get::<f32>("frame_height")
-                        .unwrap_or(32.0)
-                        .max(1.0)
-                        .min(image_h as f32);
-                    let spacing = component.get::<f32>("spacing").unwrap_or(0.0).max(0.0);
-                    let margin = component
-                        .get::<f32>("margin")
-                        .unwrap_or(0.0)
-                        .max(0.0)
-                        .min(((image_w as f32 - frame_w) * 0.5).max(0.0))
-                        .min(((image_h as f32 - frame_h) * 0.5).max(0.0));
-                    let usable_w = (image_w as f32 - margin * 2.0).max(frame_w);
-                    let usable_h = (image_h as f32 - margin * 2.0).max(frame_h);
-                    let available_columns =
-                        (((usable_w + spacing) / (frame_w + spacing)).floor() as i64).max(1);
-                    let columns = component
-                        .get::<i64>("columns")
-                        .unwrap_or(0)
-                        .max(0);
-                    let columns = if columns == 0 {
-                        available_columns
-                    } else {
-                        columns.min(available_columns).max(1)
-                    };
-                    let available_rows =
-                        (((usable_h + spacing) / (frame_h + spacing)).floor() as i64).max(1);
-                    let available_frames = columns.saturating_mul(available_rows).max(1);
-                    let configured_count = component.get::<i64>("frame_count").unwrap_or(0);
-                    let frame_count = if configured_count <= 0 {
-                        available_frames
-                    } else {
-                        configured_count.min(available_frames).max(1)
-                    };
-                    let mut frame = component.get::<i64>("frame").unwrap_or(0).max(0);
+            lua.create_function(move |ctx, (entity, component, dt): (Table, Table, f32)| {
+                if !component.get::<bool>("visible").unwrap_or(true) {
+                    return Ok(());
+                }
+                let Some(image) = component.get::<Option<AnyUserData>>("image")? else {
+                    return Ok(());
+                };
+                let image = image.borrow::<crate::assets::ImageHandle>()?;
+                image.ensure_uploaded()?;
+                let (image_w, image_h) = image.dimensions()?;
+                let frame_w = component
+                    .get::<f32>("frame_width")
+                    .unwrap_or(32.0)
+                    .max(1.0)
+                    .min(image_w as f32);
+                let frame_h = component
+                    .get::<f32>("frame_height")
+                    .unwrap_or(32.0)
+                    .max(1.0)
+                    .min(image_h as f32);
+                let spacing = component.get::<f32>("spacing").unwrap_or(0.0).max(0.0);
+                let margin = component
+                    .get::<f32>("margin")
+                    .unwrap_or(0.0)
+                    .max(0.0)
+                    .min(((image_w as f32 - frame_w) * 0.5).max(0.0))
+                    .min(((image_h as f32 - frame_h) * 0.5).max(0.0));
+                let usable_w = (image_w as f32 - margin * 2.0).max(frame_w);
+                let usable_h = (image_h as f32 - margin * 2.0).max(frame_h);
+                let available_columns =
+                    (((usable_w + spacing) / (frame_w + spacing)).floor() as i64).max(1);
+                let columns = component.get::<i64>("columns").unwrap_or(0).max(0);
+                let columns = if columns == 0 {
+                    available_columns
+                } else {
+                    columns.min(available_columns).max(1)
+                };
+                let available_rows =
+                    (((usable_h + spacing) / (frame_h + spacing)).floor() as i64).max(1);
+                let available_frames = columns.saturating_mul(available_rows).max(1);
+                let configured_count = component.get::<i64>("frame_count").unwrap_or(0);
+                let frame_count = if configured_count <= 0 {
+                    available_frames
+                } else {
+                    configured_count.min(available_frames).max(1)
+                };
+                let mut frame = component.get::<i64>("frame").unwrap_or(0).max(0);
 
-                    let fps = component.get::<f32>("fps").unwrap_or(12.0);
-                    if component.get::<bool>("playing").unwrap_or(true)
-                        && fps.is_finite()
-                        && fps > 0.0
-                    {
-                        let frame_duration = 1.0 / fps;
-                        let mut elapsed = component.get::<f32>("__frame_time").unwrap_or(0.0)
-                            + dt.max(0.0);
-                        let steps = (elapsed / frame_duration).floor() as i64;
-                        if steps > 0 {
-                            elapsed -= steps as f32 * frame_duration;
-                            frame = frame.saturating_add(steps);
-                            if component.get::<bool>("looping").unwrap_or(true) {
-                                frame %= frame_count;
-                            } else if frame >= frame_count {
-                                frame = frame_count - 1;
-                                component.set("playing", false)?;
-                            }
-                            component.set("frame", frame)?;
+                let fps = component.get::<f32>("fps").unwrap_or(12.0);
+                if component.get::<bool>("playing").unwrap_or(true) && fps.is_finite() && fps > 0.0
+                {
+                    let frame_duration = 1.0 / fps;
+                    let mut elapsed =
+                        component.get::<f32>("__frame_time").unwrap_or(0.0) + dt.max(0.0);
+                    let steps = (elapsed / frame_duration).floor() as i64;
+                    if steps > 0 {
+                        elapsed -= steps as f32 * frame_duration;
+                        frame = frame.saturating_add(steps);
+                        if component.get::<bool>("looping").unwrap_or(true) {
+                            frame %= frame_count;
+                        } else if frame >= frame_count {
+                            frame = frame_count - 1;
+                            component.set("playing", false)?;
                         }
-                        component.set("__frame_time", elapsed)?;
+                        component.set("frame", frame)?;
                     }
-                    frame = frame.min(frame_count - 1);
+                    component.set("__frame_time", elapsed)?;
+                }
+                frame = frame.min(frame_count - 1);
 
-                    let source = Rect {
-                        x: margin + (frame % columns) as f32 * (frame_w + spacing),
-                        y: margin + (frame / columns) as f32 * (frame_h + spacing),
-                        w: frame_w,
-                        h: frame_h,
-                    };
-                    let (x, y, rotation) = crate::window::get_global_transform(&entity)?;
-                    let (w, h) = crate::window::get_global_size(&entity)?;
-                    let use_middle_pivot = crate::window::uses_middle_pivot(&entity);
-                    let (draw_x, draw_y, pivot) = if use_middle_pivot {
-                        let (px, py) = crate::window::get_global_rotation_pivot(&entity)?;
-                        (px - w * 0.5, py - h * 0.5, Vec2 { x: px, y: py })
-                    } else {
-                        (x, y, Vec2 { x, y })
-                    };
-                    let tint: Color = color4_to_color(component.get("color")?)?;
-                    let shader = shader_from_component(&component)?;
-                    let mut renderer = sprite_sheet_render_state
-                        .lock()
-                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
-                    renderer.queue(DrawCommand::Image {
-                        image: image.clone(),
-                        dest: Rect {
-                            x: draw_x,
-                            y: draw_y,
-                            w,
-                            h,
-                        },
-                        source: Some(source),
-                        rotation,
-                        pivot,
-                        tint,
-                        filter: app_texture_filter(ctx),
-                        shader,
-                    });
-                    Ok(())
-                },
-            )?,
+                let source = Rect {
+                    x: margin + (frame % columns) as f32 * (frame_w + spacing),
+                    y: margin + (frame / columns) as f32 * (frame_h + spacing),
+                    w: frame_w,
+                    h: frame_h,
+                };
+                let (x, y, rotation) = crate::window::get_global_transform(&entity)?;
+                let (w, h) = crate::window::get_global_size(&entity)?;
+                let use_middle_pivot = crate::window::uses_middle_pivot(&entity);
+                let (draw_x, draw_y, pivot) = if use_middle_pivot {
+                    let (px, py) = crate::window::get_global_rotation_pivot(&entity)?;
+                    (px - w * 0.5, py - h * 0.5, Vec2 { x: px, y: py })
+                } else {
+                    (x, y, Vec2 { x, y })
+                };
+                let tint: Color = color4_to_color(component.get("color")?)?;
+                let shader = shader_from_component(&component)?;
+                let mut renderer = sprite_sheet_render_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
+                renderer.queue(DrawCommand::Image {
+                    image: image.clone(),
+                    dest: Rect {
+                        x: draw_x,
+                        y: draw_y,
+                        w,
+                        h,
+                    },
+                    source: Some(source),
+                    rotation,
+                    pivot,
+                    tint,
+                    filter: app_texture_filter(ctx),
+                    shader,
+                });
+                Ok(())
+            })?,
         )?;
         core_components.set("SpriteSheet2D", sprite_sheet)?;
     }
@@ -6897,12 +6985,19 @@ pub fn add_core_components(
                     let window = platform.window();
                     (window.width, window.height)
                 };
+                let camera = render_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .camera_offset();
                 let Some(visible) = visible_tile_cells(
-                    base_x,
-                    base_y,
+                    base_x + camera.x,
+                    base_y + camera.y,
                     width,
                     height,
-                    pivot,
+                    Vec2 {
+                        x: pivot.x + camera.x,
+                        y: pivot.y + camera.y,
+                    },
                     rotation,
                     viewport_width,
                     viewport_height,
@@ -7285,7 +7380,10 @@ mod tests {
             -320.0,
             1280.0,
             1280.0,
-            Vec2 { x: -320.0, y: -320.0 },
+            Vec2 {
+                x: -320.0,
+                y: -320.0,
+            },
             0.0,
             320.0,
             240.0,
@@ -7314,32 +7412,32 @@ mod tests {
         assert!(rotated.column_start < rotated.column_end);
         assert!(rotated.row_start < rotated.row_end);
 
-        assert!(visible_tile_cells(
-            1000.0,
-            1000.0,
-            320.0,
-            320.0,
-            Vec2 { x: 1000.0, y: 1000.0 },
-            0.0,
-            320.0,
-            240.0,
-            10,
-            10,
-        )
-        .is_none());
+        assert!(
+            visible_tile_cells(
+                1000.0,
+                1000.0,
+                320.0,
+                320.0,
+                Vec2 {
+                    x: 1000.0,
+                    y: 1000.0
+                },
+                0.0,
+                320.0,
+                240.0,
+                10,
+                10,
+            )
+            .is_none()
+        );
     }
 
     fn lua_with_core_components() -> (Lua, SharedRenderState) {
         let lua = Lua::new();
         let platform = crate::platform::new_shared_platform_state();
         let render_state = crate::renderer::new_shared_render_state();
-        add_core_components(
-            &lua,
-            platform,
-            render_state.clone(),
-            std::env::temp_dir(),
-        )
-        .expect("core components install");
+        add_core_components(&lua, platform, render_state.clone(), std::env::temp_dir())
+            .expect("core components install");
         (lua, render_state)
     }
 
@@ -7444,6 +7542,24 @@ mod tests {
         )
         .exec()
         .expect("component registration script runs");
+    }
+
+    #[test]
+    fn camera_component_is_registered_with_activation_methods() {
+        let (lua, _render_state) = lua_with_core_components();
+        lua.load(
+            r#"
+                assert(type(core.Camera) == "table", "Camera missing")
+                assert(core.Camera.__neolove_component == "Camera")
+                assert(core.Camera.NEOLOVE_CAMERA == true)
+                assert(type(core.Camera.SetActive) == "function")
+                assert(type(core.Camera.setActive) == "function")
+                assert(type(core.Camera.IsActive) == "function")
+                assert(type(core.Camera.isActive) == "function")
+            "#,
+        )
+        .exec()
+        .expect("camera component registration script runs");
     }
 
     fn component_with_letter_bounds(lua: &Lua) -> mlua::Result<Table> {

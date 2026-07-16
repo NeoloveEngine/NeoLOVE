@@ -366,12 +366,13 @@ impl HubApp {
         if self.recents.is_empty() {
             let empty = Rect::new(area.x + 14.0, list_top, area.w - 28.0, 62.0);
             ui.painter.fill_round_rect(empty, 4.0, panel_alt);
-            ui.painter.text(
+            ui.painter.text_clipped(
                 empty.x + 12.0,
                 empty.y + 21.0,
                 "No recent projects yet.",
                 14.0,
                 ui.theme.text_dim,
+                (empty.w - 24.0).max(0.0),
             );
             return;
         }
@@ -498,7 +499,14 @@ impl HubApp {
             ("Autosave before Run", &mut draft.autosave_before_run),
             ("Autosave before Build", &mut draft.autosave_before_build),
         ] {
-            ui.painter.text(px + 16.0, y + 4.0, label, 13.0, ui.theme.text_dim);
+            ui.painter.text_clipped(
+                px + 16.0,
+                y + 4.0,
+                label,
+                13.0,
+                ui.theme.text_dim,
+                214.0_f32.min(width - 48.0).max(0.0),
+            );
             if let Some(next) = ui.checkbox(Rect::new(px + 240.0, y, 22.0, 22.0), *value) {
                 *value = next;
             }

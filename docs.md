@@ -15,7 +15,8 @@ This manual documents the complete user-facing surface:
 - every NeoLOVE Luau global, module, handle, function, field, callback, alias,
   and core component;
 - platform differences, build outputs, and supported asset formats; and
-- the complete generated Luau declaration file in the final API appendix.
+- task-oriented, per-function reference entries with parameters, results,
+  failure modes, edge cases, and runnable examples.
 
 ::: info
 The API reference describes the implemented runtime. Names beginning with `_`
@@ -32,7 +33,7 @@ contract.
 | Application | `app`, `window`, `mouse` |
 | Input and platform | `input`, `userInput`, `android`, `mobile` |
 | Entities and transforms | `ecs`, `core`, `transform`, `transforms` |
-| Assets and sound | `assets`, `audio` |
+| Assets, sound, and capture | `assets`, `audio`, `media`, `microphone` |
 | Files and processes | `fs`, `commands`, `command` |
 | Networking | `http`, `servers` |
 | Gameplay helpers | `async`, `prefabs`, `prefab`, `tweening`, `tween`, `animation`, `animations` |
@@ -50,13 +51,14 @@ editor logger when the game is launched from the editor.
 ## Requirements
 
 - A current stable Rust toolchain for manual builds.
-- Linux: ALSA and `pkg-config` development packages.
+- Linux: ALSA development files, `pkg-config`, Clang/libclang, and Linux V4L2
+  headers. These cover native audio plus microphone/camera capture.
 - Vulkan is optional. The default desktop build uses the software renderer.
 
 On Debian or Ubuntu:
 
 ```sh
-sudo apt-get install pkg-config libasound2-dev
+sudo apt-get install pkg-config libasound2-dev clang libclang-dev linux-libc-dev
 ```
 
 ## Automated installers
@@ -436,6 +438,41 @@ core component properties, and behaviour-script variables. Selecting a
 `Collider2D` draws its effective collision shape. Image, nine-slice, tiled,
 tilemap, sprite-sheet, and particle components use real asset previews.
 
+## Attached entity values
+
+The Inspector's **Attached Values** section authors fields directly on the
+runtime entity, without requiring a behaviour component. Click **Add Value**,
+name the field, choose its type, and edit it in place. This is the visual-editor
+equivalent of writing `entity.foo = "bar"` in Luau.
+
+Available value types are numbers, strings, booleans, colors, entity
+references, component references, images, sounds, shaders, animations, lists,
+and tables. Lists and table values can contain any of those types recursively;
+table keys can be strings, numbers, or booleans. Asset values use the same
+searchable project picker as component fields. Assign entity references by
+dragging a Hierarchy row, and component references by dragging a component
+header. Deleting the referenced entity/component clears matching references,
+including references nested inside lists and tables.
+
+For example, an editor-authored entity with `health`, `portrait`, `target`, and
+`stats` values is available directly to gameplay code:
+
+```luau
+print(enemy.health)
+enemy.stats.hits += 1
+enemy.target = nil
+sprite.image = enemy.portrait
+```
+
+Scene export uses bracket assignment, such as
+`enemy["display name"] = "Knight"`, so spaces and punctuation in names are
+preserved. Empty names are retained in the editor but skipped at runtime.
+Duplicate names are assigned in order, so the final value wins. Because these
+are real entity-table fields, avoid engine-managed names such as `id`, `parent`,
+`children`, and `components`, and avoid replacing transform fields or methods
+unless that override is deliberate. Internal entity/component references are
+remapped when a prefab is instantiated or an entity subtree is duplicated.
+
 ## Viewport tools
 
 - Move, scale, rotate, and combined transform gizmos.
@@ -497,6 +534,13 @@ Entity reference fields accept a dragged Hierarchy row. For a component
 reference, drag a component header, hover the destination entity to inspect it,
 then drop on the destination field without releasing the pointer.
 
+For a `Dropdown`, expand **Options** in the Inspector to add, rename, move up,
+move down, or delete entries. The editor preserves order, duplicates, empty
+strings, and escaped characters when saving and exporting the scene. Newly
+added rows receive keyboard focus. The visual editor authors string options;
+use Luau when an option needs the runtime's richer table form with a separate
+value or icon.
+
 Color properties expose inline R, G, B, and A fields; alpha `0` is transparent
 and `255` opaque. A swatch opens either an HSV square/hue strip or RGBA sliders,
 both with alpha. The chosen mode is saved globally. Interactive widget state
@@ -549,7 +593,8 @@ New editor saves use compressed MessagePack documents with format headers:
 The loaders retain JSON compatibility for older or hand-authored files. A scene
 stores `name`, RGBA `background`, `nearest_neighbor_scaling`, `antialiasing`,
 and `entities`. Each entity stores its id, name, optional linked prefab source,
-transform fields, optional parent id, active state, and components.
+transform fields, optional parent id, active state, attached values, and
+components.
 
 `.neoanim` is JSON and uses the same `AnimationClip` shape documented in the
 animation API.
@@ -557,10 +602,10 @@ animation API.
 At runtime, scene loading generates Luau from the document. It omits inactive
 entities and every descendant of an inactive entity, creates parents before
 children, requires each unique script component module once, and reuses each
-unique image path. Core properties and Inspector values are assigned to the
-new component instances; entity/component references are resolved after their
-targets exist. Scene background, image filtering, and anti-aliasing are written
-to `app`.
+unique image path. Core properties and Inspector values are assigned to new
+component instances, and Attached Values are assigned directly to their entity
+tables; entity/component references are resolved after their targets exist.
+Scene background, image filtering, and anti-aliasing are written to `app`.
 
 ::: warning
 Scene and prefab serialization is an editor interchange format, not a stable
@@ -600,6 +645,7 @@ than intended for manual editing.
 | `show_tooltips` | boolean | `true` |
 | `show_window_bounds` | boolean | `true` |
 | `show_transform_hud` | boolean | `true` |
+| `preview_lighting` | boolean | `true` |
 | `autosave_before_run` | boolean | `true` |
 | `autosave_before_build` | boolean | `true` |
 | `mobile_emulator` | boolean | `false` |
@@ -764,7 +810,7 @@ Each update performs:
 
 1. reset per-frame UI popup state;
 2. synchronize `mouse`, `window`, and `ecs.root` size;
-3. deliver completed HTTP and server work;
+3. deliver completed HTTP, media-device, and server work;
 4. resume each unfinished `async` task once;
 5. run pending custom-component `awake` callbacks;
 6. advance tween and animation players;
@@ -774,8 +820,10 @@ Each update performs:
 10. run newly queued component `awake` callbacks;
 11. run non-rendering component `update` callbacks in entity/component order;
 12. simulate rigidbodies, colliders, bolts, and ropes;
-13. run rendering-component updates in stable draw order; and
-14. submit queued draw commands to the selected presenter.
+13. resolve enabled Camera components in a dedicated camera pre-pass;
+14. run drawable rendering-component updates in stable draw order; and
+15. translate the scene and lighting by the resolved camera before submitting
+    commands to the selected presenter.
 
 `NEOLOVE_RENDERING = true` delays a component's update until the render pass.
 Draw order is ascending `z`, then ascending entity id, with component order
@@ -812,6 +860,8 @@ Aliases reference the same module or operation unless noted:
 | `tweening` | `tween` |
 | `animation` | `animations` |
 | `transform` | `transforms` |
+| `microphone` | `media.microphone` |
+| `microphone.listDevices` | `microphone.enumerateDevices` |
 | `core.Panel` | `core.Frame` |
 | `core.TextBox` | `core.TextLabel`, `core.RudimentaryTextLabel` |
 | `core.NineSliceSprite2D` | `core["9SliceSprite2D"]` |
@@ -835,6 +885,13 @@ Invalid argument types raise Luau errors. Synchronous filesystem, shader,
 asset, scene, prefab, and animation loads also raise on failure. APIs which
 represent expected operational failure return `false`, `nil`, or a result table
 with `ok = false` as documented.
+
+In the function-reference tables, **Parameters** names every argument other
+than an implicit method `self`. **Returns** lists every normal result; `()`
+means the call has no return value. Unless an entry explicitly says otherwise,
+passing a value of the wrong Luau type raises an argument error before the
+operation starts. Canonical spellings head each entry and exact aliases are
+listed in that same entry rather than documented as separate operations.
 
 <!-- page: global-helpers | Globals and Helpers -->
 # Globals and Helpers
@@ -866,8 +923,14 @@ proxies.
 Color4(r: number, g: number, b: number, a: number?) -> Color4Value
 ```
 
-Each channel is clamped to `0..255` and converted to a byte. Alpha defaults to
-`255`.
+| Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- |
+| `r`, `g`, `b`: numeric byte-channel values. `a`: optional alpha, default `255`. | A new `{ r, g, b, a }` table whose fields are integer bytes. | Each channel is clamped to `0..255` and converted to a byte. Values outside that range do not wrap. The returned table is mutable and is not shared with another color. |
+
+```luau
+local translucentOrange = Color4(300, 128, -20, 96)
+assert(translucentOrange.r == 255 and translucentOrange.b == 0)
+```
 
 ## `die`
 
@@ -875,8 +938,9 @@ Each channel is clamped to `0..255` and converted to a byte. Alpha defaults to
 die(reason: string?) -> ()
 ```
 
-Requests a clean runtime exit. An absent or blank reason becomes
-`"die() called"`.
+| Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- |
+| `reason`: optional diagnostic string. | `()`; control does not continue through a normal game frame. | Requests a clean runtime exit. `nil`, `""`, or whitespace-only text becomes `"die() called"`. The reason is reported through the runtime's normal shutdown/error channel; this is not a recoverable `false` result. |
 
 ## `softrequire`
 
@@ -905,6 +969,29 @@ is attempted only when no file resolves.
 Cache keys do not include `allowedModules`; the first successful load for a
 given resolved path or source determines the cached result for later calls.
 
+**Parameters.** `modulePathOrSource` is either a project-contained module path
+or Luau source text. `allowedModules`, when present, is either an array of
+runtime-global names to copy or a string-keyed table whose values are installed
+under those keys. A numeric list entry whose global does not exist is simply
+not installed.
+
+**Returns and failures.** The function returns every normal value produced by
+the loaded chunk according to the loader's module semantics. Resolution,
+syntax, runtime, project-boundary, and invalid-allowlist errors raise. A module
+which legitimately returns `nil` therefore has the same visible result as any
+other nil-returning module; failures never use `nil` as a sentinel.
+
+```luau
+-- File form: only expose the globals this utility actually needs.
+local parser = softrequire("scripts/parser", { "Color4", "Rng" })
+
+-- Source form: inject an explicit dependency without widening the sandbox.
+local double = softrequire("return function(n) return dep(n) * 2 end", {
+    dep = function(n) return n + 1 end,
+})
+assert(double(4) == 10)
+```
+
 ## `print` and `require`
 
 ```luau
@@ -912,9 +999,22 @@ print(...any) -> ()
 require(modulePath: string) -> any
 ```
 
-`print` applies `tostring`, joins arguments with tabs, writes one line to
-stdout, and forwards it to the editor logger. `require` is the mlua text-module
-loader rooted at the project.
+`print` accepts any number of values, returns nothing, applies `tostring`, joins
+arguments with tabs, writes one line to stdout, and forwards it to the editor
+logger. With no arguments it writes a blank line. A failing custom `__tostring`
+metamethod propagates as an error.
+
+`require` accepts one project module path and returns the value exported by the
+module. It is the mlua text-module loader rooted at the project. Paths may omit
+the script suffix and may resolve a directory's `init` file; missing files,
+syntax/runtime errors, and paths escaping the project raise. Successfully
+loaded modules are cached, so later calls return the cached export rather than
+running top-level code again.
+
+```luau
+local inventory = require("scripts/inventory")
+print("slots", #inventory.slots)
+```
 
 ## Legacy `bg`
 
@@ -957,23 +1057,31 @@ export type AppModule = {
 | `nearestNeighborScaling` | `true` | `true` selects nearest-neighbor image filtering; `false` selects linear filtering. |
 | `antiAliasing` | `high` | Global geometry and default text quality. The runtime also reads lowercase `antialiasing` as a fallback. |
 
-## Functions
+## Function reference
 
-| Function | Behavior |
-| --- | --- |
-| `setMaxFps(fps?)` | Stores a positive finite cap. `nil`, non-positive, NaN, or infinite input clears it. |
-| `getMaxFps()` | Returns the valid current cap or `nil`. |
-| `setShowFps(enabled?)` | Enables or disables the counter; omitted input means `true`. |
-| `getShowFps()` | Returns the current value, defaulting to `true`. |
-| `setNearestNeighborScaling(enabled?)` | Sets filtering; omitted input means `true`. |
-| `getNearestNeighborScaling()` | Returns the current value, defaulting to `true`. |
-| `setAntiAliasing(mode?)` | Sets `off`, `standard`, or `high`; omitted/unknown input becomes `high`. |
-| `getAntiAliasing()` | Returns the stored mode, defaulting to `high`. |
+| Function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `setMaxFps(fps?)` | `fps`: optional numeric frames-per-second cap. | `()` | Stores a positive finite cap. `nil`, `0`, negative, NaN, or infinite input clears the cap. It affects frame pacing, not simulation `dt` clamping. |
+| `getMaxFps()` | None. | Positive finite `number`, or `nil` when uncapped/invalid. | Reads and validates the current `app.maxFps`, including direct field assignments. |
+| `setShowFps(enabled?)` | `enabled`: optional boolean; default `true`. | `()` | Controls the presenter's built-in FPS counter. |
+| `getShowFps()` | None. | `boolean`. | Returns `app.showFps`; a missing field defaults to `true`. |
+| `setNearestNeighborScaling(enabled?)` | `enabled`: optional boolean; default `true`. | `()` | `true` selects nearest-neighbor sampling and `false` selects linear sampling for images. Existing image handles need not be reloaded. |
+| `getNearestNeighborScaling()` | None. | `boolean`. | Returns the current filtering preference; a missing field defaults to `true`. |
+| `setAntiAliasing(mode?)` | `mode`: optional quality name. | `()` | Stores normalized `"off"`, `"standard"`, or `"high"`. `nil` and unknown strings become `"high"`; compatibility spellings are listed below. |
+| `getAntiAliasing()` | None. | `"off"`, `"standard"`, or `"high"`. | Normalizes the current field on read, so a legacy or unknown directly assigned value still has a defined result. |
 
 Replacing the global `app` table is supported: the functions look up the
 current table when called. Desktop frame pacing also reads the current table.
 The parser maps `none`, `disabled`, and `pixel` to `off`; `fast`, `normal`, and
 `on` to `standard`; and every other string to `high`.
+
+```luau
+app.setMaxFps(120)
+app.setShowFps(false)
+app.setNearestNeighborScaling(true)
+app.setAntiAliasing("standard")
+print(app.getMaxFps(), app.getAntiAliasing())
+```
 
 <!-- page: input | Input API -->
 # Input API
@@ -1004,25 +1112,25 @@ export type InputModule = {
 }
 ```
 
-## State functions
+## State-function reference
 
-| Function | Meaning |
-| --- | --- |
-| `isKeyDown(key)` | Key is currently held. |
-| `isKeyPressed(key)` | Key transitioned down during this frame. |
-| `isKeyReleased(key)` | Key transitioned up during this frame. |
-| `isMouseDown(button?)` | Mouse button is held; omitted button is `left`. |
-| `isMousePressed(button?)` | Mouse button transitioned down this frame. |
-| `isMouseReleased(button?)` | Mouse button transitioned up this frame. |
-| `getMouseWheel()` | Returns horizontal and vertical frame deltas. |
-| `isScrollingIn()` | Vertical wheel delta is positive. |
-| `isScrollingOut()` | Vertical wheel delta is negative. |
-| `getScrollInAmount()` | Returns the signed vertical wheel delta despite the historical name. |
-| `getMouseDelta()` | Returns cursor movement `dx, dy` for this frame. |
-| `setMouseLocked(locked)` | Requests locked/grabbed cursor mode. |
-| `isMouseLocked()` | Returns the requested lock state. |
-| `getLastKeyPressed()` | Last mapped key pressed this frame, or `nil`. |
-| `getCharPressed()` | Text character received this frame, or `nil`. |
+| Function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `isKeyDown(key)` | `key`: normalized key name. | `boolean`. | `true` for every frame the mapped key remains held. Unknown names return `false`. |
+| `isKeyPressed(key)` | `key`: normalized key name. | `boolean`. | `true` only in the frame in which the mapped key transitioned up-to-down. Repeats do not create another transition unless the key was released. Unknown names return `false`. |
+| `isKeyReleased(key)` | `key`: normalized key name. | `boolean`. | `true` only in the down-to-up transition frame. Unknown names return `false`. |
+| `isMouseDown(button?)` | `button`: optional normalized button, default `"left"`. | `boolean`. | Tests held state. Unknown buttons return `false`. |
+| `isMousePressed(button?)` | `button`: optional normalized button, default `"left"`. | `boolean`. | Tests this frame's up-to-down transition. |
+| `isMouseReleased(button?)` | `button`: optional normalized button, default `"left"`. | `boolean`. | Tests this frame's down-to-up transition. |
+| `getMouseWheel()` | None. | Horizontal `x` delta, then vertical `y` delta. | Both are signed numbers accumulated for the current frame and reset for the next. A frame with no wheel input returns `0, 0`. |
+| `isScrollingIn()` | None. | `boolean`. | Equivalent to testing whether the current vertical wheel delta is positive. |
+| `isScrollingOut()` | None. | `boolean`. | Equivalent to testing whether the current vertical wheel delta is negative. |
+| `getScrollInAmount()` | None. | Signed vertical wheel delta. | Historical name notwithstanding, scrolling out returns a negative number and no scrolling returns `0`. |
+| `getMouseDelta()` | None. | `dx, dy` movement for this frame. | Values are logical-window deltas and reset each frame; locked mode may report relative motion without moving `mouse`. |
+| `setMouseLocked(locked)` | `locked`: requested lock/grab state. | `()` | Requests the platform cursor mode. Browser policy may defer/reject pointer lock until a user gesture; the stored request can still be read back. |
+| `isMouseLocked()` | None. | `boolean`. | Returns the requested state, not a guarantee that the OS/browser currently owns the pointer. |
+| `getLastKeyPressed()` | None. | Normalized key `string`, or `nil`. | Returns the last mapped key transition observed in the current frame. Multiple presses keep only the last one. |
+| `getCharPressed()` | None. | Text `string`, or `nil`. | Returns the last text-input character received in the current frame. It is text input, not a physical-key name; multiple characters keep only the last. |
 
 Key and button strings are normalized by removing non-alphanumeric characters
 and lowercasing, so `"Left Shift"`, `"left_shift"`, and `"leftshift"` match.
@@ -1035,10 +1143,20 @@ Supported cross-platform key names are `a` through `z`, `0` through `9`,
 
 ## On-screen keyboard
 
-`showKeyboard` and `openKeyboard` are aliases. They request the Android soft
-keyboard and default `implicit` to `true`. `hideKeyboard` and `closeKeyboard`
-are aliases; `implicitOnly` defaults to `false`. All four return `true` when an
-Android activity handled the request and `false` on unsupported platforms.
+| Canonical function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `showKeyboard(implicit?)` (`openKeyboard` alias) | `implicit`: optional boolean, default `true`, forwarded to Android's show mode. | `true` when an Android activity accepted the request; `false` when unsupported or no activity was available. | This is a request, so `true` does not guarantee a particular IME visibly opened. Desktop, web, and iOS builds return `false`. |
+| `hideKeyboard(implicitOnly?)` (`closeKeyboard` alias) | `implicitOnly`: optional boolean, default `false`, forwarded to Android's hide mode. | `true` when an Android activity accepted the request; otherwise `false`. | When `true`, an explicitly opened keyboard may remain visible according to Android IME rules. |
+
+```luau
+function update()
+    if input.isKeyPressed("escape") then
+        input.setMouseLocked(not input.isMouseLocked())
+    end
+    local wheelX, wheelY = input.getMouseWheel()
+    if wheelY ~= 0 then print("wheel", wheelX, wheelY) end
+end
+```
 
 Pressed, released, wheel, character, and delta values are frame-local. Mobile
 emulation suppresses hardware keyboard events.
@@ -1089,22 +1207,41 @@ local task = async(function()
 end)
 ```
 
-## Module functions
+## Module-function reference
 
-| Function | Result |
-| --- | --- |
-| `async(callback)` | Queues a coroutine and returns its handle. The callback starts next update. |
-| `async.yield(...values)` | Yields the current coroutine until a later update. Yielded values follow normal coroutine semantics. |
-| `async.count()` | Count of queued or suspended unfinished tasks. |
-| `async.cancelAll()` | Marks every unfinished task cancelled and returns the number changed. |
+| Function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `async(callback)` | `callback`: zero-argument function whose return values become the task result. | A new `AsyncTask` in `"queued"` state. | Queues but does not immediately invoke the callback; first execution is on the next engine update. A callback error is captured on the task and printed rather than returned by this call. |
+| `async.yield(...values)` | Any values to yield through the Luau coroutine. | Values supplied when the coroutine is next resumed, following ordinary coroutine semantics. | Suspends only the calling coroutine until a later engine update. Calling outside a yieldable coroutine raises. Engine scheduling does not currently inject resume values, so normal task use receives no values. |
+| `async.count()` | None. | Non-negative number of queued/running/suspended unfinished tasks. | Completed, cancelled, and errored handles are excluded even while user code still references them. |
+| `async.cancelAll()` | None. | Number of tasks newly changed to cancelled. | Already terminal tasks are ignored. Cancellation is cooperative between resumes; it cannot interrupt a callback while that callback is currently executing. |
 
-## Handle fields and methods
+## Handle fields and method reference
 
-`result` is the first return value; `results` stores all return values as a
-1-based table; `getResult()` returns them as multiple values. `cancel()` returns
-`true` only when it changed an unfinished task. Errors set `status = "error"`,
-`done = true`, and `error`, and are also printed. Completed and cancelled tasks
-cannot be resumed.
+`result` is the first return value and `results` stores all return values as a
+1-based table. Errors set `status = "error"`, `done = true`, and `error`, and
+are also printed. Completed and cancelled tasks cannot be resumed.
+
+| Canonical method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `task:cancel()` (`Cancel` alias) | None beyond `self`. | `true` if this call changed an unfinished task; otherwise `false`. | Marks a queued or suspended task cancelled. It is idempotent and cannot interrupt Lua code already running during the same resume. |
+| `task:isDone()` (`IsDone` alias) | None. | `boolean`. | `true` for `completed`, `cancelled`, and `error`; `false` for queued/running/suspended. Equivalent to the current `done` field. |
+| `task:getStatus()` (`GetStatus` alias) | None. | One status string from the declared status union. | Returns a snapshot; retaining the string does not track later state. |
+| `task:getError()` (`GetError` alias) | None. | Error message `string`, or `nil`. | Only errored tasks normally have a message. A not-yet-finished, completed, or cancelled task returns `nil`. |
+| `task:getResult()` (`GetResult` alias) | None. | Every callback return value as multiple results. | Before successful completion, or after cancellation/error, it returns no values. Nil holes follow normal Luau multiple-return/table limitations; use `status` to distinguish unfinished from a callback that intentionally returned nothing. |
+
+```luau
+local job = async(function()
+    async.yield()
+    return "ready", 42
+end)
+
+-- In a later frame:
+if job:isDone() and job:getStatus() == "completed" then
+    local label, value = job:getResult()
+    print(label, value)
+end
+```
 
 ::: warning
 Synchronous asset, filesystem, networking setup, and command calls still block
@@ -1133,13 +1270,13 @@ export type AssetsModule = {
 
 ## Image functions
 
-| Function | Behavior |
-| --- | --- |
-| `loadImage(pathOrBase64Png)` | Loads/caches a file or accepts raw PNG base64, `base64:...`, or a `data:image/png;base64,...` URI. |
-| `loadImageBase64(base64Png)` | Explicit raw/base64 PNG loader. |
-| `snapPhoto(x,y,x2,y2)` | Copies a clipped top-left/bottom-right rectangle from the most recently rendered frame. |
-| `newImage(width,height,color?)` | Creates a mutable RGBA image; dimensions clamp to at most 65535 and color defaults opaque white. |
-| `unloadImage(pathOrHandle)` | Unloads a cached path or handle; returns whether an asset changed. |
+| Function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `loadImage(pathOrBase64Png)` | A project/data resource path, raw PNG base64, `base64:...`, or `data:image/png;base64,...`. | Live `ImageHandle`. | File loads are cached by resolved path. Base64 is decoded as PNG. Missing files, malformed base64, unsupported/corrupt image data, and path violations raise. An explicitly unloaded cached image is decoded again on the next load. |
+| `loadImageBase64(base64Png)` | Raw, `base64:`-prefixed, or PNG data-URI text. | Live `ImageHandle`. | Bypasses path detection and decodes PNG bytes. Invalid encoding/data raises; equivalent text may share the base64 cache. |
+| `snapPhoto(x, y, x2, y2)` | Opposite rectangle corners in logical screen pixels. | New mutable `ImageHandle` containing the clipped region. | Coordinates may be supplied in either order and are clipped to the last completed frame. It raises before a frame exists or if clipping leaves no positive-area region. The snapshot does not update with future frames. |
+| `newImage(width, height, color?)` | Numeric dimensions and optional initial color, default opaque white. | New mutable `ImageHandle`. | Dimensions are converted to integer pixel counts and capped at `65535` each; non-positive/invalid dimensions raise. Every pixel receives a copy of the clamped color. |
+| `unloadImage(value)` | Cached path/base64 key or an `ImageHandle`. | `true` if a live cache/handle was invalidated; otherwise `false`. | Unloading is idempotent. Other references to the same handle become unusable; a later path load creates a live replacement. |
 
 ```luau
 export type ImageHandle = {
@@ -1161,18 +1298,43 @@ export type ImageHandle = {
 ```
 
 Pixels are zero-based. Both mutation methods accept a `Color4` table or separate
-`r,g,b[,a]` channels, clamped to bytes. `setPixel` and `fill` modify the CPU copy; call `upload`
-before expecting an already uploaded texture to reflect changes. `save` and
-`export` are aliases and write PNG, adding `.png` when no extension is present.
-A different extension raises an error.
+`r,g,b[,a]` channels, clamped to bytes. `setPixel` and `fill` modify the CPU
+copy; call `upload` before expecting an already uploaded texture to reflect
+changes.
+
+| Canonical method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `image:width()` | None. | Pixel width as an integer. | Raises after unload. |
+| `image:height()` | None. | Pixel height as an integer. | Raises after unload. |
+| `image:size()` | None. | Width, then height. | Both results match the methods above; raises after unload. |
+| `image:getPixel(x, y)` | Zero-based integer pixel coordinates. | New `Color4Value` table for that pixel. | Raises when either coordinate is outside the image or the handle is unloaded. Mutating the returned table does not edit the image. |
+| `image:setPixel(x, y, color)` | Coordinates plus `Color4Value`; the runtime also accepts `x, y, r, g, b, a?`. | `()` | Updates the CPU copy at exactly one pixel. Channels clamp to bytes. Out-of-range coordinates/unloaded handles raise. Call `upload()` to refresh a texture already sent to the renderer. |
+| `image:fill(color)` | `Color4Value`; the runtime also accepts `r, g, b, a?`. | `()` | Replaces every CPU-side pixel. It does not resize or automatically re-upload an existing GPU texture. |
+| `image:upload()` | None. | `()` | Uploads or refreshes renderer texture data from the CPU copy. Repeated calls are allowed; unloaded handles raise. |
+| `image:export(path)` (`save` alias) | Destination path. | `()` | Encodes the current CPU copy as PNG. Adds `.png` when no extension is present; any other extension raises. Relative paths use the writable data root and parent directories are created where supported. I/O/encoding failures raise. |
+| `image:unload()` | None. | `()` | Invalidates the handle and associated cached/render resources. Repeating it is safe; all data methods subsequently raise. Use `isUnloaded()` when the distinction matters. |
+| `image:isUnloaded()` | None. | `boolean`. | Never raises solely because the handle is unloaded. |
+
+```luau
+local checker = assets.newImage(16, 16, Color4(20, 20, 24))
+for y = 0, 15 do
+    for x = 0, 15 do
+        if (x + y) % 2 == 0 then
+            checker:setPixel(x, y, 240, 90, 160)
+        end
+    end
+end
+checker:upload()
+checker:save("generated/checker.png")
+```
 
 ## Sound functions
 
-| Function | Behavior |
-| --- | --- |
-| `loadSound(path)` | Loads/caches decoded interleaved floating-point samples. |
-| `newSound(sampleRate,channels,len,fill?)` | Creates at least `len` interleaved samples initialized to `fill` (default `0`), padding to a complete channel frame. |
-| `unloadSound(pathOrHandle)` | Unloads a cached path or handle; returns whether an asset changed. |
+| Function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `loadSound(path)` | Project/data resource path to supported encoded audio. | Live cached `SoundHandle`. | Resolves writable data before packaged resources. Missing, unreadable, corrupt, or unsupported audio raises. Browser encoded audio can be playable without exposing decoded samples, as described below. |
+| `newSound(sampleRate, channels, len, fill?)` | Positive sample rate, channel count of at least `1`, requested interleaved sample count, and optional initial amplitude (default `0`). | New editable `SoundHandle`. | Values are converted to the runtime's integral counts; sample length is padded upward to a complete channel frame and fill clamps to `-1..1`. Invalid/non-positive rate, channels, or length raise. |
+| `unloadSound(value)` | Cached path or `SoundHandle`. | `true` if a live sound/cache entry changed; otherwise `false`. | Idempotent. All references to an invalidated handle cease to be playable/editable; loading the path again creates a replacement. |
 
 ```luau
 export type SoundHandle = {
@@ -1195,14 +1357,37 @@ samples after any padding. `upload`
 refreshes the playable buffer. `save` and `export` write WAV and add `.wav` if
 needed.
 
+| Canonical method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `sound:sampleRate()` | None. | Sample rate in Hz, or `0` for opaque browser-encoded audio. | Raises after unload. |
+| `sound:channels()` | None. | Interleaved channel count, or `0` for opaque browser audio. | Raises after unload. |
+| `sound:len()` | None. | Total interleaved sample count, or `0` when samples are unavailable. | This is not frames-per-channel; divide by `channels()` when nonzero. |
+| `sound:getSample(index)` | Zero-based interleaved sample index. | Amplitude number in `-1..1`. | Out-of-range indexes, unavailable decoded samples, and unloaded handles raise. |
+| `sound:setSample(index, value)` | Zero-based interleaved index and numeric amplitude. | `()` | Writes the CPU sample, clamping amplitude to `-1..1`; it does not automatically refresh current playback. Invalid indexes/unavailable data raise. |
+| `sound:upload()` | None. | `()` | Rebuilds the playable buffer from editable samples. Opaque browser audio and unloaded handles reject sample upload. Existing playback may need to be restarted to use changed data. |
+| `sound:export(path)` (`save` alias) | Destination path. | `()` | Writes editable samples as WAV, adding `.wav` when no extension is present. Other extensions, unavailable decoded samples, or I/O failures raise. |
+| `sound:unload()` | None. | `()` | Invalidates samples and playback resources. Repeated calls are safe. |
+| `sound:isUnloaded()` | None. | `boolean`. | Reports invalidation without accessing sample data. |
+
+```luau
+local tone = assets.newSound(48_000, 1, 4_800)
+for i = 0, tone:len() - 1 do
+    tone:setSample(i, math.sin(i * 2 * math.pi * 440 / tone:sampleRate()) * 0.2)
+end
+tone:upload()
+audio.playOnce(tone)
+```
+
 On web, encoded browser-audio loads retain their encoded bytes for playback but
 do not expose decoded editable samples: `sampleRate()`, `channels()`, and
 `len()` report zero. Newly generated sounds still use the editable WAV path.
 
 ## Cache collection and path rules
 
-`assets.gc()` removes cache entries whose weak handles no longer have any live
-references and returns the numbers of image entries and sound entries removed.
+`assets.gc()` takes no parameters, removes cache entries whose weak handles no
+longer have any live references, and returns two non-negative integers: image
+entries removed, then sound entries removed. Explicitly unloaded entries may
+also disappear; still-referenced live handles are never collected.
 Unloaded handles reject further reads, writes,
 uploads, rendering, and playback.
 
@@ -1228,19 +1413,476 @@ export type AudioModule = {
 }
 ```
 
-| Function | Behavior |
-| --- | --- |
-| `play(sound,looped?,volume?)` | Starts or restarts non-spatial playback. Defaults: not looped, volume `1`. |
-| `playOnce(sound,volume?)` | Equivalent to `play(sound,false,volume)`. |
-| `stop(sound)` | Stops active playback associated with the handle. |
-| `setVolume(sound,volume)` | Changes current playback volume. |
-| `playSpatial(sound,x,y,looped?,volume?)` | Starts a 2D emitter at world coordinates. |
-| `setPosition(sound,x,y)` | Moves an existing spatial emitter; returns `false` if none is active. |
-| `setListenerPosition(x,y)` | Moves the 2D listener. |
+| Function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `play(sound, looped?, volume?)` | Live `SoundHandle`; optional loop flag (default `false`); optional gain (default `1`). | `()` | Starts or restarts non-spatial playback associated with this handle. Gain clamps to `0..1`. Invalid/unloaded sound data or an unavailable audio device raises/reports through the platform audio backend. |
+| `playOnce(sound, volume?)` | Live sound and optional gain. | `()` | Exact convenience behavior of `play(sound, false, volume)`. A later `play` on the same handle replaces its associated playback. |
+| `stop(sound)` | Sound whose associated playback should stop. | `()` | Stops both looping and one-shot playback tracked for the handle. Calling it when nothing is active is a no-op; an unloaded handle is not a valid sound argument. |
+| `setVolume(sound, volume)` | Sound and numeric gain. | `()` | Changes the tracked active playback, clamping to `0..1`. If no playback is active there is nothing to modify; use the next `play` call's volume. |
+| `playSpatial(sound, x, y, looped?, volume?)` | Live sound, world-space emitter position, optional loop flag and gain. | `()` | Starts/restarts tracked 2D spatial playback. Attenuation depends on distance from the current listener. Non-finite coordinates are invalid. |
+| `setPosition(sound, x, y)` | Sound and new world-space emitter coordinates. | `true` when an active spatial emitter moved; `false` when none exists. | Non-spatial playback does not count as an emitter. |
+| `setListenerPosition(x, y)` | World-space listener coordinates. | `()` | Affects current and future spatial playback. The listener is global; the Camera component does not move it automatically. |
 
 Volume is clamped to `0..1`. Browser playback is subject to user-gesture
 autoplay restrictions. `SpatialSound2D` is preferable when the emitter should
 follow an entity automatically.
+
+```luau
+local bell = assets.loadSound("assets/bell.wav")
+audio.setListenerPosition(player:GetWorldPosition())
+local towerX, towerY = tower:GetWorldPosition()
+audio.playSpatial(bell, towerX, towerY, false, 0.8)
+```
+
+<!-- page: media | Microphone and Camera API -->
+# Microphone and Camera API
+
+Globals: `media`, `microphone` (`media.microphone` is the same table)
+
+NeoLOVE never opens a microphone/camera or displays a permission prompt merely
+because the module exists. Device enumeration and permission-status reads do
+not open hardware. Only an explicit `media.requestAccess(...)`,
+`microphone.requestAccess(...)`, or `microphone.requestDevice(...)` call
+requests capture permission and starts devices. Make that call in response to a
+clear user action, explain what will be captured, retain the returned stream
+only as long as needed, and stop it when the feature ends.
+
+All discovery/access callbacks are asynchronous and are delivered at the start
+of a later engine frame. Submission returns a request id, never a stream
+directly. Callback errors in game code are logged and do not make the request
+callback run again.
+
+## Devices, permissions, and support
+
+```luau
+export type MediaPermissionStatus = "prompt" | "granted" | "denied" | "unavailable"
+export type MediaDeviceKind = "microphone" | "camera"
+export type MediaEnumerationKind = MediaDeviceKind | "all" | "both"
+
+export type MediaDevice = {
+    id: string,
+    kind: MediaDeviceKind,
+    label: string,
+    isDefault: boolean,
+}
+
+export type MediaDeviceResult = {
+    ok: boolean,
+    devices: { MediaDevice }?,
+    code: string?,
+    error: string?,
+}
+```
+
+Device ids are opaque selections for a later constraint's `deviceId`; do not
+parse, persist as identity, or expose them unnecessarily. They can change after
+reboot, reconnect, browser permission changes, or site-data clearing. Browser
+labels/ids may be blank, generic, or anonymized until permission is granted.
+
+| Function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `media.enumerateDevices(callback)` / `media.enumerateDevices(kind, callback)` | Optional `"microphone"`, `"camera"`, `"all"`, or `"both"` filter; callback receives `MediaDeviceResult`. Omitted kind means both. | Monotonically increasing request-id number. | Enumerates asynchronously without opening a device. Success has `ok = true` and a `devices` array, which can legitimately be empty. Failure has `ok = false`, `code`, and `error`. When both kinds are requested, native enumeration succeeds with devices from the working kind if the other kind failed; it fails only when no devices were returned and at least one enumeration failed. Runtime compatibility spellings `mic`/`audio`/`audioinput` and `video`/`videoinput` are accepted, but canonical code should use the declared names. Invalid call shapes/kinds raise synchronously and do not schedule a callback. |
+| `media.getPermissionStatus(kind)` | Exactly `"microphone"` or `"camera"`. | `"prompt"`, `"granted"`, `"denied"`, or `"unavailable"`. | Read-only snapshot; never prompts. `prompt` means access has not produced a known decision, not a guarantee the next request will show UI. `unavailable` means the backend/policy cannot request that kind. `"all"`/`"both"` and unknown kinds raise. Browser Permissions API updates can arrive asynchronously, so a later call can differ. |
+| `media.permissions()` | None. | New `{ microphone = status, camera = status }` table. | Snapshot equivalent to two permission reads. Mutating it does not change permission state. A failed combined audio+video request does not mark both denied when the runtime cannot know which permission failed; query each status or request separately when the distinction matters. |
+| `media.isSupported(kind)` | One device/enumeration kind. | `boolean`. | Reports backend capability, **not** attached hardware, current permission, or whether a requested format will work. `all`/`both` is true only when the backend supports both categories. Linux, Windows, and macOS can return true with no device connected. Web requires a secure context and `getUserMedia`; Android and native platforms without a capture backend return false. Invalid kinds raise. |
+
+```luau
+local statuses = media.permissions()
+print("microphone", statuses.microphone, "camera", statuses.camera)
+
+media.enumerateDevices("camera", function(result)
+    if not result.ok then
+        print("camera discovery failed", result.code, result.error)
+        return
+    end
+    for _, device in ipairs(result.devices or {}) do
+        print(device.id, device.label, device.isDefault)
+    end
+end)
+```
+
+## Focused `microphone` library
+
+The focused library exposes the common list → choose → request flow without a
+mixed audio/video options table. `microphone` and `media.microphone` refer to
+the same object and use the same asynchronous backend, request ids, streams,
+permission rules, and errors as `media`. Listing devices never opens a
+microphone or prompts for permission.
+
+```luau
+export type MicrophoneModule = {
+    listDevices: (callback: (MediaDeviceResult) -> ()) -> number,
+    enumerateDevices: (callback: (MediaDeviceResult) -> ()) -> number,
+    requestAccess: (((MediaAccessResult) -> ()) -> number)
+        & ((MediaAudioConstraints, (MediaAccessResult) -> ()) -> number)
+        & ((string, (MediaAccessResult) -> ()) -> number),
+    requestDevice: (deviceId: string, callback: (MediaAccessResult) -> ()) -> number,
+    cancelRequest: (requestId: number) -> boolean,
+    getPermissionStatus: () -> MediaPermissionStatus,
+    isSupported: () -> boolean,
+}
+```
+
+| Function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `microphone.listDevices(callback)` (`enumerateDevices` alias) | Callback receiving `MediaDeviceResult`. | Monotonically increasing request-id number. | Enumerates only microphone devices. A successful result can contain an empty `devices` array. Device ids and labels have the privacy/lifetime caveats above. Invalid callback types raise synchronously. |
+| `microphone.requestAccess(callback)` | Access-result callback. | Request-id number. | Requests the default microphone with backend defaults. It is asynchronous and may display a permission prompt. |
+| `microphone.requestAccess(constraints, callback)` | `MediaAudioConstraints` table and result callback. | Request-id number. | Requests one microphone with the supplied device/rate/channel/processing preferences. Actual negotiated format can differ; inspect `stream:getAudioFormat()`. Invalid constraints raise before a request is queued. |
+| `microphone.requestAccess(deviceId, callback)` | Opaque enumeration id and result callback. | Request-id number. | Shorthand for `{ deviceId = deviceId }`. A stale/unknown id completes with `device_unavailable`; an empty id selects the default. |
+| `microphone.requestDevice(deviceId, callback)` | Opaque enumeration id and result callback. | Request-id number. | Explicitly named alias of the string overload above, useful after a device picker. It does not validate that the id is still attached until asynchronous startup. |
+| `microphone.cancelRequest(requestId)` | Pending enumeration/access request id. | `boolean`. | Same cancellation function as `media.cancelRequest`; `true` means this call first cancelled a pending request. The callback still runs once with code `cancelled`. |
+| `microphone.getPermissionStatus()` | None. | `MediaPermissionStatus`. | Read-only microphone permission snapshot; never prompts. |
+| `microphone.isSupported()` | None. | `boolean`. | Reports backend microphone capability, not whether a device is attached or permission is granted. |
+
+```luau
+local microphoneStream: MediaStream? = nil
+
+microphone.listDevices(function(result)
+    if not result.ok then
+        print("Microphone discovery failed", result.code, result.error)
+        return
+    end
+
+    local devices = result.devices or {}
+    for index, device in ipairs(devices) do
+        print(index, device.label, device.id, device.isDefault)
+    end
+    if #devices == 0 then
+        print("No microphone is attached")
+        return
+    end
+
+    -- In a real settings screen, pass the id chosen by the user.
+    microphone.requestDevice(devices[1].id, function(access)
+        if access.ok then
+            microphoneStream = access.stream
+            local format = microphoneStream:getAudioFormat()
+            if format then
+                print("Using microphone", devices[1].label, format.sampleRate, format.channels)
+            end
+        else
+            print("Microphone could not start", access.code, access.error)
+        end
+    end)
+end)
+
+-- When voice mode ends:
+-- if microphoneStream then microphoneStream:stop(); microphoneStream = nil end
+```
+
+## Requesting access
+
+```luau
+export type MediaAudioConstraints = {
+    deviceId: string?,
+    sampleRate: number?,
+    channels: number?,
+    echoCancellation: boolean?,
+    noiseSuppression: boolean?,
+    autoGainControl: boolean?,
+}
+
+export type MediaVideoConstraints = {
+    deviceId: string?,
+    width: number?,
+    height: number?,
+    frameRate: number?,
+    facingMode: ("user" | "environment" | "left" | "right")?,
+}
+
+export type MediaRequestOptions = {
+    audio: (boolean | MediaAudioConstraints)?,
+    video: (boolean | MediaVideoConstraints)?,
+    microphone: (boolean | MediaAudioConstraints)?,
+    camera: (boolean | MediaVideoConstraints)?,
+}
+
+export type MediaAccessResult = {
+    ok: boolean,
+    stream: MediaStream?,
+    code: string?,
+    error: string?,
+}
+```
+
+`audio` and `video` are canonical; `microphone` and `camera` are fallback
+aliases used only when their canonical key is nil. Thus `audio = false` disables
+audio even if `microphone` also contains a table. `true` requests backend
+defaults, `false`/nil disables that track, and a table requests it with
+constraints. At least one track must be enabled.
+
+| Constraint | Accepted values | Negotiation and edge cases |
+| --- | --- | --- |
+| `audio.deviceId` | Id from microphone enumeration, or a platform id string. | Selects that input. Empty/default ids choose the default. A stale/unknown exact id fails with `device_unavailable`. |
+| `audio.sampleRate` | Whole number `8000..384000`. | Native selects the closest supported rate/config; web sends an ideal constraint and reports the AudioContext's actual rate. Read `stream:getAudioFormat()` rather than assuming the request was exact. |
+| `audio.channels` | Whole number `1..32`. | Native selects the closest supported channel configuration; browser support varies. Samples are always returned interleaved at the negotiated count. |
+| `echoCancellation`, `noiseSuppression`, `autoGainControl` | Optional booleans. | Passed to browser media constraints. The current desktop backend accepts but does not implement these software-processing hints. |
+| `video.deviceId` | Camera enumeration id/platform id. | Selects the device; stale ids fail. Empty/default uses the first/default camera. |
+| `video.width`, `video.height` | Whole numbers `1..16384`. | Desired dimensions. Desktop selects the closest decodable format; browser treats them as ideal. Actual frame dimensions can differ and can change, so inspect each frame. |
+| `video.frameRate` | Whole number `1..240`. | Desired FPS, not a delivery guarantee. Slow game reads drop intermediate frames rather than building an unbounded queue. |
+| `video.facingMode` | `user`, `environment`, `left`, or `right`. | Browser ideal-facing hint. The current desktop backend accepts but ignores it; choose a desktop `deviceId` instead. Values are case-sensitive and unknown values raise synchronously. |
+
+All numeric constraints must be finite integers in range. Wrong types,
+fractional/out-of-range values, a non-table options argument, a non-function
+callback, or enabling neither track raises synchronously; no request id is
+returned and no callback runs.
+
+### `media.requestAccess(options, callback) -> number`
+
+Validates the options, registers the callback, starts an asynchronous
+all-or-nothing capture request, and returns its id. Success invokes the callback
+once with `{ ok = true, stream = MediaStream }`. Failure invokes it once with
+`{ ok = false, code = ..., error = ... }`. A combined request succeeds only
+when both requested tracks open; if either fails, partially opened tracks are
+stopped. Native startup times out after about 60 seconds rather than waiting
+forever for a device/permission response.
+
+Keep a strong reference to `result.stream`. Dropping the last Luau stream
+handle stops its devices automatically; saving only a frame image does not keep
+capture alive.
+
+### `media.cancelRequest(requestId) -> boolean`
+
+Returns `true` only when this call first marks a still-pending enumeration or
+access request cancelled. It returns `false` for an unknown, already completed,
+or already cancelled id. A successful cancellation still invokes the original
+callback exactly once on a later frame with `ok = false`, `code = "cancelled"`;
+any stream that races to completion is immediately stopped. Cancellation
+cannot retract a permission choice the user already made at the OS/browser
+prompt.
+
+### Result error codes
+
+Every asynchronous failure includes a human-readable `error`; branch on the
+stable `code` and show/log the message. Backends may add codes in future.
+
+| Code | Meaning and likely recovery |
+| --- | --- |
+| `cancelled` | The matching pending request was cancelled. Usually no user-facing error is needed. |
+| `permission_denied` | User, OS privacy settings, browser policy, insecure/security policy, or a permission timeout denied capture. Explain how to re-enable permission; do not immediately reprompt in a loop. |
+| `device_unavailable` | No matching/default device exists, or a selected id went stale. Re-enumerate and let the user choose another device. |
+| `device_busy` | Another application/session owns the device or it could not be read. Offer retry after the other use ends. |
+| `constraints_unsatisfied` | Browser could not satisfy a requested constraint. Relax dimensions/rate/channels or request defaults. |
+| `unsupported_format` | Native microphone hardware exposed a sample format this build cannot convert. Choose another device/config. |
+| `unsupported` | Capture API/backend/context is unavailable (including current Android builds and insecure web capture). Hide/disable the feature or direct web users to HTTPS/localhost. |
+| `invalid_options` | Backend rejected encoded options. Most invalid Luau options instead raise synchronously before submission. |
+| `capture_failed` | Generic startup/runtime worker, decode, timeout, or browser failure not covered above. The accompanying message is diagnostic. |
+
+## Stream methods and capture formats
+
+```luau
+export type MediaAudioFormat = { sampleRate: number, channels: number }
+export type MediaVideoFormat = { width: number, height: number, frameRate: number }
+
+export type MediaAudioSamples = MediaAudioFormat & {
+    frameCount: number,
+    droppedSamples: number,
+    format: "f32le",
+    samples: { number },
+}
+
+export type MediaAudioBytes = MediaAudioFormat & {
+    frameCount: number,
+    droppedSamples: number,
+    format: "f32le",
+    data: string,
+}
+
+export type MediaVideoFrame = {
+    image: ImageHandle,
+    width: number,
+    height: number,
+    timestamp: number,
+    droppedFrames: number,
+}
+```
+
+| Method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `stream:stop()` | None. | `()` | Idempotently stops all tracks, clears buffered audio/video, releases device/backend nodes, and wipes the stream's privacy-sensitive live camera image (including retained clones) to one transparent pixel. The image handle remains safely renderable while a preview is removed. The stream remains queryable for state, formats, and its last runtime error, but read methods raise `media stream is stopped`. Always stop promptly when leaving voice/camera mode. |
+| `stream:isActive()` | None. | `boolean`. | True while the backend has at least one live track and no stop/runtime-failure flag. A cable disconnect, browser track end, runtime capture error, explicit stop, or `stopAll` makes it false. |
+| `stream:hasAudio()` | None. | `boolean`. | Reports whether the negotiated stream was created with an audio track. It remains a format/capability fact after stop; it is not active-state. |
+| `stream:hasVideo()` | None. | `boolean`. | Same rule for the video track. |
+| `stream:getAudioFormat()` | None. | New `{ sampleRate, channels }`, or `nil` without audio. | Actual negotiated values. Browser processing can update internal capture details, but returned chunks also carry their exact format. Mutating the table has no effect. |
+| `stream:getVideoFormat()` | None. | New `{ width, height, frameRate }`, or `nil` without video. | Initial negotiated/settings values; web width/height/FPS can be `0` before metadata is ready. Each returned frame is authoritative if the camera changes resolution. |
+| `stream:readAudio(maxFrames?)` | Optional whole frame limit, default `1024`, valid `1..16384`. | `MediaAudioSamples`, or `nil` when no complete frame is buffered. | Consumes oldest buffered complete channel frames. Raises if the stream has no microphone track, has stopped, or the limit is invalid. `samples` is 1-based, interleaved floating-point PCM (frame 1 channel 1, frame 1 channel 2, ...), normally `-1..1`. |
+| `stream:readAudioBytes(maxFrames?)` | Same frame limit. | `MediaAudioBytes`, or `nil`. | Consumes from the **same FIFO** as `readAudio`; choose one representation per consumer. Raises without a microphone track, after stop, or for an invalid limit. `data` is a binary-safe Luau string of interleaved IEEE-754 32-bit little-endian floats. Its byte length is `frameCount * channels * 4`. Use this form for compact network/storage conversion. |
+| `stream:readVideoFrame()` | None. | New frame record, or `nil` when no newer frame is available. | Consumes the newest available camera frame; intermediate frames are intentionally replaced/dropped. Raises if there is no camera track, the stream has stopped, or a frame cannot be copied/decoded. Updating the frame image is CPU/GPU revision-aware; do not call `image:upload()`. |
+| `stream:getLastError()` | None. | Runtime error/track-ended message string, or `nil`. | Startup failures arrive through `MediaAccessResult`, not here. This reports an error after a previously successful stream; it may remain readable after activity ends. A normal explicit stop need not set an error. |
+
+Audio capture retains at most approximately five seconds. If the game does not
+read quickly enough, oldest interleaved samples are discarded.
+`droppedSamples` reports the number of individual channel samples discarded
+since the previous successful audio read (divide by `channels` for dropped
+frames); it resets when a non-empty chunk is returned. `frameCount` is the
+number of complete multi-channel frames actually returned, never the raw sample
+array length.
+
+Camera capture retains only its newest unread frame. `droppedFrames` reports
+frames overwritten since the previous successful frame read. `timestamp` is a
+monotonic seconds value useful for ordering within that stream/session, but its
+origin differs by backend and must not be compared across machines/streams.
+
+::: warning Live camera image
+Each stream owns exactly one mutable camera `ImageHandle`. Every successful
+`readVideoFrame()` updates that same image's pixels, dimensions, and renderer
+revision. A previously retained `oldFrame.image` therefore shows the **newest
+read frame**, not a snapshot. This avoids allocating a texture every frame and
+lets a `Sprite2D` keep the first image handle. Copy/export pixels before the next
+read when a snapshot is required. The live handle has no export destination of
+its own: copy its pixels into an `assets.newImage(...)` handle, then export that
+copy. Do not unload this live image while its
+stream is active. Stopping the stream wipes the image and every retained clone
+to one transparent pixel so captured pixels are not kept implicitly; explicitly
+copy a frame first when the application has informed consent to retain it.
+:::
+
+### `media.stopAll() -> number`
+
+Stops every still-referenced active media stream and backend capture session,
+returning how many tracked streams were active immediately before stopping.
+Repeated calls normally return `0`. It does not cancel pending access/device
+requests; cancel those ids separately. Runtime shutdown/module teardown stops
+pending work and active streams, and the web build also stops tracks on page
+hide/unload.
+
+### `media._poll() -> ()`
+
+Drains device/access completions and invokes callbacks. The engine calls it at
+the start of each update. Manual calls return nothing but can re-enter user code
+and change callback ordering, so `_poll` is engine-managed.
+
+## Camera preview example
+
+Request access from a button/click handler on web. The stream and component are
+retained outside the callback; the same sprite image then updates without
+allocation on each successful read.
+
+```luau
+local cameraStream: MediaStream? = nil
+local previewSprite: Sprite2D? = nil
+
+local function startCamera()
+    if not media.isSupported("camera") then
+        print("Camera capture is unavailable")
+        return
+    end
+
+    media.requestAccess({
+        video = { width = 640, height = 480, frameRate = 30, facingMode = "user" },
+    }, function(result)
+        if not result.ok then
+            print("Camera failed", result.code, result.error)
+            return
+        end
+        cameraStream = result.stream -- retain it or capture stops
+    end)
+end
+
+local previewEntity = ecs.newEntity("Camera preview", ecs.root, 32, 32)
+previewEntity.size_x, previewEntity.size_y = 320, 240
+previewSprite = previewEntity:AddComponent(core.Sprite2D)
+
+function update(dt)
+    if cameraStream and cameraStream:isActive() then
+        local frame = cameraStream:readVideoFrame()
+        if frame then
+            previewSprite.image = frame.image -- same live handle after first frame
+            previewEntity.size_y = previewEntity.size_x * frame.height / frame.width
+        end
+    end
+end
+
+-- Wire this to a visible opt-in button:
+-- permissionButton.onClick = function() startCamera() end
+-- On leaving the camera mode: cameraStream:stop(); cameraStream = nil
+```
+
+## Proximity-voice transport example
+
+`readAudioBytes` supplies capture PCM; it does not provide a codec, jitter
+buffer, echo mixer, encryption, or networking. This compact example sends
+20-ms-ish PCM packets through a class-service client. A production game should
+add an audio codec, sequence/timestamps, authentication/moderation, jitter
+buffering, resampling, packet-loss handling, and bandwidth/rate limits.
+
+```luau
+local voiceStream: MediaStream? = nil
+
+local function startVoiceAfterUserConsent()
+    media.requestAccess({
+        audio = {
+            sampleRate = 48_000,
+            channels = 1,
+            echoCancellation = true,
+            noiseSuppression = true,
+        },
+    }, function(result)
+        if result.ok then
+            voiceStream = result.stream
+        else
+            print("Voice unavailable", result.code, result.error)
+        end
+    end)
+end
+
+local function sendVoice(networkClient, player)
+    if not voiceStream or not voiceStream:isActive() then return end
+    local format = voiceStream:getAudioFormat()
+    if not format then return end
+
+    local framesPerPacket = math.max(1, math.floor(format.sampleRate * 0.02))
+    local chunk = voiceStream:readAudioBytes(framesPerPacket)
+    if not chunk then return end
+    local x, y = player:GetWorldPosition()
+    networkClient:emit("voice", {
+        sampleRate = chunk.sampleRate,
+        channels = chunk.channels,
+        frameCount = chunk.frameCount,
+        pcm = buffer.fromstring(chunk.data),
+        x = x,
+        y = y,
+    })
+end
+```
+
+A minimal receiver can turn one packet into a generated sound and place it in
+world space. This is intentionally simple and allocates per packet; a real
+voice player should reuse buffers and queue decoded frames smoothly.
+
+```luau
+networkClient:on("voice", function(packet)
+    local sampleCount = packet.frameCount * packet.channels
+    local sound = assets.newSound(packet.sampleRate, packet.channels, sampleCount)
+    for index = 0, sampleCount - 1 do
+        sound:setSample(index, buffer.readf32(packet.pcm, index * 4))
+    end
+    sound:upload()
+    audio.playSpatial(sound, packet.x, packet.y, false, 1)
+end)
+```
+
+## Platform and privacy notes
+
+- Linux, Windows, and macOS desktop builds support microphone/camera discovery and capture. Requested
+  formats are best-fit; `isSupported` does not promise hardware is attached.
+  macOS can show an OS camera prompt; other desktop privacy controls can still
+  deny or hide devices.
+- Web builds require a secure context (HTTPS or browser-trusted localhost) and
+  `navigator.mediaDevices.getUserMedia`. Permissions Policy, embedding iframe
+  policy, browser settings, and OS privacy settings still apply. Start access
+  from a click/tap/key gesture; the audio track also uses Web Audio and browsers
+  can keep its context suspended until a gesture. Enumeration may conceal
+  labels before permission.
+- Native Android capture is not available in this build:
+  `isSupported(...)` is false, permission statuses are `unavailable`, device
+  enumeration succeeds with an empty list, and access callbacks fail with
+  `code = "unsupported"`. The iOS simulator is not currently documented as a
+  supported capture deployment target.
+- Never treat permission as permanent. Provide an obvious mute/camera-off
+  control, stop on disconnect/scene exit, avoid recording/transmitting without
+  an active indicator, and protect captured/networked data according to the
+  user's jurisdiction and your game's privacy policy.
 
 <!-- page: filesystem | File System API -->
 # File System API
@@ -1284,31 +1926,40 @@ export type FsModule = {
 
 ## Complete function reference
 
-| Function | Result and path behavior |
-| --- | --- |
-| `isWebasm()` | `true` in the Emscripten browser target. |
-| `isWebAssembly()` | Exact alias of `isWebasm`. |
-| `isMobile()` | `true` on Android/iOS or in mobile emulation. |
-| `isAndroid()` | `true` only on Android. |
-| `openFilePicker()` | Native desktop file path, or `nil` when cancelled/unavailable. |
-| `openFolderPicker()` | Native desktop folder path, or `nil` when cancelled/unavailable. |
-| `getDataDirectory()` | Absolute/default writable root string. |
-| `dataPath(path)` | Resolves `path` against data using normal absolute/relative rules. |
-| `readFile(path)` | Reads UTF-8 text from data, then bundled resources. |
-| `readBytes(path)` | Reads arbitrary bytes into a Luau string. |
-| `writeFile(path,content)` | Replaces a data-root-relative file and creates parents. |
-| `appendFile(path,content)` | Creates/appends and creates parents. |
-| `exists(path)` | Tests the resolved read path. |
-| `isFile(path)` | Tests whether the resolved read path is a file. |
-| `isDir(path)` | Tests whether the resolved read path is a directory. |
-| `createDir(path)` | Recursively creates a directory. |
-| `walk(path?,recursive?)` | Lists path entries; defaults to data root and recursive `true`. |
-| `rename(from,to)` | Renames between writable paths and creates destination parents. |
-| `copy(from,to)` | Copies a file or directory tree from read resolution to writable resolution. |
-| `removeFile(path)` | Removes one file; returns `false` when absent. |
+| Canonical function | Parameters | Returns | Result, path behavior, and edge cases |
+| --- | --- | --- | --- |
+| `isWebasm()` (`isWebAssembly` alias) | None. | `boolean`. | `true` only in the Emscripten browser target; mobile emulation does not affect it. |
+| `isMobile()` | None. | `boolean`. | `true` on native Android/iOS and while desktop mobile emulation is active. |
+| `isAndroid()` | None. | `boolean`. | `true` only on Android; Android-like emulation still returns `false`. |
+| `openFilePicker()` | None. | Selected native path string, or `nil`. | Returns `nil` on cancel, picker failure/unavailability, web, and Android. It does not copy the selected file into the project/data root. |
+| `openFolderPicker()` | None. | Selected native directory string, or `nil`. | Same cancellation/platform behavior as the file picker. |
+| `getDataDirectory()` | None. | Absolute/default writable-root string. | The directory may not exist until the first write. The exact location is platform/build dependent. |
+| `dataPath(path)` | Relative or absolute path string. | Resolved writable-path string. | Relative paths are joined to the data root; absolute paths stay absolute under normal platform rules. This resolves only—it does not create or validate the target. |
+| `readFile(path)` | Read path. | UTF-8 text string. | Searches writable data before packaged resources. Missing files, directories, invalid UTF-8, and I/O failures raise. Use `readBytes` for arbitrary data. |
+| `readBytes(path)` | Read path. | Byte-preserving Luau string. | Uses the same resolution order as `readFile`; missing/unreadable paths raise. Embedded NUL bytes are retained. |
+| `writeFile(path, content)` | Writable destination and replacement string bytes. | `()` | Replaces/creates a file and creates parent directories. Relative destinations use data, never overwrite packaged resources. Permission/I/O failures raise. |
+| `appendFile(path, content)` | Writable destination and bytes to append. | `()` | Creates the file/parents if absent; an empty string is a valid no-content append. I/O failures raise. |
+| `exists(path)` | Read path. | `boolean`. | Tests data/resource resolution and returns `false` for missing/unresolvable targets rather than raising for ordinary absence. Either files or directories count. |
+| `isFile(path)` | Read path. | `boolean`. | `true` only for a resolved regular file; missing paths/directories return `false`. |
+| `isDir(path)` | Read path. | `boolean`. | `true` only for a resolved directory; missing paths/files return `false`. |
+| `createDir(path)` | Writable directory path. | `()` | Recursively creates parents and succeeds when the directory already exists; a conflicting file or I/O failure raises. |
+| `walk(path?, recursive?)` | Optional starting path (default data root) and optional recursion flag (default `true`). | Array of `FsWalkEntry` records. | Returns deterministic entries for the resolved directory. A file/nonexistent/unreadable start raises. Symlink handling follows the host filesystem and should not be used to assume sandboxing. |
+| `rename(from, to)` | Two writable paths. | `()` | Renames and creates destination parents. Source absence, cross-device restrictions, destination conflicts, and I/O errors raise. Packaged-only resources cannot be renamed. |
+| `copy(from, to)` | Read-resolved source and writable destination. | `()` | Copies one file or a directory tree and creates destination parents. It does not mutate the source. Missing source/conflicts/I/O errors raise. |
+| `removeFile(path)` | Writable file path. | `true` if removed; `false` if absent. | Does not remove directories or packaged resources. Other failures, including a directory at the path, raise. |
 
 Pickers return `nil` on web and Android. `removeFile` does not remove
 directories. I/O errors otherwise raise with the operation and resolved path.
+
+```luau
+fs.createDir("saves")
+fs.writeFile("saves/slot1.json", "{\"level\":3}")
+if fs.isFile("saves/slot1.json") then
+    local bytes = fs.readBytes("saves/slot1.json")
+    fs.copy("saves/slot1.json", "saves/slot1.backup.json")
+    print(#bytes)
+end
+```
 
 <!-- page: platform | Android and Mobile APIs -->
 # Android and Mobile APIs
@@ -1335,9 +1986,25 @@ export type AndroidModule = {
 }
 ```
 
-All metadata getters return `nil` outside Android or when the platform did not
-provide the property. `getApiLevel` aliases `getSdkInt`. Keyboard functions
-match the input-module aliases and defaults.
+| Canonical function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `android.isAndroid()` | None. | `boolean`. | `true` only inside the Android runtime. Desktop mobile emulation does not change this result. |
+| `android.getDeviceId()` | None. | Device-id string, or `nil`. | Returns the Android property supplied to the runtime. It is not promised to be globally unique, permanent, or suitable as an authentication secret. Returns `nil` outside Android or when unavailable. |
+| `android.getSdkInt()` (`getApiLevel` alias) | None. | Android API-level integer, or `nil`. | Returns `nil` outside Android or when the platform omitted/failed to parse the property. |
+| `android.getBrand()` | None. | Brand string, or `nil`. | Direct platform metadata; it can be blank/spoofed and is absent off Android. |
+| `android.getManufacturer()` | None. | Manufacturer string, or `nil`. | Same availability caveats as `getBrand`. |
+| `android.getModel()` | None. | Model string, or `nil`. | Same availability caveats as `getBrand`. |
+| `android.getDevice()` | None. | Android device-code string, or `nil`. | This is the platform's device value, not a NeoLOVE entity/device handle. |
+| `android.getProduct()` | None. | Product-code string, or `nil`. | Same availability caveats as the other metadata getters. |
+| `android.showKeyboard(implicit?)` (`openKeyboard` alias) | Optional implicit-show flag, default `true`. | Whether the current Android activity accepted the request. | Returns `false` outside Android or without an activity; acceptance does not guarantee the IME becomes visible. |
+| `android.hideKeyboard(implicitOnly?)` (`closeKeyboard` alias) | Optional implicit-only flag, default `false`. | Whether an Android activity accepted the request. | Returns `false` when unsupported/unavailable. |
+
+```luau
+if android.isAndroid() then
+    print("Android API", android.getSdkInt() or "unknown")
+    android.showKeyboard(false)
+end
+```
 
 ## Mobile state
 
@@ -1364,8 +2031,29 @@ oriented emulator size when enabled, otherwise the current window size.
 `getSafeAreaInsets` returns `top, right, bottom, left`; the current runtime
 models portrait mobile as `47, 0, 34, 0` and all other states as zeros.
 
+| Function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `mobile.isMobile()` | None. | `boolean`. | `true` on Android/iOS or when editor/desktop mobile emulation is enabled. |
+| `mobile.isEmulated()` | None. | `boolean`. | `true` only for emulation; native mobile returns `false`. |
+| `mobile.isOnline()` | None. | `boolean`. | Simulated connectivity: `true` when Wi-Fi or cellular state is enabled. It does not prove Internet reachability. |
+| `mobile.isWifiEnabled()` | None. | `boolean`. | Current simulated Wi-Fi flag. |
+| `mobile.isCellularEnabled()` | None. | `boolean`. | Current simulated cellular flag. |
+| `mobile.isLowPowerMode()` | None. | `boolean`. | Current simulated low-power flag; not a live native battery query. |
+| `mobile.getNetworkType()` | None. | `"wifi"`, `"cellular"`, or `"offline"`. | Prefers `"wifi"` when both flags are enabled, then cellular, otherwise offline. |
+| `mobile.getOrientation()` | None. | `"portrait"` or `"landscape"`. | Derived from current/emulated dimensions; a square uses the runtime's portrait fallback. |
+| `mobile.isLandscape()` | None. | `boolean`. | Convenience test equivalent to `getOrientation() == "landscape"`. |
+| `mobile.getDeviceSize()` | None. | Width, then height as numbers. | Returns oriented emulator size when enabled, otherwise current logical window dimensions. Values can change after resize/orientation events. |
+| `mobile.getSafeAreaInsets()` | None. | `top, right, bottom, left` numeric insets. | Current model returns `47, 0, 34, 0` for portrait mobile and zeros otherwise; callers should still read all four rather than hard-code them. |
+
 The network and low-power values are simulation state, not a live native
 connectivity probe.
+
+```luau
+local width, height = mobile.getDeviceSize()
+local top, right, bottom, left = mobile.getSafeAreaInsets()
+hud.x, hud.y = left, top
+hud.size_x, hud.size_y = width - left - right, height - top - bottom
+```
 
 <!-- page: commands | Commands API -->
 # Commands API
@@ -1394,10 +2082,10 @@ export type CommandsModule = {
 }
 ```
 
-`run` waits, captures stdout/stderr, and uses status `-1` when the process could
-not start or had no exit code. `runDetached` returns after spawning with stdio
-disconnected; `pid` is `0` on failure. Empty command strings return an error
-record instead of raising.
+| Function | Parameters | Returns | Behavior, outputs, and edge cases |
+| --- | --- | --- | --- |
+| `commands.run(command, args?, cwd?)` | Executable name/path; optional array of literal argument strings; optional working directory. | `CommandRunResult`: `ok` is true only for exit code `0`; `statusCode`/`status_code` are the exit status; captured `stdout` and `stderr`; `error` is a launch/wait diagnostic or `nil`. | Waits synchronously. A nonzero child exit is a completed result with `ok = false` but normally no launch `error`. Launch failure/no exit code uses status `-1`. Empty command returns an error record. Output is decoded to strings by the platform process layer. |
+| `commands.runDetached(command, args?, cwd?)` | Same executable/argument/cwd contract. | `CommandDetachedResult`: `ok`, spawned `pid` (`0` on failure), and optional `error`. | Returns after spawn with stdio disconnected and does not report the later exit status. Empty command returns an error record. The process can outlive the game. |
 
 `cwd` defaults to the project root. Relative values resolve beneath it;
 normalized values which escape the project raise an error. The command is
@@ -1407,6 +2095,15 @@ Web builds expose the same functions but always return `ok = false` with
 `"commands are not available in web builds"`. Their shared unsupported record
 also includes `statusCode = status_code = -1`, `pid = 0`, and empty
 `stdout`/`stderr`, regardless of which function was called.
+
+```luau
+local result = commands.run("git", { "rev-parse", "--short", "HEAD" })
+if result.ok then
+    print("revision", result.stdout)
+else
+    print("git failed", result.statusCode, result.error or result.stderr)
+end
+```
 
 <!-- page: http | HTTP API -->
 # HTTP API
@@ -1456,18 +2153,51 @@ http.request({
 end)
 ```
 
-`request` and `get` return monotonically increasing request ids. They are the
-same function, so both accept all three overloads. A bare URL uses GET. An
-options table defaults `method` to GET. In the three-argument form, the first
-URL overrides `options.url`; `options.method` still controls the method.
-Callbacks are delivered at the beginning of a later frame. `ok` means no
-transport error; inspect `status` for HTTP success. A failed transport may have
-`status = nil`, empty body, and populated `error`.
+### `http.request(...) -> number` (`http.get` alias)
 
-Native builds support `http://` and `https://` with bundled WebPKI roots. Web
-builds use browser `fetch` and obey CORS. `http._poll()` drains completed work
-and is called automatically; calling it from gameplay can change callback
-timing and is not recommended.
+Accepted forms are `(url, callback)`, `(options, callback)`, and
+`(url, options, callback)`. `url`/`options.url` is the HTTP(S) destination;
+`options.method` defaults to `"GET"`; `headers` maps header names to string
+values; `body` is the request bytes in a Luau string. The callback receives one
+`HttpResponse`. In the three-argument form, the positional URL overrides
+`options.url`, while the options method/headers/body still apply. Despite its
+name, `get` is an exact alias and does not override an explicitly supplied
+method.
+
+The function returns a monotonically increasing request id immediately. The id
+is for correlation only—there is no public cancellation/query operation.
+Callbacks run at the start of a later frame, exactly once for work accepted by
+the runtime. `response.ok` means no transport error, not a `2xx` status; inspect
+`response.status`. HTTP error responses can therefore have `ok = true`, a
+status such as `404`, body bytes, and `error = nil`. DNS/TLS/connect/fetch
+failure can produce `ok = false`, `status = nil`, an empty/partial body, and an
+`error`. Response header keys follow the underlying platform and should be
+treated case-insensitively.
+
+Missing/blank URLs, malformed options, unsupported schemes, or a non-function
+callback raise during submission. Native builds support `http://` and
+`https://` with bundled WebPKI roots. Web builds use browser `fetch`, obey CORS,
+and may reject headers/methods prohibited by browser policy.
+
+### `http._poll() -> ()`
+
+Takes no parameters and returns nothing. It drains completed work and invokes
+ready callbacks. The engine calls it automatically; gameplay calls can move
+callbacks earlier in the frame and re-enter user code unexpectedly, so the
+underscore marks it engine-managed rather than a normal update primitive.
+
+```luau
+local requestId = http.get("https://example.com/health", function(response)
+    if not response.ok then
+        print("transport failed", response.error)
+    elseif response.status and response.status >= 200 and response.status < 300 then
+        print("healthy", response.body)
+    else
+        print("HTTP status", response.status)
+    end
+end)
+print("queued request", requestId)
+```
 
 <!-- page: servers | Servers API -->
 # Servers API
@@ -1514,17 +2244,18 @@ export type ServersModule = {
 }
 ```
 
-| Function | Behavior |
-| --- | --- |
-| `host(scriptPath,port,options?)` | Starts a separate low-level Luau server runtime from a project-contained script. Port `0` asks the OS for a free port. |
-| `connect(url)` | Connects a low-level client; class-service `connect` wraps this with named events. |
-| `define(definition)` | Decorates a class-like service table in place. The other three service constructor names are aliases. |
-| `serializeTable(value)` | MessagePack-serializes supported Luau tables and buffers. Snake-case alias included. |
-| `deserializeTable(payload)` | Restores a serialized table or raises when the root is not a table. |
-| UUID helpers | Return lowercase standard UUID strings; v7 is time ordered. |
-| `sha256(value)` | Returns a 64-character lowercase hex digest. |
-| `sha128(value)` | Returns the first 128 bits as 32 lowercase hex characters. |
-| `_poll()` | Delivers host/client work; engine-managed. |
+| Canonical function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `servers.host(scriptPath, port, options?)` | Project-contained server script; numeric port; optional bind/TLS options. | `HostedServerHandle`. | Starts a separate low-level Luau server runtime. Port `0` asks the OS for a free port. Bind, script load/compile, project-boundary, and incomplete/invalid TLS configuration raise. Startup of the script can report asynchronously through server logging. |
+| `servers.connect(url)` | Complete `http://` or `https://` server URL. | `ServerClientHandle`. | Creates a low-level client and starts connection work; the returned handle can exist before the connection succeeds. Bad URL/TLS/transport ultimately leaves it disconnected and gives `getKickReason()` a diagnostic where available. Unsupported web targets raise. |
+| `servers.define(definition)` (`service`, `createService`, `create_service` aliases) | Mutable service-definition table. | The same table, decorated as `ServerService`. | Mutates in place by installing class-service methods/metadata. Re-defining a decorated table is idempotent. Non-table definitions raise. User keys can be callbacks or arbitrary service state; avoid replacing installed methods. |
+| `servers.serializeTable(value)` (`serialize_table` alias) | Supported Luau table root. | MessagePack `buffer`. | Preserves supported nested values and table shape as described below. Unsupported values, non-table roots where the implementation requires a table, excessive/cyclic structure, and serialization failures raise. |
+| `servers.deserializeTable(payload)` (`deserialize_table` alias) | MessagePack `buffer` created by the compatible serializer. | Reconstructed Luau table. | Malformed/truncated payloads, unsupported encoded values, or a non-table root raise; failure is never returned as `nil`. |
+| `servers.generateUuid4()` (`generate_uuid4` alias) | None. | Lowercase standard random UUID string. | Produces a new v4 value per call; randomness is suitable for identifiers, not a secret/authentication proof. |
+| `servers.generateUuid7()` (`generate_uuid7` alias) | None. | Lowercase standard time-ordered UUID string. | Encodes current time ordering plus randomness. Clock rollback/concurrency can affect strict textual ordering; uniqueness does not imply authorization. |
+| `servers.sha256(value)` | String bytes or `buffer`. | 64-character lowercase hexadecimal digest. | Hashes exact bytes, including embedded NULs; it is not keyed and should not be used as a password hash or MAC. |
+| `servers.sha128(value)` | String bytes or `buffer`. | 32-character lowercase hexadecimal digest. | Returns the first 128 bits of the SHA-256 digest. The truncation has less collision resistance than `sha256`. |
+| `servers._poll()` | None. | `()` | Delivers pending host/client work and callbacks. Engine-managed; manual calls can alter ordering/re-enter callbacks. |
 
 Serialization accepts table roots containing nils, booleans, integers,
 numbers, UTF-8 strings, buffers, and nested tables. Consecutive 1-based keys
@@ -1535,6 +2266,13 @@ threads, userdata, and cyclic tables raise errors.
 access, then clients connect to the machine's actual address. TLS requires both
 certificate and private-key paths; camel and snake spellings are accepted, and
 both files must stay inside the project.
+
+```luau
+local packet = servers.serializeTable({ kind = "ready", players = 4 })
+local decoded = servers.deserializeTable(packet)
+assert(decoded.kind == "ready")
+print(servers.generateUuid7(), servers.sha256("lobby:" .. decoded.players))
+```
 
 ## Class service
 
@@ -1582,6 +2320,17 @@ table returns it. Named event packets are ordinary serialized tables; an
 unwrapped low-level payload arrives to a class service as event `"message"`
 with the buffer as data.
 
+### Service callbacks and methods
+
+| Member | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `service:host(port, options?)` | Port and the same bind/TLS options as `servers.host`; `self` is implicit. | Class-enabled `HostedServerHandle`. | Starts the service without a separate user server script, attaches `service`, calls `onStart(self, host)` after setup, and routes named events. Callback errors are logged and do not become a return value from later polling. |
+| `service:connect(url)` | Server URL. | Class-enabled `ServerClientHandle`. | Creates a low-level connection and enables `on`/`once`/`emit` event wrappers for this service protocol. Connection establishment remains asynchronous. |
+| `onStart(self, host)` | Decorated service and new host. | Return values ignored. | Optional lifecycle callback, once per successful host invocation. |
+| `onConnect(self, client)` | Service and connected `ServerPeer`. | Return values ignored. | Optional callback for a non-host peer becoming available. The peer may disconnect before later sends. |
+| `onMessage(self, client, eventName, data)` | Service, sending peer, decoded event name, decoded data. | Return values ignored. | Optional callback per event. Decode/callback failures are reported; malformed payloads do not produce a valid user event. |
+| `onDisconnect(self, client)` | Service and the disconnected peer snapshot. | Return values ignored. | Optional final notification. `client:isConnected()` is false by this point and sends fail. |
+
 ## Client handle
 
 ```luau
@@ -1611,10 +2360,34 @@ export type ServerClientHandle = {
 }
 ```
 
-The raw callbacks registered through `addCallback` receive buffers. Class
-listeners receive decoded data. `on`/`once`/`onAny` return the registered
-function; pass it to `off`. `disconnect` returns `false` if already disconnected.
-`getKickReason` includes server kicks, remote closure messages, or `nil`.
+The raw callbacks registered through `addCallback` receive buffers; class
+listeners receive decoded data.
+
+| Canonical operation | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `client.send(payload)` | Raw `buffer`; this low-level operation uses dot syntax. | `true` if queued for an active connection, otherwise `false`. | Success means queued, not acknowledged or delivered. A disconnected/closing connection returns `false`; serialization is the caller's responsibility. |
+| `client.addCallback(callback)` (`addcallback` alias) | Function receiving one raw buffer. | `()` | Registers an additional persistent low-level callback. There is no removal handle; avoid adding one each frame. Callback errors are logged during polling. |
+| `client.disconnect()` | None. | `true` if this call began disconnection; `false` if already disconnected/closing. | Idempotent. Queued messages are not guaranteed to flush. |
+| `client.isConnected()` | None. | `boolean`. | Snapshot of current transport state. A newly returned client can be false until connection setup completes. |
+| `client.getKey()` | None. | Stable connection-key string. | Matches public `key`; it remains readable after disconnect for correlation. |
+| `client.isHost()` | None. | `boolean`. | Reports whether this is the service's internal host client; normal remote clients are false. |
+| `client.getKickReason()` | None. | Server/closure diagnostic string, or `nil`. | `nil` means no reason has been recorded, not necessarily that the connection is healthy. |
+| `client:on(eventName, callback)` | Event name and `(data, eventName, client)` callback; colon syntax. | The same callback function. | Registers persistently. Duplicate registration can invoke the function multiple times. Return it (or retain the original) for `off`. Available on class-enabled clients. |
+| `client:once(eventName, callback)` | Same arguments as `on`. | The same callback. | Removes this registration before/when its first matching event is delivered. It may never run if disconnected first. |
+| `client:off(eventName, callback)` | Exact event name and exact previously registered function. | `true` if a registration was removed; otherwise `false`. | Does not remove a different closure with identical code. |
+| `client:onAny(callback)` | `(eventName, data, client)` callback. | The same callback. | Observes all decoded named events. Register sparingly; no event-name filter is applied. |
+| `client:emit(eventName, data)` (`sendEvent` alias) | Event name and serializable data. | `true` if the encoded event was queued; otherwise `false`. | Encoding errors raise; transport loss returns `false`. It provides no delivery/remote-handler acknowledgement. |
+
+```luau
+local listener
+listener = client:on("score", function(data)
+    print("score", data.value)
+    client:off("score", listener)
+end)
+if not client:emit("ready", { at = os.clock() }) then
+    print("not connected")
+end
+```
 
 ## Host and peer handles
 
@@ -1647,11 +2420,28 @@ export type ServerPeer = {
 }
 ```
 
-`broadcast` excludes the internal host client and returns successful sends.
-`getClients` likewise returns only connected non-host keys. `stop` is idempotent
-and returns whether it stopped an active host. `emit` and `sendEvent` are added
-only to class-service handles; those handles also receive `service`, pointing
-to the decorated service definition.
+| Host operation | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `host.stop()` | None. | `true` if an active host was stopped; otherwise `false`. | Idempotent. Disconnects clients and prevents new sends; queued work may be discarded. |
+| `host.getPort()` | None. | Bound port integer. | For requested port `0`, this is the actual assigned port. Remains readable after stop. |
+| `host.getUrl()` | None. | Connection URL string. | Matches `url`; wildcard binds may still require clients to replace the host portion with a reachable address. |
+| `host:send(clientKey, payload)` | Target key and raw buffer. | `true` when queued to that connected peer; otherwise `false`. | Unknown, host-internal, or disconnected keys fail without acknowledgement. |
+| `host:broadcast(payload)` | Raw buffer. | Number of peers for which queuing succeeded. | Excludes the internal host client. Partial success is represented by a count smaller than `getClientCount()`. |
+| `host:getClients()` | None. | Array of connected non-host key strings. | Snapshot only; a key can disconnect immediately after return. Ordering should not be treated as stable. |
+| `host:getClientCount()` | None. | Non-negative number of connected non-host peers. | Equivalent to the current snapshot count, excluding internal host. |
+| `host:emit(eventName, data)` | Event name and serializable value. | Number of peers successfully queued. | Class-service handles only; nil/absent on raw hosts. Encoding errors raise. |
+| `host:sendEvent(clientKey, eventName, data)` | Peer key, event name, serializable value. | `true` if queued; otherwise `false`. | Class-service handles only. Unknown/disconnected clients return false; encoding errors raise. |
+
+| Peer operation | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `peer:send(payload)` | Raw buffer. | `boolean` queued status. | Success is not delivery acknowledgement; disconnected peers return false. |
+| `peer:emit(eventName, data)` (`sendEvent` alias) | Event name and serializable data. | `boolean` queued status. | Uses the class event envelope; encoding errors raise. |
+| `peer:kick(reason?)` | Optional reason sent to the peer. | `()` | Begins disconnection. Omitted reason uses the runtime default. Repeated kicks have no additional effect; delivery of the textual reason is best-effort. |
+| `peer:isConnected()` | None. | `boolean`. | Snapshot of the peer transport state. |
+
+`broadcast` and `getClients` exclude the internal host client. `emit` and
+`sendEvent` are added only to class-service handles; those handles also receive
+`service`, pointing to the decorated service definition.
 
 ## Separate server-script environment
 
@@ -1683,6 +2473,27 @@ export type ServerScriptModule = {
 
 Lifecycle connect/disconnect notifications are not sent to low-level script
 callbacks; callbacks receive client key and payload messages.
+
+The server-script functions use dot syntax. `server.addCallback(callback)`
+(`addcallback`) registers a persistent `(clientKey, payload)` listener and
+returns nothing. `server.send(clientKey, payload)` queues raw bytes and returns
+nothing (invalid/disconnected keys are reported by the server runtime rather
+than a boolean). `server.kick(clientKey, reason?)` begins removal and returns
+nothing. `server.isHost(clientKey)` returns a boolean; unknown keys are false.
+`server.getClientTags(clientKey)` returns a new array (empty for no/unknown
+tags), and `server.getHostClientKey()` returns the internal host key string.
+The serialization, UUID, and hash helpers have exactly the parameter, result,
+and failure contracts documented for the `servers` module above.
+
+```luau
+-- server_main.luau, started by servers.host(...)
+server.addCallback(function(clientKey, payload)
+    local message = server.deserializeTable(payload)
+    if message.kind == "ping" then
+        server.send(clientKey, server.serializeTable({ kind = "pong" }))
+    end
+end)
+```
 
 <!-- page: shaders | Shader API -->
 # Shader API
@@ -1716,14 +2527,42 @@ export type ShaderHandle = {
 }
 ```
 
-`load` reads both project files; `loadFragment` supplies the built-in vertex
-source; the `from...Source` variants compile provided strings. The current
-runtime accepts the options shape for compatibility but does not need it to
-create uniform slots. `DEFAULT_VERTEX_SHADER` exposes the built-in GLSL.
+| Function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `shaders.load(vertexPath, fragmentPath, options?)` | Two project resource paths and optional compatibility options. | Compiled `ShaderHandle`. | Reads and compiles both sources. Missing/escaping paths, UTF-8/I/O failures, unsupported renderer, and compile/link errors raise with diagnostics. |
+| `shaders.loadFragment(fragmentPath, options?)` | Fragment path and optional options. | Compiled `ShaderHandle`. | Uses `DEFAULT_VERTEX_SHADER` for the vertex stage; otherwise has the same failures as `load`. |
+| `shaders.fromSource(vertexSource, fragmentSource, options?)` | Complete GLSL source strings and optional options. | Compiled `ShaderHandle`. | Compiles directly without filesystem resolution. Empty/invalid source and backend failures raise. |
+| `shaders.fromFragmentSource(fragmentSource, options?)` | Fragment GLSL and optional options. | Compiled `ShaderHandle`. | Pairs the source with the default vertex shader. |
+
+The current runtime accepts `options` for compatibility but does not require
+its `uniforms`, `images`/`textures`, or `pipelines` lists to create uniform
+slots. Unknown option keys are ignored. `DEFAULT_VERTEX_SHADER` is a readable
+string containing the built-in GLSL; assigning a new value does not rewrite an
+already compiled shader.
 
 Float uniform storage is bounded to 16 named entries and texture uniforms to 4.
 `setUniformColor` converts byte channels to normalized floats. `setTexture`
 requires a live uploaded image.
+
+| Handle method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `shader:setUniform1f(name, x)` | Uniform name and one number. | `()` | Stores/replaces one float value. An absent/optimized-out shader uniform is backend-dependent; exceeding 16 distinct float-uniform names raises. Non-finite values can produce shader-defined output. |
+| `shader:setUniform2f(name, x, y)` | Name and two numbers. | `()` | Stores a two-component float vector under the name, replacing another float arity for that name. |
+| `shader:setUniform3f(name, x, y, z)` | Name and three numbers. | `()` | Same rules, three components. |
+| `shader:setUniform4f(name, x, y, z, w)` | Name and four numbers. | `()` | Same rules, four components. |
+| `shader:setUniformColor(name, color)` | Name and `Color4Value`. | `()` | Converts byte channels to `0..1` floats and stores a four-component uniform. Invalid/missing color channels raise. |
+| `shader:setTexture(name, image)` | Sampler name and live `ImageHandle`. | `()` | Stores/replaces one texture binding. The image is uploaded as needed by rendering; unloaded images raise. More than four distinct texture names raises. |
+
+```luau
+local tintShader = shaders.loadFragment("shaders/tint.frag")
+tintShader:setUniformColor("Tint", Color4(255, 120, 160))
+tintShader:setUniform1f("Strength", 0.75)
+
+local sprite = ecs.newEntity("Tinted", ecs.root, 100, 100)
+local image = sprite:AddComponent(core.Sprite2D)
+image.image = assets.loadImage("assets/character.png")
+image.shader = tintShader
+```
 
 Custom shaders require a Vulkan-feature desktop build. WebAssembly supports
 fragment shaders for rectangles, primitive shapes, and images through WebGL;
@@ -1793,22 +2632,23 @@ export type LightingModule = {
 
 ## `lighting` functions
 
-| Function | Behavior |
-| --- | --- |
-| `setEnabled(enabled?)` | Turns the system on or off; omitted input means `true`. |
-| `enable()` / `disable()` | Convenience wrappers for `setEnabled`. |
-| `isEnabled()` | Returns the current toggle state. |
-| `setAmbient(color, intensity?)` | Sets the base light color and, when given, its intensity (clamped to `>= 0`). |
-| `setAmbientIntensity(intensity)` | Sets only the ambient intensity. |
-| `getAmbient()` | Returns the ambient `Color4` and its intensity. |
-| `setAmbientOcclusion(enabled?, radius?, intensity?, samples?)` | Toggles AO and optionally sets its radius (pixels), strength (`0..1`), and per-pixel sample count (`1..64`). |
-| `setShadows(enabled?, softness?)` | Toggles occluder shadows; `softness` is the penumbra size in pixels (`0` is a hard shadow). |
-| `setBloom(amount)` | Sets extra glow added where light exceeds full brightness. |
-| `setExposure(value)` | Sets the output multiplier applied after lighting. |
-| `setQuality(quality)` | Sets the light-map resolution: `low` (quarter), `medium` (half), `high` (full), `ultra` (full plus extra shadow/AO samples). |
-| `getQuality()` | Returns the current quality string. |
-| `sample(x, y)` | Returns the light color reaching a screen-space position as a `Color4`, or `nil` when the point is off-screen. `getAt` and `sampleAt` are aliases. Reads the **last completed frame's** lights/occluders, so it is safe to call from `update` while this frame's lights are still being queued. Returns opaque white when lighting is disabled (everything is effectively fully lit). |
-| `reset()` | Restores every lighting setting to its default (which includes disabling the system). |
+| Canonical function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `lighting.setEnabled(enabled?)` | Optional boolean, default `true`. | `()` | Turns light-map generation/compositing on or off. Disabling does not discard other settings, so re-enabling restores them. |
+| `lighting.enable()` | None. | `()` | Convenience call equivalent to `setEnabled(true)`. |
+| `lighting.disable()` | None. | `()` | Equivalent to `setEnabled(false)`. The already completed frame remains available to internal history, but sampling while disabled returns white. |
+| `lighting.isEnabled()` | None. | `boolean`. | Returns the current global toggle immediately. |
+| `lighting.setAmbient(color, intensity?)` | Ambient `Color4Value`; optional numeric intensity. | `()` | Copies/clamps the color. When intensity is present it is clamped to `>= 0`; omitting it preserves the previous intensity. Non-finite values are normalized/rejected according to numeric validation rather than allowed to poison the light map. |
+| `lighting.setAmbientIntensity(intensity)` | Numeric ambient multiplier. | `()` | Changes only intensity, clamped to non-negative. Values above `1` intentionally permit over-bright light in the software path. |
+| `lighting.getAmbient()` | None. | New ambient `Color4Value`, then numeric intensity. | Mutating the returned color does not change settings; call `setAmbient` to write it back. |
+| `lighting.setAmbientOcclusion(enabled?, radius?, intensity?, samples?)` | Optional toggle (default `true` when supplied alone), pixel radius, strength, and sample count. | `()` | Only supplied numeric fields change. Radius is non-negative, intensity clamps to `0..1`, and samples to integer `1..64`. AO has no visible effect without occluders. |
+| `lighting.setShadows(enabled?, softness?)` | Optional toggle and optional penumbra size in pixels. | `()` | Omitted toggle means enabled. Softness clamps to non-negative; `0` is hard-edged. Lights with `castsShadows = false` ignore occluders, and per-light non-negative softness overrides this global value. |
+| `lighting.setBloom(amount)` | Numeric bloom strength. | `()` | Clamps to non-negative. Bloom only adds energy where computed light exceeds full brightness and is not represented by the Vulkan multiply-only composite. |
+| `lighting.setExposure(value)` | Numeric output multiplier. | `()` | Clamps to non-negative. `0` produces black while lighting is enabled; it does not alter stored ambient/light intensities. |
+| `lighting.setQuality(quality)` | `"low"`, `"medium"`, `"high"`, or `"ultra"`. | `()` | Low uses one light texel per 4×4 output pixels, medium 2×2, and high always 1×1. Ultra adds higher-detail sampling but adapts map resolution to roughly one million texels: 1280×720 remains 1×1, 1080p/1440p use 2×2, and 4K uses 3×3. Linear upscaling and independent shadow/AO fields keep the result smooth while preventing display resolution from multiplying CPU work without bound. Unknown names raise rather than silently selecting a quality. A resize/rebuild takes effect on the next rendered frame. |
+| `lighting.getQuality()` | None. | One `LightQuality` string. | Returns the normalized current setting. |
+| `lighting.sample(x, y)` (`getAt`, `sampleAt` aliases) | Logical screen-space pixel coordinates. | Opaque `Color4Value`, or `nil` when outside the completed frame. | Reads the **last completed frame**, so it is stable during `update`. When disabled, any on-screen point returns opaque white. Fractional points sample the containing light-map pixel; camera-aware gameplay should convert world coordinates to screen coordinates before sampling. Before a completed frame or outside its bounds, returns `nil`. |
+| `lighting.reset()` | None. | `()` | Restores all defaults: disabled, white full ambient, default AO/shadow/bloom/exposure/quality settings. Components are not removed or edited. |
 
 ```luau
 -- Dim an enemy that is standing in shadow.
@@ -1881,22 +2721,41 @@ The viewport previews lighting by tinting each object by the light reaching its
 center — a live, per-object approximation rather than a flat veil. The full
 per-pixel light map (smooth gradients across a single sprite, in-shadow
 softening) is produced by the runtime; the editor preview is a guide to placement
-and mood.
+and mood. **Editor Settings → Preview scene lighting** controls this preview and
+defaults to on. Turning it off can make a very dense scene easier to edit; it
+does not change, disable, or save over the scene's runtime lighting settings.
 
 ## Performance notes
 
-The software light pass is built to stay cheap: the light map is computed on
-worker threads (one band of rows each), the final composite is likewise
-parallelized, occluder rotations and bounds are resolved once per frame, ambient
-occlusion is evaluated only near occluders, and **soft shadows are produced by
-blurring the light map** rather than casting many penumbra rays per pixel — so
-softness is nearly free.
+The light pass avoids repeating expensive geometry work at every output pixel:
 
-To tune further: lower `setQuality` (`low` is quarter-resolution and much
-cheaper; the blur keeps it smooth), reduce light `radius`, disable
-`castsShadows` on fill lights, and prefer fewer shadow-casting **directional**
-lights (they cover the whole screen). Ambient occlusion is the other main cost;
-fewer `samples` or a smaller `radius` both help.
+- a BVH rejects most occluders during exact ray tests;
+- screen tiles contain compact lists of only the lights that can affect them;
+- each shadow-casting light builds a compact byte visibility field once, then
+  all light-map texels bilinearly reuse it;
+- soft-shadow blur runs on that small visibility field, not on the full RGB
+  light map;
+- ambient occlusion is sampled on a low-frequency byte field near occluders and
+  interpolated across the map;
+- light-map rows, shadow fields, AO rows, CPU compositing, and GPU upload
+  encoding use bounded worker bands; and
+- an unchanged light/config/occluder snapshot reuses its cached map.
+
+The maintained release benchmark uses 1920×1080 Ultra, 16 moving lights, 40
+occluders, 4px soft shadows, and 12-sample AO. On the development host, the
+combined map-build result fell from about **179.7 ms/frame** before these
+optimizations to about **10.9 ms/frame**. Run the same workload on a target
+machine with:
+
+```sh
+cargo test --release benchmark_ultra_dynamic_light_maps -- --ignored --nocapture
+```
+
+That figure measures light-map construction, not the rest of a game's frame,
+and hardware/scene layout still matter. To tune further, lower `setQuality`,
+reduce light radius, disable `castsShadows` on fill lights, and avoid unnecessary
+shadow-casting directional lights because each covers the whole screen. Fewer
+AO samples or a smaller radius also lowers field construction cost.
 
 <!-- page: rng | Random Numbers -->
 # Random Numbers
@@ -1930,30 +2789,40 @@ export type RngModule = {
 
 ## Module functions
 
-| Function | Result |
-| --- | --- |
-| `Rng.new(seed?)` | A generator seeded with `seed`, or entropy-seeded when omitted. |
-| `Rng.fromString(text)` | A generator seeded from a stable hash of `text`. |
-| `Rng(seed?)` | Callable shorthand for `Rng.new`. |
+| Canonical function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `Rng.new(seed?)` (`Rng(seed?)` callable shorthand) | Optional integer-compatible numeric seed. | New independent `RngInstance`. | With a seed, identical integer values produce identical streams. Without one, wall-clock entropy plus a process counter makes adjacent instances best-effort distinct. Numeric seeds are converted to the runtime's 64-bit integer representation; this is deterministic randomness, not cryptographic randomness. |
+| `Rng.fromString(text)` | Arbitrary UTF-8 string. | New independently seeded `RngInstance`. | Hashes the exact string bytes with a stable built-in hash, so the same text reproduces across runs. Case, whitespace, and normalization differences produce different seeds. Hash collisions are possible. |
 
 ## Instance methods
 
-| Method | Result |
-| --- | --- |
-| `next()` | Float in `[0, 1)`. |
-| `number(min?, max?)` | `[0,1)` with no args, `[0,max)` with one, `[min,max)` with two. `float` and `range` are aliases. |
-| `integer(min, max?)` | Inclusive integer; `integer(max)` means `[1, max]`. `int` is an alias. |
-| `boolean(p?)` | `true` with probability `p` (default `0.5`). `bool` is an alias. |
-| `sign()` | `-1` or `1`. |
-| `angle()` | Radians in `[0, 2π)`. |
-| `unit()` | A random unit vector `x, y`. |
-| `pick(list)` | A uniformly random element of an array-like table, or `nil` when empty. |
-| `shuffle(list)` | Shuffles the table in place (Fisher-Yates) and returns it. |
-| `seed(n)` | Reseeds this generator in place. |
-| `clone()` | An independent copy at the same position in the stream. |
+| Canonical method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `rng:next()` | None. | Float in `[0, 1)`. | Advances the stream once with 53 bits of floating-point resolution. |
+| `rng:number(min?, max?)` (`float`, `range` aliases) | No bounds; one `max`; or `min, max`. | With no bounds `[0,1)`; one bound scales from zero toward `max`; two bounds interpolate from `min` toward but not including `max`. | Bounds are not reordered: reversed two-bound input travels downward from `min` toward `max`. Equal bounds always return that bound. NaN/infinite bounds propagate non-finite arithmetic and should be avoided. |
+| `rng:integer(min, max?)` (`int` alias) | One integer `max`, or inclusive `min, max`. | Integer uniformly selected from the inclusive range. | One argument means `[1,max]`. Two bounds are order-insensitive. Equal bounds return that value. The runtime also accepts no arguments and returns a raw signed 64-bit stream value, but this compatibility behavior is intentionally absent from the typed API. |
+| `rng:boolean(p?)` (`bool` alias) | Optional probability, default `0.5`. | `boolean`. | Advances once and compares with `p`: `p <= 0` is always false and `p >= 1` always true; NaN is false. Values are not otherwise clamped. |
+| `rng:sign()` | None. | Exactly `-1` or `1`. | Each outcome is equally likely and advances the stream. |
+| `rng:angle()` | None. | Radians in `[0, 2π)`. | Suitable for `math.cos`/`math.sin`; `2π` itself is excluded. |
+| `rng:unit()` | None. | Unit-vector components `x, y`. | Samples an angle then returns cosine and sine. Floating-point rounding can make length differ microscopically from one. |
+| `rng:pick(list)` | Array-like table. | One array element, or `nil` when raw length is zero. | Uses indices `1..#list`. Sparse holes can therefore return `nil`, which is indistinguishable from an empty list or an element intentionally containing nil. |
+| `rng:shuffle(list)` | Mutable array-like table. | The exact same table. | Fisher–Yates shuffles indices `1..#list` in place. Sparse/non-array keys are not rearranged. Empty and one-item arrays are returned unchanged. |
+| `rng:seed(seed)` | Integer-compatible numeric seed. | `()` | Replaces the instance state; the next result matches a fresh generator with the same seed. Clones remain independent and are not reseeded. |
+| `rng:clone()` (`Clone` alias) | None. | New independent `RngInstance` at the same stream position. | The clone initially produces the same future sequence; advancing/reseeding either one does not affect the other. |
 
 Two generators created with the same seed produce identical sequences, which is
 what makes seeded worlds and deterministic tests reproducible.
+
+```luau
+local layout = Rng.fromString("world:desert:3")
+local replay = layout:clone()
+local x, y = layout:unit()
+assert(replay:unit() == x) -- first return value is identical
+
+local rewards = { "coin", "gem", "key" }
+layout:shuffle(rewards)
+print(layout:pick(rewards))
+```
 
 <!-- page: ecs | ECS API -->
 # ECS API
@@ -1976,20 +2845,32 @@ export type EcsModule = {
 
 ## Function behavior
 
-| Function or variable | Behavior |
-| --- | --- |
-| `root` | Id `0` entity. Its `size_x`/`size_y` track the logical window. |
-| `newEntity(name,parent?,x?,y?)` | Creates an entity. Omitted position is `0,0`; omitted parent leaves it unparented. |
-| `deleteEntity(entity)` | Recursively removes the entity/descendants, detaches from its parent, and disconnects listeners. |
-| `duplicateEntity(entity,parent)` | Captures and instantiates a deep prefab-style copy under `parent`. |
-| `findFirstChild(parent,name)` | Returns the first direct child with an exact name. It is not recursive. |
-| `addComponent(entity,prototype)` | Deep-copies a table prototype, attaches instance methods, runs core setup, and queues custom `awake`. |
-| `removeComponent(entity,target)` | Removes by 1-based component index or exact instance; returns `false` if absent. |
-| `addSystem(system)` | Immediately calls optional `awake`, then registers the table. |
-| `loadScene(path)` | Reads a project `.neoscene`, clears all existing non-root entities/listeners, then instantiates the scene. |
+`ecs.root` is the id-`0` root entity. Its `size_x`/`size_y` track the logical
+window. Do not delete it or overwrite its engine-managed identity/collections.
+
+| Function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `ecs.newEntity(name, parent?, x?, y?)` | Name; optional parent; optional local coordinates defaulting to `0, 0`. | New attached/registered `Entity`. | A `nil` parent creates an unparented entity, not a root child. Names need not be unique. Parent must be a live entity; invalid arguments raise. Components are initially empty and size defaults are listed below. |
+| `ecs.deleteEntity(entity)` | Live non-root entity. | `()` | Recursively unregisters descendants, detaches from its parent, and disconnects listeners. The entity table may still be referenced by Luau but is no longer live. Re-deleting/stale/root entities is invalid or a no-op according to registry state; component destroy callbacks are not guaranteed, as warned below. |
+| `ecs.duplicateEntity(targetEntity, parent)` | Source entity and explicit destination parent. | Root of a fresh deep-copy subtree. | Uses prefab capture/instantiate semantics, remapping internal references and queueing custom `awake`. A source/destination that is stale or would violate hierarchy constraints raises. |
+| `ecs.findFirstChild(parent, name)` | Parent and exact, case-sensitive direct-child name. | First matching `Entity`, or `nil`. | Does not recurse and makes no uniqueness guarantee. Current child-array order decides among duplicates. |
+| `ecs.addComponent(entity, component)` | Live entity and component prototype table. | New `ComponentInstance`. | Deep-copies the prototype, attaches instance helpers/entity, runs core setup immediately, and queues custom `awake`. Prototype functions/tables follow the engine copy rules. Invalid core/custom definitions raise without returning a partial instance. |
+| `ecs.removeComponent(entity, target)` | Live owner plus 1-based component index or exact attached instance. | `true` if removed; `false` if absent/invalid index. | Runs `destroy` or fallback `onDestroy`, removes it, and clears `instance.entity`. Callback errors can propagate/report while removal is underway. |
+| `ecs.addSystem(system)` | Mutable system table. | `()` | Calls optional `system:awake()` synchronously, then registers it for per-frame `update`. If `awake` errors, registration does not complete normally. Adding the same table twice creates duplicate scheduling unless user code prevents it. |
+| `ecs.loadScene(path)` | Project `.neoscene` path. | `()` | Reads and executes the generated scene representation, replacing all non-root entities/listeners only after entering the load workflow. Missing/invalid files, parsing, or generated Luau errors raise with path context. This is a destructive scene replacement; retain persistent data outside scene entities. |
 
 `loadScene` preserves `ecs.root` but replaces its children. If parsing or
 generated Luau execution fails, it raises a path-rich error.
+
+```luau
+local world = ecs.newEntity("World", ecs.root)
+local player = ecs.newEntity("Player", world, 64, 96)
+local body = player:AddComponent(core.Rigidbody2D)
+
+local copy = ecs.duplicateEntity(player, world)
+copy.name, copy.x = "Player ghost", 160
+assert(world:FindFirstChild("Player") == player)
+```
 
 ## Entity definition
 
@@ -2077,6 +2958,14 @@ export type Entity = {
 | `children` | `{}` | Direct child array, managed by ECS operations. |
 | `components` | `{}` | 1-based attached component instances. |
 
+Entities are ordinary extensible Luau tables, so game code may attach any
+additional key/value (`entity.health = 100`, `entity.inventory = {}`). The
+visual editor's **Attached Values** section serializes the supported authored
+types into those same fields. ECS duplication and prefab instantiation
+deep-copy ordinary tables and remap internal entity/component references.
+Engine-managed fields and methods are not protected from assignment; replacing
+them can invalidate hierarchy, rendering, or lifecycle behavior.
+
 Transform reads also accept camel aliases `anchorX/Y`, `pivotX/Y`,
 `positionPivot`, `positionPivotX/Y`, and `rotationPivot/X/Y`. The older
 `position_pivot_x/y` and boolean `rotation_pivot_middle` are accepted too.
@@ -2086,6 +2975,20 @@ pivots fall back to top-left.
 `Duplicate()` without a parent uses the current parent, falling back to
 `ecs.root`. `IsInside` tests transformed bounds including hierarchy scale,
 rotation, anchors, and pivots; boundary points count as inside.
+
+### Entity method reference
+
+| Canonical method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `entity:listen(event, callback)` (`Listen` alias) | Event name and `(entity, eventInfo)` function. | Live `Connection`. | Registers one pointer listener on this entity. Valid canonical event names and payloads are in Entity Listeners. Unknown event strings raise rather than silently inventing events. Deleting the entity disconnects it. |
+| `entity:delete()` (`Delete` alias) | None. | `()` | Same recursive operation and caveats as `ecs.deleteEntity(entity)`. The table should be treated as stale after the call. |
+| `entity:addComponent(prototype)` (`AddComponent` alias) | Component prototype. | New attached `ComponentInstance`. | Equivalent to `ecs.addComponent(entity, prototype)`. Always configures the copy, never the shared `core` prototype. |
+| `entity:removeComponent(target)` (`RemoveComponent` alias) | 1-based index or exact component instance. | Removal `boolean`. | Equivalent to the ECS function. Indexes are evaluated against the current list, so earlier removals shift later indexes. |
+| `entity:duplicate(parent?)` (`Duplicate` alias) | Optional destination parent. | New copied `Entity`. | Defaults to the current parent, then `ecs.root` when unparented. The new entity is independent but internal references within its copied subtree are remapped consistently. |
+| `entity:findFirstChild(name)` (`FindFirstChild` alias) | Exact direct-child name. | Matching entity or `nil`. | Equivalent to `ecs.findFirstChild(self, name)`; not recursive. |
+| `entity:getWorldPosition()` (`GetWorldPosition` alias) | None. | World top-left `x, y`. | Resolves anchors, pivots, parent scale/rotation, and hierarchy. Values are computed from current mutable fields; a cyclic/corrupt parent chain is invalid. |
+| `entity:getWorldRotation()` (`GetWorldRotation` alias) | None. | World rotation in radians. | Sums local rotations through ancestors. It does not normalize to `0..2π`. |
+| `entity:isInside(worldX, worldY)` (`IsInside` alias) | World-space point. | `boolean`. | Tests transformed bounds including rotation and scale; edges count as inside. Non-positive global size has no interior. Sprite transparency/masks are ignored—use `Spritebox2D:IsInside` for its pixel mask. |
 
 ## Component definition and lifecycle
 
@@ -2116,6 +3019,11 @@ Core setup runs immediately during attachment. `update` runs once per frame.
 Removal calls `destroy`; if absent it calls `onDestroy`. It then clears
 `component.entity`. Removing an already detached instance returns `false`.
 
+| Component-instance method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `component:remove()` (`Remove` alias) | None. | `true` if still attached and removed; otherwise `false`. | Delegates to the owning entity. During/after removal, `entity` becomes nil. A destroy callback should not recursively assume the same component remains in the list. |
+| `component:getEntity()` (`GetEntity` alias) | None. | Owning `Entity`, or `nil`. | Returns nil after removal. The entity can still become stale after a later entity/scene deletion, so this is attachment state rather than an eternal liveness guarantee. |
+
 ::: warning
 Current `deleteEntity` and scene replacement remove entity registries directly;
 they do not run every attached component's `destroy`/`onDestroy`. Use
@@ -2134,8 +3042,14 @@ export type System = {
 }
 ```
 
-`awake` runs synchronously in `addSystem`; `update` runs each frame. As noted in
-Runtime Model, the other two declared callbacks are not currently scheduled.
+`awake(self)` receives the system itself, returns nothing meaningful, and runs
+synchronously inside `addSystem`. `update(self, dt)` receives the same table and
+elapsed frame seconds; its return values are ignored and it runs once per
+engine frame in registration order. Errors propagate through the runtime's
+frame error reporting and prevent the rest of that callback invocation from
+finishing. As noted in Runtime Model, `lateUpdate(self, dt)` and
+`fixedUpdate(self, dt)` are declared compatibility hooks but are not currently
+scheduled, so assigning them alone has no effect.
 
 <!-- page: transforms | Transform and Query API -->
 # Transform and Query API
@@ -2173,20 +3087,28 @@ export type TransformModule = {
 }
 ```
 
-| Function | Semantics |
-| --- | --- |
-| `getWorldPosition(entity)` | Returns transformed top-left position after parent scale/rotation, anchors, and pivots. |
-| `getWorldRotation(entity)` | Sum of local rotations through the parent chain. |
-| `lookAt(fromX,fromY,toX,toY)` | Radians facing the target; zero faces positive X and positive angles turn toward positive Y. `look_at` aliases it. |
-| `GetEntitiesInFront(x,y,minimumZ?)` | All non-root transformed bounds containing the point, sorted descending z then descending id. Lower-camel alias included. |
-| `doTheyOverlap(entities)` | `true` when any pair of global axis-aligned entity bounds overlaps. It ignores Spritebox masks and rotation polygon detail. |
-| `raycast(...)` | Nearest AABB hit along a normalized direction. |
+| Canonical function | Parameters | Returns | Semantics and edge cases |
+| --- | --- | --- | --- |
+| `transform.getWorldPosition(entity)` | Entity to resolve. | World-space top-left `x, y`. | Applies the entity's pivot/anchor plus ancestor scale/rotation and current mutable fields. Stale/malformed entities or cyclic hierarchy data raise/fail rather than yielding a meaningful transform. |
+| `transform.getWorldRotation(entity)` | Entity to resolve. | Rotation in radians. | Adds rotations through the parent chain without normalizing. Scale/pivots do not change this scalar result. |
+| `transform.lookAt(fromX, fromY, toX, toY)` (`look_at` alias) | World-space start and target coordinates. | Facing angle in radians. | Uses `atan2(toY-fromY, toX-fromX)`: zero faces positive X and positive angles turn toward positive Y. Coincident points return the platform's defined zero-angle result. Non-finite input yields non-finite/platform math and should be avoided. |
+| `transform.GetEntitiesInFront(worldX, worldY, minimumZ?)` (`getEntitiesInFront` alias) | World-space query point and optional inclusive minimum z. | New array of matching entities. | Tests all live non-root transformed bounds, sorted descending z then descending id (frontmost first). Omitted minimum accepts all z. Boundaries count; non-rendering/invisible entities can still match because this is a geometry query. |
+| `transform.doTheyOverlap(entities)` | Array of entities. | `true` if any pair's global AABBs overlap, else `false`. | Fewer than two valid entries returns false. It compares global axis-aligned bounds, so rotated rectangles can produce broad-phase false positives; Spritebox masks and component visibility are ignored. Duplicate references can overlap themselves according to the pair traversal and should be removed by callers. |
+| `transform.raycast(originX, originY, dirX, dirY, maxDistance?, options?)` | Origin; direction (need not be normalized); optional distance; optional ignore record. | Nearest `RaycastHit`, or `nil`. | Normalizes direction, intersects entity AABBs, and returns the closest allowed hit including distance, point, and normal aliases. A zero/non-finite direction returns nil. Distance defaults to infinity, clamps to `0..1,000,000`, and negative becomes zero. Both ignore fields accept one entity or an array and are combined. Root, explicit `raycastable = false`, non-positive global bounds, and ignored entities are skipped. |
 
-`raycast` returns `nil` for a zero/non-finite direction. Distance defaults to
-infinity, is clamped to `0..1,000,000`, and negative becomes zero. Both ignore
-fields accept one entity or an array and are combined. Entities with explicit
-`raycastable = false`, non-positive global size, or id `0` are skipped. Normal
-aliases carry identical numbers.
+Normal aliases in `RaycastHit` carry identical numbers. A hit at the origin can
+have distance `0`. When two candidates tie, stable engine entity ordering
+decides which one is returned; do not use ties as an identity rule.
+
+```luau
+local angle = transform.lookAt(player.x, player.y, mouse.x, mouse.y)
+player.rotation = angle
+
+local hit = transform.raycast(player.x, player.y, math.cos(angle), math.sin(angle), 500, {
+    ignore = player,
+})
+if hit then print("hit", hit.entity.name, hit.distance, hit.normalX, hit.normalY) end
+```
 
 <!-- page: listeners | Entity Listeners -->
 # Entity Listeners
@@ -2237,6 +3159,11 @@ for hover/scroll.
 Disconnect is idempotent and returns whether it removed a live registration.
 Deleting an entity recursively disconnects its registrations.
 
+| Connection method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `connection:Disconnect()` (`disconnect` alias) | None. | `true` if a live registration was removed; otherwise `false`. | Idempotent. A callback may disconnect itself safely; it will not run on later events. Deleting its entity has the same terminal effect. |
+| `connection:IsConnected()` (`isConnected` alias) | None. | `boolean`. | Reports whether the registration is currently eligible for future events. It becomes false immediately after disconnection/entity deletion, including while another callback is being dispatched. |
+
 <!-- page: prefabs | Prefab API -->
 # Prefab API
 
@@ -2280,16 +3207,15 @@ export type PrefabsModule = {
 }
 ```
 
-| Function | Behavior |
-| --- | --- |
-| `capture(entity)` | Deep-captures the entity subtree and internal references. |
-| `component(source,overrides?)` | Deep-copies a component prototype and overlays keyed values. |
-| `load(path)` | Parses a `.neoprefab` from data/resource resolution without instantiating it. |
-| `register(name,source)` | Captures/loads a source and stores the template under an exact name. |
-| `get(name)` | Returns the registered template or `nil`. |
-| `remove(name)` | Removes a registration and reports whether it existed. |
-| `instantiate(source,parent?)` | Resolves registered name/entity/template and creates a fresh subtree; parent defaults to `ecs.root`. |
-| `duplicate(...)` | Exact alias of `instantiate`. |
+| Canonical function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `prefabs.capture(entity)` | Live source entity. | Detached `PrefabTemplate` snapshot. | Deep-captures the entity subtree, components, shared/cyclic table structure, and references whose targets are inside the subtree. Later source edits do not change the snapshot. Unsupported userdata/functions follow capture rules and invalid/stale entities raise. |
+| `prefabs.component(source, overrides?)` | Component prototype/instance-like table and optional keyed override table. | Fresh component table of the source's generic type. | Deep-copies source then assigns override keys. Nested override values replace, rather than recursively merge, the copied key. It does not attach the result; use it in a prefab or `AddComponent`. |
+| `prefabs.load(path)` | `.neoprefab` project/data/resource path. | Parsed detached `PrefabTemplate`. | Does not instantiate/register. Missing files, invalid JSON/document shape, path violations, or script/component resolution failures raise. |
+| `prefabs.register(name, source)` | Exact registry name and a path, live entity, or template. | Captured/loaded stored `PrefabTemplate`. | Replaces an existing exact-name registration. The registry owns a safe snapshot rather than retaining a live entity. Empty/invalid names or invalid sources raise. |
+| `prefabs.get(name)` | Exact registry name. | Registered `PrefabTemplate`, or `nil`. | Returns the stored template table; treat it as source data. Mutating it can affect later instantiations, so clone/register a separate value when isolation matters. |
+| `prefabs.remove(name)` | Exact registry name. | `true` if removed; otherwise `false`. | Does not delete existing instances or invalidate template tables already held by user code. |
+| `prefabs.instantiate(source, parent?)` (`duplicate` alias) | Registry name/path resolution as supported, live entity, or template; optional parent default `ecs.root`. | New entity-subtree root. | Creates a fresh hierarchy, remaps internal entity/component references, then queues custom `awake` after fields exist. Unknown registered names/invalid paths/templates/parents raise. Every invocation gets independent ordinary fields while intentionally shared references inside that one snapshot stay shared. |
 
 Instantiation remaps entity/component references within each copy and preserves
 shared table identity, cycles, and metatables. It builds the complete tree
@@ -2300,6 +3226,20 @@ prefabs stay project-relative.
 `prefabs.ui` provides immutable source templates for a label, panel, dialog,
 and status chip. Instantiate or register/capture before customization. The
 module also exposes engine-managed `_registry`; do not mutate it directly.
+
+```luau
+local enemyTemplate = prefabs.capture(enemy)
+prefabs.register("enemy", enemyTemplate)
+
+for i = 1, 3 do
+    local copy = prefabs.instantiate("enemy", ecs.root)
+    copy.x = 100 + i * 80
+end
+
+local redPanel = prefabs.component(core.Panel, {
+    backgroundColor = Color4(120, 24, 32),
+})
+```
 
 <!-- page: tweening | Tweening API -->
 # Tweening API
@@ -2335,11 +3275,15 @@ export type TweeningModule = {
 }
 ```
 
-`to`, `new`, and `create` are identical. The target's current and destination
-values must be numeric; duration must be finite and non-negative. Defaults are
-`linear` and `out`. Progress is clamped to `0..1`; zero duration completes on the
-next positive update. Completion writes the exact destination, calls the
-callback once, and releases registry references.
+### Module functions
+
+| Canonical function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `tweening.to(target, key, value, duration, style?, direction?, onComplete?)` (`new`, `create` aliases) | Mutable target table; exact key; numeric destination; finite non-negative seconds; optional easing style/direction; optional zero-argument completion callback. | New active `TweenHandle`. | Reads the target's numeric starting value immediately. Progress is clamped to `0..1`; zero duration reaches the destination on the next positive update. Completion writes the exact destination, invokes the callback once, and releases registry references. Missing/non-numeric start/destination, invalid duration/easing, or non-function callback raises without a useful handle. Concurrent tweens for the same key both write in update order; cancel the old one explicitly. |
+| `tweening.cancelAll()` (`cancel_all` alias) | None. | Number of live tweens newly cancelled. | Already completed/cancelled entries are not counted. Completion callbacks do not run for cancellation. |
+| `tweening.count()` | None. | Number of currently live tween entries. | Terminal tweens are excluded after registry cleanup even if handles remain referenced. |
+| `tweening.ease(t, style?, direction?)` | Numeric progress and optional easing names. | Eased numeric progress. | Evaluates without creating state. Input progress is clamped to `0..1`; defaults are `linear` and `out`; unknown names raise. Some styles such as back/bounce can overshoot within their mathematical curve even though input is clamped. |
+| `tweening.update(dt)` (`_update` alias) | Elapsed seconds. | `()` | Advances all live tweens. The engine calls `_update` once per frame. Manual use adds another advance; negative/non-finite `dt` is invalid or clamped by runtime validation and should not be supplied. |
 
 Accepted style aliases are `sin`, `quadratic`, `quartic`, `quintic`,
 `exponential`, and `circular`. Direction parsing ignores `_` and `-`, so
@@ -2349,6 +3293,22 @@ Accepted style aliases are `sin`, `quadratic`, `quartic`, `quintic`,
 tweens. `ease` evaluates without creating a tween. `update` and `_update` are
 the same function; the engine calls `_update` automatically, so gameplay should
 not call either unless it deliberately wants an extra advance.
+
+### Handle methods
+
+| Canonical method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `handle:cancel()` (`Cancel` alias) | None. | `true` if a live tween was cancelled; otherwise `false`. | Idempotent. Leaves the target at its current interpolated value and suppresses `onComplete`. |
+| `handle:isDone()` (`IsDone` alias) | None. | `boolean`. | True after normal completion or cancellation. Use your own flag inside `onComplete` if those outcomes must be distinguished. |
+
+```luau
+local fade = tweening.to(panel, "opacity", 0, 0.25, "sine", "out", function()
+    panel.entity:delete()
+end)
+
+-- Later, if the panel must stay:
+if not fade:isDone() then fade:cancel() end
+```
 
 <!-- page: animation | Animation API -->
 # Animation API
@@ -2397,20 +3357,47 @@ export type AnimationModule = {
 }
 ```
 
-`load`/`Load` read `.neoanim` JSON from the project path. `new`/`create` create
-a paused player; `play` creates a playing one. `duration` defaults to the last
-key time when absent and is raised to at least that time when supplied shorter.
-Looping defaults false; `looped` is a compatibility alias of `looping`.
+### Module functions
+
+| Canonical function | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `animation.load(path)` (`Load` alias) | Project/data/resource `.neoanim` path. | Parsed mutable `AnimationClip`. | Loads JSON without creating a player. Missing/invalid files, malformed tracks/keys, nonnumeric required fields, and path failures raise. `duration` defaults to the latest key time and is raised to at least that time if supplied shorter. Looping defaults false; `looped` aliases `looping`. |
+| `animation.new(target, clip)` (`create` alias) | Mutable target table and clip table. | Paused `AnimationHandle`. | Validates/prepares tracks and registers a player at time zero. Target properties are not advanced until play/manual update. Invalid clip/target fields raise. The player retains references while registered. |
+| `animation.play(target, clip)` | Mutable target and clip. | Playing `AnimationHandle`. | Convenience constructor equivalent to creating then calling `:play()`. Initial key values are applied according to player sampling/update timing. |
+| `animation.update(dt)` (`_update` alias) | Elapsed seconds. | `()` | Advances registered players once. Engine-managed under `_update`; manual calls double-advance. Non-finite/negative `dt` should not be supplied. |
 
 Tracks write numeric target properties by exact string key. Keys are sampled in
 time order. `step` and `hold` retain the earlier value. `cubic` and `ease` alias
 `bezier`. Bezier x handles clamp to `0..1`; defaults are outgoing `(0.333, 0)`
 and incoming `(0.667, 1)`. Linear is the track default.
 
-`seek` clamps to clip duration and clears finished state. `stop` pauses and
-rewinds to zero. `setSpeed` accepts finite values at least zero. Players remain
-registered after finishing and can be played again. `update`/`_update` are the
-same engine-managed advance function; avoid an accidental double update.
+### Handle methods
+
+| Method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `player:play()` | None. | `()` | Sets playback active. A finished non-looping player can be played again according to its current/finished state; use `stop` or `seek(0)` when an explicit rewind is required. |
+| `player:pause()` | None. | `()` | Stops time advancement while preserving current time and target values. Repeated calls are harmless. |
+| `player:stop()` | None. | `()` | Pauses, rewinds to time zero, clears finished state, and applies/schedules the initial sample according to runtime player behavior. It does not unregister the handle. |
+| `player:seek(time)` | Desired seconds. | `()` | Clamps to `0..clip.duration`, clears finished state, and samples all tracks at that time. Non-finite time is invalid. Seeking does not itself choose playing versus paused. |
+| `player:setSpeed(speed)` | Finite non-negative multiplier. | `()` | `0` freezes advancement while preserving `isPlaying`; `1` is normal. Negative/non-finite values raise. Reverse playback is not supported. |
+| `player:isPlaying()` | None. | `boolean`. | True only while active; paused/stopped/finished non-looping players return false. Looping players remain active until paused/stopped. |
+
+Tracks write numeric target properties by exact string key. Keys are sampled in
+time order. `step` and `hold` retain the earlier value. `cubic` and `ease` alias
+`bezier`. Bezier x handles clamp to `0..1`; defaults are outgoing `(0.333, 0)`
+and incoming `(0.667, 1)`. Linear is the track default. Players remain
+registered after finishing and can be played again.
+
+```luau
+local clip = animation.load("animations/open.neoanim")
+local player = animation.play(door, clip)
+
+-- Scrubbing does not require a second clip or target.
+player:pause()
+player:seek((clip.duration or 0) * 0.5)
+player:setSpeed(1.5)
+player:play()
+```
 
 ## `core.AnimationController`
 
@@ -2431,6 +3418,7 @@ export type CoreModule = {
     Light2D: Light2D,
     LightOccluder2D: LightOccluder2D,
     EntityScaler: EntityScaler,
+    Camera: Camera,
     Shape2D: Shape2D,
     ParticleSystem2D: ParticleSystem2D,
     AnimationController: AnimationController,
@@ -2532,6 +3520,82 @@ Snake case is canonical. Camel aliases and `percent_x`/`percent_y` are read as
 fallbacks. Defaults are enabled, percent editing enabled, and all numbers zero.
 `edit_with_percent` is editor metadata and does not change the calculation.
 
+## `core.Camera`
+
+```luau
+export type Camera = ComponentInstance & {
+    enabled: boolean,
+    SetActive: (self: Camera) -> boolean,
+    setActive: (self: Camera) -> boolean,
+    IsActive: (self: Camera) -> boolean,
+    isActive: (self: Camera) -> boolean,
+}
+```
+
+A Camera makes its owning entity's world position the center of the logical
+window. For a `1280 × 720` window, a camera at `(400, 250)` maps that world
+point to screen point `(640, 360)`. Camera translation is applied once to the
+complete scene command list, lights, and light occluders. It does not change
+physics coordinates, entity transforms, the clear color, or screen-space
+editor/debug overlays. Camera rotation and zoom are not currently supported.
+
+The global `mouse.x/y` and pointer event `x/y` remain logical screen
+coordinates. Built-in UI controls and entity-listener hit tests automatically
+apply the inverse camera translation, so they continue to line up with rendered
+entities. When gameplay needs an explicit world point, use
+`worldX = mouse.x - window.x / 2 + cameraEntityWorldX` and the corresponding
+Y formula for the active camera (`window.x/y` are the logical width/height).
+
+### `camera:SetActive() -> boolean`
+
+`self` is the Camera component to select; colon syntax supplies it
+automatically. The function returns `true` and makes the camera active when the
+component is enabled and still attached to an entity. It returns `false`
+without changing the selection when `enabled = false` or after the component
+has been removed. `setActive` is an exact alias.
+
+Selection is frame-atomic: even when `SetActive` is called from a system or a
+component whose update occurs after a drawable, all scene commands in the
+presented frame use the newly selected camera. With multiple cameras, the
+explicit selection remains active while it is enabled and attached.
+
+### `camera:IsActive() -> boolean`
+
+Returns whether `self` is the selected camera at the instant of the call.
+`isActive` is an exact alias. A newly added first camera becomes the automatic
+fallback during the next camera pre-pass, so `IsActive()` can still be `false`
+between `AddComponent` and the first update.
+
+The first enabled Camera is selected automatically when a scene has no valid
+active camera. If the active component is disabled, removed, or unloaded with
+its scene, the next enabled camera becomes the fallback. When no enabled Camera
+exists, translation is exactly `(0, 0)`, preserving the original behavior in
+which entity coordinates are rendered directly as screen coordinates.
+
+```luau
+local player = ecs.newEntity("Player", ecs.root, 800, 450)
+player.size_x, player.size_y = 32, 48
+player:AddComponent(core.Sprite2D).image = assets.loadImage("assets/player.png")
+
+local followRig = ecs.newEntity("Follow camera", ecs.root, 800, 450)
+local followCamera = followRig:AddComponent(core.Camera)
+
+local mapRig = ecs.newEntity("Map camera", ecs.root, 0, 0)
+local mapCamera = mapRig:AddComponent(core.Camera)
+
+-- Switch to the map for one mode, then back to the player-following rig.
+assert(mapCamera:SetActive())
+-- Later:
+followRig.x, followRig.y = player:GetWorldPosition()
+followCamera:SetActive()
+```
+
+Raw `mouse.x` and `mouse.y` remain screen coordinates. Built-in UI controls and
+entity listener hit tests apply the inverse camera translation internally, so
+their visible and clickable regions stay aligned. APIs explicitly documented
+as accepting world coordinates, such as raycasts and `isInside`, continue to
+take unshifted world values.
+
 ## `core.Shape2D`
 
 ```luau
@@ -2618,10 +3682,23 @@ normalized lifetime; keypoint times are clamped/sorted by the renderer. Without
 an image, particles render as circles; with one, the image is tinted and scaled.
 Emission is bounded by `max_particles`.
 
-`play` resumes automatic emission. `pause` keeps existing particles alive but
-stops automatic emission. `stop` pauses and clears particles/timers. `emit`
-queues a manual burst, defaulting to one particle. Non-looping emission stops
-after `duration`, while existing particles finish.
+| Canonical method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `particles:play()` (`Play` alias) | None. | `()` | Sets `playing = true` and resumes automatic emission from current timers. A non-looping emitter whose duration already elapsed may need `stop()` before replaying from time zero. Existing particles keep their current ages. |
+| `particles:pause()` (`Pause` alias) | None. | `()` | Sets `playing = false`, stopping automatic emission while existing particles continue to simulate and expire. It does not clear queued/manual state. |
+| `particles:stop()` (`Stop` alias) | None. | `()` | Pauses, clears all live particles and manual/emission timers, and resets derived `particle_count` to zero by the next component update. |
+| `particles:emit(count?)` (`Emit` alias) | Optional numeric burst count, default `1`. | `()` | Queues a manual burst, still capped by `max_particles`. Counts are converted/clamped to a non-negative whole-particle quantity; zero/negative requests emit nothing. A paused emitter can still emit manually, while invisible rendering does not necessarily stop simulation. |
+
+Non-looping automatic emission stops after `duration`, while particles already
+alive finish their lifetimes.
+
+```luau
+local sparks = hitEffect:AddComponent(core.ParticleSystem2D)
+sparks.looping = false
+sparks.playing = false
+sparks.max_particles = 64
+sparks:emit(24)
+```
 
 ## `core.AnimationController`
 
@@ -2643,8 +3720,23 @@ export type AnimationController = ComponentInstance & {
 
 Defaults: no animation, autoplay and looping `true`, playing `false`, speed
 `1`. Assigning an animation creates/replaces the internal player when needed.
-`play` sets desired playback; `pause` pauses; `stop` pauses and rewinds. A
-negative speed is rejected by the underlying handle.
+
+| Canonical method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `controller:play()` (`Play` alias) | None. | `()` | Sets desired `playing = true`. When `animation` is present, creates/reuses an internal player and starts it with component `looping`/`speed`. With no clip, the desired flag remains but there is nothing to sample until a clip is assigned. |
+| `controller:pause()` (`Pause` alias) | None. | `()` | Sets desired playback false and pauses an existing player at its current time. Safe before a clip/player exists. |
+| `controller:stop()` (`Stop` alias) | None. | `()` | Sets desired playback false and asks an existing player to pause/rewind to zero. Safe with no clip. |
+
+Assigning a different animation creates/replaces the internal player when
+needed. A negative/non-finite `speed` is rejected by the underlying handle
+during synchronization.
+
+```luau
+local controller = door:AddComponent(core.AnimationController)
+controller.animation = animation.load("animations/door.neoanim")
+controller.looping = false
+controller:play()
+```
 
 ## `core.SpatialSound2D`
 
@@ -2661,10 +3753,20 @@ export type SpatialSound2D = ComponentInstance & {
 }
 ```
 
-Defaults: sound `nil`, volume `1`, looping/autoplay `false`. `play` returns
-`false` without a sound; otherwise it starts spatial playback at the current
-world transform and returns `true`. The component moves the emitter every
-frame while active. Removal stops its sound.
+Defaults: sound `nil`, volume `1`, looping/autoplay `false`. The component moves
+the emitter every frame while active. Removal stops its sound.
+
+| Canonical method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `spatial:play()` (`Play` alias) | None. | `false` when `sound` is nil; `true` after requesting playback. | Starts/restarts spatial playback at the owning entity's current world position using `looping` and volume clamped to `0..1`. A detached component or unloaded/invalid sound cannot produce valid playback and may fail through the audio backend. `true` is a start request, not proof the browser allowed audible output. |
+| `spatial:stop()` (`Stop` alias) | None. | `()` | Stops the sound handle associated with this component and clears its active state. Safe when idle or before a sound is assigned. |
+
+```luau
+local hum = machine:AddComponent(core.SpatialSound2D)
+hum.sound = assets.loadSound("assets/hum.ogg")
+hum.looping, hum.volume = true, 0.35
+assert(hum:play())
+```
 
 <!-- page: text | Text Components -->
 # Text Components
@@ -2764,18 +3866,43 @@ are layout outputs. `scale_x`/`scale_y` are legacy layout fields and begin zero.
 
 ### Rich formatting and letter queries
 
-Ranges use zero-based, end-exclusive character indexes. Formatting ranges may
-overlap and are retained when new text still intersects them. `setSize` is
-relative to component scale. `setOffset` and `setPixelOffset` are aliases and
-do not change character advance. `setCharacterOffset` formats one character.
-Calling `clearFormatting()` without a complete range clears all formatting.
+Ranges use zero-based, end-exclusive Unicode-scalar indexes (not UTF-8 byte
+offsets or grapheme-cluster indexes). Formatting ranges may overlap; later
+range properties are composed by layout and remain while edited text still
+intersects them.
 
-Letter query indexes are zero-based. Position returns `x,y`; bounds returns
-`x,y,w,h`; invalid/unlaid-out input returns nil values. Closest-index queries
-accept world coordinates and return the nearest cursor/insertion index.
-`getClosestCharacterIndex` aliases `getClosestLetterIndex`.
+| Method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `text:setBold(startIndex, endIndex)` | Start inclusive and end exclusive. | `()` | Adds a bold range. Negative/fractional indexes are coerced to non-negative whole indexes. An empty/reversed/out-of-text range has no visible glyphs but can remain in range state. |
+| `text:setItalic(startIndex, endIndex)` | Same range contract. | `()` | Adds italic formatting; overlaps combine with bold/other styles. |
+| `text:setUnderline(startIndex, endIndex)` | Same range contract. | `()` | Adds underline formatting. |
+| `text:setColor(startIndex, endIndex, color)` | Range and `Color4Value`. | `()` | Adds a foreground-color range. Color is read during layout; pass a complete valid color. |
+| `text:setSize(startIndex, endIndex, scale)` | Range and numeric relative scale. | `()` | Multiplies glyph size relative to component `scale`; non-positive values can make text invisible/degenerate and should be avoided. |
+| `text:setFont(startIndex, endIndex, fontPath)` | Range and project font path/name. | `()` | Selects a font for the range. The call stores formatting; missing/invalid font data can surface when layout/rendering resolves it. |
+| `text:setOffset(startIndex, endIndex, x, y)` (`setPixelOffset` alias) | Range and finite pixel offsets. | `()` | Visually shifts glyphs without changing their normal advance. End is clamped to at least start in this operation. Offsets affect reported world letter bounds after layout. |
+| `text:setCharacterOffset(charIndex, x, y)` | One index and pixel offsets. | `()` | Convenience range `[charIndex, charIndex + 1)`. An out-of-text index is retained but has no visible effect until text/range intersects it. |
+| `text:clearFormatting(startIndex?, endIndex?)` | Either no complete range, or inclusive/exclusive bounds. | `()` | With either bound omitted, clears every rich range. With both, removes only overlap and splits preserved left/right parts as needed. Empty/reversed ranges remove nothing. |
+| `text:clearAllFormatting()` | None. | `()` | Unconditionally replaces the rich-range list with an empty one. Plain component-wide style fields remain unchanged. |
+| `text:getLetterCount()` | None. | Non-negative Unicode-scalar count. | Counts `text` characters, not bytes or visual grapheme clusters; combining marks can count separately. Does not require a rendered frame. |
+| `text:getLetterPosition(charIndex)` | Zero-based glyph index. | World `x, y`, or `nil, nil`. | Refreshes layout when attached and returns the top-left of that glyph. Index `-1` addresses the start caret and index equal to letter count addresses the end caret; other invalid/non-integral values return nils. |
+| `text:getLetterBounds(charIndex)` | Zero-based glyph/caret index. | World `x, y, width, height`, or four nils. | Same refresh/index rules as position. Newlines/whitespace can have layout-specific bounds. |
+| `text:getClosestLetterIndex(x, y)` (`getClosestCharacterIndex` alias) | Finite world coordinates. | Nearest insertion index `0..letterCount`, or `nil` for invalid arguments. | Refreshes layout, considers both sides of every glyph, and returns `0` for a valid empty layout. Ties use the first candidate encountered. |
 
 The three `core` names reference the same prototype behavior.
+
+```luau
+local title = label:AddComponent(core.TextBox)
+title.text = "NeoLOVE editor"
+title:setBold(0, 7)
+title:setColor(0, 7, Color4(255, 90, 150))
+title:setPixelOffset(8, 14, 0, 2)
+
+local index = title:getClosestLetterIndex(mouse.x, mouse.y)
+if index then
+    local x, y, w, h = title:getLetterBounds(index)
+    if x then print("caret", index, x, y, w, h) end
+end
+```
 
 ## `core.TextInput`
 
@@ -2847,9 +3974,33 @@ scale `18`, minimum `12`, left/center alignment, no fitting/wrap, and 2-pixel
 caret. It uses the VS Code Dark+ colors shown by the field names.
 
 `hovered`, `focused`, `cursor_index`, `view_start`, and `cursor_blink` are
-engine-updated. `focus` succeeds only while enabled and unlocked; `blur` always
-clears focus. Password mode masks display but retains real `text`. The same rich
-formatting methods as TextBox are supported.
+engine-updated. Password mode masks display but retains real `text`. The same
+rich formatting methods as TextBox are supported with identical parameters,
+no return values, Unicode-scalar range semantics, and edge cases.
+
+| Input-specific method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `inputComponent:focus()` (`Focus` alias) | None. | `()` | Sets `focused` true only if `enabled` and not `locked`; otherwise explicitly leaves/sets it false. Focus transitions discovered by the next update invoke `onFocus`/`onBlur` and request/hide the platform keyboard as appropriate. |
+| `inputComponent:blur()` (`Blur` alias) | None. | `()` | Sets `focused` false unconditionally. Repeated calls are safe; callback delivery follows the component update's transition observation. |
+
+Callbacks return nothing meaningful. `onChanged(entity, component, text)` runs
+after a user edit that changes the string; `onSubmit(entity, component, text)`
+runs on enabled Enter submission before optional clear/blur behavior;
+`onFocus(entity, component)` and `onBlur(entity, component)` report focus
+transitions. Programmatically assigning `text` does not necessarily synthesize
+a user `onChanged` event. Callback errors are reported by the runtime and can
+interrupt the remainder of that UI update.
+
+```luau
+local field = nameEntity:AddComponent(core.TextInput)
+field.placeholder = "Display name"
+field.max_length = 24
+field.onSubmit = function(entity, component, value)
+    print("submitted", value)
+    component:blur()
+end
+field:focus()
+```
 
 ::: warning
 UI callbacks receive the owning `entity` first and the component instance
@@ -2945,6 +4096,23 @@ Pressing inside calls `onPress`. Releasing a previously pressed button calls
 `onRelease`, then `onClick` only if still hovered. Hover transitions call the
 corresponding callbacks. Disabled buttons clear pressed state and do not emit.
 
+Each optional callback receives `(entity, component)` and its return values are
+ignored. `onPress` runs on a primary press inside; `onRelease` runs when that
+captured press is released even if the pointer moved outside; `onClick` then
+runs only if the release is still inside. `onHoverEnter`/`onHoverLeave` run once
+per derived hover transition. Assigning `nil` disables a callback. Callback
+errors are reported during the UI update and can prevent later callbacks in
+that same interaction.
+
+```luau
+local button = buttonEntity:AddComponent(core.Button)
+button.text = "Continue"
+button.onClick = function(entity, component)
+    component.enabled = false
+    print(entity.name, "clicked")
+end
+```
+
 ## `core.Slider`
 
 ```luau
@@ -2991,8 +4159,29 @@ fill, and thumb.
 The engine clamps `value` between the lower and upper of `min`/`max`, so
 reversed ranges work. Fraction follows the directed range and remains `0..1`.
 Positive `step` snaps relative to `min`. Vertical sliders place maximum at the
-top. `setValue`/`SetValue` clamp and recompute fraction without firing
-`onChanged`; dragging fires only when the numeric value changes.
+top.
+
+### `slider:setValue(value) -> ()` (`SetValue` alias)
+
+`value` is the desired numeric value. The method snaps/clamps it against the
+current directed range, writes `value`, and recomputes derived `fraction`; it
+returns nothing and deliberately does **not** invoke `onChanged`. Equal min/max
+produces a stable zero fraction. Non-finite values are rejected/normalized by
+numeric validation rather than becoming a useful slider state.
+
+Dragging invokes `onChanged(entity, component, value)` only when the numeric
+value actually changes. The callback's returns are ignored; disabled sliders
+do not drag or fire. Use the callback for user intent and call your own handler
+after `setValue` if programmatic changes should have equivalent effects.
+
+```luau
+local volume = sliderEntity:AddComponent(core.Slider)
+volume.min, volume.max, volume.step = 0, 1, 0.05
+volume:setValue(0.7)
+volume.onChanged = function(entity, component, value)
+    settings.volume = value
+end
+```
 
 ## `core.Dropdown`
 
@@ -3100,6 +4289,25 @@ Wheel scrolling changes the visible zero-based `scroll_index`. `open_upwards`
 forces upward opening; otherwise the menu automatically flips when it would
 overflow the bottom and space exists above.
 
+`onChanged(entity, component, index, value)` receives a 1-based selected option
+index and its normalized **string** value. Its return values are ignored. It
+runs only for a user choice that changes selection, not when gameplay assigns
+`selected_index`/`options`. Empty or disabled dropdowns do not emit. Callback
+errors are reported during the UI update after selection state has changed.
+
+```luau
+local quality = dropdownEntity:AddComponent(core.Dropdown)
+quality.options = {
+    { text = "Low (fast)", value = "low" },
+    { text = "High", value = "high" },
+    { text = "Ultra", value = "ultra" },
+}
+quality.onChanged = function(entity, component, index, value)
+    lighting.setQuality(value)
+    print("choice", index, component.selected_text)
+end
+```
+
 <!-- page: image-components | Image and Tile Components -->
 # Image and Tile Components
 
@@ -3169,10 +4377,24 @@ to available atlas cells. `columns = 0` derives from image width;
 `frame_count <= 0` derives the whole atlas. Positive margin surrounds the
 atlas; spacing separates cells.
 
-`pause` retains frame/time. `stop` pauses, resets frame and accumulated time.
-`setFrame`/`set_frame` clamp negative indexes to zero and reset time. Pascal
-aliases exist for play/pause/stop even though older declarations omit them.
-Non-looping playback stops on the last valid frame.
+| Canonical method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `sheet:play()` (`Play` alias) | None. | `()` | Sets `playing = true` and resumes from the current frame/accumulated time. With no valid image/cells there is nothing to advance, but desired state remains. |
+| `sheet:pause()` (`Pause` alias) | None. | `()` | Sets `playing = false` while retaining frame and accumulated fractional-frame time. |
+| `sheet:stop()` (`Stop` alias) | None. | `()` | Pauses, resets frame to zero, and clears accumulated time. Safe before an image is assigned. |
+| `sheet:setFrame(frame)` (`set_frame` alias) | Desired zero-based numeric frame. | `()` | Converts/clamps negative input to zero and resets accumulated time. Effective rendering also clamps to the available/declared atlas range. Setting the final frame does not itself toggle `playing`. |
+
+Non-looping playback stops on the last valid frame. Zero/non-positive FPS does
+not produce forward automatic advancement.
+
+```luau
+local walk = actor:AddComponent(core.SpriteSheet2D)
+walk.image = assets.loadImage("assets/walk.png")
+walk.frame_width, walk.frame_height = 32, 48
+walk.frame_count, walk.fps = 8, 10
+walk:setFrame(3)
+walk:play()
+```
 
 ## `core.NineSliceSprite2D`
 
@@ -3270,21 +4492,31 @@ export type Spritebox2D = ComponentInstance & {
 }
 ```
 
-Defaults: not computed, threshold `0`, zero rectangles and bounds. Computing
-reads the source image and source rectangle, clamps threshold to `0..255`, scans
-alpha, and merges opaque pixels into normalized rectangles. It raises when no
-supported source component/image exists and otherwise returns `true`, including
-an all-transparent result.
+Defaults: not computed, threshold `0`, zero rectangles and bounds.
 
-`IsInside` accepts world coordinates. `IsIntersecting` accepts another
-Spritebox instance or an entity containing one. Both follow live world size,
-scale, hierarchy, and rotation. Intersection uses an AABB broad phase and SAT
-on cached rectangles.
+| Canonical method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `spritebox:ComputeSpritebox()` (`computeSpritebox` alias) | None. | `true` after a successful scan. | Reads the supported sibling image/source rectangle, clamps threshold to `0..255`, scans alpha, and merges opaque pixels into normalized rectangles. It raises when detached, no supported source component/live image exists, or pixels cannot be read. An all-transparent image is still a successful empty result (`true`, `computed = true`, `rect_count = 0`). Replaces the previous cache atomically enough for later queries. |
+| `spritebox:IsInside(x, y)` (`isInside` alias) | World-space point. | `boolean`. | Tests cached opaque rectangles after current entity hierarchy size/scale/rotation. Returns false when not successfully computed or when the cache is empty. Boundary handling follows polygon containment and can differ at floating-point edges. |
+| `spritebox:IsIntersecting(other)` (`isIntersecting` alias) | Another `Spritebox2D` or entity containing one. | `boolean`. | Uses an AABB broad phase then SAT on both cached rectangle sets at their live transforms. Missing/uncomputed/empty other masks return false; malformed targets raise or fail lookup. A spritebox does not intersect itself meaningfully for gameplay—avoid self-pairs. |
 
 Recompute after changing the image pixels, source rectangle, alpha threshold,
 nine-slice settings, or destination size when exact nine-slice shape matters.
 This is a gameplay query shape: it is not used by `transform.raycast`,
 `doTheyOverlap`, or Rigidbody physics.
+
+```luau
+local mask = ship:AddComponent(core.Spritebox2D)
+mask.alpha_threshold = 32
+assert(mask:ComputeSpritebox())
+
+if mask:IsInside(mouse.x, mouse.y) then
+    print("opaque ship pixel")
+end
+if mask:IsIntersecting(asteroid) then
+    print("pixel-shape overlap")
+end
+```
 
 <!-- page: physics | Physics Components -->
 # Physics Components
@@ -3354,6 +4586,33 @@ active pair. Enter fires for a new pair, stay for an existing pair, and exit
 after separation. Camel callback fields take precedence; snake fields are
 fallback aliases. The setter methods assign camel fields.
 
+Each setter takes either a `CollisionCallback` or `nil`, returns nothing, and
+replaces only its matching camel-case field:
+
+| Method | Callback phase |
+| --- | --- |
+| `collider:setOnCollisionEnter(callback?)` | First frame of a non-trigger contact pair. |
+| `collider:setOnCollisionStay(callback?)` | Later frames while that collision pair persists. |
+| `collider:setOnCollisionExit(callback?)` | First update after that collision pair ends/disables. |
+| `collider:setOnTriggerEnter(callback?)` | First frame where either member of a sensor/trigger pair overlaps. |
+| `collider:setOnTriggerStay(callback?)` | Later overlapping trigger frames. |
+| `collider:setOnTriggerExit(callback?)` | First update after trigger overlap ends/disables. |
+
+Passing nil clears the callback. Every callback receives the owning entity and
+collider, then the other entity/collider when still resolvable, plus `otherId`
+which remains available for exit/stale-partner correlation. `otherEntity` and
+`otherCollider` can be nil on an exit after deletion. Callback returns are
+ignored; callback errors are reported during physics event delivery and may
+interrupt later callbacks that frame.
+
+```luau
+local collider = player:AddComponent(core.Collider2D)
+collider:setOnCollisionEnter(function(selfEntity, selfCollider, otherEntity, otherCollider, otherId)
+    print("hit", otherEntity and otherEntity.name or otherId)
+end)
+collider:setOnCollisionExit(nil) -- explicitly no exit listener
+```
+
 ## `core.Rigidbody2D`
 
 ```luau
@@ -3421,6 +4680,32 @@ mode keeps the body's bounds inside the current logical window.
 a Rigidbody is represented as a static body. A Rigidbody may exist without a
 Collider and still integrate motion.
 
+### Rigidbody method reference
+
+All force, impulse, velocity, gravity, torque, and angular values are in the
+engine's world-unit/second convention and return no status unless stated.
+
+| Method | Parameters | Returns | Behavior and edge cases |
+| --- | --- | --- | --- |
+| `body:addForce(fx, fy)` | Force components. | `()` | Adds to `force_x/y`; multiple calls accumulate until the physics step consumes/resets them. Static/frozen axes may prevent resulting movement, but the call still updates stored force before stepping. |
+| `body:addImpulse(ix, iy)` | Linear impulse components. | `()` | Immediately adds impulse divided by `max(mass, 0.0001)` to velocity. Speed limits/freeze/static constraints are enforced by the physics update, not necessarily by this immediate write. |
+| `body:addTorque(torque)` | Scalar torque. | `()` | Accumulates into `torque` until the next step. Positive direction follows entity rotation convention. |
+| `body:addAngularImpulse(impulse)` | Scalar angular impulse. | `()` | Immediately adds impulse divided by inertia; non-positive automatic inertia falls back to mass, each floored at `0.0001`. Later freeze/static/speed limits can suppress it. |
+| `body:setVelocity(vx, vy)` | Linear velocity components. | `()` | Directly overwrites both fields. Does not clear force/acceleration. Non-finite values are invalid physics input. |
+| `body:getVelocity()` | None. | Current `vx, vy`; missing/malformed fields fall back to zero internally. | Snapshot before the next integration/contact correction. |
+| `body:setAngularVelocity(omega)` | Angular radians-per-second value. | `()` | Overwrites angular velocity without clearing torque. |
+| `body:getAngularVelocity()` | None. | Current angular velocity number, falling back to zero for a missing field. | Snapshot only. |
+| `body:setGravity(gx, gy)` | Gravity acceleration components. | `()` | Overwrites per-body gravity before `gravity_scale`; does not modify other bodies or current velocity. |
+
+```luau
+local body = ball:AddComponent(core.Rigidbody2D)
+body.mass = 2
+body:addImpulse(240, -400)
+body:addTorque(60)
+local vx, vy = body:getVelocity()
+print("launched at", vx, vy)
+```
+
 ## `core.Bolt2D` and `core.LegacyBolt2D`
 
 ```luau
@@ -3451,6 +4736,20 @@ higher strength increasingly resists relative rotation, and `1` locks it.
 LegacyBolt2D instead uses the previous spring-like positional motor where
 intermediate strength may lag. `current_force` and `force` are derived aliases.
 
+### `bolt:attach(targetEntity) -> ()` (`link` alias)
+
+`targetEntity` must be a live entity table. The method stores it in both
+`target_entity` and compatibility field `target` and returns nothing. It does
+not change offsets, strength, enabled state, or the target's hierarchy. A stale
+target later makes the constraint ineffective; reattach to a live entity.
+
+```luau
+local bolt = wheel:AddComponent(core.Bolt2D)
+bolt.offset_x, bolt.offset_y = 24, 0
+bolt.strength = 0.8
+bolt:attach(chassis)
+```
+
 ## `core.Rope2D` and `core.String2D`
 
 ```luau
@@ -3475,6 +4774,22 @@ damping `0.08`, no break threshold, and zero derived state. `link` assigns
 endpoints and clears `snapped`. The global physics step enforces the distance
 range. `break_force = 0` means unbreakable; exceeding a positive threshold
 disables and snaps the rope. `String2D` is the same prototype.
+
+### `rope:link(entityA, entityB) -> ()`
+
+Both parameters must be live endpoint entities. The method assigns
+`entity_a`/`entity_b`, clears `snapped`, and returns nothing. It preserves the
+current lengths, stiffness, damping, break threshold, and `enabled` flag—set
+`enabled = true` yourself when relinking a rope that broke. Linking an entity to
+itself yields a zero-distance constraint and is rarely useful. Deleting an
+endpoint makes solving skip/invalidates that link until relinked.
+
+```luau
+local rope = ropeController:AddComponent(core.Rope2D)
+rope.min_length, rope.max_length = 40, 180
+rope.break_force = 900
+rope:link(grapplingHook, player)
+```
 
 <!-- page: rendering | Rendering Details -->
 # Rendering Details
@@ -3699,23 +5014,27 @@ download or tool invocation.
 # Complete API Index
 
 The following checklist provides a compact audit of the supported surface.
-Every entry has a full definition on its linked conceptual page or in the
-generated declaration appendix.
+Every public entry has a full definition on its linked conceptual page; raw
+tooling declarations are deliberately not reproduced in this manual.
 
 ## Runtime and editor-declaration names
 
 `Color4`, `Inspector`, `IComponentPicker`, `IEntity`, `IComponent`, `IImage`,
 `IAudio`, `IShader`, `IAnimation`, `die`, `softrequire`, `print`, `require`,
-`app`, `input`, `userInput`, `assets`, `audio`, `fs`, `android`, `mobile`,
+`app`, `input`, `userInput`, `assets`, `audio`, `media`, `fs`, `android`, `mobile`,
 `http`, `commands`, `command`, `servers`, `shaders`, `ecs`, `prefabs`, `prefab`,
 `tweening`, `tween`, `animation`, `animations`, `transform`, `transforms`,
-`core`, `async`, `mouse`, and `window`.
+`core`, `lighting`, `Rng`, `async`, `mouse`, and `window`.
 
 ## Handle and record types
 
 `Color4Value`, `Vec2`, `Entity`, `Connection`, `EntityListenInfo`, `System`,
 `Component`, `ComponentInstance`, `ImageHandle`, `SoundHandle`, `ShaderHandle`,
-`AsyncTask`, `HttpRequestOptions`, `HttpResponse`, `CommandRunResult`,
+`MediaPermissionStatus`, `MediaDeviceKind`, `MediaEnumerationKind`, `MediaDevice`,
+`MediaAudioConstraints`, `MediaVideoConstraints`, `MediaRequestOptions`,
+`MediaAudioFormat`, `MediaVideoFormat`, `MediaAudioSamples`, `MediaAudioBytes`,
+`MediaVideoFrame`, `MediaStream`, `MediaDeviceResult`, `MediaAccessResult`,
+`RngInstance`, `AsyncTask`, `HttpRequestOptions`, `HttpResponse`, `CommandRunResult`,
 `CommandDetachedResult`, `ServerClientHandle`, `HostedServerHandle`,
 `ServerPeer`, `ServerService`, `RaycastHit`, `RaycastOptions`, `PrefabTemplate`,
 `TweenHandle`, `AnimationKeyframe`, `AnimationTrack`, `AnimationClip`, and
@@ -3723,7 +5042,8 @@ generated declaration appendix.
 
 ## Core prototypes
 
-`Rect2D`, `EntityScaler`, `Shape2D`, `ParticleSystem2D`, `AnimationController`,
+`Rect2D`, `Light2D`, `LightOccluder2D`, `EntityScaler`, `Camera`, `Shape2D`,
+`ParticleSystem2D`, `AnimationController`,
 `SpatialSound2D`, `TextBox`, `TextLabel`, `RudimentaryTextLabel`, `TextInput`,
 `Panel`, `Frame`, `Button`, `Slider`, `Dropdown`, `Sprite2D`, `Image2D`,
 `SpriteSheet2D`, `NineSliceSprite2D`, `9SliceSprite2D`, `TileTexture2D`,
@@ -3734,7 +5054,7 @@ generated declaration appendix.
 
 | Name | Owner | Purpose |
 | --- | --- | --- |
-| `_poll` | `http`, `servers` | Drains asynchronous callbacks; called by the runtime. |
+| `_poll` | `http`, `media`, `servers` | Drains asynchronous callbacks; called by the runtime. |
 | `_update` | `tweening`, `animation` | Automatic per-frame advance. |
 | `_registry` | `prefabs` | Internal registered-template table. |
 | `_hostClass` | `servers` | Raw inline class host constructor used by `servers.define`. |
@@ -3760,1354 +5080,3 @@ Additional visible engine state is exhaustive below:
 
 Do not invoke or persist engine-managed names directly. They are listed so a
 full table inspection is not mistaken for an undocumented gameplay feature.
-
-<!-- page: declarations | Generated Luau Declarations -->
-# Generated Luau Declarations
-
-This is the complete declaration source currently installed by `neolove new`
-and `neolove api`. It is reproduced verbatim so every declared type, function,
-field, callback, alias, and global is available in one copyable reference.
-
-::: warning
-The generated file is a tooling snapshot. The implementation-focused component
-pages in this manual include several runtime fields, aliases, and corrected UI
-callback parameters which this snapshot does not yet express. Runtime behavior
-described in those pages takes precedence.
-:::
-
-```luau
--- neolove engine api definitions
-
-export type Color4Value = {
-	r: number,
-	g: number,
-	b: number,
-	a: number,
-}
-
-export type Vec2 = {
-	x: number,
-	y: number,
-}
-
-export type PositionPivot = "center" | "top_right"
-
-export type EntityListenEvent = "leftClick" | "rightClick" | "middleClick" | "scrollUp" | "scrollDown" | "mouseEntered" | "mouseExited"
-
-export type EntityListenInfo = {
-	kind: EntityListenEvent,
-	type: EntityListenEvent,
-	button: "left" | "right" | "middle"?,
-	x: number,
-	y: number,
-	mouseX: number,
-	mouseY: number,
-	localX: number,
-	localY: number,
-	local_x: number,
-	local_y: number,
-	wheelX: number,
-	wheelY: number,
-	amount: number,
-}
-
-export type Connection = {
-	Disconnect: (self: Connection) -> boolean,
-	disconnect: (self: Connection) -> boolean,
-	IsConnected: (self: Connection) -> boolean,
-	isConnected: (self: Connection) -> boolean,
-}
-
-export type Entity = {
-	id: number,
-	name: string,
-	x: number,
-	y: number,
-	anchor_x: number,
-	anchor_y: number,
-	pivot_x: number?,
-	pivot_y: number?,
-	rotation: number,
-	rotation_pivot: string,
-	rotation_pivot_x: number?,
-	rotation_pivot_y: number?,
-	position_pivot: PositionPivot?,
-	z: number,
-	size_x: number,
-	size_y: number,
-	scale: number,
-	raycastable: boolean?,
-	parent: Entity?,
-	children: { Entity },
-	components: { ComponentInstance },
-	listen: (self: Entity, event: EntityListenEvent | string, callback: (entity: Entity, event: EntityListenInfo) -> ()) -> Connection,
-	Listen: (self: Entity, event: EntityListenEvent | string, callback: (entity: Entity, event: EntityListenInfo) -> ()) -> Connection,
-	delete: (self: Entity) -> (),
-	Delete: (self: Entity) -> (),
-	addComponent: (self: Entity, component: Component) -> ComponentInstance,
-	AddComponent: (self: Entity, component: Component) -> ComponentInstance,
-	removeComponent: (self: Entity, target: number | ComponentInstance) -> boolean,
-	RemoveComponent: (self: Entity, target: number | ComponentInstance) -> boolean,
-	duplicate: (self: Entity, parent: Entity?) -> Entity,
-	Duplicate: (self: Entity, parent: Entity?) -> Entity,
-	findFirstChild: (self: Entity, name: string) -> Entity?,
-	FindFirstChild: (self: Entity, name: string) -> Entity?,
-	getWorldPosition: (self: Entity) -> (number, number),
-	GetWorldPosition: (self: Entity) -> (number, number),
-	getWorldRotation: (self: Entity) -> number,
-	GetWorldRotation: (self: Entity) -> number,
-	isInside: (self: Entity, world_x: number, world_y: number) -> boolean,
-	IsInside: (self: Entity, world_x: number, world_y: number) -> boolean,
-	[string]: any,
-}
-
-export type System = {
-	awake: ((self: System) -> ())?,
-	update: ((self: System, dt: number) -> ())?,
-	lateUpdate: ((self: System, dt: number) -> ())?,
-	fixedUpdate: ((self: System, dt: number) -> ())?,
-	[string]: any,
-}
-
-export type CollisionCallback = (
-	selfEntity: Entity,
-	selfCollider: Collider2D,
-	otherEntity: Entity,
-	otherCollider: Collider2D,
-	otherId: number
-) -> ()
-
-export type Component = {
-	name: string?,
-	__neolove_component: string?,
-	awake: ((entity: Entity, component: ComponentInstance) -> ())?,
-	update: ((entity: Entity, component: ComponentInstance, dt: number) -> ())?,
-	destroy: ((entity: Entity, component: ComponentInstance) -> ())?,
-	onDestroy: ((entity: Entity, component: ComponentInstance) -> ())?,
-	NEOLOVE_RENDERING: boolean?,
-	[string]: any,
-}
-
-export type ComponentInstance = Component & {
-	entity: Entity?,
-	remove: (self: ComponentInstance) -> boolean,
-	Remove: (self: ComponentInstance) -> boolean,
-	getEntity: (self: ComponentInstance) -> Entity?,
-	GetEntity: (self: ComponentInstance) -> Entity?,
-	[string]: any,
-}
-
-export type ShaderHandle = {
-	setUniform1f: (self: ShaderHandle, name: string, x: number) -> (),
-	setUniform2f: (self: ShaderHandle, name: string, x: number, y: number) -> (),
-	setUniform3f: (self: ShaderHandle, name: string, x: number, y: number, z: number) -> (),
-	setUniform4f: (self: ShaderHandle, name: string, x: number, y: number, z: number, w: number) -> (),
-	setUniformColor: (self: ShaderHandle, name: string, color: Color4Value) -> (),
-	setTexture: (self: ShaderHandle, name: string, image: ImageHandle) -> (),
-}
-
-export type ImageHandle = {
-	width: (self: ImageHandle) -> number,
-	height: (self: ImageHandle) -> number,
-	size: (self: ImageHandle) -> (number, number),
-	getPixel: (self: ImageHandle, x: number, y: number) -> Color4Value,
-	setPixel: (self: ImageHandle, x: number, y: number, color: Color4Value) -> (),
-	fill: (self: ImageHandle, color: Color4Value) -> (),
-	upload: (self: ImageHandle) -> (),
-	export: (self: ImageHandle, path: string) -> (),
-	save: (self: ImageHandle, path: string) -> (),
-	unload: (self: ImageHandle) -> (),
-	isUnloaded: (self: ImageHandle) -> boolean,
-}
-
-export type SoundHandle = {
-	sampleRate: (self: SoundHandle) -> number,
-	channels: (self: SoundHandle) -> number,
-	len: (self: SoundHandle) -> number,
-	getSample: (self: SoundHandle, index: number) -> number,
-	setSample: (self: SoundHandle, index: number, value: number) -> (),
-	upload: (self: SoundHandle) -> (),
-	export: (self: SoundHandle, path: string) -> (),
-	save: (self: SoundHandle, path: string) -> (),
-	unload: (self: SoundHandle) -> (),
-	isUnloaded: (self: SoundHandle) -> boolean,
-}
-
-export type RaycastHit = {
-	entity: Entity,
-	id: number,
-	distance: number,
-	x: number,
-	y: number,
-	normalX: number,
-	normalY: number,
-	normal_x: number,
-	normal_y: number,
-}
-
-export type RaycastOptions = {
-	ignore: Entity | { Entity }?,
-	ignoreEntity: Entity | { Entity }?,
-}
-
-export type AppModule = {
-	bg: Color4Value,
-	antiAliasing: "off" | "standard" | "high",
-	setMaxFps: (fps: number?) -> (),
-	getMaxFps: () -> number?,
-	setShowFps: (enabled: boolean?) -> (),
-	getShowFps: () -> boolean,
-	nearestNeighborScaling: boolean,
-	setNearestNeighborScaling: (enabled: boolean?) -> (),
-	getNearestNeighborScaling: () -> boolean,
-	setAntiAliasing: (mode: ("off" | "standard" | "high")?) -> (),
-	getAntiAliasing: () -> "off" | "standard" | "high",
-}
-
-export type InputModule = {
-	isKeyDown: (key: string) -> boolean,
-	isKeyPressed: (key: string) -> boolean,
-	isKeyReleased: (key: string) -> boolean,
-	isMouseDown: (button: string?) -> boolean,
-	isMousePressed: (button: string?) -> boolean,
-	isMouseReleased: (button: string?) -> boolean,
-	getMouseWheel: () -> (number, number),
-	isScrollingIn: () -> boolean,
-	isScrollingOut: () -> boolean,
-	getScrollInAmount: () -> number,
-	getMouseDelta: () -> (number, number),
-	setMouseLocked: (locked: boolean) -> (),
-	isMouseLocked: () -> boolean,
-	getLastKeyPressed: () -> string?,
-	getCharPressed: () -> string?,
-	showKeyboard: (implicit: boolean?) -> boolean,
-	openKeyboard: (implicit: boolean?) -> boolean,
-	hideKeyboard: (implicitOnly: boolean?) -> boolean,
-	closeKeyboard: (implicitOnly: boolean?) -> boolean,
-}
-
-export type AssetsModule = {
-	loadImage: (pathOrBase64Png: string) -> ImageHandle,
-	loadImageBase64: (base64Png: string) -> ImageHandle,
-	snapPhoto: (x: number, y: number, x2: number, y2: number) -> ImageHandle,
-	newImage: (width: number, height: number, color: Color4Value?) -> ImageHandle,
-	loadSound: (path: string) -> SoundHandle,
-	newSound: (sampleRate: number, channels: number, len: number, fill: number?) -> SoundHandle,
-	unloadImage: (value: string | ImageHandle) -> boolean,
-	unloadSound: (value: string | SoundHandle) -> boolean,
-	gc: () -> (number, number),
-}
-
-export type AudioModule = {
-	play: (sound: SoundHandle, looped: boolean?, volume: number?) -> (),
-	playOnce: (sound: SoundHandle, volume: number?) -> (),
-	stop: (sound: SoundHandle) -> (),
-	setVolume: (sound: SoundHandle, volume: number) -> (),
-	playSpatial: (sound: SoundHandle, x: number, y: number, looped: boolean?, volume: number?) -> (),
-	setPosition: (sound: SoundHandle, x: number, y: number) -> boolean,
-	setListenerPosition: (x: number, y: number) -> (),
-}
-
-export type FsWalkEntry = {
-	path: string,
-	name: string,
-	kind: "file" | "directory",
-	isFile: boolean,
-	isDir: boolean,
-	is_file: boolean,
-	is_dir: boolean,
-}
-
-export type FsModule = {
-	isWebasm: () -> boolean,
-	isWebAssembly: () -> boolean,
-	isMobile: () -> boolean,
-	isAndroid: () -> boolean,
-	openFilePicker: () -> string?,
-	openFolderPicker: () -> string?,
-	getDataDirectory: () -> string,
-	dataPath: (path: string) -> string,
-	readFile: (path: string) -> string,
-	readBytes: (path: string) -> string,
-	writeFile: (path: string, content: string) -> (),
-	appendFile: (path: string, content: string) -> (),
-	exists: (path: string) -> boolean,
-	isFile: (path: string) -> boolean,
-	isDir: (path: string) -> boolean,
-	createDir: (path: string) -> (),
-	walk: (path: string?, recursive: boolean?) -> { FsWalkEntry },
-	rename: (from: string, to: string) -> (),
-	copy: (from: string, to: string) -> (),
-	removeFile: (path: string) -> boolean,
-}
-
-export type AndroidModule = {
-	isAndroid: () -> boolean,
-	getDeviceId: () -> string?,
-	getSdkInt: () -> number?,
-	getApiLevel: () -> number?,
-	getBrand: () -> string?,
-	getManufacturer: () -> string?,
-	getModel: () -> string?,
-	getDevice: () -> string?,
-	getProduct: () -> string?,
-	showKeyboard: (implicit: boolean?) -> boolean,
-	openKeyboard: (implicit: boolean?) -> boolean,
-	hideKeyboard: (implicitOnly: boolean?) -> boolean,
-	closeKeyboard: (implicitOnly: boolean?) -> boolean,
-}
-
-export type MobileModule = {
-	isMobile: () -> boolean,
-	isEmulated: () -> boolean,
-	isOnline: () -> boolean,
-	isWifiEnabled: () -> boolean,
-	isCellularEnabled: () -> boolean,
-	isLowPowerMode: () -> boolean,
-	getNetworkType: () -> "wifi" | "cellular" | "offline",
-	getOrientation: () -> "portrait" | "landscape",
-	isLandscape: () -> boolean,
-	getDeviceSize: () -> (number, number),
-	getSafeAreaInsets: () -> (number, number, number, number),
-}
-
-export type AsyncTask = {
-	id: number,
-	done: boolean,
-	cancelled: boolean,
-	status: "queued" | "running" | "suspended" | "completed" | "cancelled" | "error",
-	error: string?,
-	result: any,
-	results: { any },
-	cancel: (self: AsyncTask) -> boolean,
-	Cancel: (self: AsyncTask) -> boolean,
-	isDone: (self: AsyncTask) -> boolean,
-	IsDone: (self: AsyncTask) -> boolean,
-	getStatus: (self: AsyncTask) -> string,
-	GetStatus: (self: AsyncTask) -> string,
-	getError: (self: AsyncTask) -> string?,
-	GetError: (self: AsyncTask) -> string?,
-	getResult: (self: AsyncTask) -> ...any,
-	GetResult: (self: AsyncTask) -> ...any,
-}
-
-export type AsyncModule = {
-	yield: (...any) -> ...any,
-	count: () -> number,
-	cancelAll: () -> number,
-} & ((callback: () -> ...any) -> AsyncTask)
-
-export type HttpHeaders = { [string]: string }
-
-export type HttpResponse = {
-	ok: boolean,
-	url: string,
-	status: number?,
-	body: string,
-	error: string?,
-	headers: HttpHeaders,
-}
-
-export type HttpRequestOptions = {
-	url: string,
-	method: string?,
-	headers: HttpHeaders?,
-	body: string?,
-}
-
-export type HttpModule = {
-	request: ((url: string, callback: (response: HttpResponse) -> ()) -> number) & ((options: HttpRequestOptions, callback: (response: HttpResponse) -> ()) -> number),
-	get: (url: string, callback: (response: HttpResponse) -> ()) -> number,
-	_poll: () -> (),
-}
-
-export type CommandRunResult = {
-	ok: boolean,
-	statusCode: number,
-	status_code: number,
-	stdout: string,
-	stderr: string,
-	error: string?,
-}
-
-export type CommandDetachedResult = {
-	ok: boolean,
-	pid: number,
-	error: string?,
-}
-
-export type CommandsModule = {
-	run: (command: string, args: { string }?, cwd: string?) -> CommandRunResult,
-	runDetached: (command: string, args: { string }?, cwd: string?) -> CommandDetachedResult,
-}
-
-export type ServerHostOptions = {
-	host: string?,
-	certPath: string?,
-	keyPath: string?,
-	cert_path: string?,
-	key_path: string?,
-}
-
-export type ServerClientHandle = {
-	key: string,
-	is_host: boolean,
-	send: (payload: buffer) -> boolean,
-	addCallback: (callback: (payload: buffer) -> ()) -> (),
-	addcallback: (callback: (payload: buffer) -> ()) -> (),
-	disconnect: () -> boolean,
-	isConnected: () -> boolean,
-	getKey: () -> string,
-	isHost: () -> boolean,
-	getKickReason: () -> string?,
-	on: ((self: ServerClientHandle, eventName: string, callback: (data: any, eventName: string, client: ServerClientHandle) -> ()) -> ((data: any, eventName: string, client: ServerClientHandle) -> ()))?,
-	once: ((self: ServerClientHandle, eventName: string, callback: (data: any, eventName: string, client: ServerClientHandle) -> ()) -> ((data: any, eventName: string, client: ServerClientHandle) -> ()))?,
-	off: ((self: ServerClientHandle, eventName: string, callback: (...any) -> ()) -> boolean)?,
-	onAny: ((self: ServerClientHandle, callback: (eventName: string, data: any, client: ServerClientHandle) -> ()) -> ((eventName: string, data: any, client: ServerClientHandle) -> ()))?,
-	emit: ((self: ServerClientHandle, eventName: string, data: any) -> boolean)?,
-}
-
-export type HostedServerHandle = {
-	client: ServerClientHandle,
-	port: number,
-	url: string,
-	stop: () -> boolean,
-	getPort: () -> number,
-	getUrl: () -> string,
-	send: (self: HostedServerHandle, clientKey: string, payload: buffer) -> boolean,
-	broadcast: (self: HostedServerHandle, payload: buffer) -> number,
-	getClients: (self: HostedServerHandle) -> { string },
-	getClientCount: (self: HostedServerHandle) -> number,
-	emit: ((self: HostedServerHandle, eventName: string, data: any) -> number)?,
-	sendEvent: ((self: HostedServerHandle, clientKey: string, eventName: string, data: any) -> boolean)?,
-}
-
-export type ServerPeer = {
-	key: string,
-	is_host: boolean,
-	tags: { string },
-	send: (self: ServerPeer, payload: buffer) -> boolean,
-	emit: (self: ServerPeer, eventName: string, data: any) -> boolean,
-	kick: (self: ServerPeer, reason: string?) -> (),
-	isConnected: (self: ServerPeer) -> boolean,
-}
-
-export type ServerService = {
-	name: string?,
-	onStart: ((self: ServerService, host: HostedServerHandle) -> ())?,
-	onConnect: ((self: ServerService, client: ServerPeer) -> ())?,
-	onMessage: ((self: ServerService, client: ServerPeer, eventName: string, data: any) -> ())?,
-	onDisconnect: ((self: ServerService, client: ServerPeer) -> ())?,
-	host: (self: ServerService, port: number, options: ServerHostOptions?) -> HostedServerHandle,
-	connect: (self: ServerService, url: string) -> ServerClientHandle,
-	[string]: any,
-}
-
-export type ServersModule = {
-	host: (scriptPath: string, port: number, options: ServerHostOptions?) -> HostedServerHandle,
-	connect: (url: string) -> ServerClientHandle,
-	define: (definition: { [string]: any }) -> ServerService,
-	service: (definition: { [string]: any }) -> ServerService,
-	createService: (definition: { [string]: any }) -> ServerService,
-	create_service: (definition: { [string]: any }) -> ServerService,
-	serializeTable: (value: any) -> buffer,
-	serialize_table: (value: any) -> buffer,
-	deserializeTable: (payload: buffer) -> any,
-	deserialize_table: (payload: buffer) -> any,
-	generateUuid4: () -> string,
-	generate_uuid4: () -> string,
-	generateUuid7: () -> string,
-	generate_uuid7: () -> string,
-	sha256: (value: string | buffer) -> string,
-	sha128: (value: string | buffer) -> string,
-	_poll: () -> (),
-}
-
-export type ShaderLoadOptions = {
-	uniforms: { string }?,
-	images: { string }?,
-	textures: { string }?,
-	pipelines: { string }?,
-	[string]: any,
-}
-
-export type ShadersModule = {
-	DEFAULT_VERTEX_SHADER: string,
-	load: (vertexPath: string, fragmentPath: string, options: ShaderLoadOptions?) -> ShaderHandle,
-	loadFragment: (fragmentPath: string, options: ShaderLoadOptions?) -> ShaderHandle,
-	fromSource: (vertexSource: string, fragmentSource: string, options: ShaderLoadOptions?) -> ShaderHandle,
-	fromFragmentSource: (fragmentSource: string, options: ShaderLoadOptions?) -> ShaderHandle,
-}
-
-export type TransformModule = {
-	getWorldPosition: (entity: Entity) -> (number, number),
-	getWorldRotation: (entity: Entity) -> number,
-	lookAt: (from_x: number, from_y: number, to_x: number, to_y: number) -> number,
-	look_at: (from_x: number, from_y: number, to_x: number, to_y: number) -> number,
-	GetEntitiesInFront: (world_x: number, world_y: number, minimum_z: number?) -> { Entity },
-	getEntitiesInFront: (world_x: number, world_y: number, minimum_z: number?) -> { Entity },
-	doTheyOverlap: (entities: { Entity }) -> boolean,
-	raycast: (
-		origin_x: number,
-		origin_y: number,
-		dir_x: number,
-		dir_y: number,
-		max_distance: number?,
-		options: RaycastOptions?
-	) -> RaycastHit?,
-}
-
-export type EcsModule = {
-	addSystem: (system: System) -> (),
-	newEntity: (name: string, parent: Entity?, x: number?, y: number?) -> Entity,
-	deleteEntity: (entity: Entity) -> (),
-	duplicateEntity: (targetEntity: Entity, parent: Entity) -> Entity,
-	findFirstChild: (parent: Entity, name: string) -> Entity?,
-	root: Entity,
-	addComponent: (entity: Entity, component: Component) -> ComponentInstance,
-	removeComponent: (entity: Entity, target: number | ComponentInstance) -> boolean,
-	loadScene: (path: string) -> (),
-}
-
-export type PrefabTemplate = {
-	name: string?,
-	x: number?,
-	y: number?,
-	anchor_x: number?,
-	anchor_y: number?,
-	pivot_x: number?,
-	pivot_y: number?,
-	rotation: number?,
-	rotation_pivot: string?,
-	rotation_pivot_x: number?,
-	rotation_pivot_y: number?,
-	position_pivot: PositionPivot?,
-	z: number?,
-	size_x: number?,
-	size_y: number?,
-	scale: number?,
-	parent: PrefabTemplate?,
-	children: { PrefabTemplate }?,
-	components: { Component }?,
-	[string]: any,
-}
-
-export type PrefabUiModule = {
-	label: PrefabTemplate,
-	panel: PrefabTemplate,
-	dialog: PrefabTemplate,
-	statusChip: PrefabTemplate,
-	status_chip: PrefabTemplate,
-}
-
-export type PrefabsModule = {
-	capture: (entity: Entity) -> PrefabTemplate,
-	component: <T>(source: T & Component, overrides: { [string]: any }?) -> T & Component,
-	load: (path: string) -> PrefabTemplate,
-	register: (name: string, source: string | Entity | PrefabTemplate) -> PrefabTemplate,
-	get: (name: string) -> PrefabTemplate?,
-	remove: (name: string) -> boolean,
-	instantiate: (source: string | Entity | PrefabTemplate, parent: Entity?) -> Entity,
-	duplicate: (source: string | Entity | PrefabTemplate, parent: Entity?) -> Entity,
-	ui: PrefabUiModule,
-}
-
-export type EasingStyle =
-	"linear"
-	| "sine"
-	| "quad"
-	| "cubic"
-	| "quart"
-	| "quint"
-	| "expo"
-	| "circ"
-	| "back"
-	| "bounce"
-
-export type EasingDirection = "in" | "out" | "inOut" | "in_out"
-
-export type TweenHandle = {
-	id: number,
-	cancel: (self: TweenHandle) -> boolean,
-	Cancel: (self: TweenHandle) -> boolean,
-	isDone: (self: TweenHandle) -> boolean,
-	IsDone: (self: TweenHandle) -> boolean,
-}
-
-export type TweeningModule = {
-	to: (
-		target: { [any]: any },
-		key: any,
-		value: number,
-		duration: number,
-		style: EasingStyle?,
-		direction: EasingDirection?,
-		onComplete: (() -> ())?
-	) -> TweenHandle,
-	new: (
-		target: { [any]: any },
-		key: any,
-		value: number,
-		duration: number,
-		style: EasingStyle?,
-		direction: EasingDirection?,
-		onComplete: (() -> ())?
-	) -> TweenHandle,
-	create: (
-		target: { [any]: any },
-		key: any,
-		value: number,
-		duration: number,
-		style: EasingStyle?,
-		direction: EasingDirection?,
-		onComplete: (() -> ())?
-	) -> TweenHandle,
-	cancelAll: () -> number,
-	cancel_all: () -> number,
-	count: () -> number,
-	ease: (t: number, style: EasingStyle?, direction: EasingDirection?) -> number,
-	update: (dt: number) -> (),
-}
-
-export type AnimationKeyframe = {
-	time: number,
-	value: number,
-	out_x: number?,
-	out_y: number?,
-	in_x: number?,
-	in_y: number?,
-}
-export type AnimationTrack = {
-	property: string,
-	interpolation: "linear" | "step" | "hold" | "bezier"?,
-	keys: { AnimationKeyframe },
-}
-export type AnimationClip = {
-	duration: number?,
-	looping: boolean?,
-	looped: boolean?,
-	tracks: { AnimationTrack },
-}
-export type AnimationHandle = {
-	id: number,
-	play: (self: AnimationHandle) -> (),
-	pause: (self: AnimationHandle) -> (),
-	stop: (self: AnimationHandle) -> (),
-	seek: (self: AnimationHandle, time: number) -> (),
-	setSpeed: (self: AnimationHandle, speed: number) -> (),
-	isPlaying: (self: AnimationHandle) -> boolean,
-}
-export type AnimationModule = {
-	load: (path: string) -> AnimationClip,
-	Load: (path: string) -> AnimationClip,
-	new: (target: { [any]: any }, clip: AnimationClip) -> AnimationHandle,
-	create: (target: { [any]: any }, clip: AnimationClip) -> AnimationHandle,
-	play: (target: { [any]: any }, clip: AnimationClip) -> AnimationHandle,
-}
-
-export type BaseDrawableComponent = ComponentInstance & {
-	NEOLOVE_RENDERING: boolean,
-	color: Color4Value,
-	shader: ShaderHandle?,
-	visible: boolean,
-}
-
-export type Rect2D = BaseDrawableComponent
-
-export type EntityScaler = ComponentInstance & {
-	__neolove_component: "EntityScaler",
-	enabled: boolean,
-	edit_with_percent: boolean,
-	editWithPercent: boolean?,
-	x_percent: number,
-	y_percent: number,
-	size_x_percent: number,
-	size_y_percent: number,
-	xPercent: number?,
-	yPercent: number?,
-	sizeXPercent: number?,
-	sizeYPercent: number?,
-	percent_x: number?,
-	percent_y: number?,
-	percentX: number?,
-	percentY: number?,
-	offset_x: number,
-	offset_y: number,
-	offsetX: number?,
-	offsetY: number?,
-	pivot_x: number,
-	pivot_y: number,
-	pivotX: number?,
-	pivotY: number?,
-}
-
-export type Shape2DShape = "box" | "circle" | "triangle" | "right_triangle" | "righttriangle" | "rightangledtriangle"
-export type TriangleCorner = "bl" | "br" | "tl" | "tr" | "bottomright" | "rightbottom" | "topleft" | "lefttop" | "topright" | "righttop"
-
-export type Shape2D = BaseDrawableComponent & {
-	shape: Shape2DShape,
-	triangle_corner: TriangleCorner,
-	offset_x: number,
-	offset_y: number,
-	size_x: number,
-	size_y: number,
-}
-
-export type ParticleEmitterShape = "point" | "box" | "circle"
-export type ParticleColorKeypoint = { time: number, color: Color4Value }
-export type ParticleNumberKeypoint = { time: number, value: number }
-
-export type ParticleSystem2D = BaseDrawableComponent & {
-	__neolove_component: "ParticleSystem2D",
-	image: ImageHandle?,
-	playing: boolean,
-	looping: boolean,
-	duration: number,
-	emission_rate: number,
-	max_particles: number,
-	lifetime: number,
-	speed: number,
-	direction: number,
-	spread: number,
-	start_size: number,
-	end_size: number,
-	start_color: Color4Value,
-	end_color: Color4Value,
-	color_sequence: { ParticleColorKeypoint },
-	transparency_sequence: { ParticleNumberKeypoint },
-	shape: ParticleEmitterShape,
-	radius: number,
-	gravity_x: number,
-	gravity_y: number,
-	particle_count: number,
-	play: (self: ParticleSystem2D) -> (),
-	Play: (self: ParticleSystem2D) -> (),
-	pause: (self: ParticleSystem2D) -> (),
-	Pause: (self: ParticleSystem2D) -> (),
-	stop: (self: ParticleSystem2D) -> (),
-	Stop: (self: ParticleSystem2D) -> (),
-	emit: (self: ParticleSystem2D, count: number?) -> (),
-	Emit: (self: ParticleSystem2D, count: number?) -> (),
-}
-
-export type AnimationController = ComponentInstance & {
-	__neolove_component: "AnimationController",
-	animation: AnimationClip?,
-	autoplay: boolean,
-	looping: boolean,
-	playing: boolean,
-	speed: number,
-	play: (self: AnimationController) -> (),
-	Play: (self: AnimationController) -> (),
-	pause: (self: AnimationController) -> (),
-	Pause: (self: AnimationController) -> (),
-	stop: (self: AnimationController) -> (),
-	Stop: (self: AnimationController) -> (),
-}
-
-export type SpatialSound2D = ComponentInstance & {
-	__neolove_component: "SpatialSound2D",
-	sound: SoundHandle?,
-	volume: number,
-	looping: boolean,
-	autoplay: boolean,
-	play: (self: SpatialSound2D) -> boolean,
-	Play: (self: SpatialSound2D) -> boolean,
-	stop: (self: SpatialSound2D) -> (),
-	Stop: (self: SpatialSound2D) -> (),
-}
-
-export type TextScaleMode = "none" | "fit" | "fit_width" | "fit_height"
-export type TextAlignX = "left" | "center" | "right"
-export type TextAlignY = "top" | "center" | "bottom"
-export type TextWrapMode = "none" | "word" | "char"
-export type TextBoundsMode = "content" | "entity" | "box" | "bounds"
-
-export type TextFontOptions = {
-	path: string?,
-	file: string?,
-	source: string?,
-	builtin: string?,
-	name: string?,
-}
-
-export type TextFont = string | TextFontOptions
-
-export type UiTextStyle = {
-	scale: number,
-	min_scale: number,
-	align_x: TextAlignX,
-	align_y: TextAlignY,
-	text_scale: TextScaleMode,
-	wrap: TextWrapMode | boolean,
-	padding: number,
-	padding_x: number,
-	padding_y: number,
-	line_spacing: number,
-	letter_spacing: number,
-	tab_size: number,
-	tab_width: number?,
-	font: TextFont?,
-	antialiasing: "inherit" | "off" | "standard" | "high",
-}
-
-export type TextBox = BaseDrawableComponent & UiTextStyle & {
-	text: string,
-	used_scale: number,
-	size_mode: TextBoundsMode,
-	scale_x: number,
-	scale_y: number,
-	dx: number,
-	dy: number,
-	line_count: number,
-	setBold: (self: TextBox, startIndex: number, endIndex: number) -> (),
-	setItalic: (self: TextBox, startIndex: number, endIndex: number) -> (),
-	setUnderline: (self: TextBox, startIndex: number, endIndex: number) -> (),
-	setColor: (self: TextBox, startIndex: number, endIndex: number, color: Color4Value) -> (),
-	setSize: (self: TextBox, startIndex: number, endIndex: number, scale: number) -> (),
-	setFont: (self: TextBox, startIndex: number, endIndex: number, fontPath: string) -> (),
-	setOffset: (self: TextBox, startIndex: number, endIndex: number, x: number, y: number) -> (),
-	setPixelOffset: (self: TextBox, startIndex: number, endIndex: number, x: number, y: number) -> (),
-	setCharacterOffset: (self: TextBox, charIndex: number, x: number, y: number) -> (),
-	clearFormatting: (self: TextBox, startIndex: number?, endIndex: number?) -> (),
-	clearAllFormatting: (self: TextBox) -> (),
-	getLetterCount: (self: TextBox) -> number,
-	getLetterPosition: (self: TextBox, charIndex: number) -> (number?, number?),
-	getLetterBounds: (self: TextBox, charIndex: number) -> (number?, number?, number?, number?),
-	getClosestLetterIndex: (self: TextBox, x: number, y: number) -> number?,
-	getClosestCharacterIndex: (self: TextBox, x: number, y: number) -> number?,
-}
-
-export type TextLabel = TextBox
-export type RudimentaryTextLabel = TextBox
-
-export type TextInput = BaseDrawableComponent & UiTextStyle & {
-	__neolove_component: "TextInput",
-	text: string,
-	placeholder: string,
-	enabled: boolean,
-	locked: boolean,
-	focused: boolean,
-	password: boolean,
-	max_length: number,
-	submit_on_enter: boolean,
-	clear_on_submit: boolean,
-	blur_on_submit: boolean,
-	cursor_index: number,
-	text_color: Color4Value,
-	placeholder_color: Color4Value,
-	caret_color: Color4Value,
-	background_color: Color4Value,
-	border_color: Color4Value,
-	border_width: number,
-	corner_radius: number,
-	caret_width: number,
-	setBold: (self: TextInput, startIndex: number, endIndex: number) -> (),
-	setItalic: (self: TextInput, startIndex: number, endIndex: number) -> (),
-	setUnderline: (self: TextInput, startIndex: number, endIndex: number) -> (),
-	setColor: (self: TextInput, startIndex: number, endIndex: number, color: Color4Value) -> (),
-	setSize: (self: TextInput, startIndex: number, endIndex: number, scale: number) -> (),
-	setFont: (self: TextInput, startIndex: number, endIndex: number, fontPath: string) -> (),
-	setOffset: (self: TextInput, startIndex: number, endIndex: number, x: number, y: number) -> (),
-	setPixelOffset: (self: TextInput, startIndex: number, endIndex: number, x: number, y: number) -> (),
-	setCharacterOffset: (self: TextInput, charIndex: number, x: number, y: number) -> (),
-	clearFormatting: (self: TextInput, startIndex: number?, endIndex: number?) -> (),
-	clearAllFormatting: (self: TextInput) -> (),
-	focus: (self: TextInput) -> (),
-	blur: (self: TextInput) -> (),
-	onChanged: ((self: Entity, text: string) -> ())?,
-	onSubmit: ((self: Entity, text: string) -> ())?,
-	onFocus: ((self: Entity) -> ())?,
-	onBlur: ((self: Entity) -> ())?,
-}
-
--- A customizable UI container. Defaults match Visual Studio Code's Dark+ theme.
-export type Panel = BaseDrawableComponent & {
-	__neolove_component: "Panel",
-	background_color: Color4Value,
-	border_color: Color4Value,
-	border_width: number,
-	corner_radius: number,
-	background_image: ImageHandle?,
-	slice_left: number,
-	slice_right: number,
-	slice_top: number,
-	slice_bottom: number,
-}
-export type Frame = Panel
-
--- An interactive button. Every state colour (including hover) is configurable.
-export type Button = BaseDrawableComponent & UiTextStyle & {
-	__neolove_component: "Button",
-	text: string,
-	enabled: boolean,
-	hovered: boolean,
-	pressed: boolean,
-	background_color: Color4Value,
-	hover_background_color: Color4Value,
-	pressed_background_color: Color4Value,
-	disabled_background_color: Color4Value,
-	border_color: Color4Value,
-	hover_border_color: Color4Value,
-	pressed_border_color: Color4Value,
-	disabled_border_color: Color4Value,
-	text_color: Color4Value,
-	hover_text_color: Color4Value,
-	pressed_text_color: Color4Value,
-	disabled_text_color: Color4Value,
-	border_width: number,
-	corner_radius: number,
-	icon_image: ImageHandle?,
-	icon_color: Color4Value,
-	icon_size: number,
-	icon_gap: number,
-	icon_side: "left" | "right",
-	onClick: ((self: Entity) -> ())?,
-	onPress: ((self: Entity) -> ())?,
-	onRelease: ((self: Entity) -> ())?,
-	onHoverEnter: ((self: Entity) -> ())?,
-	onHoverLeave: ((self: Entity) -> ())?,
-}
-
--- A draggable value slider. Hover colours for the track, fill, and thumb are
--- each configurable.
-export type Slider = BaseDrawableComponent & {
-	__neolove_component: "Slider",
-	enabled: boolean,
-	hovered: boolean,
-	dragging: boolean,
-	min: number,
-	max: number,
-	value: number,
-	fraction: number,
-	step: number,
-	orientation: "horizontal" | "vertical",
-	track_thickness: number,
-	thumb_size: number,
-	thumb_corner_radius: number,
-	corner_radius: number,
-	background_color: Color4Value,
-	hover_background_color: Color4Value,
-	disabled_background_color: Color4Value,
-	fill_color: Color4Value,
-	hover_fill_color: Color4Value,
-	disabled_fill_color: Color4Value,
-	thumb_color: Color4Value,
-	hover_thumb_color: Color4Value,
-	disabled_thumb_color: Color4Value,
-	setValue: (self: Slider, value: number) -> (),
-	onChanged: ((self: Entity, value: number) -> ())?,
-}
-
--- A selectable dropdown with a scrollable popup menu.
-export type Dropdown = BaseDrawableComponent & UiTextStyle & {
-	__neolove_component: "Dropdown",
-	enabled: boolean,
-	open: boolean,
-	hovered: boolean,
-	selected_index: number,
-	selected_text: string,
-	selected_value: string,
-	placeholder: string,
-	options: { any },
-	item_height: number,
-	max_visible_items: number,
-	open_upwards: boolean,
-	background_color: Color4Value,
-	hover_background_color: Color4Value,
-	open_background_color: Color4Value,
-	disabled_background_color: Color4Value,
-	border_color: Color4Value,
-	hover_border_color: Color4Value,
-	open_border_color: Color4Value,
-	text_color: Color4Value,
-	menu_background_color: Color4Value,
-	menu_border_color: Color4Value,
-	item_background_color: Color4Value,
-	item_hover_background_color: Color4Value,
-	item_selected_background_color: Color4Value,
-	item_text_color: Color4Value,
-	item_hover_text_color: Color4Value,
-	item_selected_text_color: Color4Value,
-	border_width: number,
-	corner_radius: number,
-	onChanged: ((self: Entity, index: number, value: any) -> ())?,
-}
-
-export type Sprite2D = BaseDrawableComponent & {
-	__neolove_component: "Sprite2D" | "Image2D",
-	image: ImageHandle?,
-	source_x: number?,
-	source_y: number?,
-	source_w: number?,
-	source_h: number?,
-	source_width: number?,
-	source_height: number?,
-	sourceX: number?,
-	sourceY: number?,
-	sourceW: number?,
-	sourceH: number?,
-	sourceWidth: number?,
-	sourceHeight: number?,
-}
-
-export type Image2D = Sprite2D
-
-export type SpriteSheet2D = BaseDrawableComponent & {
-	__neolove_component: "SpriteSheet2D",
-	image: ImageHandle?,
-	frame_width: number,
-	frame_height: number,
-	columns: number,
-	frame_count: number,
-	spacing: number,
-	margin: number,
-	frame: number,
-	fps: number,
-	playing: boolean,
-	looping: boolean,
-	play: (self: SpriteSheet2D) -> (),
-	pause: (self: SpriteSheet2D) -> (),
-	stop: (self: SpriteSheet2D) -> (),
-	setFrame: (self: SpriteSheet2D, frame: number) -> (),
-	set_frame: (self: SpriteSheet2D, frame: number) -> (),
-}
-
-export type NineSliceSprite2D = BaseDrawableComponent & {
-	__neolove_component: "NineSliceSprite2D",
-	image: ImageHandle?,
-	source_x: number?,
-	source_y: number?,
-	source_w: number?,
-	source_h: number?,
-	source_width: number?,
-	source_height: number?,
-	sourceX: number?,
-	sourceY: number?,
-	sourceW: number?,
-	sourceH: number?,
-	sourceWidth: number?,
-	sourceHeight: number?,
-	slice_left: number,
-	slice_right: number,
-	slice_top: number,
-	slice_bottom: number,
-	sliceLeft: number?,
-	sliceRight: number?,
-	sliceTop: number?,
-	sliceBottom: number?,
-}
-
-export type TileTexture2D = BaseDrawableComponent & {
-	image: ImageHandle?,
-	tile_width: number,
-	tile_height: number,
-	offset_x: number,
-	offset_y: number,
-}
-
-export type Tilemap2D = BaseDrawableComponent & {
-	image: ImageHandle?,
-	map_width: number,
-	map_height: number,
-	tile_width: number,
-	tile_height: number,
-	tiles: string | { number },
-	spacing: number,
-	margin: number,
-}
-
-export type Spritebox2D = ComponentInstance & {
-	__neolove_component: "Spritebox2D",
-	computed: boolean,
-	alpha_threshold: number,
-	rect_count: number,
-	bounds_x: number,
-	bounds_y: number,
-	bounds_w: number,
-	bounds_h: number,
-	ComputeSpritebox: (self: Spritebox2D) -> boolean,
-	computeSpritebox: (self: Spritebox2D) -> boolean,
-	IsInside: (self: Spritebox2D, x: number, y: number) -> boolean,
-	isInside: (self: Spritebox2D, x: number, y: number) -> boolean,
-	IsIntersecting: (self: Spritebox2D, other: Entity | Spritebox2D) -> boolean,
-	isIntersecting: (self: Spritebox2D, other: Entity | Spritebox2D) -> boolean,
-}
-
-export type Collider2D = ComponentInstance & {
-	__neolove_component: "Collider2D",
-	enabled: boolean,
-	is_trigger: boolean,
-	non_physics: boolean,
-	offset_x: number,
-	offset_y: number,
-	size_x: number,
-	size_y: number,
-	shape: string,
-	triangle_corner: TriangleCorner,
-	restitution: number,
-	friction: number,
-	touching: boolean,
-	last_hit_id: number,
-	onCollisionEnter: CollisionCallback?,
-	onCollisionStay: CollisionCallback?,
-	onCollisionExit: CollisionCallback?,
-	onTriggerEnter: CollisionCallback?,
-	onTriggerStay: CollisionCallback?,
-	onTriggerExit: CollisionCallback?,
-	setOnCollisionEnter: (self: Collider2D, callback: CollisionCallback?) -> (),
-	setOnCollisionStay: (self: Collider2D, callback: CollisionCallback?) -> (),
-	setOnCollisionExit: (self: Collider2D, callback: CollisionCallback?) -> (),
-	setOnTriggerEnter: (self: Collider2D, callback: CollisionCallback?) -> (),
-	setOnTriggerStay: (self: Collider2D, callback: CollisionCallback?) -> (),
-	setOnTriggerExit: (self: Collider2D, callback: CollisionCallback?) -> (),
-}
-
-export type RigidbodyBoundsMode = "none" | "window"
-
-export type Rigidbody2D = ComponentInstance & {
-	__neolove_component: "Rigidbody2D",
-	velocity_x: number,
-	velocity_y: number,
-	force_x: number,
-	force_y: number,
-	acceleration_x: number,
-	acceleration_y: number,
-	gravity_x: number,
-	gravity_y: number,
-	gravity_scale: number,
-	mass: number,
-	inertia: number,
-	linear_damping: number,
-	angular_damping: number,
-	restitution: number,
-	friction: number,
-	sleep_epsilon: number,
-	bounds_mode: RigidbodyBoundsMode | string,
-	freeze_x: boolean,
-	freeze_y: boolean,
-	freeze_rotation: boolean,
-	is_static: boolean,
-	collision_enabled: boolean,
-	grounded: boolean,
-	max_speed: number,
-	max_angular_speed: number,
-	angular_velocity: number,
-	torque: number,
-	addForce: (self: Rigidbody2D, fx: number, fy: number) -> (),
-	addImpulse: (self: Rigidbody2D, ix: number, iy: number) -> (),
-	addTorque: (self: Rigidbody2D, torque: number) -> (),
-	addAngularImpulse: (self: Rigidbody2D, impulse: number) -> (),
-	setVelocity: (self: Rigidbody2D, vx: number, vy: number) -> (),
-	getVelocity: (self: Rigidbody2D) -> (number, number),
-	setAngularVelocity: (self: Rigidbody2D, omega: number) -> (),
-	getAngularVelocity: (self: Rigidbody2D) -> number,
-	setGravity: (self: Rigidbody2D, gx: number, gy: number) -> (),
-}
-
-export type Bolt2D = ComponentInstance & {
-	__neolove_component: "Bolt2D",
-	enabled: boolean,
-	target_entity: Entity?,
-	target: Entity?,
-	x: number,
-	y: number,
-	offset_x: number,
-	offset_y: number,
-	strength: number,
-	contacts_enabled: boolean,
-	current_force: number,
-	force: number,
-	attach: (self: Bolt2D, targetEntity: Entity) -> (),
-	link: (self: Bolt2D, targetEntity: Entity) -> (),
-}
-
-export type LegacyBolt2D = ComponentInstance & {
-	__neolove_component: "LegacyBolt2D",
-	enabled: boolean,
-	target_entity: Entity?,
-	target: Entity?,
-	x: number,
-	y: number,
-	offset_x: number,
-	offset_y: number,
-	strength: number,
-	contacts_enabled: boolean,
-	current_force: number,
-	force: number,
-	attach: (self: LegacyBolt2D, targetEntity: Entity) -> (),
-	link: (self: LegacyBolt2D, targetEntity: Entity) -> (),
-}
-
-export type Rope2D = ComponentInstance & {
-	__neolove_component: "Rope2D",
-	enabled: boolean,
-	entity_a: Entity?,
-	entity_b: Entity?,
-	min_length: number,
-	max_length: number,
-	stiffness: number,
-	damping: number,
-	break_force: number,
-	current_length: number,
-	tension: number,
-	snapped: boolean,
-	link: (self: Rope2D, entityA: Entity, entityB: Entity) -> (),
-}
-
-export type Light2DKind = "point" | "spot" | "directional"
-
-export type Light2D = ComponentInstance & {
-	__neolove_component: "Light2D",
-	NEOLOVE_RENDERING: boolean,
-	kind: Light2DKind,
-	color: Color4Value,
-	intensity: number,
-	radius: number,
-	falloff: number,
-	angleOffset: number,
-	coneAngle: number,
-	coneSoftness: number,
-	castsShadows: boolean,
-	shadowSoftness: number,
-	visible: boolean,
-}
-
-export type LightOccluderShape = "box" | "circle"
-
-export type LightOccluder2D = ComponentInstance & {
-	__neolove_component: "LightOccluder2D",
-	NEOLOVE_RENDERING: boolean,
-	shape: LightOccluderShape,
-	visible: boolean,
-}
-
-export type LightQuality = "low" | "medium" | "high" | "ultra"
-
-export type LightingModule = {
-	setEnabled: (enabled: boolean?) -> (),
-	enable: () -> (),
-	disable: () -> (),
-	isEnabled: () -> boolean,
-	setAmbient: (color: Color4Value, intensity: number?) -> (),
-	setAmbientIntensity: (intensity: number) -> (),
-	getAmbient: () -> (Color4Value, number),
-	setAmbientOcclusion: (enabled: boolean?, radius: number?, intensity: number?, samples: number?) -> (),
-	setShadows: (enabled: boolean?, softness: number?) -> (),
-	setBloom: (amount: number) -> (),
-	setExposure: (value: number) -> (),
-	setQuality: (quality: LightQuality) -> (),
-	getQuality: () -> LightQuality,
-	sample: (x: number, y: number) -> Color4Value?,
-	getAt: (x: number, y: number) -> Color4Value?,
-	sampleAt: (x: number, y: number) -> Color4Value?,
-	reset: () -> (),
-}
-
-export type CoreModule = {
-	Rect2D: Rect2D,
-	Light2D: Light2D,
-	LightOccluder2D: LightOccluder2D,
-	EntityScaler: EntityScaler,
-	Shape2D: Shape2D,
-	ParticleSystem2D: ParticleSystem2D,
-	AnimationController: AnimationController,
-	SpatialSound2D: SpatialSound2D,
-	TextBox: TextBox,
-	TextLabel: TextLabel,
-	RudimentaryTextLabel: RudimentaryTextLabel,
-	TextInput: TextInput,
-	Panel: Panel,
-	Frame: Frame,
-	Button: Button,
-	Slider: Slider,
-	Dropdown: Dropdown,
-	Sprite2D: Sprite2D,
-	SpriteSheet2D: SpriteSheet2D,
-	Image2D: Image2D,
-	NineSliceSprite2D: NineSliceSprite2D,
-	["9SliceSprite2D"]: NineSliceSprite2D,
-	TileTexture2D: TileTexture2D,
-	Tilemap2D: Tilemap2D,
-	Spritebox2D: Spritebox2D,
-	Collider2D: Collider2D,
-	Rigidbody2D: Rigidbody2D,
-	Bolt2D: Bolt2D,
-	LegacyBolt2D: LegacyBolt2D,
-	Rope2D: Rope2D,
-	String2D: Rope2D,
-}
-
-export type RngInstance = {
-	next: (self: RngInstance) -> number,
-	number: (self: RngInstance, min: number?, max: number?) -> number,
-	float: (self: RngInstance, min: number?, max: number?) -> number,
-	range: (self: RngInstance, min: number?, max: number?) -> number,
-	integer: (self: RngInstance, min: number, max: number?) -> number,
-	int: (self: RngInstance, min: number, max: number?) -> number,
-	boolean: (self: RngInstance, p: number?) -> boolean,
-	bool: (self: RngInstance, p: number?) -> boolean,
-	sign: (self: RngInstance) -> number,
-	angle: (self: RngInstance) -> number,
-	unit: (self: RngInstance) -> (number, number),
-	pick: (self: RngInstance, list: { any }) -> any,
-	shuffle: (self: RngInstance, list: { any }) -> { any },
-	seed: (self: RngInstance, seed: number) -> (),
-	clone: (self: RngInstance) -> RngInstance,
-	Clone: (self: RngInstance) -> RngInstance,
-}
-
-export type RngModule = {
-	new: (seed: number?) -> RngInstance,
-	fromString: (text: string) -> RngInstance,
-} & ((seed: number?) -> RngInstance)
-
-declare function Color4(r: number, g: number, b: number, a: number?): Color4Value
-declare function Inspector<T>(defaultValue: T, max: number?, fractional: boolean?): T
--- Inspector reference placeholders. The visual editor replaces these with a
--- selected scene entity/component when it generates the scene.
-declare IEntity: Entity
-declare IComponent: ComponentInstance
-declare IImage: ImageHandle
-declare IAudio: SoundHandle
-declare IShader: ShaderHandle
-declare IAnimation: AnimationClip
--- Register the current behaviour module in the editor's "Add Component" picker,
--- so it can be attached to entities like a core component. Call it at module
--- scope, e.g. `IComponentPicker(Behaviour)`.
-declare function IComponentPicker(behaviour: any): ()
-declare function die(): ()
-declare function softrequire(modulePathOrSource: string, allowedModules: { [string]: any } | { string }?): any
-
-declare app: AppModule
-declare input: InputModule
-declare userInput: InputModule
-declare assets: AssetsModule
-declare audio: AudioModule
-declare fs: FsModule
-declare android: AndroidModule
-declare mobile: MobileModule
-declare http: HttpModule
-declare commands: CommandsModule
-declare command: CommandsModule
-declare servers: ServersModule
-declare shaders: ShadersModule
-declare ecs: EcsModule
-declare prefabs: PrefabsModule
-declare prefab: PrefabsModule
-declare tweening: TweeningModule
-declare tween: TweeningModule
-declare animation: AnimationModule
-declare animations: AnimationModule
-declare transform: TransformModule
-declare transforms: TransformModule
-declare core: CoreModule
-declare lighting: LightingModule
-declare Rng: RngModule
-declare async: AsyncModule
-
-declare mouse: Vec2
-declare window: Vec2
-
-return nil
-```

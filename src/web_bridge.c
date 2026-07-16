@@ -34,6 +34,17 @@ EM_JS(void, neolove_js_bootstrap, (), {
       lastError: "",
       resumeHooksInstalled: false
     },
+    media: {
+      queue: [],
+      current: null,
+      cancelled: new Set(),
+      streams: new Map(),
+      stoppedErrors: new Map(),
+      nextStreamId: 1,
+      permissions: { microphone: "prompt", camera: "prompt" },
+      permissionQueries: { microphone: false, camera: false },
+      cleanupInstalled: false
+    },
     fonts: new Map(),
     images: new Map(),
     imageUseCounter: 0
@@ -61,6 +72,91 @@ EM_JS(void, neolove_js_bootstrap, (), {
   module.neoloveClearAudioError = () => {
     state.audio.lastError = "";
   };
+
+  if (!state.media) {
+    state.media = {
+      queue: [],
+      current: null,
+      cancelled: new Set(),
+      streams: new Map(),
+      stoppedErrors: new Map(),
+      nextStreamId: 1,
+      permissions: { microphone: "prompt", camera: "prompt" },
+      permissionQueries: { microphone: false, camera: false },
+      cleanupInstalled: false
+    };
+  }
+
+  module.neoloveMediaError = (error) => {
+    const name = String((error && error.name) || "");
+    const message = String((error && error.message) || error || "media capture failed");
+    let code = "capture_failed";
+    if (name === "NotAllowedError" || name === "SecurityError") {
+      code = "permission_denied";
+    } else if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+      code = "device_unavailable";
+    } else if (name === "NotReadableError" || name === "TrackStartError") {
+      code = "device_busy";
+    } else if (name === "OverconstrainedError" || name === "ConstraintNotSatisfiedError") {
+      code = "constraints_unsatisfied";
+    } else if (name === "TypeError" || name === "NotSupportedError") {
+      code = "unsupported";
+    } else if (name === "AbortError") {
+      code = "capture_failed";
+    }
+    return { code, message };
+  };
+
+  module.neoloveDisposeMediaEntry = (entry) => {
+    if (!entry || entry.stopped) {
+      return;
+    }
+    entry.stopped = true;
+    try {
+      entry.stream.getTracks().forEach((track) => track.stop());
+    } catch (_error) {
+    }
+    if (entry.audio) {
+      entry.audio.processor.onaudioprocess = null;
+      try { entry.audio.source.disconnect(); } catch (_error) {}
+      try { entry.audio.processor.disconnect(); } catch (_error) {}
+      try { entry.audio.silence.disconnect(); } catch (_error) {}
+      entry.audio.chunks.length = 0;
+      entry.audio.available = 0;
+    }
+    if (entry.video) {
+      try { entry.video.element.pause(); } catch (_error) {}
+      entry.video.element.srcObject = null;
+      entry.video.currentPixels = null;
+    }
+  };
+
+  module.neoloveStopMediaStream = (streamId) => {
+    const media = state.media;
+    const entry = media && media.streams.get(streamId);
+    if (!entry) {
+      return false;
+    }
+    media.streams.delete(streamId);
+    if (entry.lastError) {
+      media.stoppedErrors.set(streamId, entry.lastError);
+      if (media.stoppedErrors.size > 128) {
+        media.stoppedErrors.delete(media.stoppedErrors.keys().next().value);
+      }
+    }
+    module.neoloveDisposeMediaEntry(entry);
+    return true;
+  };
+
+  if (!state.media.cleanupInstalled) {
+    const stopAllMedia = () => {
+      const ids = Array.from(state.media.streams.keys());
+      ids.forEach((id) => module.neoloveStopMediaStream(id));
+    };
+    window.addEventListener("pagehide", stopAllMedia);
+    window.addEventListener("beforeunload", stopAllMedia);
+    state.media.cleanupInstalled = true;
+  }
 
   module.neoloveEnsureAudioContext = () => {
     const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
@@ -1467,6 +1563,551 @@ EM_JS(int, neolove_js_take_audio_error, (char* buffer, int capacity), {
   return required - 1;
 });
 
+EM_JS(int, neolove_js_media_enumerate, (int request_id, int kind), {
+  const state = Module.neoloveState;
+  const media = state && state.media;
+  const devicesApi = navigator.mediaDevices;
+  if (!media || !devicesApi || typeof devicesApi.enumerateDevices !== "function") {
+    return 0;
+  }
+  devicesApi.enumerateDevices()
+    .then((devices) => {
+      if (media.cancelled.delete(request_id)) {
+        return;
+      }
+      let audioPosition = 0;
+      let videoPosition = 0;
+      const result = [];
+      for (const device of devices) {
+        if (device.kind === "audioinput" && (kind === 0 || kind === 1)) {
+          const rawId = device.deviceId || (audioPosition === 0 ? "default" : `anonymous-${audioPosition}`);
+          result.push({
+            id: `audio:${rawId}`,
+            kind: "microphone",
+            label: device.label || `Microphone ${audioPosition + 1}`,
+            isDefault: rawId === "default" || audioPosition === 0
+          });
+          audioPosition += 1;
+        } else if (device.kind === "videoinput" && (kind === 0 || kind === 2)) {
+          const rawId = device.deviceId || (videoPosition === 0 ? "default" : `anonymous-${videoPosition}`);
+          result.push({
+            id: `camera:${rawId}`,
+            kind: "camera",
+            label: device.label || `Camera ${videoPosition + 1}`,
+            isDefault: rawId === "default" || videoPosition === 0
+          });
+          videoPosition += 1;
+        }
+      }
+      media.queue.push({
+        requestId: request_id,
+        eventKind: 0,
+        ok: 1,
+        streamId: -1,
+        payload: JSON.stringify({ devices: result }),
+        error: "",
+        code: ""
+      });
+    })
+    .catch((error) => {
+      if (media.cancelled.delete(request_id)) {
+        return;
+      }
+      const failure = Module.neoloveMediaError(error);
+      media.queue.push({
+        requestId: request_id,
+        eventKind: 0,
+        ok: 0,
+        streamId: -1,
+        payload: "",
+        error: failure.message,
+        code: failure.code
+      });
+    });
+  return 1;
+});
+
+EM_JS(int, neolove_js_media_request, (int request_id, const char* constraints_json), {
+  const state = Module.neoloveState;
+  const media = state && state.media;
+  const devicesApi = navigator.mediaDevices;
+  if (!media || !devicesApi || typeof devicesApi.getUserMedia !== "function" || !window.isSecureContext) {
+    return 0;
+  }
+
+  let requested;
+  try {
+    requested = JSON.parse(UTF8ToString(constraints_json));
+  } catch (error) {
+    const failure = Module.neoloveMediaError(error);
+    media.queue.push({
+      requestId: request_id,
+      eventKind: 1,
+      ok: 0,
+      streamId: -1,
+      payload: "",
+      error: failure.message,
+      code: "invalid_options"
+    });
+    return 1;
+  }
+
+  const normalizeDeviceId = (value, prefix) => {
+    if (typeof value !== "string" || !value) {
+      return null;
+    }
+    const raw = value.startsWith(prefix) ? value.slice(prefix.length) : value;
+    if (!raw || raw === "default" || raw.startsWith("anonymous-")) {
+      return null;
+    }
+    return { exact: raw };
+  };
+  const audioConstraints = (value) => {
+    if (!value || value === false) {
+      return false;
+    }
+    const out = {};
+    const deviceId = normalizeDeviceId(value.deviceId, "audio:");
+    if (deviceId) out.deviceId = deviceId;
+    if (Number.isFinite(value.sampleRate)) out.sampleRate = { ideal: value.sampleRate };
+    if (Number.isFinite(value.channels)) out.channelCount = { ideal: value.channels };
+    if (typeof value.echoCancellation === "boolean") out.echoCancellation = value.echoCancellation;
+    if (typeof value.noiseSuppression === "boolean") out.noiseSuppression = value.noiseSuppression;
+    if (typeof value.autoGainControl === "boolean") out.autoGainControl = value.autoGainControl;
+    return Object.keys(out).length ? out : true;
+  };
+  const videoConstraints = (value) => {
+    if (!value || value === false) {
+      return false;
+    }
+    const out = {};
+    const deviceId = normalizeDeviceId(value.deviceId, "camera:");
+    if (deviceId) out.deviceId = deviceId;
+    if (Number.isFinite(value.width)) out.width = { ideal: value.width };
+    if (Number.isFinite(value.height)) out.height = { ideal: value.height };
+    if (Number.isFinite(value.frameRate)) out.frameRate = { ideal: value.frameRate };
+    if (typeof value.facingMode === "string" && value.facingMode) out.facingMode = { ideal: value.facingMode };
+    return Object.keys(out).length ? out : true;
+  };
+  const constraints = {
+    audio: audioConstraints(requested.audio),
+    video: videoConstraints(requested.video)
+  };
+
+  devicesApi.getUserMedia(constraints)
+    .then(async (stream) => {
+      if (media.cancelled.delete(request_id)) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      const streamId = media.nextStreamId++;
+      const entry = {
+        stream,
+        audio: null,
+        video: null,
+        lastError: "",
+        stopped: false
+      };
+      const markEnded = (kind) => {
+        entry.lastError = `${kind} track ended`;
+      };
+      stream.getTracks().forEach((track) => {
+        track.addEventListener("ended", () => markEnded(track.kind), { once: true });
+      });
+
+      try {
+        const audioTrack = stream.getAudioTracks()[0] || null;
+        if (audioTrack) {
+          const context = Module.neoloveEnsureAudioContext();
+          if (context.state === "suspended") {
+            try { await context.resume(); } catch (_error) {}
+          }
+          const settings = typeof audioTrack.getSettings === "function" ? audioTrack.getSettings() : {};
+          const source = context.createMediaStreamSource(new MediaStream([audioTrack]));
+          const requestedChannels = Math.max(1, settings.channelCount || 1);
+          const processor = context.createScriptProcessor(2048, requestedChannels, 1);
+          const silence = context.createGain();
+          silence.gain.value = 0;
+          const audio = {
+            source,
+            processor,
+            silence,
+            chunks: [],
+            offset: 0,
+            available: 0,
+            dropped: 0,
+            sampleRate: context.sampleRate || settings.sampleRate || 48000,
+            channels: Math.max(1, settings.channelCount || 1),
+            maxSamples: 0
+          };
+          audio.maxSamples = audio.sampleRate * audio.channels * 5;
+          processor.onaudioprocess = (event) => {
+            const input = event.inputBuffer;
+            if (!input || input.numberOfChannels <= 0 || input.length <= 0) {
+              return;
+            }
+            const channels = input.numberOfChannels;
+            const frames = input.length;
+            const sampleRate = input.sampleRate || context.sampleRate || audio.sampleRate;
+            // Never mix two channel layouts or sample rates in one Luau
+            // chunk. Browsers can renegotiate a live input track.
+            if (audio.channels !== channels || audio.sampleRate !== sampleRate) {
+              audio.dropped += audio.available;
+              audio.chunks.length = 0;
+              audio.offset = 0;
+              audio.available = 0;
+            }
+            audio.channels = channels;
+            audio.sampleRate = sampleRate;
+            audio.maxSamples = audio.sampleRate * channels * 5;
+            const interleaved = new Float32Array(frames * channels);
+            for (let channel = 0; channel < channels; channel += 1) {
+              const data = input.getChannelData(channel);
+              for (let frame = 0; frame < frames; frame += 1) {
+                interleaved[frame * channels + channel] = data[frame];
+              }
+            }
+            audio.chunks.push(interleaved);
+            audio.available += interleaved.length;
+            let overflow = Math.max(0, audio.available - audio.maxSamples);
+            audio.dropped += overflow;
+            while (overflow > 0 && audio.chunks.length) {
+              const first = audio.chunks[0];
+              const remaining = first.length - audio.offset;
+              const remove = Math.min(overflow, remaining);
+              audio.offset += remove;
+              audio.available -= remove;
+              overflow -= remove;
+              if (audio.offset >= first.length) {
+                audio.chunks.shift();
+                audio.offset = 0;
+              }
+            }
+          };
+          source.connect(processor);
+          processor.connect(silence);
+          silence.connect(context.destination);
+          entry.audio = audio;
+        }
+
+        const videoTrack = stream.getVideoTracks()[0] || null;
+        if (videoTrack) {
+          const settings = typeof videoTrack.getSettings === "function" ? videoTrack.getSettings() : {};
+          const element = document.createElement("video");
+          element.muted = true;
+          element.playsInline = true;
+          element.autoplay = true;
+          element.srcObject = new MediaStream([videoTrack]);
+          try { await element.play(); } catch (_error) {}
+          const frameCanvas = document.createElement("canvas");
+          const frameContext = frameCanvas.getContext("2d", { willReadFrequently: true });
+          if (!frameContext) {
+            throw new Error("browser could not create a camera frame canvas");
+          }
+          const video = {
+            element,
+            canvas: frameCanvas,
+            context: frameContext,
+            settings,
+            currentPixels: null,
+            currentWidth: 0,
+            currentHeight: 0,
+            currentTimestamp: 0,
+            currentDropped: 0,
+            lastTime: -1,
+            producedFrames: 0,
+            consumedFrames: 0
+          };
+          if (typeof element.requestVideoFrameCallback === "function") {
+            const countFrame = () => {
+              if (entry.stopped) {
+                return;
+              }
+              video.producedFrames += 1;
+              element.requestVideoFrameCallback(countFrame);
+            };
+            element.requestVideoFrameCallback(countFrame);
+          }
+          entry.video = video;
+        }
+
+        // Permission prompts, AudioContext resume, and video.play() all await.
+        // A Lua cancellation may arrive during any of them, so check again
+        // before publishing the stream and dispose every partially built node.
+        if (media.cancelled.delete(request_id)) {
+          Module.neoloveDisposeMediaEntry(entry);
+          return;
+        }
+        media.streams.set(streamId, entry);
+        media.stoppedErrors.delete(streamId);
+        if (entry.audio) media.permissions.microphone = "granted";
+        if (entry.video) media.permissions.camera = "granted";
+        const audioPayload = entry.audio ? {
+          sampleRate: entry.audio.sampleRate,
+          channels: entry.audio.channels
+        } : null;
+        const videoSettings = entry.video ? entry.video.settings : null;
+        const videoPayload = entry.video ? {
+          width: Number(videoSettings.width || entry.video.element.videoWidth || 0),
+          height: Number(videoSettings.height || entry.video.element.videoHeight || 0),
+          frameRate: Number(videoSettings.frameRate || 0)
+        } : null;
+        media.queue.push({
+          requestId: request_id,
+          eventKind: 1,
+          ok: 1,
+          streamId,
+          payload: JSON.stringify({ audio: audioPayload, video: videoPayload }),
+          error: "",
+          code: ""
+        });
+      } catch (error) {
+        Module.neoloveDisposeMediaEntry(entry);
+        const failure = Module.neoloveMediaError(error);
+        media.queue.push({
+          requestId: request_id,
+          eventKind: 1,
+          ok: 0,
+          streamId: -1,
+          payload: "",
+          error: failure.message,
+          code: failure.code
+        });
+      }
+    })
+    .catch((error) => {
+      if (media.cancelled.delete(request_id)) {
+        return;
+      }
+      const failure = Module.neoloveMediaError(error);
+      if (constraints.audio && failure.code === "permission_denied") media.permissions.microphone = "denied";
+      if (constraints.video && failure.code === "permission_denied") media.permissions.camera = "denied";
+      media.queue.push({
+        requestId: request_id,
+        eventKind: 1,
+        ok: 0,
+        streamId: -1,
+        payload: "",
+        error: failure.message,
+        code: failure.code
+      });
+    });
+  return 1;
+});
+
+EM_JS(void, neolove_js_media_cancel, (int request_id), {
+  const media = Module.neoloveState && Module.neoloveState.media;
+  if (media) {
+    media.cancelled.add(request_id);
+  }
+});
+
+EM_JS(int, neolove_js_media_poll, (int* request_id, int* event_kind, int* ok, int* stream_id), {
+  const media = Module.neoloveState && Module.neoloveState.media;
+  if (!media || !media.queue.length) {
+    return 0;
+  }
+  const event = media.queue.shift();
+  media.current = event;
+  HEAP32[request_id >> 2] = event.requestId | 0;
+  HEAP32[event_kind >> 2] = event.eventKind | 0;
+  HEAP32[ok >> 2] = event.ok ? 1 : 0;
+  HEAP32[stream_id >> 2] = event.streamId | 0;
+  return 1;
+});
+
+EM_JS(int, neolove_js_media_copy_event_field, (int field, char* buffer, int capacity), {
+  const media = Module.neoloveState && Module.neoloveState.media;
+  const event = media && media.current;
+  let value = "";
+  if (event) {
+    if (field === 0) value = event.payload || "";
+    else if (field === 1) value = event.error || "";
+    else if (field === 2) value = event.code || "";
+  }
+  const required = lengthBytesUTF8(value) + 1;
+  if (capacity <= 0 || required > capacity) {
+    return -required;
+  }
+  stringToUTF8(value, buffer, capacity);
+  return required - 1;
+});
+
+EM_JS(int, neolove_js_media_permission, (int kind, char* buffer, int capacity), {
+  const media = Module.neoloveState && Module.neoloveState.media;
+  if (!media) {
+    return 0;
+  }
+  const permissionName = kind === 1 ? "microphone" : kind === 2 ? "camera" : "";
+  if (!permissionName) {
+    return 0;
+  }
+  if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function" || !window.isSecureContext) {
+    media.permissions[permissionName] = "unavailable";
+  } else if (!media.permissionQueries[permissionName]
+      && navigator.permissions
+      && typeof navigator.permissions.query === "function") {
+    media.permissionQueries[permissionName] = true;
+    try {
+      navigator.permissions.query({ name: permissionName }).then((status) => {
+        if (status && typeof status.state === "string") {
+          media.permissions[permissionName] = status.state;
+          status.onchange = () => { media.permissions[permissionName] = status.state; };
+        }
+      }).catch(() => {});
+    } catch (_error) {
+    }
+  }
+  const value = media.permissions[permissionName] || "prompt";
+  const required = lengthBytesUTF8(value) + 1;
+  if (capacity <= 0 || required > capacity) {
+    return -required;
+  }
+  stringToUTF8(value, buffer, capacity);
+  return required - 1;
+});
+
+EM_JS(int, neolove_js_media_supported, (int kind), {
+  const supported = !!(window.isSecureContext
+    && navigator.mediaDevices
+    && typeof navigator.mediaDevices.getUserMedia === "function");
+  return supported && (kind === 0 || kind === 1 || kind === 2) ? 1 : 0;
+});
+
+EM_JS(void, neolove_js_media_stop, (int stream_id), {
+  if (Module.neoloveStopMediaStream) {
+    Module.neoloveStopMediaStream(stream_id);
+  }
+});
+
+EM_JS(void, neolove_js_media_stop_all, (), {
+  const media = Module.neoloveState && Module.neoloveState.media;
+  if (!media || !Module.neoloveStopMediaStream) {
+    return;
+  }
+  Array.from(media.streams.keys()).forEach((id) => Module.neoloveStopMediaStream(id));
+});
+
+EM_JS(int, neolove_js_media_is_active, (int stream_id), {
+  const media = Module.neoloveState && Module.neoloveState.media;
+  const entry = media && media.streams.get(stream_id);
+  return entry && entry.stream.active && entry.stream.getTracks().some((track) => track.readyState === "live") ? 1 : 0;
+});
+
+EM_JS(int, neolove_js_media_audio_info, (
+  int stream_id,
+  int* sample_rate,
+  int* channels,
+  int* available_samples,
+  int* dropped_samples
+), {
+  const media = Module.neoloveState && Module.neoloveState.media;
+  const entry = media && media.streams.get(stream_id);
+  const audio = entry && entry.audio;
+  if (!audio) {
+    return 0;
+  }
+  HEAP32[sample_rate >> 2] = audio.sampleRate | 0;
+  HEAP32[channels >> 2] = audio.channels | 0;
+  HEAP32[available_samples >> 2] = audio.available | 0;
+  HEAP32[dropped_samples >> 2] = audio.dropped | 0;
+  return 1;
+});
+
+EM_JS(int, neolove_js_media_read_audio, (int stream_id, float* samples, int max_samples), {
+  const media = Module.neoloveState && Module.neoloveState.media;
+  const entry = media && media.streams.get(stream_id);
+  const audio = entry && entry.audio;
+  if (!audio || max_samples <= 0) {
+    return 0;
+  }
+  const count = Math.min(max_samples, audio.available);
+  let written = 0;
+  while (written < count && audio.chunks.length) {
+    const first = audio.chunks[0];
+    const remaining = first.length - audio.offset;
+    const copyCount = Math.min(count - written, remaining);
+    HEAPF32.set(first.subarray(audio.offset, audio.offset + copyCount), (samples >> 2) + written);
+    written += copyCount;
+    audio.offset += copyCount;
+    audio.available -= copyCount;
+    if (audio.offset >= first.length) {
+      audio.chunks.shift();
+      audio.offset = 0;
+    }
+  }
+  audio.dropped = 0;
+  return written;
+});
+
+EM_JS(int, neolove_js_media_video_info, (
+  int stream_id,
+  int* width,
+  int* height,
+  double* timestamp,
+  int* dropped_frames
+), {
+  const media = Module.neoloveState && Module.neoloveState.media;
+  const entry = media && media.streams.get(stream_id);
+  const video = entry && entry.video;
+  if (!video) {
+    return -1;
+  }
+  const element = video.element;
+  const frameWidth = element.videoWidth | 0;
+  const frameHeight = element.videoHeight | 0;
+  if (element.readyState < 2 || frameWidth <= 0 || frameHeight <= 0 || element.currentTime === video.lastTime) {
+    return 0;
+  }
+  try {
+    video.lastTime = element.currentTime;
+    if (video.canvas.width !== frameWidth || video.canvas.height !== frameHeight) {
+      video.canvas.width = frameWidth;
+      video.canvas.height = frameHeight;
+    }
+    video.context.drawImage(element, 0, 0, frameWidth, frameHeight);
+    video.currentPixels = video.context.getImageData(0, 0, frameWidth, frameHeight).data;
+    video.currentWidth = frameWidth;
+    video.currentHeight = frameHeight;
+    video.currentTimestamp = performance.now() / 1000.0;
+    video.currentDropped = Math.max(0, video.producedFrames - video.consumedFrames - 1);
+    video.consumedFrames = video.producedFrames;
+    HEAP32[width >> 2] = frameWidth;
+    HEAP32[height >> 2] = frameHeight;
+    HEAPF64[timestamp >> 3] = video.currentTimestamp;
+    HEAP32[dropped_frames >> 2] = video.currentDropped | 0;
+    return video.currentPixels.length | 0;
+  } catch (error) {
+    entry.lastError = String((error && error.message) || error || "failed to read camera frame");
+    return -2;
+  }
+});
+
+EM_JS(int, neolove_js_media_copy_video, (int stream_id, uint8_t* pixels, int capacity), {
+  const media = Module.neoloveState && Module.neoloveState.media;
+  const entry = media && media.streams.get(stream_id);
+  const video = entry && entry.video;
+  if (!video || !video.currentPixels || capacity < video.currentPixels.length) {
+    return 0;
+  }
+  HEAPU8.set(video.currentPixels, pixels);
+  const written = video.currentPixels.length;
+  video.currentPixels = null;
+  return written;
+});
+
+EM_JS(int, neolove_js_media_copy_stream_error, (int stream_id, char* buffer, int capacity), {
+  const media = Module.neoloveState && Module.neoloveState.media;
+  const entry = media && media.streams.get(stream_id);
+  const value = (entry && entry.lastError) || (media && media.stoppedErrors.get(stream_id)) || "";
+  const required = lengthBytesUTF8(value) + 1;
+  if (capacity <= 0 || required > capacity) {
+    return -required;
+  }
+  stringToUTF8(value, buffer, capacity);
+  return required - 1;
+});
+
 void neolove_web_bootstrap(void) {
   neolove_js_bootstrap();
 }
@@ -1720,4 +2361,75 @@ int neolove_web_http_poll(int* request_id, int* status, int* ok) {
 
 int neolove_web_http_copy_field(int field, char* buffer, int capacity) {
   return neolove_js_http_copy_field(field, buffer, capacity);
+}
+
+int neolove_web_media_enumerate(int request_id, int kind) {
+  return neolove_js_media_enumerate(request_id, kind);
+}
+
+int neolove_web_media_request(int request_id, const char* constraints_json) {
+  return neolove_js_media_request(request_id, constraints_json);
+}
+
+void neolove_web_media_cancel(int request_id) {
+  neolove_js_media_cancel(request_id);
+}
+
+int neolove_web_media_poll(int* request_id, int* event_kind, int* ok, int* stream_id) {
+  return neolove_js_media_poll(request_id, event_kind, ok, stream_id);
+}
+
+int neolove_web_media_copy_event_field(int field, char* buffer, int capacity) {
+  return neolove_js_media_copy_event_field(field, buffer, capacity);
+}
+
+int neolove_web_media_permission(int kind, char* buffer, int capacity) {
+  return neolove_js_media_permission(kind, buffer, capacity);
+}
+
+int neolove_web_media_supported(int kind) {
+  return neolove_js_media_supported(kind);
+}
+
+void neolove_web_media_stop(int stream_id) {
+  neolove_js_media_stop(stream_id);
+}
+
+void neolove_web_media_stop_all(void) {
+  neolove_js_media_stop_all();
+}
+
+int neolove_web_media_is_active(int stream_id) {
+  return neolove_js_media_is_active(stream_id);
+}
+
+int neolove_web_media_audio_info(
+    int stream_id,
+    int* sample_rate,
+    int* channels,
+    int* available_samples,
+    int* dropped_samples) {
+  return neolove_js_media_audio_info(
+      stream_id, sample_rate, channels, available_samples, dropped_samples);
+}
+
+int neolove_web_media_read_audio(int stream_id, float* samples, int max_samples) {
+  return neolove_js_media_read_audio(stream_id, samples, max_samples);
+}
+
+int neolove_web_media_video_info(
+    int stream_id,
+    int* width,
+    int* height,
+    double* timestamp,
+    int* dropped_frames) {
+  return neolove_js_media_video_info(stream_id, width, height, timestamp, dropped_frames);
+}
+
+int neolove_web_media_copy_video(int stream_id, uint8_t* pixels, int capacity) {
+  return neolove_js_media_copy_video(stream_id, pixels, capacity);
+}
+
+int neolove_web_media_copy_stream_error(int stream_id, char* buffer, int capacity) {
+  return neolove_js_media_copy_stream_error(stream_id, buffer, capacity);
 }
