@@ -1,5 +1,5 @@
 use crate::assets::ImageHandle;
-use crate::platform::{lock_platform_state, Color, SharedPlatformState};
+use crate::platform::{Antialiasing, Color, SharedPlatformState, lock_platform_state};
 use crate::renderer::{self, DrawCommand, Rect, SharedRenderState, TextureFilter, Vec2};
 use bytemuck::{Pod, Zeroable};
 use image::RgbaImage;
@@ -7,6 +7,7 @@ use naga::back::spv;
 use naga::front::glsl;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
@@ -25,6 +26,7 @@ use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, Standar
 use vulkano::pipeline::graphics::color_blend::{
     AttachmentBlend, ColorBlendAttachmentState, ColorBlendState, ColorComponents,
 };
+use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveTopology};
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::RasterizationState;
@@ -50,7 +52,7 @@ use winit::event_loop::EventLoop;
 use winit::window::Window;
 
 const BUILTIN_VERTEX_SHADER: &str = r#"#version 450
-layout(location = 0) in vec2 position;
+layout(location = 0) in vec4 position;
 layout(location = 1) in vec4 color;
 layout(location = 2) in vec2 uv;
 
@@ -58,7 +60,7 @@ layout(location = 0) out vec4 v_color;
 layout(location = 1) out vec2 v_uv;
 
 void main() {
-    gl_Position = vec4(position, 0.0, 1.0);
+    gl_Position = position;
     v_color = color;
     v_uv = uv;
 }
@@ -77,11 +79,42 @@ void main() {
 }
 "#;
 
+const EQUIRECTANGULAR_ENVIRONMENT_FRAGMENT_SHADER: &str = r#"#version 450
+layout(binding = 0) uniform texture2D Texture;
+layout(binding = 1) uniform sampler TextureSampler;
+layout(binding = 2) uniform EnvironmentUniforms {
+    vec4 slots[16];
+};
+
+layout(location = 0) in vec4 color;
+layout(location = 1) in vec2 uv;
+layout(location = 0) out vec4 f_color;
+
+void main() {
+    vec2 plane = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    vec3 direction = normalize(
+        slots[2].xyz + slots[0].xyz * plane.x * slots[3].x
+        + slots[1].xyz * plane.y * slots[3].y
+    );
+    float yaw_sin = slots[3].z;
+    float yaw_cos = slots[3].w;
+    direction = vec3(
+        direction.x * yaw_cos - direction.z * yaw_sin,
+        direction.y,
+        direction.x * yaw_sin + direction.z * yaw_cos
+    );
+    float panorama_u = fract(atan(direction.z, direction.x) / 6.28318530718 + 0.5);
+    float panorama_v = clamp(0.5 - asin(clamp(direction.y, -1.0, 1.0)) / 3.14159265359, 0.0, 1.0);
+    vec4 sampled = texture(sampler2D(Texture, TextureSampler), vec2(panorama_u, panorama_v));
+    f_color = vec4(sampled.rgb * max(slots[4].x, 0.0), sampled.a);
+}
+"#;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Zeroable, Pod, Vertex)]
 struct GpuVertex {
-    #[format(R32G32_SFLOAT)]
-    position: [f32; 2],
+    #[format(R32G32B32A32_SFLOAT)]
+    position: [f32; 4],
     #[format(R32G32B32A32_SFLOAT)]
     color: [f32; 4],
     #[format(R32G32_SFLOAT)]
@@ -103,6 +136,33 @@ struct CachedTexture {
     view: Arc<ImageView>,
     descriptor_nearest: Arc<PersistentDescriptorSet>,
     descriptor_linear: Arc<PersistentDescriptorSet>,
+}
+
+fn environment_scaled_color(color: Color, intensity: f32) -> Color {
+    let intensity = if intensity.is_finite() {
+        intensity.max(0.0)
+    } else {
+        1.0
+    };
+    Color::rgba(
+        (color.r as f32 * intensity).clamp(0.0, 255.0).round() as u8,
+        (color.g as f32 * intensity).clamp(0.0, 255.0).round() as u8,
+        (color.b as f32 * intensity).clamp(0.0, 255.0).round() as u8,
+        color.a,
+    )
+}
+
+fn environment_clear_color(
+    environment: &crate::environment3d::Environment3D,
+    fallback: Color,
+) -> Color {
+    if environment.enabled
+        && environment.mode == crate::environment3d::EnvironmentMode3D::Solid
+    {
+        environment_scaled_color(environment.solid, environment.intensity)
+    } else {
+        fallback
+    }
 }
 
 /// A prepared light-map composite: the multiply pipeline, the uploaded light-map
@@ -184,6 +244,7 @@ pub(crate) struct VulkanPresenter {
     recreate_swapchain: bool,
     nearest_sampler: Arc<Sampler>,
     linear_sampler: Arc<Sampler>,
+    supported_samples: SampleCounts,
     msaa_samples: SampleCount,
     white_texture: TextureKey,
     texture_cache: HashMap<TextureKey, CachedTexture>,
@@ -247,21 +308,9 @@ impl VulkanPresenter {
             })
             .ok_or_else(|| "no suitable Vulkan physical device found".to_string())?;
 
-        let msaa_samples = if physical
-            .properties()
-            .framebuffer_color_sample_counts
-            .intersects(SampleCounts::SAMPLE_4)
-        {
-            SampleCount::Sample4
-        } else if physical
-            .properties()
-            .framebuffer_color_sample_counts
-            .intersects(SampleCounts::SAMPLE_2)
-        {
-            SampleCount::Sample2
-        } else {
-            SampleCount::Sample1
-        };
+        let mut supported_samples = physical.properties().framebuffer_color_sample_counts
+            & physical.properties().framebuffer_depth_sample_counts;
+        let mut msaa_samples = preferred_sample_count(Antialiasing::High, supported_samples);
 
         let (device, mut queues) = Device::new(
             physical.clone(),
@@ -311,11 +360,10 @@ impl VulkanPresenter {
                 surface_caps.supported_usage_flags
             ));
         }
-        let msaa_samples = if image_usage.intersects(ImageUsage::TRANSFER_DST) {
-            msaa_samples
-        } else {
-            SampleCount::Sample1
-        };
+        if !image_usage.intersects(ImageUsage::TRANSFER_DST) {
+            supported_samples = SampleCounts::SAMPLE_1;
+            msaa_samples = SampleCount::Sample1;
+        }
         let present_mode = if present_modes.contains(&PresentMode::Immediate) {
             PresentMode::Immediate
         } else {
@@ -407,6 +455,7 @@ impl VulkanPresenter {
             recreate_swapchain: false,
             nearest_sampler,
             linear_sampler,
+            supported_samples,
             msaa_samples,
             white_texture: TextureKey(0),
             texture_cache: HashMap::new(),
@@ -438,11 +487,17 @@ impl VulkanPresenter {
                         load_op: Clear,
                         store_op: Store,
                         final_layout: ImageLayout::PresentSrc,
+                    },
+                    depth: {
+                        format: Format::D16_UNORM,
+                        samples: 1,
+                        load_op: Clear,
+                        store_op: DontCare,
                     }
                 },
                 pass: {
                     color: [color],
-                    depth_stencil: {}
+                    depth_stencil: {depth}
                 }
             )
             .map_err(|e| e.to_string());
@@ -463,12 +518,18 @@ impl VulkanPresenter {
                     load_op: DontCare,
                     store_op: Store,
                     final_layout: ImageLayout::PresentSrc,
+                },
+                depth: {
+                    format: Format::D16_UNORM,
+                    samples: u32::from(msaa_samples),
+                    load_op: Clear,
+                    store_op: DontCare,
                 }
             },
             pass: {
                 color: [color_msaa],
                 color_resolve: [color_resolve],
-                depth_stencil: {}
+                depth_stencil: {depth}
             }
         )
         .map_err(|e| e.to_string())
@@ -486,8 +547,24 @@ impl VulkanPresenter {
             .map(|image| {
                 let swapchain_view =
                     ImageView::new_default(image.clone()).map_err(|e| e.to_string())?;
+                let depth_image = Image::new(
+                    memory_allocator.clone(),
+                    ImageCreateInfo {
+                        format: Format::D16_UNORM,
+                        extent: image.extent(),
+                        usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
+                        samples: msaa_samples,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+                let depth_view = ImageView::new_default(depth_image).map_err(|e| e.to_string())?;
                 let attachments = if msaa_samples == SampleCount::Sample1 {
-                    vec![swapchain_view]
+                    vec![swapchain_view, depth_view]
                 } else {
                     let msaa_image = Image::new(
                         memory_allocator.clone(),
@@ -506,7 +583,7 @@ impl VulkanPresenter {
                     .map_err(|e| e.to_string())?;
                     let msaa_view =
                         ImageView::new_default(msaa_image).map_err(|e| e.to_string())?;
-                    vec![msaa_view, swapchain_view]
+                    vec![msaa_view, swapchain_view, depth_view]
                 };
 
                 Framebuffer::new(
@@ -680,6 +757,13 @@ impl VulkanPresenter {
                     rasterization_samples: msaa_samples,
                     ..Default::default()
                 }),
+                depth_stencil_state: Some(DepthStencilState {
+                    depth: Some(DepthState {
+                        write_enable: true,
+                        compare_op: CompareOp::LessOrEqual,
+                    }),
+                    ..Default::default()
+                }),
                 color_blend_state: Some(ColorBlendState::with_attachment_states(
                     1,
                     ColorBlendAttachmentState {
@@ -754,7 +838,8 @@ impl VulkanPresenter {
                 .as_deref()
                 .ok_or_else(|| "missing fragment source for custom shader batch".to_string())?,
         )?;
-        self.shader_cache.insert(shader.pipeline_key, pipeline.clone());
+        self.shader_cache
+            .insert(shader.pipeline_key, pipeline.clone());
         Ok(pipeline)
     }
 
@@ -796,30 +881,89 @@ impl VulkanPresenter {
         Ok(())
     }
 
+    fn set_antialiasing(
+        &mut self,
+        antialiasing: Antialiasing,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        let samples = preferred_sample_count(antialiasing, self.supported_samples);
+        if samples == self.msaa_samples {
+            return Ok(());
+        }
+        self.msaa_samples = samples;
+        self.render_pass =
+            Self::create_render_pass(self.device.clone(), self.swapchain.image_format(), samples)?;
+        self.framebuffers = Self::create_framebuffers(
+            &self.images,
+            self.render_pass.clone(),
+            self.memory_allocator.clone(),
+            self.swapchain.image_format(),
+            samples,
+        )?;
+        self.pipeline = Self::create_pipeline(
+            self.device.clone(),
+            self.render_pass.clone(),
+            width.max(1),
+            height.max(1),
+            samples,
+        )?;
+        self.shader_cache.clear();
+        self.composite_pipeline = None;
+        self.light_composite_cache = None;
+        Ok(())
+    }
+
     pub(crate) fn render(
         &mut self,
         platform: &SharedPlatformState,
         render_state: &SharedRenderState,
-        width: u32,
-        height: u32,
+        surface_width: u32,
+        surface_height: u32,
+        logical_width: u32,
+        logical_height: u32,
     ) -> Result<(), String> {
         if let Some(previous) = self.previous_frame_end.as_mut() {
             previous.cleanup_finished();
         }
 
         if self.recreate_swapchain {
-            self.recreate(width, height)?;
+            self.recreate(surface_width, surface_height)?;
         }
+
+        let antialiasing = lock_platform_state(platform).antialiasing();
+        self.set_antialiasing(antialiasing, surface_width, surface_height)?;
 
         self.frame_serial = self.frame_serial.wrapping_add(1);
 
         let commands = renderer::drain_commands_without_remembering(render_state)?;
-        let clear_color = lock_platform_state(platform).clear_color();
-        let (config, lights, occluders) = render_state
-            .lock()
-            .map_err(|_| "render state lock poisoned".to_string())?
-            .take_lighting();
-        let batches = self.build_batches(&commands, width.max(1), height.max(1))?;
+        let platform_clear_color = lock_platform_state(platform).clear_color();
+        let (config, lights, occluders, lights_3d, environment, camera_3d) = {
+            let mut state = render_state
+                .lock()
+                .map_err(|_| "render state lock poisoned".to_string())?;
+            let (config, lights, occluders) = state.take_lighting();
+            let lights_3d = state.take_lights_3d();
+            let environment = state.environment_3d();
+            let camera_3d = state.camera_3d();
+            (
+                config,
+                lights,
+                occluders,
+                lights_3d,
+                environment,
+                camera_3d,
+            )
+        };
+        let clear_color = environment_clear_color(&environment, platform_clear_color);
+        let batches = self.build_batches(
+            &commands,
+            logical_width.max(1),
+            logical_height.max(1),
+            &lights_3d,
+            &environment,
+            camera_3d,
+        )?;
         self.prune_dynamic_texture_caches();
         renderer::remember_last_frame_commands(render_state, commands)?;
 
@@ -827,8 +971,8 @@ impl VulkanPresenter {
         // failure here is non-fatal: the scene simply renders unlit rather than
         // taking down the frame.
         let light_map = crate::lighting::render_light_map_cached(
-            width.max(1),
-            height.max(1),
+            logical_width.max(1),
+            logical_height.max(1),
             &config,
             &lights,
             &occluders,
@@ -874,8 +1018,8 @@ impl VulkanPresenter {
 
         let command_buffer = self.build_command_buffer(
             image_index as usize,
-            width.max(1),
-            height.max(1),
+            surface_width.max(1),
+            surface_height.max(1),
             clear_color,
             batches,
             light_composite,
@@ -940,7 +1084,10 @@ impl VulkanPresenter {
                 Self::multiply_blend(),
             )?);
         }
-        let pipeline = self.composite_pipeline.clone().unwrap();
+        let pipeline = self
+            .composite_pipeline
+            .clone()
+            .ok_or_else(|| "light composite pipeline was not initialized".to_string())?;
 
         // Upload the light map as a texture (synchronous, like other uploads).
         let image = Image::new(
@@ -978,10 +1125,9 @@ impl VulkanPresenter {
         )
         .map_err(|e| e.to_string())?;
         builder
-            .copy_buffer_to_image(vulkano::command_buffer::CopyBufferToImageInfo::buffer_image(
-                upload,
-                image.clone(),
-            ))
+            .copy_buffer_to_image(
+                vulkano::command_buffer::CopyBufferToImageInfo::buffer_image(upload, image.clone()),
+            )
             .map_err(|e| e.to_string())?;
         let command_buffer = builder.build().map_err(|e| e.to_string())?;
         sync::now(self.device.clone())
@@ -1016,12 +1162,36 @@ impl VulkanPresenter {
         // top-left. A linear sampler upscales the downsampled map smoothly.
         let white = [1.0f32; 4];
         let verts = [
-            GpuVertex { position: [-1.0, 1.0], color: white, uv: [0.0, 0.0] },
-            GpuVertex { position: [1.0, 1.0], color: white, uv: [1.0, 0.0] },
-            GpuVertex { position: [1.0, -1.0], color: white, uv: [1.0, 1.0] },
-            GpuVertex { position: [-1.0, 1.0], color: white, uv: [0.0, 0.0] },
-            GpuVertex { position: [1.0, -1.0], color: white, uv: [1.0, 1.0] },
-            GpuVertex { position: [-1.0, -1.0], color: white, uv: [0.0, 1.0] },
+            GpuVertex {
+                position: [-1.0, 1.0, 0.0, 1.0],
+                color: white,
+                uv: [0.0, 0.0],
+            },
+            GpuVertex {
+                position: [1.0, 1.0, 0.0, 1.0],
+                color: white,
+                uv: [1.0, 0.0],
+            },
+            GpuVertex {
+                position: [1.0, -1.0, 0.0, 1.0],
+                color: white,
+                uv: [1.0, 1.0],
+            },
+            GpuVertex {
+                position: [-1.0, 1.0, 0.0, 1.0],
+                color: white,
+                uv: [0.0, 0.0],
+            },
+            GpuVertex {
+                position: [1.0, -1.0, 0.0, 1.0],
+                color: white,
+                uv: [1.0, 1.0],
+            },
+            GpuVertex {
+                position: [-1.0, -1.0, 0.0, 1.0],
+                color: white,
+                uv: [0.0, 1.0],
+            },
         ];
         let vertex_buffer = Buffer::from_iter(
             self.memory_allocator.clone(),
@@ -1062,12 +1232,15 @@ impl VulkanPresenter {
         .map_err(|e| e.to_string())?;
 
         let clear_values = if self.msaa_samples == SampleCount::Sample1 {
-            vec![Some(ClearValue::Float([
-                clear.r as f32 / 255.0,
-                clear.g as f32 / 255.0,
-                clear.b as f32 / 255.0,
-                clear.a as f32 / 255.0,
-            ]))]
+            vec![
+                Some(ClearValue::Float([
+                    clear.r as f32 / 255.0,
+                    clear.g as f32 / 255.0,
+                    clear.b as f32 / 255.0,
+                    clear.a as f32 / 255.0,
+                ])),
+                Some(ClearValue::Depth(1.0)),
+            ]
         } else {
             vec![
                 Some(ClearValue::Float([
@@ -1077,6 +1250,7 @@ impl VulkanPresenter {
                     clear.a as f32 / 255.0,
                 ])),
                 None,
+                Some(ClearValue::Depth(1.0)),
             ]
         };
 
@@ -1111,8 +1285,12 @@ impl VulkanPresenter {
                 continue;
             }
             let pipeline = self.pipeline_for_batch(&batch.shader, width, height)?;
-            let descriptor =
-                self.descriptor_for_batch(pipeline.clone(), batch.texture, batch.filter, &batch.shader)?;
+            let descriptor = self.descriptor_for_batch(
+                pipeline.clone(),
+                batch.texture,
+                batch.filter,
+                &batch.shader,
+            )?;
             let vertex_count = batch.vertices.len() as u32;
             let vertex_buffer = Buffer::from_iter(
                 self.memory_allocator.clone(),
@@ -1227,7 +1405,10 @@ impl VulkanPresenter {
                 .texture_cache
                 .get(texture_key)
                 .ok_or_else(|| format!("missing cached texture for shader binding {binding}"))?;
-            writes.push(WriteDescriptorSet::image_view(*binding, cached.view.clone()));
+            writes.push(WriteDescriptorSet::image_view(
+                *binding,
+                cached.view.clone(),
+            ));
             writes.push(WriteDescriptorSet::sampler(*binding + 1, sampler.clone()));
         }
 
@@ -1252,9 +1433,16 @@ impl VulkanPresenter {
         commands: &[DrawCommand],
         width: u32,
         height: u32,
+        lights_3d: &[crate::render3d::Light3D],
+        environment: &crate::environment3d::Environment3D,
+        camera_3d: crate::render3d::Camera3D,
     ) -> Result<Vec<TextureBatch>, String> {
         let mut batches = Vec::with_capacity(commands.len().min(64));
         let mut current: Option<TextureBatch> = None;
+
+        if let Some(background) = self.environment_batch(environment, camera_3d, width, height) {
+            batches.push(background);
+        }
 
         for command in commands {
             if !renderer::command_intersects_viewport(&command, width, height) {
@@ -1372,6 +1560,57 @@ impl VulkanPresenter {
                     let shader = self.batch_shader_for_command(shader.as_ref())?;
                     push_vertices(&mut current, &mut batches, texture, *filter, shader, verts);
                 }
+                DrawCommand::Mesh3D(command) => {
+                    let texture = match command.texture.as_ref() {
+                        Some(image) => self.texture_for_image(image)?,
+                        None => self.white_texture,
+                    };
+                    let filter = if command.texture.is_some() {
+                        TextureFilter::Linear
+                    } else {
+                        TextureFilter::Nearest
+                    };
+                    let shader = self.batch_shader_for_command(command.shader.as_ref())?;
+                    let triangles = crate::render3d::project_mesh(command, lights_3d)?;
+                    let vertices = triangles.into_iter().flat_map(|triangle| {
+                        triangle.vertices.into_iter().map(|vertex| GpuVertex {
+                            position: vertex.clip_position,
+                            color: vertex.color,
+                            uv: vertex.uv,
+                        })
+                    });
+                    push_vertices(
+                        &mut current,
+                        &mut batches,
+                        texture,
+                        filter,
+                        shader,
+                        vertices,
+                    );
+                }
+                DrawCommand::Particles3D(command) => {
+                    let texture = match command.texture.as_ref() {
+                        Some(image) => self.texture_for_image(image)?,
+                        None => self.white_texture,
+                    };
+                    let vertices = crate::render3d::project_particles(command)?
+                        .into_iter()
+                        .flat_map(|triangle| {
+                            triangle.vertices.into_iter().map(|vertex| GpuVertex {
+                                position: vertex.clip_position,
+                                color: vertex.color,
+                                uv: vertex.uv,
+                            })
+                        });
+                    push_vertices(
+                        &mut current,
+                        &mut batches,
+                        texture,
+                        command.filter,
+                        BatchShaderState::default_pipeline(),
+                        vertices,
+                    );
+                }
                 DrawCommand::Text(request) => {
                     let Some(sprite) = renderer::rasterize_text_sprite(request) else {
                         continue;
@@ -1401,6 +1640,110 @@ impl VulkanPresenter {
             batches.push(batch);
         }
         Ok(batches)
+    }
+
+    fn environment_batch(
+        &mut self,
+        environment: &crate::environment3d::Environment3D,
+        camera: crate::render3d::Camera3D,
+        width: u32,
+        height: u32,
+    ) -> Option<TextureBatch> {
+        use crate::environment3d::EnvironmentMode3D;
+
+        if !environment.enabled || environment.mode == EnvironmentMode3D::Solid {
+            return None;
+        }
+        let rgba = |color: Color| {
+            let color = environment_scaled_color(color, environment.intensity);
+            [
+                color.r as f32 / 255.0,
+                color.g as f32 / 255.0,
+                color.b as f32 / 255.0,
+                color.a as f32 / 255.0,
+            ]
+        };
+        let fullscreen = |top: [f32; 4], bottom: [f32; 4]| {
+            vec![
+                GpuVertex {
+                    position: [-1.0, 1.0, 1.0, 1.0],
+                    color: top,
+                    uv: [0.0, 0.0],
+                },
+                GpuVertex {
+                    position: [1.0, 1.0, 1.0, 1.0],
+                    color: top,
+                    uv: [1.0, 0.0],
+                },
+                GpuVertex {
+                    position: [1.0, -1.0, 1.0, 1.0],
+                    color: bottom,
+                    uv: [1.0, 1.0],
+                },
+                GpuVertex {
+                    position: [-1.0, 1.0, 1.0, 1.0],
+                    color: top,
+                    uv: [0.0, 0.0],
+                },
+                GpuVertex {
+                    position: [1.0, -1.0, 1.0, 1.0],
+                    color: bottom,
+                    uv: [1.0, 1.0],
+                },
+                GpuVertex {
+                    position: [-1.0, -1.0, 1.0, 1.0],
+                    color: bottom,
+                    uv: [0.0, 1.0],
+                },
+            ]
+        };
+        let white_texture = self.white_texture;
+        let gradient = || TextureBatch {
+            texture: white_texture,
+            filter: TextureFilter::Linear,
+            vertices: fullscreen(rgba(environment.top), rgba(environment.bottom)),
+            shader: BatchShaderState::default_pipeline(),
+        };
+
+        if environment.mode != EnvironmentMode3D::Equirectangular {
+            return Some(gradient());
+        }
+        let Some(image) = environment.equirectangular.as_ref() else {
+            return Some(gradient());
+        };
+        let Ok(texture) = self.texture_for_image(image) else {
+            return Some(gradient());
+        };
+        let rotation = crate::render3d::Mat4::rotation_euler_degrees(camera.euler);
+        let right = rotation.transform_direction(crate::render3d::Vec3::new(1.0, 0.0, 0.0));
+        let up = rotation.transform_direction(crate::render3d::Vec3::new(0.0, 1.0, 0.0));
+        let forward = rotation.transform_direction(crate::render3d::Vec3::new(0.0, 0.0, -1.0));
+        let aspect = width.max(1) as f32 / height.max(1) as f32;
+        let half_height = (camera.fov.clamp(1.0, 179.0).to_radians() * 0.5).tan();
+        let yaw = environment.rotation_degrees.to_radians();
+        let (yaw_sin, yaw_cos) = yaw.sin_cos();
+        let mut uniform_slots = [[0.0; 4]; crate::shader::MAX_SHADER_FLOAT_UNIFORMS];
+        uniform_slots[0] = [right.x, right.y, right.z, 0.0];
+        uniform_slots[1] = [up.x, up.y, up.z, 0.0];
+        uniform_slots[2] = [forward.x, forward.y, forward.z, 0.0];
+        uniform_slots[3] = [half_height * aspect, half_height, yaw_sin, yaw_cos];
+        uniform_slots[4][0] = environment.intensity.max(0.0);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        EQUIRECTANGULAR_ENVIRONMENT_FRAGMENT_SHADER.hash(&mut hasher);
+        Some(TextureBatch {
+            texture,
+            filter: TextureFilter::Linear,
+            vertices: fullscreen([1.0; 4], [1.0; 4]),
+            shader: BatchShaderState {
+                pipeline_key: hasher.finish(),
+                fragment_source: Some(
+                    EQUIRECTANGULAR_ENVIRONMENT_FRAGMENT_SHADER.to_string(),
+                ),
+                uses_uniform_buffer: true,
+                uniform_slots,
+                extra_textures: Vec::new(),
+            },
+        })
     }
 
     fn batch_shader_for_command(
@@ -1472,11 +1815,15 @@ impl VulkanPresenter {
             .image_cache_last_used
             .iter()
             .filter_map(|(&id, &last_used)| {
-                (frame.wrapping_sub(last_used) > GPU_TEXTURE_IDLE_FRAMES)
-                    .then_some((id, last_used))
+                (frame.wrapping_sub(last_used) > GPU_TEXTURE_IDLE_FRAMES).then_some((id, last_used))
             })
             .collect();
-        if self.image_cache_keys.len().saturating_sub(stale_images.len()) > GPU_IMAGE_CACHE_LIMIT {
+        if self
+            .image_cache_keys
+            .len()
+            .saturating_sub(stale_images.len())
+            > GPU_IMAGE_CACHE_LIMIT
+        {
             let mut remaining: Vec<(usize, u64)> = self
                 .image_cache_last_used
                 .iter()
@@ -1515,9 +1862,7 @@ impl VulkanPresenter {
                 .iter()
                 .filter_map(|(&hash, &last_used)| {
                     (last_used != frame
-                        && !stale_text
-                            .iter()
-                            .any(|(stale_hash, _)| *stale_hash == hash))
+                        && !stale_text.iter().any(|(stale_hash, _)| *stale_hash == hash))
                     .then_some((hash, last_used))
                 })
                 .collect();
@@ -1639,6 +1984,18 @@ impl VulkanPresenter {
     }
 }
 
+fn preferred_sample_count(antialiasing: Antialiasing, supported: SampleCounts) -> SampleCount {
+    match antialiasing {
+        Antialiasing::Off => SampleCount::Sample1,
+        Antialiasing::Standard if supported.intersects(SampleCounts::SAMPLE_2) => {
+            SampleCount::Sample2
+        }
+        Antialiasing::High if supported.intersects(SampleCounts::SAMPLE_4) => SampleCount::Sample4,
+        Antialiasing::High if supported.intersects(SampleCounts::SAMPLE_2) => SampleCount::Sample2,
+        Antialiasing::Standard | Antialiasing::High => SampleCount::Sample1,
+    }
+}
+
 fn push_vertices(
     current: &mut Option<TextureBatch>,
     batches: &mut Vec<TextureBatch>,
@@ -1723,7 +2080,12 @@ fn vertex_from_point(
     let width = width.max(1) as f32;
     let height = height.max(1) as f32;
     GpuVertex {
-        position: [point.x / width * 2.0 - 1.0, 1.0 - point.y / height * 2.0],
+        position: [
+            point.x / width * 2.0 - 1.0,
+            1.0 - point.y / height * 2.0,
+            0.0,
+            1.0,
+        ],
         color: [
             color.r as f32 / 255.0,
             color.g as f32 / 255.0,
@@ -1747,4 +2109,47 @@ fn image_uvs(image: &ImageHandle, source: Option<Rect>) -> Result<[[f32; 2]; 4],
     let u1 = (source.x + source.w) / img_w.max(1) as f32;
     let v1 = (source.y + source.h) / img_h.max(1) as f32;
     Ok([[u0, v0], [u1, v0], [u1, v1], [u0, v1]])
+}
+
+#[cfg(test)]
+mod environment_shader_tests {
+    use super::*;
+
+    #[test]
+    fn global_antialiasing_selects_supported_vulkan_msaa_samples() {
+        let supported = SampleCounts::SAMPLE_1
+            | SampleCounts::SAMPLE_2
+            | SampleCounts::SAMPLE_4
+            | SampleCounts::SAMPLE_8;
+        assert_eq!(
+            preferred_sample_count(Antialiasing::Off, supported),
+            SampleCount::Sample1
+        );
+        assert_eq!(
+            preferred_sample_count(Antialiasing::Standard, supported),
+            SampleCount::Sample2
+        );
+        assert_eq!(
+            preferred_sample_count(Antialiasing::High, supported),
+            SampleCount::Sample4
+        );
+        assert_eq!(
+            preferred_sample_count(Antialiasing::High, SampleCounts::SAMPLE_1),
+            SampleCount::Sample1
+        );
+    }
+
+    #[test]
+    fn equirectangular_environment_shader_parses_and_validates() {
+        let mut frontend = glsl::Frontend::default();
+        let module = frontend
+            .parse(
+                &glsl::Options::from(naga::ShaderStage::Fragment),
+                EQUIRECTANGULAR_ENVIRONMENT_FRAGMENT_SHADER,
+            )
+            .expect("environment fragment shader should parse");
+        Validator::new(ValidationFlags::all(), Capabilities::all())
+            .validate(&module)
+            .expect("environment fragment shader should validate");
+    }
 }

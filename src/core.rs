@@ -10,7 +10,6 @@ use crate::renderer::{
 };
 use mlua::{AnyUserData, Function, Lua, Table, UserData, Value};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 fn color4(lua: &Lua, r: u8, g: u8, b: u8, a: u8) -> mlua::Result<Table> {
     let color = lua.create_table()?;
@@ -504,40 +503,8 @@ struct UiInputSnapshot {
     window: WindowState,
 }
 
-#[derive(Clone, Debug)]
-struct UiPopupRegion {
-    owner: String,
-    bounds: Rect,
-    pivot: Vec2,
-    rotation: f32,
-}
-
-#[derive(Default)]
-struct UiFrameState {
-    active_popups: Vec<UiPopupRegion>,
-    next_popups: Vec<UiPopupRegion>,
-}
-
-fn ui_frame_state() -> &'static Mutex<UiFrameState> {
-    static STATE: OnceLock<Mutex<UiFrameState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(UiFrameState::default()))
-}
-
-fn upsert_popup(popups: &mut Vec<UiPopupRegion>, popup: UiPopupRegion) {
-    if let Some(existing) = popups
-        .iter_mut()
-        .find(|existing| existing.owner == popup.owner)
-    {
-        *existing = popup;
-    } else {
-        popups.push(popup);
-    }
-}
-
-pub(crate) fn begin_ui_frame() {
-    if let Ok(mut state) = ui_frame_state().lock() {
-        state.active_popups = std::mem::take(&mut state.next_popups);
-    }
+pub(crate) fn begin_ui_frame(render_state: &SharedRenderState) {
+    crate::widget_interaction::begin_frame(interaction_surface(render_state));
 }
 
 fn current_input_snapshot(
@@ -572,6 +539,317 @@ fn camera_offset_for_entity(entity: &Table, platform: &SharedPlatformState) -> m
         x: window.width * 0.5 - camera_x,
         y: window.height * 0.5 - camera_y,
     })
+}
+
+fn camera_3d_for_entity(
+    entity: &Table,
+    component: &Table,
+) -> mlua::Result<crate::render3d::Camera3D> {
+    let transform = crate::window::get_global_transform_3d(entity)?;
+    let projection = component
+        .get::<String>("projection")
+        .unwrap_or_else(|_| "perspective".to_string());
+    Ok(crate::render3d::Camera3D {
+        position: transform.position,
+        euler: transform.euler,
+        projection: if projection.eq_ignore_ascii_case("orthographic") {
+            crate::render3d::Projection3D::Orthographic
+        } else {
+            crate::render3d::Projection3D::Perspective
+        },
+        fov: component
+            .get::<f32>("fov")
+            .unwrap_or(60.0)
+            .clamp(1.0, 179.0),
+        orthographic_size: component
+            .get::<f32>("orthographic_size")
+            .unwrap_or(10.0)
+            .max(0.0001),
+        near_clip: component.get::<f32>("near_clip").unwrap_or(0.1).max(0.0001),
+        far_clip: component
+            .get::<f32>("far_clip")
+            .unwrap_or(1000.0)
+            .max(0.0002),
+    })
+}
+
+fn forward_from_euler(euler: crate::render3d::Vec3) -> crate::render3d::Vec3 {
+    crate::render3d::Mat4::rotation_euler_degrees(euler)
+        .transform_direction(crate::render3d::Vec3::new(0.0, 0.0, -1.0))
+}
+
+fn environment_3d_from_component(
+    lua: &Lua,
+    component: &Table,
+) -> mlua::Result<crate::environment3d::Environment3D> {
+    use crate::environment3d::{Environment3D, EnvironmentMode3D};
+
+    let mut environment = Environment3D::default();
+    environment.enabled = component.get::<bool>("enabled").unwrap_or(true);
+    let mode = component
+        .get::<String>("mode")
+        .unwrap_or_else(|_| "gradient".to_string())
+        .to_ascii_lowercase();
+    environment.mode = match mode.as_str() {
+        "solid" | "color" | "colour" => EnvironmentMode3D::Solid,
+        "equirectangular" | "panorama" | "skybox" | "texture" => EnvironmentMode3D::Equirectangular,
+        _ => EnvironmentMode3D::Gradient,
+    };
+    if let Ok(color) = component.get::<Table>("color") {
+        environment.solid = color4_to_color(color)?;
+    }
+    if let Ok(color) = component.get::<Table>("top_color") {
+        environment.top = color4_to_color(color)?;
+    }
+    if let Ok(color) = component.get::<Table>("bottom_color") {
+        environment.bottom = color4_to_color(color)?;
+    }
+    environment.intensity = component.get::<f32>("intensity").unwrap_or(1.0).max(0.0);
+    environment.rotation_degrees = component.get::<f32>("rotation").unwrap_or(0.0);
+    environment.equirectangular = get_image_field(component, "texture")?;
+    if environment.equirectangular.is_none() {
+        let path = component.get::<String>("texture_path").unwrap_or_default();
+        if !path.trim().is_empty() {
+            let assets: Table = lua.globals().get("assets")?;
+            let image: AnyUserData = assets.get::<Function>("loadImage")?.call(path)?;
+            environment.equirectangular = Some(image.borrow::<ImageHandle>()?.clone());
+            component.set("texture", image)?;
+        }
+    }
+    Ok(environment)
+}
+
+fn particle_config_3d_from_component(
+    component: &Table,
+) -> mlua::Result<crate::particles3d::ParticleConfig3D> {
+    use crate::particles3d::{EmissionShape3D, ParticleConfig3D};
+    use crate::render3d::Vec3;
+
+    let defaults = ParticleConfig3D::default();
+    let shape = component
+        .get::<String>("shape")
+        .unwrap_or_else(|_| "point".to_string())
+        .to_ascii_lowercase();
+    let lifetime = component.get::<f32>("lifetime").unwrap_or(1.5);
+    let speed = component.get::<f32>("speed").unwrap_or(2.0);
+    let color = |name: &str, fallback: Color| -> mlua::Result<Color> {
+        match component.get::<Table>(name) {
+            Ok(value) => color4_to_color(value),
+            Err(_) => Ok(fallback),
+        }
+    };
+    Ok(ParticleConfig3D {
+        max_particles: component
+            .get::<i32>("max_particles")
+            .unwrap_or(defaults.max_particles as i32)
+            .clamp(1, crate::particles3d::MAX_PARTICLES_PER_EMITTER as i32)
+            as usize,
+        playing: component.get::<bool>("playing").unwrap_or(true),
+        looping: component.get::<bool>("looping").unwrap_or(true),
+        duration: component.get::<f32>("duration").unwrap_or(5.0).max(0.0),
+        emission_rate: component
+            .get::<f32>("emission_rate")
+            .unwrap_or(defaults.emission_rate)
+            .max(0.0),
+        shape: match shape.as_str() {
+            "box" | "cube" => EmissionShape3D::Box,
+            "sphere" | "ball" => EmissionShape3D::Sphere,
+            "cone" => EmissionShape3D::Cone,
+            _ => EmissionShape3D::Point,
+        },
+        box_extents: Vec3::new(
+            component.get::<f32>("box_size_x").unwrap_or(2.0).abs() * 0.5,
+            component.get::<f32>("box_size_y").unwrap_or(2.0).abs() * 0.5,
+            component.get::<f32>("box_size_z").unwrap_or(2.0).abs() * 0.5,
+        ),
+        sphere_radius: component
+            .get::<f32>("sphere_radius")
+            .or_else(|_| component.get::<f32>("radius"))
+            .unwrap_or(1.0)
+            .max(0.0),
+        cone_angle_degrees: component
+            .get::<f32>("cone_angle")
+            .unwrap_or(defaults.cone_angle_degrees)
+            .abs(),
+        cone_length: component
+            .get::<f32>("cone_length")
+            .unwrap_or(defaults.cone_length)
+            .max(0.0),
+        direction: Vec3::new(
+            component.get::<f32>("direction_x").unwrap_or(0.0),
+            component.get::<f32>("direction_y").unwrap_or(1.0),
+            component.get::<f32>("direction_z").unwrap_or(0.0),
+        ),
+        spread_degrees: component
+            .get::<f32>("spread")
+            .unwrap_or(defaults.spread_degrees)
+            .abs(),
+        lifetime_min: component
+            .get::<f32>("lifetime_min")
+            .unwrap_or(lifetime)
+            .max(0.001),
+        lifetime_max: component
+            .get::<f32>("lifetime_max")
+            .unwrap_or(lifetime)
+            .max(0.001),
+        speed_min: component.get::<f32>("speed_min").unwrap_or(speed).max(0.0),
+        speed_max: component.get::<f32>("speed_max").unwrap_or(speed).max(0.0),
+        gravity: Vec3::new(
+            component.get::<f32>("gravity_x").unwrap_or(0.0),
+            component.get::<f32>("gravity_y").unwrap_or(-9.81),
+            component.get::<f32>("gravity_z").unwrap_or(0.0),
+        ),
+        drag: component.get::<f32>("drag").unwrap_or(0.0).max(0.0),
+        start_size: component
+            .get::<f32>("start_size")
+            .unwrap_or(defaults.start_size)
+            .max(0.0),
+        end_size: component
+            .get::<f32>("end_size")
+            .unwrap_or(defaults.end_size)
+            .max(0.0),
+        start_color: color("start_color", defaults.start_color)?,
+        end_color: color("end_color", defaults.end_color)?,
+        start_rotation_degrees: component.get::<f32>("start_rotation").unwrap_or(0.0),
+        angular_velocity_degrees: component.get::<f32>("angular_velocity").unwrap_or(0.0),
+    })
+}
+
+fn particle_emitter_3d_from_component(
+    component: &Table,
+) -> mlua::Result<crate::particles3d::ParticleEmitterHandle> {
+    let state = component.get::<AnyUserData>("__particle_state")?;
+    let emitter = state
+        .borrow::<crate::particles3d::ParticleEmitterHandle>()?
+        .clone();
+    Ok(emitter)
+}
+
+fn post_process_number(options: &Option<Table>, name: &str, default: f32) -> f32 {
+    options
+        .as_ref()
+        .and_then(|table| table.get::<f32>(name).ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+}
+
+fn post_process_bool(options: &Option<Table>, name: &str, default: bool) -> bool {
+    options
+        .as_ref()
+        .and_then(|table| table.get::<bool>(name).ok())
+        .unwrap_or(default)
+}
+
+fn post_process_effect(
+    kind: &str,
+    options: Option<Table>,
+) -> mlua::Result<crate::post_process::Effect> {
+    use crate::post_process::*;
+
+    let normalized = kind.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    match normalized.as_str() {
+        "bloom" => {
+            let defaults = BloomConfig::default();
+            Ok(Effect::Bloom(BloomConfig {
+                threshold: post_process_number(&options, "threshold", defaults.threshold),
+                intensity: post_process_number(&options, "intensity", defaults.intensity),
+                radius: post_process_number(&options, "radius", defaults.radius as f32)
+                    .round()
+                    .clamp(0.0, 64.0) as u32,
+            }))
+        }
+        "pixelate" | "pixelated" | "pixelation" => {
+            let defaults = PixelateConfig::default();
+            Ok(Effect::Pixelate(PixelateConfig {
+                block_size: post_process_number(&options, "block_size", defaults.block_size as f32)
+                    .round()
+                    .clamp(1.0, 4096.0) as u32,
+            }))
+        }
+        "chromatic_aberration" | "chromatic_abberation" | "chromatic" => {
+            let defaults = ChromaticAberrationConfig::default();
+            Ok(Effect::ChromaticAberration(ChromaticAberrationConfig {
+                offset_pixels: post_process_number(
+                    &options,
+                    "offset_pixels",
+                    defaults.offset_pixels,
+                ),
+                angle_degrees: post_process_number(
+                    &options,
+                    "angle_degrees",
+                    defaults.angle_degrees,
+                ),
+            }))
+        }
+        "motion_blur" | "motionblur" => {
+            let defaults = MotionBlurConfig::default();
+            Ok(Effect::MotionBlur(MotionBlurConfig {
+                strength: post_process_number(&options, "strength", defaults.strength),
+            }))
+        }
+        "quantization" | "quantize" | "posterize" => {
+            let defaults = QuantizationConfig::default();
+            Ok(Effect::Quantization(QuantizationConfig {
+                levels: post_process_number(&options, "levels", defaults.levels as f32)
+                    .round()
+                    .clamp(2.0, 255.0) as u8,
+                dither_strength: post_process_number(
+                    &options,
+                    "dither_strength",
+                    defaults.dither_strength,
+                ),
+            }))
+        }
+        "vignette" => {
+            let defaults = VignetteConfig::default();
+            Ok(Effect::Vignette(VignetteConfig {
+                strength: post_process_number(&options, "strength", defaults.strength),
+                radius: post_process_number(&options, "radius", defaults.radius),
+                softness: post_process_number(&options, "softness", defaults.softness),
+            }))
+        }
+        "grayscale" | "greyscale" => {
+            let defaults = GrayscaleConfig::default();
+            Ok(Effect::Grayscale(GrayscaleConfig {
+                amount: post_process_number(&options, "amount", defaults.amount),
+            }))
+        }
+        "invert" | "negative" => {
+            let defaults = InvertConfig::default();
+            Ok(Effect::Invert(InvertConfig {
+                amount: post_process_number(&options, "amount", defaults.amount),
+            }))
+        }
+        "color_adjust" | "brightness_contrast_saturation" | "bcs" => {
+            let defaults = BrightnessContrastSaturationConfig::default();
+            Ok(Effect::BrightnessContrastSaturation(
+                BrightnessContrastSaturationConfig {
+                    brightness: post_process_number(&options, "brightness", defaults.brightness),
+                    contrast: post_process_number(&options, "contrast", defaults.contrast),
+                    saturation: post_process_number(&options, "saturation", defaults.saturation),
+                },
+            ))
+        }
+        "exposure" | "tonemap" | "exposure_tonemap" => {
+            let defaults = ExposureTonemapConfig::default();
+            let operator = options
+                .as_ref()
+                .and_then(|table| table.get::<String>("operator").ok())
+                .unwrap_or_else(|| "reinhard".to_string());
+            Ok(Effect::ExposureTonemap(ExposureTonemapConfig {
+                exposure: post_process_number(&options, "exposure", defaults.exposure),
+                operator: match operator.to_ascii_lowercase().as_str() {
+                    "none" | "off" => TonemapOperator::None,
+                    "aces" | "aces_filmic" => TonemapOperator::Aces,
+                    _ => TonemapOperator::Reinhard,
+                },
+                gamma: post_process_number(&options, "gamma", defaults.gamma).max(0.01),
+            }))
+        }
+        _ => Err(mlua::Error::external(format!(
+            "unknown post-process effect '{kind}'"
+        ))),
+    }
 }
 
 fn get_entity_draw_context(entity: &Table) -> mlua::Result<EntityDrawContext> {
@@ -641,36 +919,141 @@ fn point_in_bounds(point: Vec2, bounds: Rect, pivot: Vec2, rotation: f32) -> boo
         && sample_y <= bounds.y + bounds.h
 }
 
-fn component_owner_key(entity: &Table, component: &Table) -> String {
-    let entity_id = entity.get::<i64>("id").unwrap_or(0);
+fn component_owner_key(component: &Table) -> String {
     let name = component
         .get::<String>("__neolove_component")
         .unwrap_or_else(|_| "component".to_string());
-    format!("{entity_id}:{name}")
+    // Component type alone is not unique: an entity can legally contain two
+    // widgets of the same type. The Lua table identity remains stable for the
+    // life of the component and also lets methods such as TextInput:focus()
+    // participate without needing its entity passed separately.
+    format!("{name}:{:p}", component.to_pointer())
 }
 
-fn register_popup(owner: String, bounds: Rect, pivot: Vec2, rotation: f32) {
-    let popup = UiPopupRegion {
+fn interaction_surface(render_state: &SharedRenderState) -> usize {
+    crate::renderer::interaction_surface_id(render_state)
+}
+
+fn widget_body_region_id(owner: &str) -> String {
+    format!("{owner}/body")
+}
+
+fn widget_popup_region_id(owner: &str) -> String {
+    format!("{owner}/popup")
+}
+
+fn interaction_region(
+    id: String,
+    owner: String,
+    bounds: Rect,
+    pivot: Vec2,
+    rotation: f32,
+    layer: crate::widget_interaction::Layer,
+    focusable: bool,
+    enabled: bool,
+) -> crate::widget_interaction::Region {
+    crate::widget_interaction::Region {
+        id,
         owner,
-        bounds,
-        pivot,
-        rotation,
-    };
-    if let Ok(mut state) = ui_frame_state().lock() {
-        upsert_popup(&mut state.active_popups, popup.clone());
-        upsert_popup(&mut state.next_popups, popup);
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.w,
+        height: bounds.h,
+        pivot_x: pivot.x,
+        pivot_y: pivot.y,
+        rotation_degrees: rotation,
+        layer,
+        focusable,
+        enabled,
     }
 }
 
-fn point_blocked_by_popup(point: Vec2, owner: &str) -> bool {
-    if let Ok(state) = ui_frame_state().lock() {
-        state.active_popups.iter().any(|popup| {
-            popup.owner != owner
-                && point_in_bounds(point, popup.bounds, popup.pivot, popup.rotation)
-        })
-    } else {
-        false
-    }
+fn register_widget_region(
+    surface: usize,
+    owner: &str,
+    draw: EntityDrawContext,
+    enabled: bool,
+) -> String {
+    let id = widget_body_region_id(owner);
+    crate::widget_interaction::register(
+        surface,
+        interaction_region(
+            id.clone(),
+            owner.to_string(),
+            draw.bounds,
+            draw.pivot,
+            draw.rotation,
+            crate::widget_interaction::Layer::Content,
+            true,
+            enabled,
+        ),
+    );
+    id
+}
+
+fn register_popup(surface: usize, owner: &str, bounds: Rect, pivot: Vec2, rotation: f32) -> String {
+    let id = widget_popup_region_id(owner);
+    crate::widget_interaction::register(
+        surface,
+        interaction_region(
+            id.clone(),
+            owner.to_string(),
+            bounds,
+            pivot,
+            rotation,
+            crate::widget_interaction::Layer::Popup,
+            false,
+            true,
+        ),
+    );
+    id
+}
+
+fn unregister_widget(render_state: &SharedRenderState, component: &Table) {
+    let surface = interaction_surface(render_state);
+    let owner = component_owner_key(component);
+    crate::widget_interaction::unregister_owner(surface, &owner);
+}
+
+fn tab_navigation(snapshot: &UiInputSnapshot) -> (bool, bool) {
+    let tab = snapshot.input.keys_pressed.contains("tab")
+        || snapshot.input.last_key_pressed.as_deref() == Some("tab");
+    let reverse = snapshot.input.keys_down.contains("shift")
+        || snapshot.input.keys_down.contains("leftshift")
+        || snapshot.input.keys_down.contains("rightshift");
+    (tab, reverse)
+}
+
+fn install_widget_focus_methods(
+    lua: &Lua,
+    prototype: &Table,
+    render_state: &SharedRenderState,
+) -> mlua::Result<()> {
+    let focus_state = render_state.clone();
+    let focus = lua.create_function(move |_lua, component: Table| {
+        let enabled = component.get::<bool>("enabled").unwrap_or(true);
+        let surface = interaction_surface(&focus_state);
+        let owner = component_owner_key(&component);
+        if enabled {
+            crate::widget_interaction::request_focus(surface, &owner);
+        } else {
+            crate::widget_interaction::clear_focus(surface, &owner);
+        }
+        component.set("focused", enabled)
+    })?;
+    prototype.set("focus", focus.clone())?;
+    prototype.set("Focus", focus)?;
+
+    let blur_state = render_state.clone();
+    let blur = lua.create_function(move |_lua, component: Table| {
+        let surface = interaction_surface(&blur_state);
+        let owner = component_owner_key(&component);
+        crate::widget_interaction::clear_focus(surface, &owner);
+        component.set("focused", false)
+    })?;
+    prototype.set("blur", blur.clone())?;
+    prototype.set("Blur", blur)?;
+    Ok(())
 }
 
 fn queue_rect_fill(
@@ -2752,6 +3135,120 @@ pub fn add_core_components(
         )?;
     }
 
+    // Persistent scene environment controls. The Environment3D component below
+    // writes through the same state, while scripts that do not use an ECS scene
+    // can configure the sky directly through `environment3d` / `skybox`.
+    {
+        let environment = lua.create_table()?;
+        let solid_state = render_state.clone();
+        environment.set(
+            "setSolid",
+            lua.create_function(move |_lua, color: Table| {
+                let mut value = solid_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .environment_3d();
+                value.enabled = true;
+                value.mode = crate::environment3d::EnvironmentMode3D::Solid;
+                value.solid = color4_to_color(color)?;
+                solid_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .set_environment_3d(None, value);
+                Ok(())
+            })?,
+        )?;
+        let gradient_state = render_state.clone();
+        environment.set(
+            "setGradient",
+            lua.create_function(move |_lua, (top, bottom): (Table, Table)| {
+                let mut value = gradient_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .environment_3d();
+                value.enabled = true;
+                value.mode = crate::environment3d::EnvironmentMode3D::Gradient;
+                value.top = color4_to_color(top)?;
+                value.bottom = color4_to_color(bottom)?;
+                gradient_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .set_environment_3d(None, value);
+                Ok(())
+            })?,
+        )?;
+        let panorama_state = render_state.clone();
+        environment.set(
+            "setEquirectangular",
+            lua.create_function(move |_lua, (image, rotation): (AnyUserData, Option<f32>)| {
+                let image = image.borrow::<ImageHandle>()?.clone();
+                let mut value = panorama_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .environment_3d();
+                value.enabled = true;
+                value.mode = crate::environment3d::EnvironmentMode3D::Equirectangular;
+                value.equirectangular = Some(image);
+                value.rotation_degrees = rotation.unwrap_or(0.0);
+                panorama_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .set_environment_3d(None, value);
+                Ok(())
+            })?,
+        )?;
+        let enabled_state = render_state.clone();
+        environment.set(
+            "setEnabled",
+            lua.create_function(move |_lua, enabled: bool| {
+                let mut value = enabled_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .environment_3d();
+                value.enabled = enabled;
+                enabled_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .set_environment_3d(None, value);
+                Ok(())
+            })?,
+        )?;
+        let intensity_state = render_state.clone();
+        environment.set(
+            "setIntensity",
+            lua.create_function(move |_lua, intensity: f32| {
+                let mut value = intensity_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .environment_3d();
+                value.intensity = if intensity.is_finite() {
+                    intensity.max(0.0)
+                } else {
+                    1.0
+                };
+                intensity_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .set_environment_3d(None, value);
+                Ok(())
+            })?,
+        )?;
+        let clear_state = render_state.clone();
+        environment.set(
+            "clear",
+            lua.create_function(move |_lua, ()| {
+                clear_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .clear_environment_3d(None);
+                Ok(())
+            })?,
+        )?;
+        lua.globals().set("environment3d", environment.clone())?;
+        lua.globals().set("environment3D", environment.clone())?;
+        lua.globals().set("skybox", environment)?;
+    }
+
     // EntityScaler
     // percentage-plus-pixel transform helper for responsive parent-relative layout
     {
@@ -2901,6 +3398,1596 @@ pub fn add_core_components(
         )?;
 
         core_components.set("Camera", camera)?;
+    }
+
+    // Camera3D
+    // Resolves an Euler-authored view/projection in the shared camera pre-pass.
+    {
+        let camera = lua.create_table()?;
+        camera.set("__neolove_component", "Camera3D")?;
+        camera.set("NEOLOVE_RENDERING", true)?;
+        camera.set("NEOLOVE_CAMERA", true)?;
+        camera.set(
+            "awake",
+            lua.create_function(|_lua, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "Camera3D")?;
+                component.set("enabled", true)?;
+                component.set("projection", "perspective")?;
+                component.set("fov", 60.0)?;
+                component.set("orthographic_size", 10.0)?;
+                component.set("near_clip", 0.1)?;
+                component.set("far_clip", 1000.0)?;
+                Ok(())
+            })?,
+        )?;
+
+        let active_render_state = render_state.clone();
+        let set_active = lua.create_function(move |_lua, component: Table| {
+            if !component.get::<bool>("enabled").unwrap_or(true) {
+                return Ok(false);
+            }
+            let Some(entity) = component.get::<Option<Table>>("entity")? else {
+                return Ok(false);
+            };
+            let camera = camera_3d_for_entity(&entity, &component)?;
+            active_render_state
+                .lock()
+                .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                .activate_camera_3d(component.to_pointer() as usize, camera);
+            Ok(true)
+        })?;
+        camera.set("SetActive", set_active.clone())?;
+        camera.set("setActive", set_active)?;
+
+        let query_render_state = render_state.clone();
+        let is_active = lua.create_function(move |_lua, component: Table| {
+            Ok(query_render_state
+                .lock()
+                .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                .is_camera_active(component.to_pointer() as usize))
+        })?;
+        camera.set("IsActive", is_active.clone())?;
+        camera.set("isActive", is_active)?;
+
+        let update_render_state = render_state.clone();
+        camera.set(
+            "update",
+            lua.create_function(move |_lua, (entity, component, _dt): (Table, Table, f32)| {
+                if !component.get::<bool>("enabled").unwrap_or(true) {
+                    return Ok(());
+                }
+                let camera = camera_3d_for_entity(&entity, &component)?;
+                update_render_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .submit_camera_3d(component.to_pointer() as usize, camera);
+                Ok(())
+            })?,
+        )?;
+
+        let destroy_render_state = render_state.clone();
+        camera.set(
+            "destroy",
+            lua.create_function(move |_lua, (_entity, component): (Table, Table)| {
+                destroy_render_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .clear_camera(component.to_pointer() as usize);
+                Ok(())
+            })?,
+        )?;
+        core_components.set("Camera3D", camera)?;
+    }
+
+    // Environment3D / Skybox3D
+    // Fills the framebuffer before depth-tested geometry. Texture mode accepts
+    // an equirectangular ImageHandle and follows camera rotation without camera
+    // translation.
+    {
+        let environment = lua.create_table()?;
+        environment.set("__neolove_component", "Environment3D")?;
+        environment.set("NEOLOVE_RENDERING", true)?;
+        environment.set(
+            "awake",
+            lua.create_function(|lua, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "Environment3D")?;
+                component.set("enabled", true)?;
+                component.set("mode", "gradient")?;
+                component.set("color", color4(lua, 20, 24, 32, 255)?)?;
+                component.set("top_color", color4(lua, 30, 47, 78, 255)?)?;
+                component.set("bottom_color", color4(lua, 8, 10, 16, 255)?)?;
+                component.set("texture", Value::Nil)?;
+                component.set("texture_path", "")?;
+                component.set("rotation", 0.0)?;
+                component.set("intensity", 1.0)?;
+                Ok(())
+            })?,
+        )?;
+        let environment_state = render_state.clone();
+        environment.set(
+            "update",
+            lua.create_function(move |lua, (_entity, component, _dt): (Table, Table, f32)| {
+                let value = environment_3d_from_component(lua, &component)?;
+                environment_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .set_environment_3d(Some(component.to_pointer() as usize), value);
+                Ok(())
+            })?,
+        )?;
+        let destroy_state = render_state.clone();
+        environment.set(
+            "destroy",
+            lua.create_function(move |_lua, (_entity, component): (Table, Table)| {
+                destroy_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .clear_environment_3d(Some(component.to_pointer() as usize));
+                Ok(())
+            })?,
+        )?;
+        core_components.set("Environment3D", environment.clone())?;
+        core_components.set("Skybox3D", environment)?;
+    }
+
+    // MeshRenderer3D
+    // Mesh handles are revisioned: scripts can edit vertices/material metadata
+    // live and every backend observes the new immutable snapshot next frame.
+    {
+        let mesh_renderer = lua.create_table()?;
+        mesh_renderer.set("__neolove_component", "MeshRenderer3D")?;
+        mesh_renderer.set("NEOLOVE_RENDERING", true)?;
+        mesh_renderer.set(
+            "awake",
+            lua.create_function(|lua, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "MeshRenderer3D")?;
+                component.set("mesh", Value::Nil)?;
+                component.set("mesh_path", "")?;
+                // Keep script-created components backward compatible: assigning
+                // `mesh` must work without also opting out of an implicit cube.
+                // The visual editor schema selects "cube" for newly authored
+                // MeshRenderer3D components.
+                component.set("primitive", "none")?;
+                component.set("primitive_size_x", 1.0)?;
+                component.set("primitive_size_y", 1.0)?;
+                component.set("primitive_size_z", 1.0)?;
+                component.set("primitive_radius", 0.5)?;
+                component.set("primitive_height", 1.0)?;
+                component.set("primitive_segments", 24)?;
+                component.set("primitive_rings", 12)?;
+                component.set("texture", Value::Nil)?;
+                component.set("normal_texture", Value::Nil)?;
+                component.set("color", color4(lua, 255, 255, 255, 255)?)?;
+                component.set("metallic", 0.0)?;
+                component.set("roughness", 1.0)?;
+                component.set("visible", true)?;
+                component.set("casts_shadows", true)?;
+                component.set("receives_shadows", true)?;
+                component.set("double_sided", false)?;
+                component.set("shader", Value::Nil)?;
+                component.set("animation", "")?;
+                component.set("animation_autoplay", true)?;
+                component.set("animation_looping", true)?;
+                component.set("animation_playing", true)?;
+                component.set("animation_speed", 1.0)?;
+                component.raw_set("__mesh_animation_initialized", false)?;
+                component.raw_set("__mesh_animation_play_requested", false)?;
+                component.raw_set("__mesh_animation_time", 0.0)?;
+                Ok(())
+            })?,
+        )?;
+
+        let play_animation =
+            lua.create_function(|_lua, (component, clip): (Table, Option<String>)| {
+                if let Some(clip) = clip {
+                    component.set("animation", clip)?;
+                }
+                component.set("animation_playing", true)?;
+                component.raw_set("__active_mesh_animation", Value::Nil)?;
+                component.raw_set("__mesh_animation_paused", false)?;
+                component.raw_set("__mesh_animation_play_requested", true)?;
+                component.raw_set("__mesh_animation_time", 0.0)?;
+                Ok(())
+            })?;
+        mesh_renderer.set("playAnimation", play_animation.clone())?;
+        mesh_renderer.set("PlayAnimation", play_animation)?;
+        let pause_animation = lua.create_function(|_lua, component: Table| {
+            component.set("animation_playing", false)?;
+            component.raw_set("__mesh_animation_play_requested", false)?;
+            component.raw_set("__mesh_animation_initialized", true)?;
+            let animation = component.get::<String>("animation").unwrap_or_default();
+            if !animation.trim().is_empty() {
+                component.raw_set("__mesh_animation_clip", animation.trim())?;
+            }
+            if component
+                .raw_get::<Option<String>>("__active_mesh_animation")
+                .unwrap_or(None)
+                .is_some()
+                && let Value::UserData(userdata) = component.get::<Value>("mesh")?
+            {
+                userdata
+                    .borrow::<crate::mesh::MeshHandle>()?
+                    .set_animation_paused(true)
+                    .map_err(mlua::Error::external)?;
+                component.raw_set("__mesh_animation_paused", true)?;
+            }
+            Ok(())
+        })?;
+        mesh_renderer.set("pauseAnimation", pause_animation.clone())?;
+        mesh_renderer.set("PauseAnimation", pause_animation)?;
+        let stop_animation = lua.create_function(|_lua, component: Table| {
+            component.set("animation_playing", false)?;
+            component.raw_set("__active_mesh_animation", Value::Nil)?;
+            component.raw_set("__mesh_animation_paused", false)?;
+            component.raw_set("__mesh_animation_play_requested", false)?;
+            component.raw_set("__mesh_animation_initialized", true)?;
+            component.raw_set("__mesh_animation_time", 0.0)?;
+            let animation = component.get::<String>("animation").unwrap_or_default();
+            if !animation.trim().is_empty() {
+                component.raw_set("__mesh_animation_clip", animation.trim())?;
+            }
+            if let Value::UserData(userdata) = component.get::<Value>("mesh")? {
+                userdata
+                    .borrow::<crate::mesh::MeshHandle>()?
+                    .stop_animation()
+                    .map_err(mlua::Error::external)?;
+            }
+            Ok(())
+        })?;
+        mesh_renderer.set("stopAnimation", stop_animation.clone())?;
+        mesh_renderer.set("StopAnimation", stop_animation)?;
+
+        let mesh_render_state = render_state.clone();
+        let mesh_platform = platform.clone();
+        mesh_renderer.set(
+            "update",
+            lua.create_function(move |lua, (entity, component, dt): (Table, Table, f32)| {
+                if !component.get::<bool>("visible").unwrap_or(true) {
+                    return Ok(());
+                }
+
+                let path = component
+                    .get::<Option<String>>("mesh_path")?
+                    .unwrap_or_default();
+                let primitive = component
+                    .get::<Option<String>>("primitive")?
+                    .unwrap_or_else(|| "cube".to_string());
+                let primitive_enabled = path.trim().is_empty()
+                    && !matches!(
+                        primitive.trim().to_ascii_lowercase().as_str(),
+                        "" | "none" | "off"
+                    );
+                // Preserve validation errors from active primitive values instead
+                // of silently replacing an invalid value with a default. Irrelevant
+                // primitive fields do not interfere with path/manual mesh modes.
+                let primitive_options = if primitive_enabled {
+                    Some(crate::mesh::PrimitiveOptions {
+                        size: [
+                            component
+                                .get::<Option<f32>>("primitive_size_x")?
+                                .unwrap_or(1.0),
+                            component
+                                .get::<Option<f32>>("primitive_size_y")?
+                                .unwrap_or(1.0),
+                            component
+                                .get::<Option<f32>>("primitive_size_z")?
+                                .unwrap_or(1.0),
+                        ],
+                        radius: component
+                            .get::<Option<f32>>("primitive_radius")?
+                            .unwrap_or(0.5),
+                        height: component
+                            .get::<Option<f32>>("primitive_height")?
+                            .unwrap_or(1.0),
+                        segments: component
+                            .get::<Option<u32>>("primitive_segments")?
+                            .unwrap_or(24),
+                        rings: component
+                            .get::<Option<u32>>("primitive_rings")?
+                            .unwrap_or(12),
+                    })
+                } else {
+                    None
+                };
+                let managed_source = if !path.trim().is_empty() {
+                    Some(format!("path:{}", path.trim()))
+                } else {
+                    primitive_options.as_ref().map(|options| {
+                        format!(
+                        "primitive:{}:{:08x}:{:08x}:{:08x}:{:08x}:{:08x}:{}:{}",
+                        primitive.trim().to_ascii_lowercase(),
+                        options.size[0].to_bits(),
+                        options.size[1].to_bits(),
+                        options.size[2].to_bits(),
+                        options.radius.to_bits(),
+                        options.height.to_bits(),
+                        options.segments,
+                        options.rings,
+                    )
+                    })
+                };
+                let current_source = component
+                    .raw_get::<Option<String>>("__mesh_source")
+                    .unwrap_or(None);
+                let mesh_before = component.get::<Value>("mesh")?;
+                let mesh_identity_before = match &mesh_before {
+                    Value::UserData(userdata) => {
+                        Some(userdata.borrow::<crate::mesh::MeshHandle>()?.identity() as i64)
+                    }
+                    _ => None,
+                };
+                let recorded_identity = component
+                    .raw_get::<Option<i64>>("__mesh_identity")
+                    .unwrap_or(None);
+
+                // A configured path/primitive owns the mesh slot. Scripts that
+                // assign a handle directly opt out with primitive = "none".
+                // When both are changed in one frame, preserve the newly assigned
+                // manual handle rather than clearing it with the old source.
+                if managed_source.is_none() && current_source.is_some() {
+                    let replaced_with_manual = mesh_identity_before.is_some()
+                        && recorded_identity.is_some()
+                        && mesh_identity_before != recorded_identity;
+                    component.raw_set("__mesh_source", Value::Nil)?;
+                    if !replaced_with_manual {
+                        component.set("mesh", Value::Nil)?;
+                        component.raw_set("__mesh_identity", Value::Nil)?;
+                        component.raw_set("__mesh_animation_detached", false)?;
+                        component.raw_set("__active_mesh_animation", Value::Nil)?;
+                        component.raw_set("__mesh_animation_paused", false)?;
+                        return Ok(());
+                    }
+                }
+
+                let source_changed = current_source.as_ref() != managed_source.as_ref();
+                let managed_identity_changed = current_source.is_some()
+                    && !source_changed
+                    && recorded_identity.is_some()
+                    && mesh_identity_before != recorded_identity;
+                let needs_managed_mesh = managed_source.is_some()
+                    && (mesh_identity_before.is_none()
+                        || source_changed
+                        || managed_identity_changed);
+                if needs_managed_mesh {
+                    let source = managed_source.as_ref().ok_or_else(|| {
+                        mlua::Error::external("managed mesh source disappeared during update")
+                    })?;
+                    let userdata: AnyUserData = if source.starts_with("path:") {
+                        let assets: Table = lua.globals().get("assets")?;
+                        assets.get::<Function>("loadMesh")?.call(path.clone())?
+                    } else {
+                        let options = primitive_options.ok_or_else(|| {
+                            mlua::Error::external("primitive mesh options disappeared during update")
+                        })?;
+                        let handle = crate::mesh::primitive_mesh(&primitive, options)
+                            .map_err(mlua::Error::external)?;
+                        lua.create_userdata(handle)?
+                    };
+                    component.set("mesh", userdata)?;
+                    component.raw_set("__mesh_source", source.clone())?;
+                    component.raw_set("__mesh_animation_detached", false)?;
+                    component.raw_set("__active_mesh_animation", Value::Nil)?;
+                    component.raw_set("__mesh_animation_paused", false)?;
+                    component.raw_set("__mesh_animation_time", 0.0)?;
+                } else if managed_source.is_none() {
+                    component.raw_set("__mesh_source", Value::Nil)?;
+                }
+
+                let mut mesh_userdata = match component.get::<Value>("mesh")? {
+                    Value::UserData(userdata) => userdata,
+                    _ => return Ok(()),
+                };
+                let mut mesh = mesh_userdata.borrow::<crate::mesh::MeshHandle>()?.clone();
+                let identity = mesh.identity() as i64;
+                if component
+                    .raw_get::<Option<i64>>("__mesh_identity")
+                    .unwrap_or(None)
+                    != Some(identity)
+                {
+                    component.raw_set("__mesh_identity", identity)?;
+                    component.raw_set("__mesh_animation_detached", false)?;
+                    component.raw_set("__active_mesh_animation", Value::Nil)?;
+                    component.raw_set("__mesh_animation_paused", false)?;
+                    component.raw_set("__mesh_animation_time", 0.0)?;
+                }
+
+                let animation = component
+                    .get::<Option<String>>("animation")?
+                    .unwrap_or_default();
+                let animation = animation.trim();
+                let configured_clip = component
+                    .raw_get::<Option<String>>("__mesh_animation_clip")
+                    .unwrap_or(None);
+                if animation.is_empty() {
+                    component.set("animation_playing", false)?;
+                    let active = component
+                        .raw_get::<Option<String>>("__active_mesh_animation")
+                        .unwrap_or(None)
+                        .is_some();
+                    if active {
+                        mesh.stop_animation().map_err(mlua::Error::external)?;
+                    }
+                    component.raw_set("__mesh_animation_clip", Value::Nil)?;
+                    component.raw_set("__mesh_animation_initialized", false)?;
+                    component.raw_set("__mesh_animation_play_requested", false)?;
+                    component.raw_set("__active_mesh_animation", Value::Nil)?;
+                    component.raw_set("__mesh_animation_paused", false)?;
+                    component.raw_set("__mesh_animation_time", 0.0)?;
+                } else {
+                    if configured_clip.as_deref() != Some(animation) {
+                        if component
+                            .raw_get::<Option<String>>("__active_mesh_animation")
+                            .unwrap_or(None)
+                            .is_some()
+                        {
+                            mesh.stop_animation().map_err(mlua::Error::external)?;
+                        }
+                        component.raw_set("__mesh_animation_clip", animation)?;
+                        component.raw_set("__mesh_animation_initialized", false)?;
+                        component.raw_set("__active_mesh_animation", Value::Nil)?;
+                        component.raw_set("__mesh_animation_paused", false)?;
+                        component.raw_set("__mesh_animation_time", 0.0)?;
+                    }
+
+                    let play_requested = component
+                        .raw_get::<bool>("__mesh_animation_play_requested")
+                        .unwrap_or(false);
+                    let initialized = component
+                        .raw_get::<bool>("__mesh_animation_initialized")
+                        .unwrap_or(false);
+                    if play_requested {
+                        component.set("animation_playing", true)?;
+                        component.raw_set("__mesh_animation_play_requested", false)?;
+                        component.raw_set("__mesh_animation_initialized", true)?;
+                    } else if !initialized {
+                        let autoplay = component
+                            .get::<Option<bool>>("animation_autoplay")?
+                            .unwrap_or(true);
+                        component.set("animation_playing", autoplay)?;
+                        component.raw_set("__mesh_animation_initialized", true)?;
+                    }
+
+                    let looped = component
+                        .get::<Option<bool>>("animation_looping")?
+                        .unwrap_or(true);
+                    let speed = component
+                        .get::<Option<f32>>("animation_speed")?
+                        .unwrap_or(1.0);
+                    if !speed.is_finite() || speed < 0.0 {
+                        return Err(mlua::Error::external(
+                            "MeshRenderer3D animation_speed must be a finite non-negative number; reverse component playback is not supported",
+                        ));
+                    }
+                    let animation_signature =
+                        format!("{}:{}:{:08x}", animation, looped, speed.to_bits());
+                    let mut active_signature = component
+                        .raw_get::<Option<String>>("__active_mesh_animation")
+                        .unwrap_or(None);
+                    let playing = component
+                        .get::<Option<bool>>("animation_playing")?
+                        .unwrap_or(false);
+                    if playing {
+                        if !component
+                            .raw_get::<bool>("__mesh_animation_detached")
+                            .unwrap_or(false)
+                        {
+                            mesh = mesh.detached_clone().map_err(mlua::Error::external)?;
+                            mesh_userdata = lua.create_userdata(mesh.clone())?;
+                            component.set("mesh", mesh_userdata.clone())?;
+                            component.raw_set("__mesh_identity", mesh.identity() as i64)?;
+                            component.raw_set("__mesh_animation_detached", true)?;
+                            component.raw_set("__active_mesh_animation", Value::Nil)?;
+                            component.raw_set("__mesh_animation_paused", false)?;
+                            active_signature = None;
+                        }
+                        if active_signature.as_deref() != Some(animation_signature.as_str()) {
+                            mesh.play_animation(animation, looped, speed)
+                                .map_err(mlua::Error::external)?;
+                            component.raw_set("__active_mesh_animation", animation_signature)?;
+                            component.raw_set("__mesh_animation_paused", false)?;
+                            component.raw_set("__mesh_animation_time", 0.0)?;
+                        }
+                        if component
+                            .raw_get::<bool>("__mesh_animation_paused")
+                            .unwrap_or(false)
+                        {
+                            mesh.set_animation_paused(false)
+                                .map_err(mlua::Error::external)?;
+                            component.raw_set("__mesh_animation_paused", false)?;
+                        }
+                        let delta = if dt.is_finite() {
+                            dt.max(0.0)
+                        } else {
+                            return Err(mlua::Error::external(
+                                "MeshRenderer3D update delta must be finite",
+                            ));
+                        };
+                        let advanced = mesh
+                            .advance_animation(delta)
+                            .map_err(mlua::Error::external)?;
+                        let previous_time = component
+                            .raw_get::<f32>("__mesh_animation_time")
+                            .unwrap_or(0.0);
+                        let animation_time = previous_time + delta * speed;
+                        component.raw_set("__mesh_animation_time", animation_time)?;
+                        let duration = mesh
+                            .animation_duration(animation)
+                            .map_err(mlua::Error::external)?
+                            .ok_or_else(|| {
+                                mlua::Error::external(format!(
+                                    "animation '{animation}' does not exist"
+                                ))
+                            })?;
+                        let completed =
+                            !looped && (duration <= 0.0 || animation_time >= duration);
+                        if !advanced || completed {
+                            component.set("animation_playing", false)?;
+                            if advanced && completed {
+                                mesh.set_animation_paused(true)
+                                    .map_err(mlua::Error::external)?;
+                            }
+                            component.raw_set("__mesh_animation_paused", true)?;
+                        }
+                    } else if active_signature.is_some()
+                        && !component
+                            .raw_get::<bool>("__mesh_animation_paused")
+                            .unwrap_or(false)
+                    {
+                        mesh.set_animation_paused(true)
+                            .map_err(mlua::Error::external)?;
+                        component.raw_set("__mesh_animation_paused", true)?;
+                    }
+                }
+                let texture = match component.get::<Value>("texture")? {
+                    Value::UserData(userdata) => Some(userdata.borrow::<ImageHandle>()?.clone()),
+                    _ => None,
+                };
+                let color = match component.get::<Table>("color") {
+                    Ok(color) => color4_to_color(color)?,
+                    Err(_) => Color::WHITE,
+                };
+                let shader = shader_from_component(&component)?;
+                let transform = crate::window::get_global_transform_3d(&entity)?;
+                let (camera, window) = {
+                    let state = mesh_render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
+                    (
+                        state.camera_3d(),
+                        lock_platform_state(&mesh_platform).window(),
+                    )
+                };
+                let aspect = window.width.max(1.0) / window.height.max(1.0);
+                mesh_render_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .queue(DrawCommand::Mesh3D(crate::render3d::Mesh3DCommand {
+                        mesh,
+                        model: transform.model,
+                        view_projection: camera.view_projection(aspect),
+                        tint: color,
+                        texture,
+                        shader,
+                        double_sided: component.get::<bool>("double_sided").unwrap_or(false),
+                    }));
+                Ok(())
+            })?,
+        )?;
+        core_components.set("MeshRenderer3D", mesh_renderer)?;
+    }
+
+    // Light3D
+    {
+        let light = lua.create_table()?;
+        light.set("__neolove_component", "Light3D")?;
+        light.set("NEOLOVE_RENDERING", true)?;
+        light.set(
+            "awake",
+            lua.create_function(|lua, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "Light3D")?;
+                component.set("kind", "point")?;
+                component.set("color", color4(lua, 255, 255, 255, 255)?)?;
+                component.set("intensity", 1.0)?;
+                component.set("range", 10.0)?;
+                component.set("spot_angle", 45.0)?;
+                component.set("spot_softness", 0.15)?;
+                component.set("casts_shadows", true)?;
+                component.set("shadow_bias", 0.005)?;
+                component.set("visible", true)?;
+                Ok(())
+            })?,
+        )?;
+        let light_render_state = render_state.clone();
+        light.set(
+            "update",
+            lua.create_function(move |_lua, (entity, component, _dt): (Table, Table, f32)| {
+                if !component.get::<bool>("visible").unwrap_or(true) {
+                    return Ok(());
+                }
+                let transform = crate::window::get_global_transform_3d(&entity)?;
+                let kind = match component
+                    .get::<String>("kind")
+                    .unwrap_or_else(|_| "point".to_string())
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "directional" | "sun" => crate::render3d::LightKind3D::Directional,
+                    "spot" | "spotlight" => crate::render3d::LightKind3D::Spot,
+                    _ => crate::render3d::LightKind3D::Point,
+                };
+                let color = match component.get::<Table>("color") {
+                    Ok(color) => color4_to_color(color)?,
+                    Err(_) => Color::WHITE,
+                };
+                light_render_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .queue_light_3d(crate::render3d::Light3D {
+                        kind,
+                        position: transform.position,
+                        direction: forward_from_euler(transform.euler),
+                        color,
+                        intensity: component.get::<f32>("intensity").unwrap_or(1.0).max(0.0),
+                        range: component.get::<f32>("range").unwrap_or(10.0).max(0.0001),
+                        spot_angle_radians: component
+                            .get::<f32>("spot_angle")
+                            .unwrap_or(45.0)
+                            .clamp(0.1, 179.0)
+                            .to_radians(),
+                        spot_softness: component
+                            .get::<f32>("spot_softness")
+                            .unwrap_or(0.15)
+                            .clamp(0.0, 1.0),
+                        casts_shadows: component.get::<bool>("casts_shadows").unwrap_or(true),
+                    });
+                Ok(())
+            })?,
+        )?;
+        core_components.set("Light3D", light)?;
+    }
+
+    // ParticleSystem3D
+    // Simulation lives in a fixed-capacity native pool. Rendering expands the
+    // entire emitter into a single camera-facing billboard command.
+    {
+        let particles = lua.create_table()?;
+        particles.set("__neolove_component", "ParticleSystem3D")?;
+        particles.set("NEOLOVE_RENDERING", true)?;
+        particles.set(
+            "awake",
+            lua.create_function(|lua, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "ParticleSystem3D")?;
+                component.set("enabled", true)?;
+                component.set("visible", true)?;
+                component.set("playing", true)?;
+                component.set("looping", true)?;
+                component.set("duration", 5.0)?;
+                component.set("emission_rate", 24.0)?;
+                component.set("max_particles", 1024)?;
+                component.set("shape", "point")?;
+                component.set("box_size_x", 2.0)?;
+                component.set("box_size_y", 2.0)?;
+                component.set("box_size_z", 2.0)?;
+                component.set("sphere_radius", 1.0)?;
+                component.set("cone_angle", 30.0)?;
+                component.set("cone_length", 1.0)?;
+                component.set("direction_x", 0.0)?;
+                component.set("direction_y", 1.0)?;
+                component.set("direction_z", 0.0)?;
+                component.set("spread", 12.0)?;
+                component.set("lifetime", 1.5)?;
+                component.set("lifetime_min", 1.0)?;
+                component.set("lifetime_max", 2.0)?;
+                component.set("speed", 2.0)?;
+                component.set("speed_min", 1.0)?;
+                component.set("speed_max", 3.0)?;
+                component.set("gravity_x", 0.0)?;
+                component.set("gravity_y", -9.81)?;
+                component.set("gravity_z", 0.0)?;
+                component.set("drag", 0.0)?;
+                component.set("start_size", 0.25)?;
+                component.set("end_size", 0.0)?;
+                component.set("start_color", color4(lua, 255, 190, 80, 255)?)?;
+                component.set("end_color", color4(lua, 255, 70, 20, 0)?)?;
+                component.set("start_rotation", 0.0)?;
+                component.set("angular_velocity", 0.0)?;
+                component.set("texture", Value::Nil)?;
+                component.set("particle_count", 0)?;
+                component.set("seed", 0x6d2b_79f5_i64)?;
+                component.set(
+                    "__particle_state",
+                    crate::particles3d::ParticleEmitterHandle::new(1024, 0x6d2b_79f5),
+                )?;
+                Ok(())
+            })?,
+        )?;
+
+        let play = lua.create_function(|_lua, component: Table| {
+            component.set("playing", true)?;
+            particle_emitter_3d_from_component(&component)?
+                .play()
+                .map_err(mlua::Error::external)
+        })?;
+        particles.set("play", play.clone())?;
+        particles.set("Play", play)?;
+        let pause = lua.create_function(|_lua, component: Table| {
+            component.set("playing", false)?;
+            particle_emitter_3d_from_component(&component)?
+                .pause()
+                .map_err(mlua::Error::external)
+        })?;
+        particles.set("pause", pause.clone())?;
+        particles.set("Pause", pause)?;
+        let stop = lua.create_function(|_lua, component: Table| {
+            component.set("playing", false)?;
+            component.set("particle_count", 0)?;
+            particle_emitter_3d_from_component(&component)?
+                .stop()
+                .map_err(mlua::Error::external)
+        })?;
+        particles.set("stop", stop.clone())?;
+        particles.set("Stop", stop)?;
+        let emit = lua.create_function(|_lua, (component, count): (Table, Option<i32>)| {
+            particle_emitter_3d_from_component(&component)?
+                .emit(count.unwrap_or(1).max(0) as usize)
+                .map_err(mlua::Error::external)
+        })?;
+        particles.set("emit", emit.clone())?;
+        particles.set("Emit", emit)?;
+
+        let particle_render_state = render_state.clone();
+        let particle_platform = platform.clone();
+        particles.set(
+            "update",
+            lua.create_function(move |lua, (entity, component, dt): (Table, Table, f32)| {
+                if !component.get::<bool>("enabled").unwrap_or(true) {
+                    return Ok(());
+                }
+                let emitter = particle_emitter_3d_from_component(&component)?;
+                let mut config = particle_config_3d_from_component(&component)?;
+                let transform = crate::window::get_global_transform_3d(&entity)?;
+                let scale = crate::render3d::Vec3::new(
+                    transform.scale.x.abs(),
+                    transform.scale.y.abs(),
+                    transform.scale.z.abs(),
+                );
+                config.box_extents.x *= scale.x;
+                config.box_extents.y *= scale.y;
+                config.box_extents.z *= scale.z;
+                let average_scale = ((scale.x + scale.y + scale.z) / 3.0).max(0.0);
+                config.sphere_radius *= average_scale;
+                config.cone_length *= average_scale;
+                config.start_size *= average_scale;
+                config.end_size *= average_scale;
+                emitter
+                    .step(dt, transform.position, transform.euler, &config)
+                    .map_err(mlua::Error::external)?;
+                let count = emitter.particle_count().map_err(mlua::Error::external)?;
+                component.set("particle_count", count)?;
+                component.set(
+                    "playing",
+                    emitter.is_playing().map_err(mlua::Error::external)?,
+                )?;
+                if count == 0 || !component.get::<bool>("visible").unwrap_or(true) {
+                    return Ok(());
+                }
+                let texture = get_image_field(&component, "texture")?;
+                let filter = app_texture_filter(lua);
+                let (camera, window) = {
+                    let state = particle_render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
+                    (
+                        state.camera_3d(),
+                        lock_platform_state(&particle_platform).window(),
+                    )
+                };
+                let aspect = window.width.max(1.0) / window.height.max(1.0);
+                particle_render_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .queue(DrawCommand::Particles3D(
+                        crate::particles3d::ParticleSystem3DCommand {
+                            emitter,
+                            view_projection: camera.view_projection(aspect),
+                            camera_euler: camera.euler,
+                            texture,
+                            filter,
+                        },
+                    ));
+                Ok(())
+            })?,
+        )?;
+        particles.set(
+            "destroy",
+            lua.create_function(|_lua, (_entity, component): (Table, Table)| {
+                particle_emitter_3d_from_component(&component)?
+                    .stop()
+                    .map_err(mlua::Error::external)
+            })?,
+        )?;
+        core_components.set("ParticleSystem3D", particles)?;
+    }
+
+    // Physics3D collider/query registry plus lightweight rigid-body integration.
+    // Triangle meshes retain their BVH across frames and refresh atomically
+    // when a script edits the source MeshHandle.
+    {
+        use crate::physics3d::{
+            Collider3D as NativeCollider3D, ColliderShape3D, CollisionFilter3D, QueryFilter3D,
+            Ray3D, Transform3D,
+        };
+
+        let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            usize,
+            NativeCollider3D,
+        >::new()));
+
+        let rigidbody = lua.create_table()?;
+        rigidbody.set("__neolove_component", "Rigidbody3D")?;
+        rigidbody.set(
+            "awake",
+            lua.create_function(|_lua, (entity, component): (Table, Table)| {
+                component.set("__neolove_component", "Rigidbody3D")?;
+                component.set("enabled", true)?;
+                component.set("is_static", false)?;
+                component.set("mass", 1.0)?;
+                component.set("gravity_scale", 1.0)?;
+                component.set("linear_damping", 0.0)?;
+                component.set("angular_damping", 0.0)?;
+                component.set("velocity_x", 0.0)?;
+                component.set("velocity_y", 0.0)?;
+                component.set("velocity_z", 0.0)?;
+                component.set("angular_velocity_x", 0.0)?;
+                component.set("angular_velocity_y", 0.0)?;
+                component.set("angular_velocity_z", 0.0)?;
+                component.set("freeze_x", false)?;
+                component.set("freeze_y", false)?;
+                component.set("freeze_z", false)?;
+                component.set("freeze_rotation_x", false)?;
+                component.set("freeze_rotation_y", false)?;
+                component.set("freeze_rotation_z", false)?;
+                component.set("continuous_collision", false)?;
+                component.set("auto_resolve", true)?;
+                component.set("contact_slop", 0.001)?;
+                component.set("onContact", Value::Nil)?;
+                component.set("onTrigger", Value::Nil)?;
+                let transform = crate::window::get_global_transform_3d(&entity)?;
+                component.set("__last_world_x", transform.position.x)?;
+                component.set("__last_world_y", transform.position.y)?;
+                component.set("__last_world_z", transform.position.z)?;
+                Ok(())
+            })?,
+        )?;
+        rigidbody.set(
+            "update",
+            lua.create_function(|_lua, (entity, component, dt): (Table, Table, f32)| {
+                if !component.get::<bool>("enabled").unwrap_or(true)
+                    || component.get::<bool>("is_static").unwrap_or(false)
+                {
+                    return Ok(());
+                }
+                let dt = dt.clamp(0.0, 0.1);
+                let linear_damping = component
+                    .get::<f32>("linear_damping")
+                    .unwrap_or(0.0)
+                    .max(0.0);
+                let angular_damping = component
+                    .get::<f32>("angular_damping")
+                    .unwrap_or(0.0)
+                    .max(0.0);
+                let linear_decay = (1.0 - linear_damping * dt).max(0.0);
+                let angular_decay = (1.0 - angular_damping * dt).max(0.0);
+                let mut velocity = [
+                    component.get::<f32>("velocity_x").unwrap_or(0.0),
+                    component.get::<f32>("velocity_y").unwrap_or(0.0),
+                    component.get::<f32>("velocity_z").unwrap_or(0.0),
+                ];
+                velocity[1] -= 9.81 * component.get::<f32>("gravity_scale").unwrap_or(1.0) * dt;
+                for axis in &mut velocity {
+                    *axis *= linear_decay;
+                }
+                for (axis, field) in ["x", "y", "position_z"].into_iter().enumerate() {
+                    let frozen = component
+                        .get::<bool>(["freeze_x", "freeze_y", "freeze_z"][axis])
+                        .unwrap_or(false);
+                    if frozen {
+                        velocity[axis] = 0.0;
+                    } else {
+                        let value = entity.get::<f32>(field).unwrap_or(0.0) + velocity[axis] * dt;
+                        entity.set(field, value)?;
+                    }
+                    component.set(
+                        ["velocity_x", "velocity_y", "velocity_z"][axis],
+                        velocity[axis],
+                    )?;
+                }
+
+                for axis in 0..3 {
+                    let velocity_field = [
+                        "angular_velocity_x",
+                        "angular_velocity_y",
+                        "angular_velocity_z",
+                    ][axis];
+                    let rotation_field = ["rotation_x", "rotation_y", "rotation_z"][axis];
+                    let freeze_field = [
+                        "freeze_rotation_x",
+                        "freeze_rotation_y",
+                        "freeze_rotation_z",
+                    ][axis];
+                    let mut angular_velocity =
+                        component.get::<f32>(velocity_field).unwrap_or(0.0) * angular_decay;
+                    if component.get::<bool>(freeze_field).unwrap_or(false) {
+                        angular_velocity = 0.0;
+                    } else {
+                        let rotation = entity.get::<f32>(rotation_field).unwrap_or(0.0)
+                            + angular_velocity * dt;
+                        entity.set(rotation_field, rotation)?;
+                    }
+                    component.set(velocity_field, angular_velocity)?;
+                }
+                if component.get::<bool>("auto_resolve").unwrap_or(true) {
+                    let physics = _lua.globals().get::<Table>("physics3d")?;
+                    physics.get::<Function>("resolveBody")?.call::<()>((
+                        entity,
+                        component,
+                        None::<Table>,
+                    ))?;
+                }
+                Ok(())
+            })?,
+        )?;
+        for (method_name, field_name) in
+            [("setOnContact", "onContact"), ("setOnTrigger", "onTrigger")]
+        {
+            rigidbody.set(
+                method_name,
+                lua.create_function(move |_lua, (component, callback): (Table, Value)| {
+                    component.set(field_name, callback)?;
+                    Ok(())
+                })?,
+            )?;
+        }
+        core_components.set("Rigidbody3D", rigidbody)?;
+
+        let collider = lua.create_table()?;
+        collider.set("__neolove_component", "Collider3D")?;
+        collider.set(
+            "awake",
+            lua.create_function(|_lua, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "Collider3D")?;
+                component.set("enabled", true)?;
+                component.set("is_trigger", false)?;
+                component.set("shape", "box")?;
+                component.set("mesh", Value::Nil)?;
+                component.set("mesh_path", "")?;
+                component.set("convex", false)?;
+                component.set("size_x", 1.0)?;
+                component.set("size_y", 1.0)?;
+                component.set("size_z", 1.0)?;
+                component.set("radius", 0.5)?;
+                component.set("height", 1.0)?;
+                component.set("offset_x", 0.0)?;
+                component.set("offset_y", 0.0)?;
+                component.set("offset_z", 0.0)?;
+                component.set("restitution", 0.0)?;
+                component.set("friction", 0.5)?;
+                component.set("non_physics", false)?;
+                component.set("layer", 1u32)?;
+                component.set("mask", u32::MAX)?;
+                Ok(())
+            })?,
+        )?;
+        let update_registry = registry.clone();
+        collider.set(
+            "update",
+            lua.create_function(move |lua, (entity, component, _dt): (Table, Table, f32)| {
+                let key = component.to_pointer() as usize;
+                if !component.get::<bool>("enabled").unwrap_or(true) {
+                    update_registry
+                        .lock()
+                        .map_err(|_| mlua::Error::external("3D collider registry lock poisoned"))?
+                        .remove(&key);
+                    return Ok(());
+                }
+                let transform = crate::window::get_global_transform_3d(&entity)?;
+                let offset = crate::render3d::Vec3::new(
+                    component.get::<f32>("offset_x").unwrap_or(0.0),
+                    component.get::<f32>("offset_y").unwrap_or(0.0),
+                    component.get::<f32>("offset_z").unwrap_or(0.0),
+                );
+                let offset = transform.model.transform_direction(offset);
+                let position = crate::render3d::Vec3::new(
+                    transform.position.x + offset.x,
+                    transform.position.y + offset.y,
+                    transform.position.z + offset.z,
+                );
+                let shape_name = component
+                    .get::<String>("shape")
+                    .unwrap_or_else(|_| "box".to_string())
+                    .to_ascii_lowercase();
+                let entity_id = entity.get::<u64>("id").unwrap_or(key as u64);
+
+                let mut registry = update_registry
+                    .lock()
+                    .map_err(|_| mlua::Error::external("3D collider registry lock poisoned"))?;
+                let mesh = if shape_name == "mesh" {
+                    let userdata = match component.get::<Value>("mesh")? {
+                        Value::UserData(userdata) => userdata,
+                        _ => {
+                            let path = component.get::<String>("mesh_path").unwrap_or_default();
+                            if path.trim().is_empty() {
+                                registry.remove(&key);
+                                return Ok(());
+                            }
+                            let assets: Table = lua.globals().get("assets")?;
+                            let userdata: AnyUserData =
+                                assets.get::<Function>("loadMesh")?.call(path)?;
+                            component.set("mesh", userdata.clone())?;
+                            userdata
+                        }
+                    };
+                    Some(userdata.borrow::<crate::mesh::MeshHandle>()?.clone())
+                } else {
+                    None
+                };
+
+                let mesh_identity = mesh.as_ref().map(|mesh| mesh.identity() as u64);
+                let reuse_mesh = mesh_identity.is_some()
+                    && component.get::<Option<u64>>("__mesh_identity")? == mesh_identity
+                    && matches!(
+                        registry.get(&key).map(|collider| &collider.shape),
+                        Some(ColliderShape3D::TriangleMesh(_))
+                    );
+                if reuse_mesh {
+                    let collider = registry
+                        .get_mut(&key)
+                        .ok_or_else(|| mlua::Error::external("3D mesh collider disappeared"))?;
+                    collider
+                        .refresh_mesh_if_changed()
+                        .map_err(mlua::Error::external)?;
+                    collider.id = entity_id;
+                    collider.transform = Transform3D {
+                        position,
+                        euler: transform.euler,
+                        scale: transform.scale,
+                    };
+                    collider.enabled = true;
+                    collider.is_trigger = component.get::<bool>("is_trigger").unwrap_or(false);
+                    collider.filter = CollisionFilter3D::new(
+                        component.get::<u32>("layer").unwrap_or(1),
+                        component.get::<u32>("mask").unwrap_or(u32::MAX),
+                    );
+                    collider.restitution = component
+                        .get::<f32>("restitution")
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 1.0);
+                    collider.friction = component
+                        .get::<f32>("friction")
+                        .unwrap_or(0.5)
+                        .clamp(0.0, 1.0);
+                    collider.response_enabled =
+                        !component.get::<bool>("non_physics").unwrap_or(false);
+                    collider.body_is_static = entity
+                        .get::<Table>("components")
+                        .ok()
+                        .and_then(|components| {
+                            components.sequence_values::<Table>().find_map(|value| {
+                                let body = value.ok()?;
+                                (body.get::<String>("__neolove_component").ok()?.as_str()
+                                    == "Rigidbody3D")
+                                    .then(|| body.get::<bool>("is_static").unwrap_or(false))
+                            })
+                        })
+                        .unwrap_or(true);
+                    return Ok(());
+                }
+
+                let shape = match shape_name.as_str() {
+                    "sphere" => ColliderShape3D::Sphere {
+                        radius: component.get::<f32>("radius").unwrap_or(0.5).max(0.0001),
+                    },
+                    "capsule" => ColliderShape3D::Capsule {
+                        radius: component.get::<f32>("radius").unwrap_or(0.5).max(0.0001),
+                        half_height: component.get::<f32>("height").unwrap_or(1.0).max(0.0) * 0.5,
+                    },
+                    "mesh" => ColliderShape3D::triangle_mesh(mesh.ok_or_else(|| {
+                        mlua::Error::external("mesh collider requires a mesh or mesh_path")
+                    })?)
+                    .map_err(mlua::Error::external)?,
+                    _ => ColliderShape3D::Box {
+                        half_extents: crate::render3d::Vec3::new(
+                            component.get::<f32>("size_x").unwrap_or(1.0).max(0.0001) * 0.5,
+                            component.get::<f32>("size_y").unwrap_or(1.0).max(0.0001) * 0.5,
+                            component.get::<f32>("size_z").unwrap_or(1.0).max(0.0001) * 0.5,
+                        ),
+                    },
+                };
+                let mut native = NativeCollider3D::new(entity_id, shape);
+                native.transform = Transform3D {
+                    position,
+                    euler: transform.euler,
+                    scale: transform.scale,
+                };
+                native.is_trigger = component.get::<bool>("is_trigger").unwrap_or(false);
+                native.filter = CollisionFilter3D::new(
+                    component.get::<u32>("layer").unwrap_or(1),
+                    component.get::<u32>("mask").unwrap_or(u32::MAX),
+                );
+                native.restitution = component
+                    .get::<f32>("restitution")
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                native.friction = component
+                    .get::<f32>("friction")
+                    .unwrap_or(0.5)
+                    .clamp(0.0, 1.0);
+                native.response_enabled = !component.get::<bool>("non_physics").unwrap_or(false);
+                native.body_is_static = entity
+                    .get::<Table>("components")
+                    .ok()
+                    .and_then(|components| {
+                        components.sequence_values::<Table>().find_map(|value| {
+                            let body = value.ok()?;
+                            (body.get::<String>("__neolove_component").ok()?.as_str()
+                                == "Rigidbody3D")
+                                .then(|| body.get::<bool>("is_static").unwrap_or(false))
+                        })
+                    })
+                    .unwrap_or(true);
+                component.set("__mesh_identity", mesh_identity)?;
+                registry.insert(key, native);
+                Ok(())
+            })?,
+        )?;
+        let destroy_registry = registry.clone();
+        collider.set(
+            "destroy",
+            lua.create_function(move |_lua, (_entity, component): (Table, Table)| {
+                destroy_registry
+                    .lock()
+                    .map_err(|_| mlua::Error::external("3D collider registry lock poisoned"))?
+                    .remove(&(component.to_pointer() as usize));
+                Ok(())
+            })?,
+        )?;
+        core_components.set("Collider3D", collider)?;
+
+        let physics = lua.create_table()?;
+        let raycast_registry = registry.clone();
+        physics.set(
+            "raycast",
+            lua.create_function(
+                move |lua,
+                      (ox, oy, oz, dx, dy, dz, max_distance, options): (
+                    f32,
+                    f32,
+                    f32,
+                    f32,
+                    f32,
+                    f32,
+                    Option<f32>,
+                    Option<Table>,
+                )| {
+                    let ray = Ray3D::new(
+                        crate::render3d::Vec3::new(ox, oy, oz),
+                        crate::render3d::Vec3::new(dx, dy, dz),
+                    )
+                    .map_err(mlua::Error::external)?;
+                    let query = QueryFilter3D {
+                        collision: CollisionFilter3D::new(
+                            options
+                                .as_ref()
+                                .and_then(|table| table.get::<u32>("layer").ok())
+                                .unwrap_or(1),
+                            options
+                                .as_ref()
+                                .and_then(|table| table.get::<u32>("mask").ok())
+                                .unwrap_or(u32::MAX),
+                        ),
+                        include_triggers: options
+                            .as_ref()
+                            .and_then(|table| table.get::<bool>("include_triggers").ok())
+                            .unwrap_or(true),
+                    };
+                    let mut registry = raycast_registry
+                        .lock()
+                        .map_err(|_| mlua::Error::external("3D collider registry lock poisoned"))?;
+                    for collider in registry.values_mut() {
+                        collider
+                            .refresh_mesh_if_changed()
+                            .map_err(mlua::Error::external)?;
+                    }
+                    let colliders = registry.values().cloned().collect::<Vec<_>>();
+                    let Some(hit) = crate::physics3d::raycast_nearest(
+                        &colliders,
+                        ray,
+                        max_distance.unwrap_or(1_000_000.0).max(0.0),
+                        query,
+                    )
+                    .map_err(mlua::Error::external)?
+                    else {
+                        return Ok(None::<Table>);
+                    };
+                    let result = lua.create_table()?;
+                    result.set("entity_id", hit.collider_id)?;
+                    result.set("distance", hit.distance)?;
+                    result.set("x", hit.position.x)?;
+                    result.set("y", hit.position.y)?;
+                    result.set("z", hit.position.z)?;
+                    result.set("normal_x", hit.normal.x)?;
+                    result.set("normal_y", hit.normal.y)?;
+                    result.set("normal_z", hit.normal.z)?;
+                    result.set("front_face", hit.front_face)?;
+                    result.set("is_trigger", hit.is_trigger)?;
+                    result.set(
+                        "triangle_index",
+                        hit.triangle_index.map(|index| index as u64 + 1),
+                    )?;
+                    if let Some(barycentric) = hit.barycentric {
+                        let values = lua.create_table_from([
+                            (1, barycentric[0]),
+                            (2, barycentric[1]),
+                            (3, barycentric[2]),
+                        ])?;
+                        result.set("barycentric", values)?;
+                    }
+                    Ok(Some(result))
+                },
+            )?,
+        )?;
+
+        let contacts_registry = registry.clone();
+        physics.set(
+            "contacts",
+            lua.create_function(move |lua, options: Option<Table>| {
+                let include_triggers = options
+                    .as_ref()
+                    .and_then(|options| options.get::<bool>("include_triggers").ok())
+                    .unwrap_or(true);
+                let include_bounds = options
+                    .as_ref()
+                    .and_then(|options| options.get::<bool>("include_bounds").ok())
+                    .unwrap_or(true);
+                let entity_id = options
+                    .as_ref()
+                    .and_then(|options| options.get::<u64>("entity_id").ok());
+                let mut registry = contacts_registry
+                    .lock()
+                    .map_err(|_| mlua::Error::external("3D collider registry lock poisoned"))?;
+                for collider in registry.values_mut() {
+                    collider
+                        .refresh_mesh_if_changed()
+                        .map_err(mlua::Error::external)?;
+                }
+                let mut colliders = registry
+                    .iter()
+                    .map(|(key, collider)| (*key, collider.clone()))
+                    .collect::<Vec<_>>();
+                drop(registry);
+                colliders.sort_unstable_by_key(|(key, collider)| (collider.id, *key));
+                let colliders = colliders
+                    .into_iter()
+                    .map(|(_, collider)| collider)
+                    .collect::<Vec<_>>();
+                let contacts =
+                    crate::physics3d::contacts(&colliders).map_err(mlua::Error::external)?;
+                let result = lua.create_table()?;
+                let mut output_index = 1usize;
+                for contact in contacts {
+                    if (!include_triggers && contact.has_trigger)
+                        || (!include_bounds
+                            && contact.quality == crate::physics3d::ContactQuality3D::Bounds)
+                        || entity_id.is_some_and(|entity_id| {
+                            contact.first_id != entity_id && contact.second_id != entity_id
+                        })
+                    {
+                        continue;
+                    }
+                    let value = lua.create_table()?;
+                    value.set("first_id", contact.first_id)?;
+                    value.set("second_id", contact.second_id)?;
+                    value.set("normal_x", contact.normal.x)?;
+                    value.set("normal_y", contact.normal.y)?;
+                    value.set("normal_z", contact.normal.z)?;
+                    value.set("penetration", contact.penetration)?;
+                    value.set("x", contact.point.x)?;
+                    value.set("y", contact.point.y)?;
+                    value.set("z", contact.point.z)?;
+                    value.set("is_trigger", contact.has_trigger)?;
+                    value.set("quality", contact.quality.as_str())?;
+                    value.set(
+                        "exact",
+                        contact.quality == crate::physics3d::ContactQuality3D::Exact,
+                    )?;
+                    value.set(
+                        "can_resolve",
+                        contact.quality == crate::physics3d::ContactQuality3D::Exact
+                            && !contact.has_trigger
+                            && colliders[contact.first_index].response_enabled
+                            && colliders[contact.second_index].response_enabled,
+                    )?;
+                    result.raw_set(output_index, value)?;
+                    output_index += 1;
+                }
+                Ok(result)
+            })?,
+        )?;
+
+        let resolve_registry = registry.clone();
+        physics.set(
+            "resolveBody",
+            lua.create_function(
+                move |lua, (entity, body, options): (Table, Table, Option<Table>)| {
+                    let entity_id = entity.get::<u64>("id").map_err(|_| {
+                        mlua::Error::external("3D body entity requires a numeric id")
+                    })?;
+                    let transform = crate::window::get_global_transform_3d(&entity)?;
+                    let previous = crate::render3d::Vec3::new(
+                        body.get::<f32>("__last_world_x")
+                            .unwrap_or(transform.position.x),
+                        body.get::<f32>("__last_world_y")
+                            .unwrap_or(transform.position.y),
+                        body.get::<f32>("__last_world_z")
+                            .unwrap_or(transform.position.z),
+                    );
+                    let movement = crate::render3d::Vec3::new(
+                        transform.position.x - previous.x,
+                        transform.position.y - previous.y,
+                        transform.position.z - previous.z,
+                    );
+                    let correction_percent = options
+                        .as_ref()
+                        .and_then(|options| options.get::<f32>("correction_percent").ok())
+                        .filter(|value| value.is_finite())
+                        .unwrap_or(1.0)
+                        .clamp(0.0, 1.0);
+                    let slop = options
+                        .as_ref()
+                        .and_then(|options| options.get::<f32>("slop").ok())
+                        .or_else(|| body.get::<f32>("contact_slop").ok())
+                        .filter(|value| value.is_finite())
+                        .unwrap_or(0.001)
+                        .max(0.0);
+                    let response_enabled = options
+                        .as_ref()
+                        .and_then(|options| options.get::<bool>("response").ok())
+                        .unwrap_or(true)
+                        && body.get::<bool>("enabled").unwrap_or(true)
+                        && !body.get::<bool>("is_static").unwrap_or(false);
+
+                    let mut registry = resolve_registry
+                        .lock()
+                        .map_err(|_| mlua::Error::external("3D collider registry lock poisoned"))?;
+                    for collider in registry.values_mut() {
+                        collider
+                            .refresh_mesh_if_changed()
+                            .map_err(mlua::Error::external)?;
+                    }
+                    let mut colliders = registry
+                        .iter()
+                        .map(|(key, collider)| (*key, collider.clone()))
+                        .collect::<Vec<_>>();
+                    drop(registry);
+                    colliders.sort_unstable_by_key(|(key, collider)| (collider.id, *key));
+                    let mut colliders = colliders
+                        .into_iter()
+                        .map(|(_, collider)| collider)
+                        .collect::<Vec<_>>();
+                    for collider in colliders
+                        .iter_mut()
+                        .filter(|collider| collider.id == entity_id)
+                    {
+                        collider.transform.position.x += movement.x;
+                        collider.transform.position.y += movement.y;
+                        collider.transform.position.z += movement.z;
+                        collider.transform.euler = transform.euler;
+                        collider.transform.scale = transform.scale;
+                        collider.body_is_static = body.get::<bool>("is_static").unwrap_or(false);
+                    }
+
+                    let generated =
+                        crate::physics3d::contacts(&colliders).map_err(mlua::Error::external)?;
+                    let contact_values = lua.create_table()?;
+                    let mut contact_count = 0usize;
+                    let mut trigger_count = 0usize;
+                    let mut exact_count = 0usize;
+                    let mut bounds_count = 0usize;
+                    let mut resolved_count = 0usize;
+                    let mut grounded = false;
+                    let mut correction = crate::render3d::Vec3::ZERO;
+                    let mut velocity = crate::render3d::Vec3::new(
+                        body.get::<f32>("velocity_x").unwrap_or(0.0),
+                        body.get::<f32>("velocity_y").unwrap_or(0.0),
+                        body.get::<f32>("velocity_z").unwrap_or(0.0),
+                    );
+
+                    for contact in generated {
+                        if contact.first_id == entity_id && contact.second_id == entity_id {
+                            continue;
+                        }
+                        let (own_index, other_index, normal) = if contact.first_id == entity_id {
+                            (contact.first_index, contact.second_index, contact.normal)
+                        } else if contact.second_id == entity_id {
+                            (
+                                contact.second_index,
+                                contact.first_index,
+                                crate::render3d::Vec3::new(
+                                    -contact.normal.x,
+                                    -contact.normal.y,
+                                    -contact.normal.z,
+                                ),
+                            )
+                        } else {
+                            continue;
+                        };
+                        let own = &colliders[own_index];
+                        let other = &colliders[other_index];
+                        let exact = contact.quality == crate::physics3d::ContactQuality3D::Exact;
+                        let can_resolve = response_enabled
+                            && exact
+                            && !contact.has_trigger
+                            && own.response_enabled
+                            && other.response_enabled;
+
+                        contact_count += 1;
+                        if contact.has_trigger {
+                            trigger_count += 1;
+                        }
+                        if exact {
+                            exact_count += 1;
+                        } else {
+                            bounds_count += 1;
+                        }
+                        let value = lua.create_table()?;
+                        value.set("self_id", entity_id)?;
+                        value.set("other_id", other.id)?;
+                        value.set("normal_x", normal.x)?;
+                        value.set("normal_y", normal.y)?;
+                        value.set("normal_z", normal.z)?;
+                        value.set("penetration", contact.penetration)?;
+                        value.set("x", contact.point.x)?;
+                        value.set("y", contact.point.y)?;
+                        value.set("z", contact.point.z)?;
+                        value.set("is_trigger", contact.has_trigger)?;
+                        value.set("quality", contact.quality.as_str())?;
+                        value.set("exact", exact)?;
+                        value.set("can_resolve", can_resolve)?;
+                        contact_values.raw_set(contact_count, value.clone())?;
+
+                        let callback_name = if contact.has_trigger {
+                            "onTrigger"
+                        } else {
+                            "onContact"
+                        };
+                        if let Ok(Value::Function(callback)) = body.get::<Value>(callback_name) {
+                            callback.call::<()>(value)?;
+                        }
+
+                        if !can_resolve {
+                            continue;
+                        }
+                        let correction_share = if other.body_is_static { 1.0 } else { 0.5 };
+                        let correction_distance = (contact.penetration - slop).max(0.0)
+                            * correction_percent
+                            * correction_share;
+                        let mut contact_correction = crate::render3d::Vec3::new(
+                            -normal.x * correction_distance,
+                            -normal.y * correction_distance,
+                            -normal.z * correction_distance,
+                        );
+                        for (axis, freeze_field) in
+                            ["freeze_x", "freeze_y", "freeze_z"].into_iter().enumerate()
+                        {
+                            if body.get::<bool>(freeze_field).unwrap_or(false) {
+                                match axis {
+                                    0 => contact_correction.x = 0.0,
+                                    1 => contact_correction.y = 0.0,
+                                    _ => contact_correction.z = 0.0,
+                                }
+                            }
+                        }
+                        correction.x += contact_correction.x;
+                        correction.y += contact_correction.y;
+                        correction.z += contact_correction.z;
+                        let restitution = own.restitution.max(other.restitution);
+                        let friction = (own.friction * other.friction).sqrt();
+                        velocity = crate::physics3d::resolve_contact_velocity(
+                            velocity,
+                            normal,
+                            restitution,
+                            friction,
+                        );
+                        grounded |= normal.y < -0.5;
+                        resolved_count += 1;
+                    }
+
+                    entity.set("x", entity.get::<f32>("x").unwrap_or(0.0) + correction.x)?;
+                    entity.set("y", entity.get::<f32>("y").unwrap_or(0.0) + correction.y)?;
+                    entity.set(
+                        "position_z",
+                        entity.get::<f32>("position_z").unwrap_or(0.0) + correction.z,
+                    )?;
+                    body.set("velocity_x", velocity.x)?;
+                    body.set("velocity_y", velocity.y)?;
+                    body.set("velocity_z", velocity.z)?;
+                    body.set("__last_world_x", transform.position.x + correction.x)?;
+                    body.set("__last_world_y", transform.position.y + correction.y)?;
+                    body.set("__last_world_z", transform.position.z + correction.z)?;
+
+                    // Keep the shared snapshot coherent for bodies updated
+                    // later in the same frame. Collider3D.update will replace
+                    // this translated snapshot with its exact offset-derived
+                    // transform when it runs, regardless of component order.
+                    let mut registry = resolve_registry
+                        .lock()
+                        .map_err(|_| mlua::Error::external("3D collider registry lock poisoned"))?;
+                    for collider in registry
+                        .values_mut()
+                        .filter(|collider| collider.id == entity_id)
+                    {
+                        collider.transform.position.x += movement.x + correction.x;
+                        collider.transform.position.y += movement.y + correction.y;
+                        collider.transform.position.z += movement.z + correction.z;
+                        collider.transform.euler = transform.euler;
+                        collider.transform.scale = transform.scale;
+                        collider.body_is_static = body.get::<bool>("is_static").unwrap_or(false);
+                    }
+                    drop(registry);
+
+                    let result = lua.create_table()?;
+                    result.set("contacts", contact_values)?;
+                    result.set("contact_count", contact_count)?;
+                    result.set("trigger_count", trigger_count)?;
+                    result.set("exact_count", exact_count)?;
+                    result.set("bounds_count", bounds_count)?;
+                    result.set("resolved_count", resolved_count)?;
+                    result.set("grounded", grounded)?;
+                    result.set("correction_x", correction.x)?;
+                    result.set("correction_y", correction.y)?;
+                    result.set("correction_z", correction.z)?;
+                    Ok(result)
+                },
+            )?,
+        )?;
+
+        let broadphase_registry = registry.clone();
+        physics.set(
+            "broadphasePairs",
+            lua.create_function(move |lua, ()| {
+                let mut registry = broadphase_registry
+                    .lock()
+                    .map_err(|_| mlua::Error::external("3D collider registry lock poisoned"))?;
+                for collider in registry.values_mut() {
+                    collider
+                        .refresh_mesh_if_changed()
+                        .map_err(mlua::Error::external)?;
+                }
+                let mut colliders = registry
+                    .iter()
+                    .map(|(key, collider)| (*key, collider.clone()))
+                    .collect::<Vec<_>>();
+                drop(registry);
+                colliders.sort_unstable_by_key(|(key, collider)| (collider.id, *key));
+                let colliders = colliders
+                    .into_iter()
+                    .map(|(_, collider)| collider)
+                    .collect::<Vec<_>>();
+                let pairs = crate::physics3d::broadphase_pairs(&colliders)
+                    .map_err(mlua::Error::external)?;
+                let result = lua.create_table_with_capacity(pairs.len(), 0)?;
+                for (index, pair) in pairs.into_iter().enumerate() {
+                    let value = lua.create_table()?;
+                    value.set("first_id", pair.first_id)?;
+                    value.set("second_id", pair.second_id)?;
+                    value.set("has_trigger", pair.has_trigger)?;
+                    result.raw_set(index + 1, value)?;
+                }
+                Ok(result)
+            })?,
+        )?;
+        lua.globals().set("physics3d", physics.clone())?;
+        lua.globals().set("physics3D", physics)?;
     }
 
     // SpatialSound2D
@@ -3239,6 +5326,167 @@ pub fn add_core_components(
         }
 
         lua.globals().set("lighting", lighting)?;
+    }
+
+    // Post-process stack
+    // Effects are ordered and mutable at runtime. The software path is also the
+    // deterministic reference used to validate backend shader equivalents.
+    {
+        let postprocess = lua.create_table()?;
+
+        {
+            let render_state = render_state.clone();
+            postprocess.set(
+                "setEnabled",
+                lua.create_function(move |_lua, enabled: Option<bool>| {
+                    render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                        .edit_post_process(|stack| stack.enabled = enabled.unwrap_or(true));
+                    Ok(())
+                })?,
+            )?;
+        }
+        {
+            let render_state = render_state.clone();
+            postprocess.set(
+                "isEnabled",
+                lua.create_function(move |_lua, ()| {
+                    Ok(render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                        .post_process()
+                        .enabled)
+                })?,
+            )?;
+        }
+        {
+            let render_state = render_state.clone();
+            postprocess.set(
+                "add",
+                lua.create_function(move |_lua, (kind, options): (String, Option<Table>)| {
+                    let enabled = post_process_bool(&options, "enabled", true);
+                    let effect = post_process_effect(&kind, options)?;
+                    let mut index = 0usize;
+                    render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                        .edit_post_process(|stack| {
+                            index = stack.push(effect);
+                            if !enabled {
+                                stack.effects[index].enabled = false;
+                            }
+                        });
+                    Ok(index as u64 + 1)
+                })?,
+            )?;
+        }
+        {
+            let render_state = render_state.clone();
+            postprocess.set(
+                "remove",
+                lua.create_function(move |_lua, index: i64| {
+                    if index <= 0 {
+                        return Ok(false);
+                    }
+                    let mut removed = false;
+                    render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                        .edit_post_process(|stack| {
+                            removed = stack.remove(index as usize - 1).is_some()
+                        });
+                    Ok(removed)
+                })?,
+            )?;
+        }
+        {
+            let render_state = render_state.clone();
+            postprocess.set(
+                "move",
+                lua.create_function(move |_lua, (from, to): (i64, i64)| {
+                    if from <= 0 || to <= 0 {
+                        return Ok(false);
+                    }
+                    let mut moved = false;
+                    render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                        .edit_post_process(|stack| {
+                            moved = stack.move_effect(from as usize - 1, to as usize - 1)
+                        });
+                    Ok(moved)
+                })?,
+            )?;
+        }
+        {
+            let render_state = render_state.clone();
+            postprocess.set(
+                "setPassEnabled",
+                lua.create_function(move |_lua, (index, enabled): (i64, bool)| {
+                    if index <= 0 {
+                        return Ok(false);
+                    }
+                    let mut changed = false;
+                    render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                        .edit_post_process(|stack| {
+                            if let Some(pass) = stack.effects.get_mut(index as usize - 1) {
+                                pass.enabled = enabled;
+                                changed = true;
+                            }
+                        });
+                    Ok(changed)
+                })?,
+            )?;
+        }
+        {
+            let render_state = render_state.clone();
+            postprocess.set(
+                "clear",
+                lua.create_function(move |_lua, ()| {
+                    render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                        .edit_post_process(|stack| {
+                            stack.effects.clear();
+                            stack.clear_history();
+                        });
+                    Ok(())
+                })?,
+            )?;
+        }
+        {
+            let render_state = render_state.clone();
+            postprocess.set(
+                "resetHistory",
+                lua.create_function(move |_lua, ()| {
+                    render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                        .edit_post_process(|stack| stack.clear_history());
+                    Ok(())
+                })?,
+            )?;
+        }
+        {
+            let render_state = render_state.clone();
+            postprocess.set(
+                "count",
+                lua.create_function(move |_lua, ()| {
+                    Ok(render_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                        .post_process()
+                        .effects
+                        .len() as u64)
+                })?,
+            )?;
+        }
+
+        lua.globals().set("postprocess", postprocess.clone())?;
+        lua.globals().set("postProcess", postprocess)?;
     }
 
     // Rng
@@ -4210,6 +6458,7 @@ pub fn add_core_components(
                     component.set("text", "Button")?;
                     component.set("enabled", true)?;
                     component.set("hovered", false)?;
+                    component.set("focused", false)?;
                     component.set("pressed", false)?;
                     component.set("scale", 18.0)?;
                     component.set("min_scale", 10.0)?;
@@ -4254,6 +6503,7 @@ pub fn add_core_components(
                 })?,
             )?;
 
+            install_widget_focus_methods(lua, &button, &render_state)?;
             let button_platform = platform.clone();
             let button_root = env_root.clone();
             let render_state = render_state.clone();
@@ -4261,16 +6511,30 @@ pub fn add_core_components(
                 "update",
                 lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
                     if !component.get::<bool>("visible").unwrap_or(true) {
+                        unregister_widget(&render_state, &component);
                         return Ok(());
                     }
 
                     let draw = get_entity_draw_context(&entity)?;
                     let snapshot = current_input_snapshot(&button_platform, &render_state)?;
-                    let owner_key = component_owner_key(&entity, &component);
+                    let surface = interaction_surface(&render_state);
+                    let owner_key = component_owner_key(&component);
                     let enabled = component.get::<bool>("enabled").unwrap_or(true);
+                    let body_region = register_widget_region(surface, &owner_key, draw, enabled);
+                    let (tab, reverse_tab) = tab_navigation(&snapshot);
+                    crate::widget_interaction::advance_focus(surface, tab, reverse_tab);
+                    if component.get::<bool>("focused").unwrap_or(false) {
+                        crate::widget_interaction::adopt_focus_if_unowned(surface, &owner_key);
+                    }
+                    if !enabled {
+                        crate::widget_interaction::clear_focus(surface, &owner_key);
+                    }
                     let hovered = enabled
-                        && point_in_bounds(snapshot.mouse, draw.bounds, draw.pivot, draw.rotation)
-                        && !point_blocked_by_popup(snapshot.mouse, &owner_key);
+                        && crate::widget_interaction::region_hovered(
+                            surface,
+                            &body_region,
+                            [snapshot.mouse.x, snapshot.mouse.y],
+                        );
                     let was_hovered = component.get::<bool>("hovered").unwrap_or(false);
                     if hovered != was_hovered {
                         component.set("hovered", hovered)?;
@@ -4282,28 +6546,68 @@ pub fn add_core_components(
                     }
 
                     let left_pressed = snapshot.input.mouse_pressed.contains("left");
+                    let left_down = snapshot.input.mouse_down.contains("left");
                     let left_released = snapshot.input.mouse_released.contains("left");
+                    let press_started = crate::widget_interaction::press_region(
+                        surface,
+                        &body_region,
+                        [snapshot.mouse.x, snapshot.mouse.y],
+                        left_pressed,
+                        left_down,
+                    );
+                    if press_started {
+                        crate::widget_interaction::request_focus(surface, &owner_key);
+                    } else if left_pressed
+                        && crate::widget_interaction::is_focused(surface, &owner_key)
+                        && !hovered
+                    {
+                        crate::widget_interaction::clear_focus(surface, &owner_key);
+                    }
+                    let was_focused = component.get::<bool>("focused").unwrap_or(false);
+                    let focused = crate::widget_interaction::is_focused(surface, &owner_key);
+                    if focused != was_focused {
+                        call_component_callback(
+                            &component,
+                            &entity,
+                            if focused { "onFocus" } else { "onBlur" },
+                        )?;
+                    }
+                    component.set("focused", focused)?;
+
                     let was_pressed = component.get::<bool>("pressed").unwrap_or(false);
                     let mut pressed = was_pressed;
 
                     if !enabled {
                         pressed = false;
                     } else {
-                        if left_pressed {
-                            if hovered {
-                                pressed = true;
-                                call_component_callback(&component, &entity, "onPress")?;
-                            } else {
-                                pressed = false;
-                            }
+                        if press_started {
+                            pressed = true;
+                            call_component_callback(&component, &entity, "onPress")?;
                         }
                         if left_released {
-                            if was_pressed {
+                            let captured = crate::widget_interaction::release_pointer(
+                                surface, &owner_key, true,
+                            );
+                            if was_pressed || captured {
                                 call_component_callback(&component, &entity, "onRelease")?;
                                 if hovered {
                                     call_component_callback(&component, &entity, "onClick")?;
                                 }
                             }
+                            pressed = false;
+                        }
+
+                        let keyboard_activate = focused
+                            && (snapshot.input.keys_pressed.contains("enter")
+                                || snapshot.input.keys_pressed.contains("space")
+                                || matches!(
+                                    snapshot.input.last_key_pressed.as_deref(),
+                                    Some("enter" | "space")
+                                ));
+                        if keyboard_activate {
+                            call_component_callback(&component, &entity, "onPress")?;
+                            call_component_callback(&component, &entity, "onRelease")?;
+                            call_component_callback(&component, &entity, "onClick")?;
                             pressed = false;
                         }
                     }
@@ -4490,15 +6794,28 @@ pub fn add_core_components(
             ] {
                 text_input.set(method, textbox.get::<Value>(method)?)?;
             }
-            let focus_input = lua.create_function(|_ctx, component: Table| {
+            let input_focus_render_state = render_state.clone();
+            let focus_input = lua.create_function(move |_ctx, component: Table| {
                 let enabled = component.get::<bool>("enabled").unwrap_or(true)
                     && !component.get::<bool>("locked").unwrap_or(false);
+                let surface = interaction_surface(&input_focus_render_state);
+                let owner = component_owner_key(&component);
+                if enabled {
+                    crate::widget_interaction::request_focus(surface, &owner);
+                } else {
+                    crate::widget_interaction::clear_focus(surface, &owner);
+                }
                 component.set("focused", enabled)
             })?;
             text_input.set("focus", focus_input.clone())?;
             text_input.set("Focus", focus_input)?;
-            let blur_input =
-                lua.create_function(|_ctx, component: Table| component.set("focused", false))?;
+            let input_blur_render_state = render_state.clone();
+            let blur_input = lua.create_function(move |_ctx, component: Table| {
+                let surface = interaction_surface(&input_blur_render_state);
+                let owner = component_owner_key(&component);
+                crate::widget_interaction::clear_focus(surface, &owner);
+                component.set("focused", false)
+            })?;
             text_input.set("blur", blur_input.clone())?;
             text_input.set("Blur", blur_input)?;
 
@@ -4509,38 +6826,64 @@ pub fn add_core_components(
                 "update",
                 lua.create_function(move |ctx, (entity, component, dt): (Table, Table, f32)| {
                     if !component.get::<bool>("visible").unwrap_or(true) {
+                        unregister_widget(&render_state, &component);
                         return Ok(());
                     }
 
                     let draw = get_entity_draw_context(&entity)?;
                     let snapshot = current_input_snapshot(&input_platform, &render_state)?;
-                    let owner_key = component_owner_key(&entity, &component);
+                    let surface = interaction_surface(&render_state);
+                    let owner_key = component_owner_key(&component);
                     let enabled = component.get::<bool>("enabled").unwrap_or(true)
                         && !component.get::<bool>("locked").unwrap_or(false);
-                    let hovered = enabled
-                        && point_in_bounds(snapshot.mouse, draw.bounds, draw.pivot, draw.rotation)
-                        && !point_blocked_by_popup(snapshot.mouse, &owner_key);
                     let was_focused = component.get::<bool>("focused").unwrap_or(false);
+                    let body_region = register_widget_region(surface, &owner_key, draw, enabled);
+                    if was_focused {
+                        crate::widget_interaction::adopt_focus_if_unowned(surface, &owner_key);
+                    }
+                    if !enabled {
+                        crate::widget_interaction::clear_focus(surface, &owner_key);
+                    }
+                    let (tab, reverse_tab) = tab_navigation(&snapshot);
+                    crate::widget_interaction::advance_focus(surface, tab, reverse_tab);
+                    let hovered = enabled
+                        && crate::widget_interaction::region_hovered(
+                            surface,
+                            &body_region,
+                            [snapshot.mouse.x, snapshot.mouse.y],
+                        );
                     let was_hovered = component.get::<bool>("hovered").unwrap_or(false);
                     if hovered != was_hovered {
                         component.set("hovered", hovered)?;
                     }
 
                     let left_pressed = snapshot.input.mouse_pressed.contains("left");
-                    let mut focused = was_focused;
-                    if !enabled && focused {
-                        focused = false;
-                        call_component_callback(&component, &entity, "onBlur")?;
-                    } else if left_pressed {
-                        if hovered {
-                            if !focused {
-                                focused = true;
-                                call_component_callback(&component, &entity, "onFocus")?;
-                            }
-                        } else if focused {
-                            focused = false;
-                            call_component_callback(&component, &entity, "onBlur")?;
-                        }
+                    let left_down = snapshot.input.mouse_down.contains("left");
+                    let left_released = snapshot.input.mouse_released.contains("left");
+                    let press_started = crate::widget_interaction::press_region(
+                        surface,
+                        &body_region,
+                        [snapshot.mouse.x, snapshot.mouse.y],
+                        left_pressed,
+                        left_down,
+                    );
+                    if press_started {
+                        crate::widget_interaction::request_focus(surface, &owner_key);
+                    } else if left_pressed
+                        && crate::widget_interaction::is_focused(surface, &owner_key)
+                    {
+                        crate::widget_interaction::clear_focus(surface, &owner_key);
+                    }
+                    if left_released {
+                        crate::widget_interaction::release_pointer(surface, &owner_key, true);
+                    }
+                    let mut focused = crate::widget_interaction::is_focused(surface, &owner_key);
+                    if focused != was_focused {
+                        call_component_callback(
+                            &component,
+                            &entity,
+                            if focused { "onFocus" } else { "onBlur" },
+                        )?;
                     }
 
                     let mut text = component.get::<String>("text").unwrap_or_default();
@@ -4610,6 +6953,7 @@ pub fn add_core_components(
                                 }
                                 "escape" => {
                                     focused = false;
+                                    crate::widget_interaction::clear_focus(surface, &owner_key);
                                     call_component_callback(&component, &entity, "onBlur")?;
                                 }
                                 "enter"
@@ -4625,6 +6969,7 @@ pub fn add_core_components(
                                     }
                                     if component.get::<bool>("blur_on_submit").unwrap_or(false) {
                                         focused = false;
+                                        crate::widget_interaction::clear_focus(surface, &owner_key);
                                         call_component_callback(&component, &entity, "onBlur")?;
                                     }
                                 }
@@ -4877,6 +7222,7 @@ pub fn add_core_components(
                     component.set("enabled", true)?;
                     component.set("open", false)?;
                     component.set("hovered", false)?;
+                    component.set("focused", false)?;
                     component.set("hover_index", 0)?;
                     component.set("selected_index", 0)?;
                     component.set("selected_text", "")?;
@@ -4945,6 +7291,7 @@ pub fn add_core_components(
                 })?,
             )?;
 
+            install_widget_focus_methods(lua, &dropdown, &render_state)?;
             let dropdown_platform = platform.clone();
             let dropdown_root = env_root.clone();
             let render_state = render_state.clone();
@@ -4952,13 +7299,25 @@ pub fn add_core_components(
                 "update",
                 lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
                     if !component.get::<bool>("visible").unwrap_or(true) {
+                        unregister_widget(&render_state, &component);
                         return Ok(());
                     }
 
                     let draw = get_entity_draw_context(&entity)?;
                     let snapshot = current_input_snapshot(&dropdown_platform, &render_state)?;
-                    let owner_key = component_owner_key(&entity, &component);
+                    let surface = interaction_surface(&render_state);
+                    let owner_key = component_owner_key(&component);
                     let enabled = component.get::<bool>("enabled").unwrap_or(true);
+                    let was_focused = component.get::<bool>("focused").unwrap_or(false);
+                    let body_region = register_widget_region(surface, &owner_key, draw, enabled);
+                    if was_focused {
+                        crate::widget_interaction::adopt_focus_if_unowned(surface, &owner_key);
+                    }
+                    if !enabled {
+                        crate::widget_interaction::clear_focus(surface, &owner_key);
+                    }
+                    let (tab, reverse_tab) = tab_navigation(&snapshot);
+                    crate::widget_interaction::advance_focus(surface, tab, reverse_tab);
                     let items = read_ui_list_items(
                         component.get::<Option<Table>>("options").ok().flatten(),
                     )?;
@@ -4971,8 +7330,11 @@ pub fn add_core_components(
                     }
                     let mut open = component.get::<bool>("open").unwrap_or(false) && enabled;
                     let hovered = enabled
-                        && point_in_bounds(snapshot.mouse, draw.bounds, draw.pivot, draw.rotation)
-                        && !point_blocked_by_popup(snapshot.mouse, &owner_key);
+                        && crate::widget_interaction::region_hovered(
+                            surface,
+                            &body_region,
+                            [snapshot.mouse.x, snapshot.mouse.y],
+                        );
 
                     let item_height = component.get::<f32>("item_height").unwrap_or(32.0).max(1.0);
                     let item_corner_radius = component
@@ -5016,14 +7378,20 @@ pub fn add_core_components(
                         w: draw.bounds.w,
                         h: menu_height,
                     };
+                    let popup_region = widget_popup_region_id(&owner_key);
                     if open && visible_count > 0 {
-                        register_popup(owner_key.clone(), menu_bounds, draw.pivot, draw.rotation);
+                        register_popup(surface, &owner_key, menu_bounds, draw.pivot, draw.rotation);
+                    } else {
+                        crate::widget_interaction::unregister_region(surface, &popup_region);
                     }
 
                     let menu_hovered = open
                         && visible_count > 0
-                        && point_in_bounds(snapshot.mouse, menu_bounds, draw.pivot, draw.rotation)
-                        && !point_blocked_by_popup(snapshot.mouse, &owner_key);
+                        && crate::widget_interaction::region_hovered(
+                            surface,
+                            &popup_region,
+                            [snapshot.mouse.x, snapshot.mouse.y],
+                        );
 
                     let mut hovered_index = 0usize;
                     if menu_hovered {
@@ -5061,10 +7429,29 @@ pub fn add_core_components(
                         }
                     }
 
-                    if snapshot.input.mouse_pressed.contains("left") {
-                        if hovered {
+                    let left_pressed = snapshot.input.mouse_pressed.contains("left");
+                    let left_down = snapshot.input.mouse_down.contains("left");
+                    let left_released = snapshot.input.mouse_released.contains("left");
+                    let body_pressed = crate::widget_interaction::press_region(
+                        surface,
+                        &body_region,
+                        [snapshot.mouse.x, snapshot.mouse.y],
+                        left_pressed,
+                        left_down,
+                    );
+                    let menu_pressed = crate::widget_interaction::press_region(
+                        surface,
+                        &popup_region,
+                        [snapshot.mouse.x, snapshot.mouse.y],
+                        left_pressed,
+                        left_down,
+                    );
+                    if left_pressed {
+                        if body_pressed {
+                            crate::widget_interaction::request_focus(surface, &owner_key);
                             open = !open;
-                        } else if open && hovered_index > 0 && menu_hovered {
+                        } else if open && hovered_index > 0 && menu_pressed {
+                            crate::widget_interaction::request_focus(surface, &owner_key);
                             selected_index = hovered_index;
                             if let Some(item) = items.get(selected_index - 1) {
                                 call_component_selection_callback(
@@ -5078,7 +7465,68 @@ pub fn add_core_components(
                             open = false;
                         } else if open {
                             open = false;
+                        } else if crate::widget_interaction::is_focused(surface, &owner_key) {
+                            crate::widget_interaction::clear_focus(surface, &owner_key);
                         }
+                    }
+
+                    if left_released {
+                        crate::widget_interaction::release_pointer(surface, &owner_key, true);
+                    }
+
+                    let focused = crate::widget_interaction::is_focused(surface, &owner_key);
+                    if focused && enabled {
+                        let key = snapshot.input.last_key_pressed.as_deref();
+                        match key {
+                            Some("escape") => open = false,
+                            Some("enter" | "space") => open = !open,
+                            Some("up" | "left") if option_count > 0 => {
+                                selected_index = if selected_index <= 1 {
+                                    option_count
+                                } else {
+                                    selected_index - 1
+                                };
+                                if let Some(item) = items.get(selected_index - 1) {
+                                    call_component_selection_callback(
+                                        &component,
+                                        &entity,
+                                        "onChanged",
+                                        selected_index,
+                                        &item.value,
+                                    )?;
+                                }
+                            }
+                            Some("down" | "right") if option_count > 0 => {
+                                selected_index =
+                                    if selected_index == 0 || selected_index >= option_count {
+                                        1
+                                    } else {
+                                        selected_index + 1
+                                    };
+                                if let Some(item) = items.get(selected_index - 1) {
+                                    call_component_selection_callback(
+                                        &component,
+                                        &entity,
+                                        "onChanged",
+                                        selected_index,
+                                        &item.value,
+                                    )?;
+                                }
+                            }
+                            Some("home") if option_count > 0 => selected_index = 1,
+                            Some("end") if option_count > 0 => selected_index = option_count,
+                            _ => {}
+                        }
+                    }
+                    if !open {
+                        crate::widget_interaction::unregister_region(surface, &popup_region);
+                    }
+                    if focused != was_focused {
+                        call_component_callback(
+                            &component,
+                            &entity,
+                            if focused { "onFocus" } else { "onBlur" },
+                        )?;
                     }
 
                     let selected_item = items.get(selected_index.saturating_sub(1)).cloned();
@@ -5095,6 +7543,7 @@ pub fn add_core_components(
                         .map(|item| item.value.clone())
                         .unwrap_or_default();
                     component.set("hovered", hovered)?;
+                    component.set("focused", focused)?;
                     component.set("open", open)?;
                     component.set("hover_index", hovered_index)?;
                     component.set("selected_index", selected_index)?;
@@ -5360,6 +7809,7 @@ pub fn add_core_components(
                     component.set("__neolove_component", "Slider")?;
                     component.set("enabled", true)?;
                     component.set("hovered", false)?;
+                    component.set("focused", false)?;
                     component.set("dragging", false)?;
                     component.set("min", 0.0)?;
                     component.set("max", 100.0)?;
@@ -5395,6 +7845,7 @@ pub fn add_core_components(
                 })?,
             )?;
 
+            install_widget_focus_methods(lua, &slider, &render_state)?;
             let set_value = lua.create_function(|_ctx, (component, value): (Table, f32)| {
                 let min = component.get::<f32>("min").unwrap_or(0.0);
                 let max = component.get::<f32>("max").unwrap_or(100.0);
@@ -5419,13 +7870,25 @@ pub fn add_core_components(
                 "update",
                 lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
                     if !component.get::<bool>("visible").unwrap_or(true) {
+                        unregister_widget(&render_state, &component);
                         return Ok(());
                     }
 
                     let draw = get_entity_draw_context(&entity)?;
                     let snapshot = current_input_snapshot(&slider_platform, &render_state)?;
-                    let owner_key = component_owner_key(&entity, &component);
+                    let surface = interaction_surface(&render_state);
+                    let owner_key = component_owner_key(&component);
                     let enabled = component.get::<bool>("enabled").unwrap_or(true);
+                    let was_focused = component.get::<bool>("focused").unwrap_or(false);
+                    let body_region = register_widget_region(surface, &owner_key, draw, enabled);
+                    if was_focused {
+                        crate::widget_interaction::adopt_focus_if_unowned(surface, &owner_key);
+                    }
+                    if !enabled {
+                        crate::widget_interaction::clear_focus(surface, &owner_key);
+                    }
+                    let (tab, reverse_tab) = tab_navigation(&snapshot);
+                    crate::widget_interaction::advance_focus(surface, tab, reverse_tab);
 
                     let min = component.get::<f32>("min").unwrap_or(0.0);
                     let max = component.get::<f32>("max").unwrap_or(100.0);
@@ -5440,17 +7903,33 @@ pub fn add_core_components(
                     let half_thumb = thumb_size * 0.5;
 
                     let hovered = enabled
-                        && point_in_bounds(snapshot.mouse, draw.bounds, draw.pivot, draw.rotation)
-                        && !point_blocked_by_popup(snapshot.mouse, &owner_key);
+                        && crate::widget_interaction::region_hovered(
+                            surface,
+                            &body_region,
+                            [snapshot.mouse.x, snapshot.mouse.y],
+                        );
 
                     let left_pressed = snapshot.input.mouse_pressed.contains("left");
                     let left_down = snapshot.input.mouse_down.contains("left");
-                    let mut dragging = component.get::<bool>("dragging").unwrap_or(false);
-                    if !enabled || !left_down {
-                        dragging = false;
-                    } else if left_pressed && hovered {
-                        dragging = true;
+                    let left_released = snapshot.input.mouse_released.contains("left");
+                    let press_started = crate::widget_interaction::press_region(
+                        surface,
+                        &body_region,
+                        [snapshot.mouse.x, snapshot.mouse.y],
+                        left_pressed,
+                        left_down,
+                    );
+                    if press_started {
+                        crate::widget_interaction::request_focus(surface, &owner_key);
+                    } else if left_pressed
+                        && crate::widget_interaction::is_focused(surface, &owner_key)
+                        && !hovered
+                    {
+                        crate::widget_interaction::clear_focus(surface, &owner_key);
                     }
+                    let mut dragging = enabled
+                        && left_down
+                        && crate::widget_interaction::pointer_owned(surface, &owner_key);
 
                     // Usable travel distance for the thumb centre.
                     let track_len = ((if vertical {
@@ -5485,6 +7964,50 @@ pub fn add_core_components(
                         }
                     }
 
+                    let focused = crate::widget_interaction::is_focused(surface, &owner_key);
+                    if focused && enabled && !dragging {
+                        let keyboard_step = if step > 0.0 { step } else { range.abs() * 0.01 };
+                        let keyboard_step = if keyboard_step > f32::EPSILON {
+                            keyboard_step
+                        } else {
+                            1.0
+                        };
+                        let keyboard_value = match snapshot.input.last_key_pressed.as_deref() {
+                            Some("home") => Some(min),
+                            Some("end") => Some(max),
+                            Some("left") if !vertical => Some(value - keyboard_step),
+                            Some("right") if !vertical => Some(value + keyboard_step),
+                            Some("down") if vertical => Some(value - keyboard_step),
+                            Some("up") if vertical => Some(value + keyboard_step),
+                            Some("pagedown") => Some(value - keyboard_step * 10.0),
+                            Some("pageup") => Some(value + keyboard_step * 10.0),
+                            _ => None,
+                        };
+                        if let Some(mut new_value) = keyboard_value {
+                            if step > 0.0 {
+                                new_value = min + (((new_value - min) / step).round()) * step;
+                            }
+                            let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
+                            new_value = new_value.clamp(lo, hi);
+                            if (new_value - value).abs() > f32::EPSILON {
+                                value = new_value;
+                                changed = true;
+                            }
+                        }
+                    }
+
+                    if left_released {
+                        crate::widget_interaction::release_pointer(surface, &owner_key, true);
+                        dragging = false;
+                    }
+                    if focused != was_focused {
+                        call_component_callback(
+                            &component,
+                            &entity,
+                            if focused { "onFocus" } else { "onBlur" },
+                        )?;
+                    }
+
                     let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
                     value = value.clamp(lo, hi);
                     let fraction = if range.abs() > f32::EPSILON {
@@ -5494,6 +8017,7 @@ pub fn add_core_components(
                     };
 
                     component.set("hovered", hovered)?;
+                    component.set("focused", focused)?;
                     component.set("dragging", dragging)?;
                     component.set("value", value)?;
                     component.set("fraction", fraction)?;
@@ -5648,7 +8172,6 @@ pub fn add_core_components(
 
         // ScrollList
         // scrolling list view with selection, keyboard navigation, and customizable item styling
-        #[cfg(any())]
         {
             let scroll_list = create_basic_drawable(lua)?;
             scroll_list.set(
@@ -5727,6 +8250,7 @@ pub fn add_core_components(
                 })?,
             )?;
 
+            install_widget_focus_methods(lua, &scroll_list, &render_state)?;
             let scroll_list_platform = platform.clone();
             let scroll_list_root = env_root.clone();
             let render_state = render_state.clone();
@@ -5734,23 +8258,50 @@ pub fn add_core_components(
                 "update",
                 lua.create_function(move |ctx, (entity, component, _dt): (Table, Table, f32)| {
                     if !component.get::<bool>("visible").unwrap_or(true) {
+                        unregister_widget(&render_state, &component);
                         return Ok(());
                     }
 
                     let draw = get_entity_draw_context(&entity)?;
                     let snapshot = current_input_snapshot(&scroll_list_platform, &render_state)?;
-                    let owner_key = component_owner_key(&entity, &component);
+                    let surface = interaction_surface(&render_state);
+                    let owner_key = component_owner_key(&component);
                     let enabled = component.get::<bool>("enabled").unwrap_or(true);
-                    let hovered = enabled
-                        && point_in_bounds(snapshot.mouse, draw.bounds, draw.pivot, draw.rotation)
-                        && !point_blocked_by_popup(snapshot.mouse, &owner_key);
                     let was_focused = component.get::<bool>("focused").unwrap_or(false);
-                    let mut focused = was_focused;
-                    if !enabled {
-                        focused = false;
-                    } else if snapshot.input.mouse_pressed.contains("left") {
-                        focused = hovered;
+                    let body_region = register_widget_region(surface, &owner_key, draw, enabled);
+                    if was_focused {
+                        crate::widget_interaction::adopt_focus_if_unowned(surface, &owner_key);
                     }
+                    if !enabled {
+                        crate::widget_interaction::clear_focus(surface, &owner_key);
+                    }
+                    let (tab, reverse_tab) = tab_navigation(&snapshot);
+                    crate::widget_interaction::advance_focus(surface, tab, reverse_tab);
+                    let hovered = enabled
+                        && crate::widget_interaction::region_hovered(
+                            surface,
+                            &body_region,
+                            [snapshot.mouse.x, snapshot.mouse.y],
+                        );
+                    let left_pressed = snapshot.input.mouse_pressed.contains("left");
+                    let left_down = snapshot.input.mouse_down.contains("left");
+                    let left_released = snapshot.input.mouse_released.contains("left");
+                    let press_started = crate::widget_interaction::press_region(
+                        surface,
+                        &body_region,
+                        [snapshot.mouse.x, snapshot.mouse.y],
+                        left_pressed,
+                        left_down,
+                    );
+                    if press_started {
+                        crate::widget_interaction::request_focus(surface, &owner_key);
+                    } else if left_pressed
+                        && crate::widget_interaction::is_focused(surface, &owner_key)
+                        && !hovered
+                    {
+                        crate::widget_interaction::clear_focus(surface, &owner_key);
+                    }
+                    let focused = crate::widget_interaction::is_focused(surface, &owner_key);
                     let focus_changed = focused != was_focused;
 
                     let items = read_ui_list_items(
@@ -5799,8 +8350,6 @@ pub fn add_core_components(
                         .unwrap_or(8.0)
                         .max(0.0);
                     let row_stride = item_height + item_spacing;
-                    let left_pressed = snapshot.input.mouse_pressed.contains("left");
-                    let left_down = snapshot.input.mouse_down.contains("left");
 
                     let background_color = if !enabled {
                         get_color_field(&component, "disabled_background_color")
@@ -5906,18 +8455,30 @@ pub fn add_core_components(
                     });
                     let track_hovered = track_bounds
                         .map(|track_bounds| {
-                            point_in_bounds(snapshot.mouse, track_bounds, draw.pivot, draw.rotation)
-                                && !point_blocked_by_popup(snapshot.mouse, &owner_key)
+                            hovered
+                                && point_in_bounds(
+                                    snapshot.mouse,
+                                    track_bounds,
+                                    draw.pivot,
+                                    draw.rotation,
+                                )
                         })
                         .unwrap_or(false);
                     let thumb_hovered = thumb_bounds
                         .map(|thumb_bounds| {
-                            point_in_bounds(snapshot.mouse, thumb_bounds, draw.pivot, draw.rotation)
-                                && !point_blocked_by_popup(snapshot.mouse, &owner_key)
+                            hovered
+                                && point_in_bounds(
+                                    snapshot.mouse,
+                                    thumb_bounds,
+                                    draw.pivot,
+                                    draw.rotation,
+                                )
                         })
                         .unwrap_or(false);
                     let mut scrollbar_dragging =
-                        component.get::<bool>("scrollbar_dragging").unwrap_or(false) && enabled;
+                        component.get::<bool>("scrollbar_dragging").unwrap_or(false)
+                            && enabled
+                            && crate::widget_interaction::pointer_owned(surface, &owner_key);
                     let mut scrollbar_drag_offset = component
                         .get::<f32>("scrollbar_drag_offset")
                         .unwrap_or(0.0)
@@ -5926,17 +8487,15 @@ pub fn add_core_components(
                         scrollbar_dragging = false;
                     }
 
-                    if enabled && left_pressed {
+                    if enabled && press_started {
                         if let Some(thumb_bounds) = thumb_bounds {
                             if thumb_hovered {
                                 scrollbar_dragging = true;
                                 scrollbar_drag_offset = (local_mouse.y - thumb_bounds.y)
                                     .clamp(0.0, thumb_bounds.h.max(0.0));
-                                focused = true;
                             } else if track_hovered {
                                 scrollbar_dragging = true;
                                 scrollbar_drag_offset = thumb_bounds.h * 0.5;
-                                focused = true;
                             }
                         }
                     }
@@ -6035,12 +8594,13 @@ pub fn add_core_components(
                             if item_bounds.h <= 0.0 {
                                 continue;
                             }
-                            if point_in_bounds(
-                                snapshot.mouse,
-                                item_bounds,
-                                draw.pivot,
-                                draw.rotation,
-                            ) && !point_blocked_by_popup(snapshot.mouse, &owner_key)
+                            if hovered
+                                && point_in_bounds(
+                                    snapshot.mouse,
+                                    item_bounds,
+                                    draw.pivot,
+                                    draw.rotation,
+                                )
                             {
                                 hovered_index = scroll_index + visible_index + 1;
                                 break;
@@ -6049,7 +8609,7 @@ pub fn add_core_components(
                     }
 
                     if enabled
-                        && left_pressed
+                        && press_started
                         && !scrollbar_dragging
                         && hovered_index > 0
                         && hovered_index != selected_index
@@ -6105,6 +8665,11 @@ pub fn add_core_components(
                     component.set("scroll_index", scroll_index)?;
                     component.set("scrollbar_dragging", scrollbar_dragging)?;
                     component.set("scrollbar_drag_offset", scrollbar_drag_offset)?;
+
+                    if left_released {
+                        crate::widget_interaction::release_pointer(surface, &owner_key, true);
+                        component.set("scrollbar_dragging", false)?;
+                    }
 
                     if focus_changed {
                         if focused {
@@ -7441,6 +10006,81 @@ mod tests {
         (lua, render_state)
     }
 
+    fn animated_mesh_renderer_test_handle() -> crate::mesh::MeshHandle {
+        crate::mesh::import_from_bytes(
+            br#"
+                ; FBX 7.4.0 project file
+                Objects: {
+                    Geometry: 1, "Geometry::Triangle", "Mesh" {
+                        Vertices: *9 { a: 0,0,0, 1,0,0, 0,1,0 }
+                        PolygonVertexIndex: *3 { a: 0,1,-3 }
+                    }
+                    Model: 30, "Model::Bone", "LimbNode" {
+                        Properties70: {
+                            P: "Lcl Translation", "Lcl Translation", "", "A",0,0,0
+                            P: "Lcl Rotation", "Lcl Rotation", "", "A",0,0,0
+                            P: "Lcl Scaling", "Lcl Scaling", "", "A",1,1,1
+                        }
+                    }
+                    Deformer: 20, "Deformer::Skin", "Skin" { }
+                    Deformer: 21, "SubDeformer::Cluster", "Cluster" {
+                        Indexes: *3 { a: 0,1,2 }
+                        Weights: *3 { a: 1,1,1 }
+                        TransformLink: *16 { a:
+                            1,0,0,0,
+                            0,1,0,0,
+                            0,0,1,0,
+                            0,0,0,1
+                        }
+                    }
+                    AnimationStack: 40, "AnimStack::Move", "" { }
+                    AnimationCurveNode: 50, "AnimCurveNode::Translate", "" { }
+                    AnimationCurve: 51, "AnimCurve::X", "" {
+                        KeyTime: *2 { a: 0,46186158000 }
+                        KeyValueFloat: *2 { a: 0,2 }
+                    }
+                }
+                Connections: {
+                    C: "OO",20,1
+                    C: "OO",21,20
+                    C: "OO",30,21
+                    C: "OP",51,50,"d|X"
+                    C: "OP",50,30,"Lcl Translation"
+                }
+            "#,
+            crate::mesh::MeshFormat::Fbx,
+        )
+        .expect("animated ASCII FBX fixture imports")
+    }
+
+    fn mesh_renderer_test_component(
+        lua: &Lua,
+        entity: &Table,
+        mesh: crate::mesh::MeshHandle,
+    ) -> Table {
+        let component = lua.create_table().expect("component table");
+        let prototype: Table = lua
+            .globals()
+            .get::<Table>("core")
+            .and_then(|core| core.get("MeshRenderer3D"))
+            .expect("MeshRenderer3D prototype");
+        prototype
+            .get::<Function>("awake")
+            .and_then(|awake| awake.call::<()>((entity.clone(), component.clone())))
+            .expect("MeshRenderer3D awake");
+        assert_eq!(
+            component
+                .get::<String>("primitive")
+                .expect("primitive mode"),
+            "none",
+            "runtime components must preserve the legacy direct-mesh workflow"
+        );
+        component
+            .set("mesh", lua.create_userdata(mesh).expect("mesh userdata"))
+            .expect("assign mesh");
+        component
+    }
+
     #[test]
     fn lighting_global_is_installed_and_updates_config() {
         let (lua, render_state) = lua_with_core_components();
@@ -7465,12 +10105,358 @@ mod tests {
         .exec()
         .expect("lighting api script runs");
 
-        let config = render_state.lock().unwrap().lighting_config();
+        let config = render_state
+            .lock()
+            .expect("render state lock should remain available")
+            .lighting_config();
         assert!(config.enabled);
         assert_eq!(config.ambient, Color::rgba(10, 20, 30, 255));
         assert!(config.ao_enabled);
         assert_eq!(config.quality, crate::lighting::LightQuality::High);
         assert!((config.exposure - 1.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn environment_global_and_component_update_shared_render_state() {
+        let (lua, render_state) = lua_with_core_components();
+        lua.load(
+            r#"
+                assert(type(environment3d) == "table")
+                assert(environment3d == skybox)
+                environment3d.setGradient(Color4(10, 20, 30), Color4(40, 50, 60))
+                environment3d.setIntensity(1.5)
+
+                local component = {}
+                core.Environment3D.awake({}, component)
+                component.mode = "solid"
+                component.color = Color4(70, 80, 90)
+                core.Environment3D.update({}, component, 0)
+            "#,
+        )
+        .exec()
+        .expect("environment script runs");
+
+        let environment = render_state.lock().expect("render state").environment_3d();
+        assert!(environment.enabled);
+        assert_eq!(
+            environment.mode,
+            crate::environment3d::EnvironmentMode3D::Solid
+        );
+        assert_eq!(environment.solid, Color::rgba(70, 80, 90, 255));
+    }
+
+    #[test]
+    fn particle_system_3d_controls_bounded_native_pool_and_queues_one_batch() {
+        let (lua, render_state) = lua_with_core_components();
+        lua.load(
+            r#"
+                local component = {}
+                local entity = {}
+                core.ParticleSystem3D.awake(entity, component)
+                component.playing = false
+                component.max_particles = 4
+                component.lifetime_min = 10
+                component.lifetime_max = 10
+                core.ParticleSystem3D.Emit(component, 100)
+                core.ParticleSystem3D.update(entity, component, 0)
+                assert(component.particle_count == 4, "emission must clamp to capacity")
+                core.ParticleSystem3D.Pause(component)
+                assert(component.playing == false)
+            "#,
+        )
+        .exec()
+        .expect("particle component script runs");
+
+        let commands = render_state.lock().expect("render state").drain();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, DrawCommand::Particles3D(_)))
+                .count(),
+            1,
+            "one emitter should submit one renderer batch"
+        );
+    }
+
+    #[test]
+    fn mesh_renderer_3d_resolves_editor_primitives_and_queues_geometry() {
+        let (lua, render_state) = lua_with_core_components();
+        let entity =
+            crate::window::create_entity_table(&lua, "primitive", 0.0, 0.0, None).expect("entity");
+        lua.globals()
+            .set("primitiveEntity", entity)
+            .expect("global");
+        lua.load(
+            r#"
+                local renderer = {}
+                core.MeshRenderer3D.awake(primitiveEntity, renderer)
+                renderer.primitive = "cube"
+                renderer.primitive_size_y = 3
+                renderer.primitive_segments = 12
+                renderer.primitive_rings = 6
+                core.MeshRenderer3D.update(primitiveEntity, renderer, 1 / 60)
+                assert(renderer.mesh ~= nil, "primitive should resolve to a MeshHandle")
+                assert(renderer.mesh:triangleCount() > 0)
+                local bounds = renderer.mesh:bounds()
+                assert(math.abs((bounds.max_y - bounds.min_y) - 3) < 0.0001,
+                    "primitive_size_y must not be shadowed by primitive_height")
+                assert(type(core.MeshRenderer3D.PlayAnimation) == "function")
+                assert(type(core.MeshRenderer3D.StopAnimation) == "function")
+
+                renderer.primitive = "sphere"
+                renderer.primitive_segments = 2
+                local ok, message = pcall(function()
+                    core.MeshRenderer3D.update(primitiveEntity, renderer, 1 / 60)
+                end)
+                assert(not ok and string.find(tostring(message), "segments must be 3..1024"),
+                    "invalid primitive tessellation must return a validation error")
+            "#,
+        )
+        .exec()
+        .expect("primitive renderer script runs");
+
+        let commands = render_state.lock().expect("render state").drain();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, DrawCommand::Mesh3D(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn mesh_renderer_3d_manual_mode_preserves_handles_and_managed_sources_replace_them() {
+        let (lua, render_state) = lua_with_core_components();
+        let entity =
+            crate::window::create_entity_table(&lua, "manual", 0.0, 0.0, None).expect("entity");
+        let source = animated_mesh_renderer_test_handle();
+        let component = mesh_renderer_test_component(&lua, &entity, source.clone());
+        let prototype: Table = lua
+            .globals()
+            .get::<Table>("core")
+            .and_then(|core| core.get("MeshRenderer3D"))
+            .expect("MeshRenderer3D prototype");
+        let update: Function = prototype.get("update").expect("update callback");
+
+        component
+            .set("primitive_segments", "unused in manual mode")
+            .expect("irrelevant primitive field");
+        update
+            .call::<()>((entity.clone(), component.clone(), 0.0f32))
+            .expect("manual mesh update");
+        let manual = component
+            .get::<AnyUserData>("mesh")
+            .expect("manual mesh userdata")
+            .borrow::<crate::mesh::MeshHandle>()
+            .expect("manual MeshHandle")
+            .clone();
+        assert_eq!(manual.identity(), source.identity());
+
+        component.set("primitive", "cube").expect("managed cube");
+        component
+            .set("primitive_segments", 24)
+            .expect("cube segments");
+        update
+            .call::<()>((entity.clone(), component.clone(), 0.0f32))
+            .expect("managed primitive update");
+        let managed = component
+            .get::<AnyUserData>("mesh")
+            .expect("managed mesh userdata")
+            .borrow::<crate::mesh::MeshHandle>()
+            .expect("managed MeshHandle")
+            .clone();
+        assert_ne!(managed.identity(), source.identity());
+
+        // Switching modes and assigning in one script frame must not clear the
+        // newly supplied handle along with the previous managed source.
+        component.set("primitive", "none").expect("manual mode");
+        component
+            .set(
+                "mesh",
+                lua.create_userdata(source.clone())
+                    .expect("source userdata"),
+            )
+            .expect("replace with manual mesh");
+        update
+            .call::<()>((entity, component.clone(), 0.0f32))
+            .expect("manual replacement update");
+        let restored = component
+            .get::<AnyUserData>("mesh")
+            .expect("restored mesh userdata")
+            .borrow::<crate::mesh::MeshHandle>()
+            .expect("restored MeshHandle")
+            .clone();
+        assert_eq!(restored.identity(), source.identity());
+
+        assert_eq!(
+            render_state
+                .lock()
+                .expect("render state")
+                .drain()
+                .into_iter()
+                .filter(|command| matches!(command, DrawCommand::Mesh3D(_)))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn mesh_renderer_3d_obeys_autoplay_pause_stop_and_completion() {
+        let (lua, _render_state) = lua_with_core_components();
+        let entity =
+            crate::window::create_entity_table(&lua, "animated", 0.0, 0.0, None).expect("entity");
+        let source = animated_mesh_renderer_test_handle();
+        let component = mesh_renderer_test_component(&lua, &entity, source.clone());
+        component.set("animation", "Move").expect("animation clip");
+        component
+            .set("animation_autoplay", false)
+            .expect("disable autoplay");
+
+        let prototype: Table = lua
+            .globals()
+            .get::<Table>("core")
+            .and_then(|core| core.get("MeshRenderer3D"))
+            .expect("MeshRenderer3D prototype");
+        let update: Function = prototype.get("update").expect("update callback");
+        let play: Function = prototype.get("PlayAnimation").expect("play callback");
+        let pause: Function = prototype.get("PauseAnimation").expect("pause callback");
+        let stop: Function = prototype.get("StopAnimation").expect("stop callback");
+
+        update
+            .call::<()>((entity.clone(), component.clone(), 0.25f32))
+            .expect("autoplay-disabled update");
+        assert!(!component.get::<bool>("animation_playing").expect("playing"));
+        let unplayed = component
+            .get::<AnyUserData>("mesh")
+            .expect("unplayed userdata")
+            .borrow::<crate::mesh::MeshHandle>()
+            .expect("unplayed MeshHandle")
+            .clone();
+        assert_eq!(unplayed.identity(), source.identity());
+        assert_eq!(source.revision().expect("source revision"), 0);
+
+        play.call::<()>((component.clone(), Option::<String>::None))
+            .expect("play animation");
+        update
+            .call::<()>((entity.clone(), component.clone(), 0.25f32))
+            .expect("playing update");
+        let posed = component
+            .get::<AnyUserData>("mesh")
+            .expect("posed userdata")
+            .borrow::<crate::mesh::MeshHandle>()
+            .expect("posed MeshHandle")
+            .clone();
+        assert_ne!(posed.identity(), source.identity());
+        assert_eq!(source.revision().expect("shared source revision"), 0);
+        assert!(posed.revision().expect("pose revision") > 0);
+
+        pause
+            .call::<()>(component.clone())
+            .expect("pause animation");
+        let paused_revision = posed.revision().expect("paused revision");
+        update
+            .call::<()>((entity.clone(), component.clone(), 0.25f32))
+            .expect("paused update");
+        assert_eq!(posed.revision().expect("still paused"), paused_revision);
+
+        component
+            .set("animation_looping", false)
+            .expect("non-looping playback");
+        play.call::<()>((component.clone(), Option::<String>::None))
+            .expect("restart animation");
+        update
+            .call::<()>((entity.clone(), component.clone(), 2.0f32))
+            .expect("finishing update");
+        assert!(
+            !component.get::<bool>("animation_playing").expect("playing"),
+            "non-looping playback must report completion on the finishing frame"
+        );
+        let completed_revision = posed.revision().expect("completed revision");
+        update
+            .call::<()>((entity.clone(), component.clone(), 0.25f32))
+            .expect("completed update");
+        assert_eq!(
+            posed.revision().expect("stable completed pose"),
+            completed_revision,
+            "a completed clip must not keep deforming the mesh"
+        );
+
+        stop.call::<()>(component.clone()).expect("stop animation");
+        let stopped_revision = posed.revision().expect("stopped revision");
+        update
+            .call::<()>((entity.clone(), component.clone(), 0.25f32))
+            .expect("stopped update");
+        assert_eq!(
+            posed.revision().expect("stable bind pose"),
+            stopped_revision
+        );
+        assert!(
+            posed.snapshot().expect("bind-pose snapshot").mesh.vertices[0].position[0].abs()
+                < 0.0001
+        );
+
+        component
+            .set("animation_speed", -1.0)
+            .expect("negative speed");
+        play.call::<()>((component.clone(), Option::<String>::None))
+            .expect("request reverse playback");
+        let error = update
+            .call::<()>((entity, component, 0.1f32))
+            .expect_err("reverse component playback should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("reverse component playback is not supported")
+        );
+    }
+
+    #[test]
+    fn mesh_renderer_3d_animated_entities_do_not_share_pose_state() {
+        let (lua, _render_state) = lua_with_core_components();
+        let source = animated_mesh_renderer_test_handle();
+        let first_entity =
+            crate::window::create_entity_table(&lua, "first", 0.0, 0.0, None).expect("entity");
+        let second_entity =
+            crate::window::create_entity_table(&lua, "second", 0.0, 0.0, None).expect("entity");
+        let first = mesh_renderer_test_component(&lua, &first_entity, source.clone());
+        let second = mesh_renderer_test_component(&lua, &second_entity, source.clone());
+        first.set("animation", "Move").expect("first animation");
+        second.set("animation", "Move").expect("second animation");
+
+        let update: Function = lua
+            .globals()
+            .get::<Table>("core")
+            .and_then(|core| core.get::<Table>("MeshRenderer3D"))
+            .and_then(|prototype| prototype.get("update"))
+            .expect("update callback");
+        update
+            .call::<()>((first_entity, first.clone(), 0.25f32))
+            .expect("first update");
+        update
+            .call::<()>((second_entity, second.clone(), 0.75f32))
+            .expect("second update");
+
+        let first_mesh = first
+            .get::<AnyUserData>("mesh")
+            .expect("first mesh")
+            .borrow::<crate::mesh::MeshHandle>()
+            .expect("first MeshHandle")
+            .clone();
+        let second_mesh = second
+            .get::<AnyUserData>("mesh")
+            .expect("second mesh")
+            .borrow::<crate::mesh::MeshHandle>()
+            .expect("second MeshHandle")
+            .clone();
+        assert_ne!(first_mesh.identity(), source.identity());
+        assert_ne!(second_mesh.identity(), source.identity());
+        assert_ne!(first_mesh.identity(), second_mesh.identity());
+        assert_eq!(source.revision().expect("shared source revision"), 0);
+        assert!(
+            first_mesh.snapshot().expect("first pose").mesh.vertices[0].position[0]
+                < second_mesh.snapshot().expect("second pose").mesh.vertices[0].position[0]
+        );
     }
 
     #[test]
@@ -7560,6 +10546,184 @@ mod tests {
         )
         .exec()
         .expect("camera component registration script runs");
+    }
+
+    #[test]
+    fn three_d_components_and_runtime_modules_are_registered() {
+        let (lua, _render_state) = lua_with_core_components();
+        lua.load(
+            r#"
+                for _, name in ipairs({
+                    "Camera3D", "MeshRenderer3D", "Light3D", "Rigidbody3D", "Collider3D"
+                }) do
+                    local component = core[name]
+                    assert(type(component) == "table", name .. " missing")
+                    assert(component.__neolove_component == name, name .. " has wrong metadata")
+                    assert(type(component.update) == "function", name .. ".update missing")
+                end
+                assert(type(physics3d) == "table", "physics3d global missing")
+                assert(type(physics3d.raycast) == "function", "physics3d.raycast missing")
+                assert(type(physics3d.contacts) == "function", "physics3d contacts missing")
+                assert(type(physics3d.resolveBody) == "function", "physics3d response missing")
+                assert(type(physics3d.broadphasePairs) == "function", "physics3d broadphase missing")
+                assert(physics3D == physics3d, "physics3D alias must share the module")
+                assert(type(postprocess) == "table", "postprocess global missing")
+                assert(postProcess == postprocess, "postProcess alias must share the module")
+            "#,
+        )
+        .exec()
+        .expect("3D runtime APIs are registered");
+    }
+
+    #[test]
+    fn postprocess_lua_stack_is_ordered_and_configurable() {
+        let (lua, render_state) = lua_with_core_components();
+        lua.load(
+            r#"
+                assert(postprocess.count() == 0)
+                local pixel = postprocess.add("pixelated", { block_size = 3 })
+                local chromatic = postprocess.add("chromatic_abberation", {
+                    offset_pixels = 1.5,
+                    angle_degrees = 90,
+                    enabled = false,
+                })
+                assert(pixel == 1 and chromatic == 2)
+                assert(postprocess.move(2, 1))
+                assert(postprocess.setPassEnabled(1, true))
+                postprocess.setEnabled(false)
+                assert(postprocess.isEnabled() == false)
+                assert(postprocess.remove(2))
+                assert(postprocess.count() == 1)
+            "#,
+        )
+        .exec()
+        .expect("post-process Lua API runs");
+
+        let state = render_state.lock().expect("render state lock");
+        let stack = state.post_process();
+        assert!(!stack.enabled);
+        assert_eq!(stack.effects.len(), 1);
+        assert!(matches!(
+            stack.effects[0].effect,
+            crate::post_process::Effect::ChromaticAberration(_)
+        ));
+        assert!(stack.effects[0].enabled);
+    }
+
+    #[test]
+    fn rigidbody_and_box_collider_work_through_lua() {
+        let (lua, _render_state) = lua_with_core_components();
+        let entity = crate::window::create_entity_table(&lua, "physics", 0.0, 0.0, None)
+            .expect("entity table");
+        entity.set("id", 42u64).expect("entity id");
+        lua.globals().set("physics_entity", entity).expect("global");
+
+        lua.load(
+            r#"
+                local body = {}
+                core.Rigidbody3D.awake(physics_entity, body)
+                body.gravity_scale = 0
+                body.velocity_z = -10
+                core.Rigidbody3D.update(physics_entity, body, 0.05)
+                assert(math.abs(physics_entity.position_z + 0.5) < 0.0001,
+                    "Rigidbody3D should integrate position_z")
+
+                local collider = {}
+                core.Collider3D.awake(physics_entity, collider)
+                collider.size_x = 2
+                collider.size_y = 2
+                collider.size_z = 2
+                core.Collider3D.update(physics_entity, collider, 0)
+                local hit = physics3d.raycast(0, 0, 5, 0, 0, -1, 20)
+                assert(hit ~= nil, "box collider should be raycastable")
+                assert(hit.entity_id == 42, "raycast returned the wrong collider")
+                assert(hit.distance > 4 and hit.distance < 5, "unexpected hit distance")
+                assert(hit.normal_z > 0.9, "front face should point toward the ray origin")
+
+                core.Collider3D.destroy(physics_entity, collider)
+                assert(physics3d.raycast(0, 0, 5, 0, 0, -1, 20) == nil,
+                    "destroy must unregister the collider")
+            "#,
+        )
+        .exec()
+        .expect("3D body and collider APIs run");
+    }
+
+    #[test]
+    fn physics3d_contacts_auto_response_and_trigger_callbacks_work_through_lua() {
+        let (lua, _render_state) = lua_with_core_components();
+        let dynamic = crate::window::create_entity_table(&lua, "dynamic", 0.0, 0.0, None)
+            .expect("dynamic entity");
+        dynamic.set("id", 100u64).expect("dynamic id");
+        let obstacle = crate::window::create_entity_table(&lua, "obstacle", 1.5, 0.0, None)
+            .expect("obstacle entity");
+        obstacle.set("id", 101u64).expect("obstacle id");
+        lua.globals().set("dynamic3d", dynamic).expect("global");
+        lua.globals().set("obstacle3d", obstacle).expect("global");
+
+        lua.load(
+            r#"
+                local body = {}
+                local dynamicCollider = {}
+                local obstacleCollider = {}
+                core.Rigidbody3D.awake(dynamic3d, body)
+                core.Collider3D.awake(dynamic3d, dynamicCollider)
+                core.Collider3D.awake(obstacle3d, obstacleCollider)
+                dynamicCollider.shape = "sphere"
+                dynamicCollider.radius = 1
+                obstacleCollider.shape = "sphere"
+                obstacleCollider.radius = 1
+                table.insert(dynamic3d.components, body)
+                table.insert(dynamic3d.components, dynamicCollider)
+                table.insert(obstacle3d.components, obstacleCollider)
+                core.Collider3D.update(dynamic3d, dynamicCollider, 0)
+                core.Collider3D.update(obstacle3d, obstacleCollider, 0)
+
+                local initial = physics3d.contacts({ entity_id = 100 })
+                assert(#initial == 1 and initial[1].quality == "exact")
+                assert(initial[1].can_resolve == true)
+                assert(math.abs(initial[1].penetration - 0.5) < 0.0001)
+
+                local contactCallbacks = 0
+                local triggerCallbacks = 0
+                core.Rigidbody3D.setOnContact(body, function(contact)
+                    contactCallbacks += 1
+                    assert(contact.self_id == 100 and contact.other_id == 101)
+                    assert(contact.exact and contact.can_resolve)
+                end)
+                core.Rigidbody3D.setOnTrigger(body, function(contact)
+                    triggerCallbacks += 1
+                    assert(contact.is_trigger and not contact.can_resolve)
+                end)
+                body.gravity_scale = 0
+                body.velocity_x = 4
+                core.Rigidbody3D.update(dynamic3d, body, 0.05)
+                assert(dynamic3d.x < -0.49, "exact contact should remove penetration")
+                assert(math.abs(body.velocity_x) < 0.0001,
+                    "zero restitution should stop inward velocity")
+                assert(contactCallbacks == 1, "onContact should run once for this step")
+
+                -- A trigger reports the same exact shape contact without moving
+                -- the body or changing velocity.
+                dynamic3d.x = 0
+                body.__last_world_x = 0
+                body.velocity_x = 4
+                core.Collider3D.update(dynamic3d, dynamicCollider, 0)
+                obstacleCollider.is_trigger = true
+                core.Collider3D.update(obstacle3d, obstacleCollider, 0)
+                local triggerResult = physics3d.resolveBody(dynamic3d, body)
+                assert(triggerResult.trigger_count == 1)
+                assert(triggerResult.resolved_count == 0)
+                assert(math.abs(dynamic3d.x) < 0.0001)
+                assert(math.abs(body.velocity_x - 4) < 0.0001)
+                assert(triggerCallbacks == 1, "onTrigger should run once")
+
+                core.Collider3D.destroy(dynamic3d, dynamicCollider)
+                core.Collider3D.destroy(obstacle3d, obstacleCollider)
+            "#,
+        )
+        .exec()
+        .expect("3D contact/response Lua APIs run");
     }
 
     fn component_with_letter_bounds(lua: &Lua) -> mlua::Result<Table> {
@@ -7691,6 +10855,223 @@ mod tests {
             .eval()?;
         assert_lua_number(&position.0, 10.0);
         assert_lua_number(&position.1, 20.0);
+        Ok(())
+    }
+
+    fn runtime_widget_fixture() -> (Lua, SharedPlatformState, SharedRenderState) {
+        let lua = Lua::new();
+        let platform = crate::platform::new_shared_platform_state();
+        let render_state = crate::renderer::new_shared_render_state();
+        add_core_components(
+            &lua,
+            platform.clone(),
+            render_state.clone(),
+            std::env::temp_dir(),
+        )
+        .expect("core components install");
+        (lua, platform, render_state)
+    }
+
+    fn make_runtime_widget(
+        lua: &Lua,
+        kind: &str,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) -> mlua::Result<(Table, Table, Function)> {
+        let entity = crate::window::create_entity_table(lua, kind, x, y, None)?;
+        entity.set("size_x", width)?;
+        entity.set("size_y", height)?;
+        let core: Table = lua.globals().get("core")?;
+        let prototype: Table = core.get(kind)?;
+        let component = lua.create_table()?;
+        prototype
+            .get::<Function>("awake")?
+            .call::<()>((entity.clone(), component.clone()))?;
+        let update = prototype.get::<Function>("update")?;
+        Ok((entity, component, update))
+    }
+
+    fn update_runtime_widget(
+        entity: &Table,
+        component: &Table,
+        update: &Function,
+    ) -> mlua::Result<()> {
+        update.call::<()>((entity.clone(), component.clone(), 1.0 / 60.0))
+    }
+
+    #[test]
+    fn overlapping_runtime_widgets_route_press_only_to_topmost() -> mlua::Result<()> {
+        let (lua, platform, _render_state) = runtime_widget_fixture();
+        let (back_entity, back, back_update) =
+            make_runtime_widget(&lua, "Button", 20.0, 20.0, 100.0, 40.0)?;
+        let (front_entity, front, front_update) =
+            make_runtime_widget(&lua, "Button", 20.0, 20.0, 100.0, 40.0)?;
+
+        // Prime retained draw order with the same order used by the renderer.
+        begin_ui_frame(&_render_state);
+        update_runtime_widget(&back_entity, &back, &back_update)?;
+        update_runtime_widget(&front_entity, &front, &front_update)?;
+
+        {
+            let mut platform = lock_platform_state(&platform);
+            platform.set_mouse_position(50.0, 40.0);
+            platform.input_mut().mouse_pressed.insert("left".into());
+            platform.input_mut().mouse_down.insert("left".into());
+        }
+        begin_ui_frame(&_render_state);
+        update_runtime_widget(&back_entity, &back, &back_update)?;
+        update_runtime_widget(&front_entity, &front, &front_update)?;
+
+        assert!(!back.get::<bool>("pressed")?);
+        assert!(!back.get::<bool>("hovered")?);
+        assert!(front.get::<bool>("pressed")?);
+        assert!(front.get::<bool>("hovered")?);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_slider_capture_and_button_keyboard_focus_are_integrated() -> mlua::Result<()> {
+        let (lua, platform, _render_state) = runtime_widget_fixture();
+        let (slider_entity, slider, slider_update) =
+            make_runtime_widget(&lua, "Slider", 20.0, 20.0, 100.0, 24.0)?;
+        begin_ui_frame(&_render_state);
+        update_runtime_widget(&slider_entity, &slider, &slider_update)?;
+
+        {
+            let mut platform = lock_platform_state(&platform);
+            platform.set_mouse_position(40.0, 32.0);
+            platform.input_mut().mouse_pressed.insert("left".into());
+            platform.input_mut().mouse_down.insert("left".into());
+        }
+        begin_ui_frame(&_render_state);
+        update_runtime_widget(&slider_entity, &slider, &slider_update)?;
+        assert!(slider.get::<bool>("dragging")?);
+
+        // Capture keeps updating after the pointer leaves the slider bounds.
+        {
+            let mut platform = lock_platform_state(&platform);
+            platform.begin_frame();
+            platform.set_mouse_position(400.0, 200.0);
+        }
+        begin_ui_frame(&_render_state);
+        update_runtime_widget(&slider_entity, &slider, &slider_update)?;
+        assert!(slider.get::<bool>("dragging")?);
+        assert_eq!(slider.get::<f32>("value")?, 100.0);
+
+        // Release the slider, then verify Tab focus and Enter activation across
+        // two independently drawn buttons.
+        {
+            let mut platform = lock_platform_state(&platform);
+            platform.begin_frame();
+            platform.input_mut().mouse_down.remove("left");
+            platform.input_mut().mouse_released.insert("left".into());
+        }
+        begin_ui_frame(&_render_state);
+        update_runtime_widget(&slider_entity, &slider, &slider_update)?;
+
+        let (first_entity, first, first_update) =
+            make_runtime_widget(&lua, "Button", 20.0, 80.0, 100.0, 32.0)?;
+        let (second_entity, second, second_update) =
+            make_runtime_widget(&lua, "Button", 140.0, 80.0, 100.0, 32.0)?;
+        let clicks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_clicks = clicks.clone();
+        second.set(
+            "onClick",
+            lua.create_function(move |_lua, (_entity, _component): (Table, Table)| {
+                callback_clicks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            })?,
+        )?;
+
+        {
+            let mut platform = lock_platform_state(&platform);
+            platform.begin_frame();
+        }
+        begin_ui_frame(&_render_state);
+        update_runtime_widget(&first_entity, &first, &first_update)?;
+        update_runtime_widget(&second_entity, &second, &second_update)?;
+
+        // Programmatic focus uses the same exclusive owner as mouse and Tab.
+        crate::widget_interaction::request_focus(
+            interaction_surface(&_render_state),
+            &component_owner_key(&first),
+        );
+        {
+            let mut platform = lock_platform_state(&platform);
+            platform.begin_frame();
+            platform.input_mut().keys_pressed.insert("tab".into());
+            platform.input_mut().last_key_pressed = Some("tab".into());
+        }
+        begin_ui_frame(&_render_state);
+        update_runtime_widget(&first_entity, &first, &first_update)?;
+        update_runtime_widget(&second_entity, &second, &second_update)?;
+        assert!(!first.get::<bool>("focused")?);
+        assert!(second.get::<bool>("focused")?);
+
+        {
+            let mut platform = lock_platform_state(&platform);
+            platform.begin_frame();
+            platform.input_mut().keys_pressed.insert("enter".into());
+            platform.input_mut().last_key_pressed = Some("enter".into());
+        }
+        begin_ui_frame(&_render_state);
+        update_runtime_widget(&first_entity, &first, &first_update)?;
+        update_runtime_widget(&second_entity, &second, &second_update)?;
+        assert_eq!(clicks.load(std::sync::atomic::Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_scroll_list_supports_pointer_selection_and_keyboard_navigation() -> mlua::Result<()>
+    {
+        let (lua, platform, _render_state) = runtime_widget_fixture();
+        let (entity, list, update) =
+            make_runtime_widget(&lua, "ScrollList", 20.0, 20.0, 160.0, 80.0)?;
+        list.set("padding", 0.0)?;
+        list.set("padding_x", 0.0)?;
+        list.set("padding_y", 0.0)?;
+        list.set("border_width", 0.0)?;
+        list.set("item_height", 20.0)?;
+        list.set("item_spacing", 0.0)?;
+        let options = lua.create_sequence_from(["one", "two", "three", "four", "five"])?;
+        list.set("options", options)?;
+
+        begin_ui_frame(&_render_state);
+        update_runtime_widget(&entity, &list, &update)?;
+        {
+            let mut platform = lock_platform_state(&platform);
+            platform.set_mouse_position(40.0, 50.0);
+            platform.input_mut().mouse_pressed.insert("left".into());
+            platform.input_mut().mouse_down.insert("left".into());
+        }
+        begin_ui_frame(&_render_state);
+        update_runtime_widget(&entity, &list, &update)?;
+        assert_eq!(list.get::<usize>("selected_index")?, 2);
+        assert_eq!(list.get::<String>("selected_value")?, "two");
+        assert!(list.get::<bool>("focused")?);
+
+        {
+            let mut platform = lock_platform_state(&platform);
+            platform.begin_frame();
+            platform.input_mut().mouse_down.remove("left");
+            platform.input_mut().mouse_released.insert("left".into());
+        }
+        begin_ui_frame(&_render_state);
+        update_runtime_widget(&entity, &list, &update)?;
+
+        {
+            let mut platform = lock_platform_state(&platform);
+            platform.begin_frame();
+            platform.input_mut().keys_pressed.insert("end".into());
+            platform.input_mut().last_key_pressed = Some("end".into());
+        }
+        begin_ui_frame(&_render_state);
+        update_runtime_widget(&entity, &list, &update)?;
+        assert_eq!(list.get::<usize>("selected_index")?, 5);
+        assert_eq!(list.get::<String>("selected_text")?, "five");
+        assert_eq!(list.get::<usize>("scroll_index")?, 1);
         Ok(())
     }
 }

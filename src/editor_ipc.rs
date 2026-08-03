@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -184,7 +184,10 @@ mod tests {
         assert!(
             wait_until(|| {
                 let guard = state.lock().expect("state mutex not poisoned");
-                guard.logs.iter().any(|line| line.message == "hello from game")
+                guard
+                    .logs
+                    .iter()
+                    .any(|line| line.message == "hello from game")
                     && guard.entities.iter().any(|entity| entity.name == "Player")
             }),
             "log line and scene snapshot should reach the shared logger state"

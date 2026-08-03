@@ -1,4 +1,4 @@
-use crate::platform::{lock_platform_state, SharedPlatformState};
+use crate::platform::{SharedPlatformState, lock_platform_state};
 use mlua::Lua;
 
 pub(crate) fn normalize_name(name: &str) -> String {

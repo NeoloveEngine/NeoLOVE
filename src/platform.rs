@@ -71,6 +71,7 @@ pub(crate) struct InputState {
 pub(crate) struct FrameState {
     pub clear_color: Color,
     pub antialiasing: Antialiasing,
+    pub nearest_neighbor_scaling: bool,
 }
 
 impl Default for FrameState {
@@ -78,6 +79,7 @@ impl Default for FrameState {
         Self {
             clear_color: Color::WHITE,
             antialiasing: Antialiasing::High,
+            nearest_neighbor_scaling: true,
         }
     }
 }
@@ -137,6 +139,14 @@ impl PlatformState {
 
     pub(crate) fn set_antialiasing(&mut self, antialiasing: Antialiasing) {
         self.frame.antialiasing = antialiasing;
+    }
+
+    pub(crate) fn nearest_neighbor_scaling(&self) -> bool {
+        self.frame.nearest_neighbor_scaling
+    }
+
+    pub(crate) fn set_nearest_neighbor_scaling(&mut self, enabled: bool) {
+        self.frame.nearest_neighbor_scaling = enabled;
     }
 
     pub(crate) fn begin_frame(&mut self) {

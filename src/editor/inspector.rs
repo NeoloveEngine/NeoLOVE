@@ -129,9 +129,7 @@ pub(crate) fn parse_inspector_module(
         .create_function(|lua, _arguments: Variadic<Value>| create_entity_stub(lua))
         .map_err(|error| error.to_string())?;
     let component_factory = lua
-        .create_function(|lua, _arguments: Variadic<Value>| {
-            create_reference_stub(lua, "component")
-        })
+        .create_function(|lua, _arguments: Variadic<Value>| create_reference_stub(lua, "component"))
         .map_err(|error| error.to_string())?;
     let ecs = create_lenient_stub(&lua).map_err(|error| error.to_string())?;
     ecs.raw_set("newEntity", entity_factory.clone())
@@ -249,7 +247,10 @@ pub(crate) fn parse_inspector_module(
     }
     variables.sort_by_key(|(order, _)| *order);
     Ok(InspectorModule {
-        variables: variables.into_iter().map(|(_, variable)| variable).collect(),
+        variables: variables
+            .into_iter()
+            .map(|(_, variable)| variable)
+            .collect(),
         registers_component_picker: registers_component_picker.get(),
     })
 }
@@ -305,9 +306,7 @@ fn create_entity_stub(lua: &Lua) -> mlua::Result<Table> {
                 let key = key.to_string_lossy();
                 if key == "AddComponent" || key == "addComponent" {
                     return Ok(Value::Function(lua.create_function(
-                        |lua, _arguments: Variadic<Value>| {
-                            create_reference_stub(lua, "component")
-                        },
+                        |lua, _arguments: Variadic<Value>| create_reference_stub(lua, "component"),
                     )?));
                 }
             }
@@ -479,9 +478,9 @@ fn table_to_var(table: Table, visiting: &mut HashSet<usize>) -> Result<VarValue,
         }
         _ => false,
     }) && (1..=sequence_len).all(|index| {
-        entries.iter().any(|(key, _)| {
-            matches!(key, VarKey::Number(value) if *value == index as f32)
-        })
+        entries
+            .iter()
+            .any(|(key, _)| matches!(key, VarKey::Number(value) if *value == index as f32))
     });
 
     let result = if is_list {
@@ -537,15 +536,26 @@ mod tests {
         assert!(matches!(variables[0].value, VarValue::Number(4.0)));
         assert!(matches!(
             variables[1].control,
-            VarControl::Slider { fractional: false, .. }
+            VarControl::Slider {
+                fractional: false,
+                ..
+            }
         ));
         assert!(matches!(
             variables[2].control,
-            VarControl::Slider { fractional: true, .. }
+            VarControl::Slider {
+                fractional: true,
+                ..
+            }
         ));
-        assert!(matches!(variables[5].value, VarValue::Color([10, 20, 30, 40])));
+        assert!(matches!(
+            variables[5].value,
+            VarValue::Color([10, 20, 30, 40])
+        ));
         assert!(matches!(variables[6].value, VarValue::List(ref values) if values.len() == 3));
-        assert!(matches!(variables[7].value, VarValue::Dictionary(ref values) if values.len() == 2));
+        assert!(
+            matches!(variables[7].value, VarValue::Dictionary(ref values) if values.len() == 2)
+        );
     }
 
     #[test]
@@ -584,7 +594,10 @@ mod tests {
             IComponentPicker(Behaviour)
             return Behaviour
         "#;
-        assert!(script_registers_component_picker(registered, "Registered.luau"));
+        assert!(script_registers_component_picker(
+            registered,
+            "Registered.luau"
+        ));
         // Inspector variables are still extracted from a registered module.
         let variables = parse_inspector_variables(registered, "Registered.luau").expect("parse");
         assert_eq!(variables.len(), 1);

@@ -12,6 +12,12 @@ export type Vec2 = {
 	y: number,
 }
 
+export type Vec3 = {
+	x: number,
+	y: number,
+	z: number,
+}
+
 export type PositionPivot = "center" | "top_right"
 
 export type EntityListenEvent = "leftClick" | "rightClick" | "middleClick" | "scrollUp" | "scrollDown" | "mouseEntered" | "mouseExited"
@@ -45,11 +51,17 @@ export type Entity = {
 	name: string,
 	x: number,
 	y: number,
+	-- 3D position. The X/Y axes continue to use x and y.
+	position_z: number,
 	anchor_x: number,
 	anchor_y: number,
 	pivot_x: number?,
 	pivot_y: number?,
 	rotation: number,
+	-- XYZ Euler angles in degrees for 3D transforms.
+	rotation_x: number,
+	rotation_y: number,
+	rotation_z: number,
 	rotation_pivot: string,
 	rotation_pivot_x: number?,
 	rotation_pivot_y: number?,
@@ -58,6 +70,9 @@ export type Entity = {
 	size_x: number,
 	size_y: number,
 	scale: number,
+	scale_x: number,
+	scale_y: number,
+	scale_z: number,
 	raycastable: boolean?,
 	parent: Entity?,
 	children: { Entity },
@@ -78,6 +93,10 @@ export type Entity = {
 	GetWorldPosition: (self: Entity) -> (number, number),
 	getWorldRotation: (self: Entity) -> number,
 	GetWorldRotation: (self: Entity) -> number,
+	getWorldPosition3D: (self: Entity) -> (number, number, number),
+	GetWorldPosition3D: (self: Entity) -> (number, number, number),
+	getWorldRotation3D: (self: Entity) -> (number, number, number),
+	GetWorldRotation3D: (self: Entity) -> (number, number, number),
 	isInside: (self: Entity, world_x: number, world_y: number) -> boolean,
 	IsInside: (self: Entity, world_x: number, world_y: number) -> boolean,
 	[string]: any,
@@ -140,6 +159,122 @@ export type ImageHandle = {
 	save: (self: ImageHandle, path: string) -> (),
 	unload: (self: ImageHandle) -> (),
 	isUnloaded: (self: ImageHandle) -> boolean,
+}
+
+-- Vertex and index arguments use Lua's one-based indexing. A vertex accepts
+-- flat x/y/z, u/v fields or nested position/normal/uv/tangent tables.
+export type MeshVertexInput = {
+	x: number?,
+	y: number?,
+	z: number?,
+	u: number?,
+	v: number?,
+	position: Vec3?,
+	normal: Vec3?,
+	uv: ({ u: number, v: number } | Vec2)?,
+	tangent: ({ x: number, y: number, z: number, w: number })?,
+}
+
+export type MeshVertex = {
+	x: number,
+	y: number,
+	z: number,
+	nx: number,
+	ny: number,
+	nz: number,
+	u: number,
+	v: number,
+	tx: number,
+	ty: number,
+	tz: number,
+	tw: number,
+}
+
+export type MeshBounds = {
+	min_x: number,
+	min_y: number,
+	min_z: number,
+	max_x: number,
+	max_y: number,
+	max_z: number,
+	center_x: number,
+	center_y: number,
+	center_z: number,
+	radius: number,
+}
+
+export type MeshMaterial = {
+	name: string,
+	metallic: number,
+	roughness: number,
+	double_sided: boolean,
+	base_color_texture: string?,
+	normal_texture: string?,
+	base_color: Color4Value,
+}
+
+export type MeshMaterialTextureSlot =
+	"base"
+	| "base_color"
+	| "albedo"
+	| "diffuse"
+	| "normal"
+	| "normal_map"
+	| "metallic_roughness"
+	| "orm"
+	| "emissive"
+	| "emission"
+
+export type PrimitiveMeshKind = "cube" | "sphere" | "plane" | "cylinder" | "capsule" | "cone"
+
+export type PrimitiveMeshOptions = {
+	-- `size` sets all three axes; axis-specific fields override it.
+	size: number?,
+	width: number?,
+	height: number?,
+	depth: number?,
+	length: number?,
+	size_x: number?,
+	size_y: number?,
+	size_z: number?,
+	radius: number?,
+	segments: number?,
+	rings: number?,
+	segments_x: number?,
+	segments_z: number?,
+}
+
+-- Mesh handles have shared identity. Successful edits commit atomically,
+-- increment revision(), and are visible to renderers and mesh colliders.
+export type MeshHandle = {
+	revision: (self: MeshHandle) -> number,
+	identity: (self: MeshHandle) -> number,
+	vertexCount: (self: MeshHandle) -> number,
+	indexCount: (self: MeshHandle) -> number,
+	triangleCount: (self: MeshHandle) -> number,
+	bounds: (self: MeshHandle) -> MeshBounds,
+	getVertex: (self: MeshHandle, index: number) -> MeshVertex,
+	setVertex: (self: MeshHandle, index: number, vertex: MeshVertexInput, recomputeNormals: boolean?) -> number,
+	setPosition: (self: MeshHandle, index: number, x: number, y: number, z: number, recomputeNormals: boolean?) -> number,
+	getIndex: (self: MeshHandle, index: number) -> number,
+	setIndex: (self: MeshHandle, index: number, vertexIndex: number) -> number,
+	replaceGeometry: (self: MeshHandle, vertices: { MeshVertexInput }, indices: { number }?) -> number,
+	recomputeNormals: (self: MeshHandle) -> number,
+	materialCount: (self: MeshHandle) -> number,
+	getMaterial: (self: MeshHandle, index: number) -> MeshMaterial,
+	setMaterialTexture: (self: MeshHandle, index: number, slot: MeshMaterialTextureSlot, source: string?, texCoord: number?) -> number,
+	setMaterialColor: (self: MeshHandle, index: number, color: Color4Value) -> number,
+	-- Cached imported/primitive handles share geometry and pose. Clone before
+	-- independently animating several instances of the same asset.
+	cloneDetached: (self: MeshHandle) -> MeshHandle,
+	animationNames: (self: MeshHandle) -> { string },
+	animationDuration: (self: MeshHandle, name: string) -> number?,
+	sampleAnimation: (self: MeshHandle, name: string, time: number, looped: boolean?) -> number,
+	playAnimation: (self: MeshHandle, name: string, looped: boolean?, speed: number?) -> (),
+	updateAnimation: (self: MeshHandle, deltaSeconds: number) -> boolean,
+	pauseAnimation: (self: MeshHandle, paused: boolean?) -> (),
+	stopAnimation: (self: MeshHandle) -> (),
+	jointCount: (self: MeshHandle) -> number,
 }
 
 export type SoundHandle = {
@@ -211,12 +346,19 @@ export type InputModule = {
 export type AssetsModule = {
 	loadImage: (pathOrBase64Png: string) -> ImageHandle,
 	loadImageBase64: (base64Png: string) -> ImageHandle,
+	-- Imports .obj, .gltf, .glb, or ASCII/binary .fbx geometry. glTF/GLB and
+	-- supported ASCII FBX files may also contain one armature and animation clips.
+	loadMesh: (path: string) -> MeshHandle,
+	primitiveMesh: (kind: PrimitiveMeshKind | string, options: PrimitiveMeshOptions?) -> MeshHandle,
+	newMesh: (vertices: { MeshVertexInput }, indices: { number }?) -> MeshHandle,
 	snapPhoto: (x: number, y: number, x2: number, y2: number) -> ImageHandle,
 	newImage: (width: number, height: number, color: Color4Value?) -> ImageHandle,
 	loadSound: (path: string) -> SoundHandle,
 	newSound: (sampleRate: number, channels: number, len: number, fill: number?) -> SoundHandle,
 	unloadImage: (value: string | ImageHandle) -> boolean,
 	unloadSound: (value: string | SoundHandle) -> boolean,
+	-- Evicts a path from the cache; existing handles remain valid.
+	unloadMesh: (path: string) -> boolean,
 	gc: () -> (number, number),
 }
 
@@ -580,13 +722,21 @@ export type ShadersModule = {
 	DEFAULT_VERTEX_SHADER: string,
 	load: (vertexPath: string, fragmentPath: string, options: ShaderLoadOptions?) -> ShaderHandle,
 	loadFragment: (fragmentPath: string, options: ShaderLoadOptions?) -> ShaderHandle,
+	load3DFragment: (fragmentPath: string, options: ShaderLoadOptions?) -> ShaderHandle,
 	fromSource: (vertexSource: string, fragmentSource: string, options: ShaderLoadOptions?) -> ShaderHandle,
 	fromFragmentSource: (fragmentSource: string, options: ShaderLoadOptions?) -> ShaderHandle,
+	from3DFragmentSource: (fragmentSource: string, options: ShaderLoadOptions?) -> ShaderHandle,
+	supports3D: () -> boolean,
+	supports3DShaders: () -> boolean,
 }
 
 export type TransformModule = {
 	getWorldPosition: (entity: Entity) -> (number, number),
 	getWorldRotation: (entity: Entity) -> number,
+	getWorldPosition3D: (entity: Entity) -> (number, number, number),
+	get_world_position_3d: (entity: Entity) -> (number, number, number),
+	getWorldRotation3D: (entity: Entity) -> (number, number, number),
+	get_world_rotation_3d: (entity: Entity) -> (number, number, number),
 	lookAt: (from_x: number, from_y: number, to_x: number, to_y: number) -> number,
 	look_at: (from_x: number, from_y: number, to_x: number, to_y: number) -> number,
 	GetEntitiesInFront: (world_x: number, world_y: number, minimum_z: number?) -> { Entity },
@@ -618,11 +768,15 @@ export type PrefabTemplate = {
 	name: string?,
 	x: number?,
 	y: number?,
+	position_z: number?,
 	anchor_x: number?,
 	anchor_y: number?,
 	pivot_x: number?,
 	pivot_y: number?,
 	rotation: number?,
+	rotation_x: number?,
+	rotation_y: number?,
+	rotation_z: number?,
 	rotation_pivot: string?,
 	rotation_pivot_x: number?,
 	rotation_pivot_y: number?,
@@ -631,6 +785,9 @@ export type PrefabTemplate = {
 	size_x: number?,
 	size_y: number?,
 	scale: number?,
+	scale_x: number?,
+	scale_y: number?,
+	scale_z: number?,
 	parent: PrefabTemplate?,
 	children: { PrefabTemplate }?,
 	components: { Component }?,
@@ -796,6 +953,214 @@ export type Camera = ComponentInstance & {
 	setActive: (self: Camera) -> boolean,
 	IsActive: (self: Camera) -> boolean,
 	isActive: (self: Camera) -> boolean,
+}
+
+-- Camera transforms use entity x/y/position_z and XYZ Euler degrees. The
+-- first enabled Camera3D is selected automatically unless SetActive is used.
+export type Camera3D = ComponentInstance & {
+	__neolove_component: "Camera3D",
+	NEOLOVE_RENDERING: boolean,
+	enabled: boolean,
+	projection: "perspective" | "orthographic",
+	fov: number,
+	orthographic_size: number,
+	near_clip: number,
+	far_clip: number,
+	SetActive: (self: Camera3D) -> boolean,
+	setActive: (self: Camera3D) -> boolean,
+	IsActive: (self: Camera3D) -> boolean,
+	isActive: (self: Camera3D) -> boolean,
+}
+
+export type Environment3DMode = "solid" | "gradient" | "equirectangular"
+
+-- A scene environment renders before 3D geometry and ignores camera
+-- translation. `texture`/`texture_path` expect an equirectangular panorama.
+export type Environment3D = ComponentInstance & {
+	__neolove_component: "Environment3D",
+	NEOLOVE_RENDERING: boolean,
+	enabled: boolean,
+	mode: Environment3DMode,
+	color: Color4Value,
+	top_color: Color4Value,
+	bottom_color: Color4Value,
+	texture: ImageHandle?,
+	texture_path: string,
+	rotation: number,
+	intensity: number,
+}
+
+export type Skybox3D = Environment3D
+
+export type MeshRenderer3D = ComponentInstance & {
+	__neolove_component: "MeshRenderer3D",
+	NEOLOVE_RENDERING: boolean,
+	mesh: MeshHandle?,
+	mesh_path: string,
+	-- An imported path takes precedence. Use "none" for a script-assigned mesh.
+	primitive: PrimitiveMeshKind | "none" | string,
+	primitive_size_x: number,
+	primitive_size_y: number,
+	primitive_size_z: number,
+	primitive_radius: number,
+	primitive_height: number,
+	primitive_segments: number,
+	primitive_rings: number,
+	-- Assign an ImageHandle here to texture the mesh immediately.
+	texture: ImageHandle?,
+	-- Reserved authoring metadata; normal mapping is not rendered yet.
+	normal_texture: ImageHandle?,
+	color: Color4Value,
+	-- Reserved authoring metadata; current 3D shading is diffuse/emissive.
+	metallic: number,
+	roughness: number,
+	visible: boolean,
+	-- Reserved authoring metadata; 3D shadow maps are not rendered yet.
+	casts_shadows: boolean,
+	receives_shadows: boolean,
+	double_sided: boolean,
+	shader: ShaderHandle?,
+	animation: string,
+	animation_autoplay: boolean,
+	animation_looping: boolean,
+	animation_playing: boolean,
+	-- Component-managed playback currently accepts finite non-negative speeds.
+	animation_speed: number,
+	playAnimation: (self: MeshRenderer3D, clip: string?) -> (),
+	PlayAnimation: (self: MeshRenderer3D, clip: string?) -> (),
+	pauseAnimation: (self: MeshRenderer3D) -> (),
+	PauseAnimation: (self: MeshRenderer3D) -> (),
+	stopAnimation: (self: MeshRenderer3D) -> (),
+	StopAnimation: (self: MeshRenderer3D) -> (),
+}
+
+export type Light3DKind = "point" | "spot" | "directional" | "sun" | "spotlight"
+
+export type Light3D = ComponentInstance & {
+	__neolove_component: "Light3D",
+	NEOLOVE_RENDERING: boolean,
+	kind: Light3DKind,
+	color: Color4Value,
+	intensity: number,
+	range: number,
+	spot_angle: number,
+	spot_softness: number,
+	-- Reserved authoring metadata; 3D shadow maps are not rendered yet.
+	casts_shadows: boolean,
+	shadow_bias: number,
+	visible: boolean,
+}
+
+export type ParticleEmissionShape3D = "point" | "box" | "sphere" | "cone"
+
+export type ParticleSystem3D = ComponentInstance & {
+	__neolove_component: "ParticleSystem3D",
+	NEOLOVE_RENDERING: boolean,
+	enabled: boolean,
+	visible: boolean,
+	playing: boolean,
+	looping: boolean,
+	duration: number,
+	emission_rate: number,
+	max_particles: number,
+	shape: ParticleEmissionShape3D,
+	box_size_x: number,
+	box_size_y: number,
+	box_size_z: number,
+	sphere_radius: number,
+	cone_angle: number,
+	cone_length: number,
+	direction_x: number,
+	direction_y: number,
+	direction_z: number,
+	spread: number,
+	lifetime: number,
+	lifetime_min: number,
+	lifetime_max: number,
+	speed: number,
+	speed_min: number,
+	speed_max: number,
+	gravity_x: number,
+	gravity_y: number,
+	gravity_z: number,
+	drag: number,
+	start_size: number,
+	end_size: number,
+	start_color: Color4Value,
+	end_color: Color4Value,
+	start_rotation: number,
+	angular_velocity: number,
+	texture: ImageHandle?,
+	particle_count: number,
+	seed: number,
+	play: (self: ParticleSystem3D) -> (),
+	Play: (self: ParticleSystem3D) -> (),
+	pause: (self: ParticleSystem3D) -> (),
+	Pause: (self: ParticleSystem3D) -> (),
+	stop: (self: ParticleSystem3D) -> (),
+	Stop: (self: ParticleSystem3D) -> (),
+	emit: (self: ParticleSystem3D, count: number?) -> (),
+	Emit: (self: ParticleSystem3D, count: number?) -> (),
+}
+
+-- Lightweight velocity/gravity integration with automatic positional and
+-- velocity response for exact primitive contacts. Bounds-only contacts (mesh,
+-- capsule-box, or non-uniform round shapes) are reported but never resolved.
+export type Rigidbody3D = ComponentInstance & {
+	__neolove_component: "Rigidbody3D",
+	enabled: boolean,
+	is_static: boolean,
+	-- Reserved metadata until the lightweight solver gains mass-coupled impulses.
+	mass: number,
+	gravity_scale: number,
+	linear_damping: number,
+	angular_damping: number,
+	velocity_x: number,
+	velocity_y: number,
+	velocity_z: number,
+	angular_velocity_x: number,
+	angular_velocity_y: number,
+	angular_velocity_z: number,
+	freeze_x: boolean,
+	freeze_y: boolean,
+	freeze_z: boolean,
+	freeze_rotation_x: boolean,
+	freeze_rotation_y: boolean,
+	freeze_rotation_z: boolean,
+	-- Reserved metadata; continuous collision detection is not implemented yet.
+	continuous_collision: boolean,
+	auto_resolve: boolean,
+	contact_slop: number,
+	onContact: Physics3DContactCallback?,
+	onTrigger: Physics3DContactCallback?,
+	setOnContact: (self: Rigidbody3D, callback: Physics3DContactCallback?) -> (),
+	setOnTrigger: (self: Rigidbody3D, callback: Physics3DContactCallback?) -> (),
+}
+
+export type Collider3DShape = "box" | "sphere" | "capsule" | "mesh"
+
+export type Collider3D = ComponentInstance & {
+	__neolove_component: "Collider3D",
+	enabled: boolean,
+	is_trigger: boolean,
+	shape: Collider3DShape,
+	mesh: MeshHandle?,
+	mesh_path: string,
+	-- Reserved metadata; mesh raycasts always use the exact triangle BVH.
+	convex: boolean,
+	size_x: number,
+	size_y: number,
+	size_z: number,
+	radius: number,
+	height: number,
+	offset_x: number,
+	offset_y: number,
+	offset_z: number,
+	restitution: number,
+	friction: number,
+	non_physics: boolean,
+	layer: number,
+	mask: number,
 }
 
 export type Shape2DShape = "box" | "circle" | "triangle" | "right_triangle" | "righttriangle" | "rightangledtriangle"
@@ -982,6 +1347,7 @@ export type TextInput = BaseDrawableComponent & UiTextStyle & {
 	placeholder: string,
 	enabled: boolean,
 	locked: boolean,
+	hovered: boolean,
 	focused: boolean,
 	password: boolean,
 	max_length: number,
@@ -993,10 +1359,27 @@ export type TextInput = BaseDrawableComponent & UiTextStyle & {
 	placeholder_color: Color4Value,
 	caret_color: Color4Value,
 	background_color: Color4Value,
+	hover_background_color: Color4Value,
+	focus_background_color: Color4Value,
+	disabled_background_color: Color4Value,
 	border_color: Color4Value,
+	hover_border_color: Color4Value,
+	focus_border_color: Color4Value,
+	disabled_border_color: Color4Value,
+	disabled_text_color: Color4Value,
 	border_width: number,
 	corner_radius: number,
 	caret_width: number,
+	background_image: ImageHandle?,
+	icon_image: ImageHandle?,
+	icon_color: Color4Value,
+	icon_size: number,
+	icon_gap: number,
+	icon_side: "left" | "right",
+	slice_left: number,
+	slice_right: number,
+	slice_top: number,
+	slice_bottom: number,
 	setBold: (self: TextInput, startIndex: number, endIndex: number) -> (),
 	setItalic: (self: TextInput, startIndex: number, endIndex: number) -> (),
 	setUnderline: (self: TextInput, startIndex: number, endIndex: number) -> (),
@@ -1009,11 +1392,13 @@ export type TextInput = BaseDrawableComponent & UiTextStyle & {
 	clearFormatting: (self: TextInput, startIndex: number?, endIndex: number?) -> (),
 	clearAllFormatting: (self: TextInput) -> (),
 	focus: (self: TextInput) -> (),
+	Focus: (self: TextInput) -> (),
 	blur: (self: TextInput) -> (),
-	onChanged: ((self: Entity, text: string) -> ())?,
-	onSubmit: ((self: Entity, text: string) -> ())?,
-	onFocus: ((self: Entity) -> ())?,
-	onBlur: ((self: Entity) -> ())?,
+	Blur: (self: TextInput) -> (),
+	onChanged: ((entity: Entity, component: TextInput, text: string) -> ())?,
+	onSubmit: ((entity: Entity, component: TextInput, text: string) -> ())?,
+	onFocus: ((entity: Entity, component: TextInput) -> ())?,
+	onBlur: ((entity: Entity, component: TextInput) -> ())?,
 }
 
 -- A customizable UI container. Defaults match Visual Studio Code's Dark+ theme.
@@ -1037,6 +1422,8 @@ export type Button = BaseDrawableComponent & UiTextStyle & {
 	text: string,
 	enabled: boolean,
 	hovered: boolean,
+	-- Mouse clicks or Tab grant exclusive focus; Enter/Space activate the button.
+	focused: boolean,
 	pressed: boolean,
 	background_color: Color4Value,
 	hover_background_color: Color4Value,
@@ -1057,11 +1444,22 @@ export type Button = BaseDrawableComponent & UiTextStyle & {
 	icon_size: number,
 	icon_gap: number,
 	icon_side: "left" | "right",
-	onClick: ((self: Entity) -> ())?,
-	onPress: ((self: Entity) -> ())?,
-	onRelease: ((self: Entity) -> ())?,
-	onHoverEnter: ((self: Entity) -> ())?,
-	onHoverLeave: ((self: Entity) -> ())?,
+	background_image: ImageHandle?,
+	slice_left: number,
+	slice_right: number,
+	slice_top: number,
+	slice_bottom: number,
+	focus: (self: Button) -> (),
+	Focus: (self: Button) -> (),
+	blur: (self: Button) -> (),
+	Blur: (self: Button) -> (),
+	onClick: ((entity: Entity, component: Button) -> ())?,
+	onPress: ((entity: Entity, component: Button) -> ())?,
+	onRelease: ((entity: Entity, component: Button) -> ())?,
+	onHoverEnter: ((entity: Entity, component: Button) -> ())?,
+	onHoverLeave: ((entity: Entity, component: Button) -> ())?,
+	onFocus: ((entity: Entity, component: Button) -> ())?,
+	onBlur: ((entity: Entity, component: Button) -> ())?,
 }
 
 -- A draggable value slider. Hover colours for the track, fill, and thumb are
@@ -1070,6 +1468,8 @@ export type Slider = BaseDrawableComponent & {
 	__neolove_component: "Slider",
 	enabled: boolean,
 	hovered: boolean,
+	-- Focused sliders support arrows, Home/End, and PageUp/PageDown.
+	focused: boolean,
 	dragging: boolean,
 	min: number,
 	max: number,
@@ -1081,17 +1481,33 @@ export type Slider = BaseDrawableComponent & {
 	thumb_size: number,
 	thumb_corner_radius: number,
 	corner_radius: number,
+	border_width: number,
 	background_color: Color4Value,
 	hover_background_color: Color4Value,
 	disabled_background_color: Color4Value,
+	border_color: Color4Value,
+	hover_border_color: Color4Value,
+	disabled_border_color: Color4Value,
 	fill_color: Color4Value,
 	hover_fill_color: Color4Value,
 	disabled_fill_color: Color4Value,
 	thumb_color: Color4Value,
 	hover_thumb_color: Color4Value,
 	disabled_thumb_color: Color4Value,
+	background_image: ImageHandle?,
+	slice_left: number,
+	slice_right: number,
+	slice_top: number,
+	slice_bottom: number,
 	setValue: (self: Slider, value: number) -> (),
-	onChanged: ((self: Entity, value: number) -> ())?,
+	SetValue: (self: Slider, value: number) -> (),
+	focus: (self: Slider) -> (),
+	Focus: (self: Slider) -> (),
+	blur: (self: Slider) -> (),
+	Blur: (self: Slider) -> (),
+	onChanged: ((entity: Entity, component: Slider, value: number) -> ())?,
+	onFocus: ((entity: Entity, component: Slider) -> ())?,
+	onBlur: ((entity: Entity, component: Slider) -> ())?,
 }
 
 -- A selectable dropdown with a scrollable popup menu.
@@ -1100,12 +1516,20 @@ export type Dropdown = BaseDrawableComponent & UiTextStyle & {
 	enabled: boolean,
 	open: boolean,
 	hovered: boolean,
+	-- Focused dropdowns support arrows/Home/End and Enter/Space/Escape.
+	focused: boolean,
+	hover_index: number,
 	selected_index: number,
 	selected_text: string,
 	selected_value: string,
+	scroll_index: number,
 	placeholder: string,
 	options: { any },
 	item_height: number,
+	item_corner_radius: number,
+	item_icon_size: number,
+	item_icon_gap: number,
+	menu_gap: number,
 	max_visible_items: number,
 	open_upwards: boolean,
 	background_color: Color4Value,
@@ -1115,7 +1539,9 @@ export type Dropdown = BaseDrawableComponent & UiTextStyle & {
 	border_color: Color4Value,
 	hover_border_color: Color4Value,
 	open_border_color: Color4Value,
+	disabled_border_color: Color4Value,
 	text_color: Color4Value,
+	disabled_text_color: Color4Value,
 	menu_background_color: Color4Value,
 	menu_border_color: Color4Value,
 	item_background_color: Color4Value,
@@ -1126,7 +1552,94 @@ export type Dropdown = BaseDrawableComponent & UiTextStyle & {
 	item_selected_text_color: Color4Value,
 	border_width: number,
 	corner_radius: number,
-	onChanged: ((self: Entity, index: number, value: any) -> ())?,
+	background_image: ImageHandle?,
+	icon_image: ImageHandle?,
+	icon_color: Color4Value,
+	icon_size: number,
+	icon_gap: number,
+	icon_side: "left" | "right",
+	slice_left: number,
+	slice_right: number,
+	slice_top: number,
+	slice_bottom: number,
+	focus: (self: Dropdown) -> (),
+	Focus: (self: Dropdown) -> (),
+	blur: (self: Dropdown) -> (),
+	Blur: (self: Dropdown) -> (),
+	onChanged: ((entity: Entity, component: Dropdown, index: number, value: string) -> ())?,
+	onFocus: ((entity: Entity, component: Dropdown) -> ())?,
+	onBlur: ((entity: Entity, component: Dropdown) -> ())?,
+}
+
+export type ScrollListItem = {
+	text: string?,
+	label: string?,
+	name: string?,
+	value: (string | number | boolean)?,
+	id: (string | number | boolean)?,
+	image: ImageHandle?,
+	icon: ImageHandle?,
+	image_color: Color4Value?,
+	icon_color: Color4Value?,
+}
+
+-- A scrollable, keyboard-navigable list with exclusive focus and captured
+-- scrollbar dragging. Options may be primitive values or ScrollListItem tables.
+export type ScrollList = BaseDrawableComponent & UiTextStyle & {
+	__neolove_component: "ScrollList",
+	enabled: boolean,
+	hovered: boolean,
+	focused: boolean,
+	hover_index: number,
+	selected_index: number,
+	selected_text: string,
+	selected_value: string,
+	scroll_index: number,
+	options: { string | number | boolean | ScrollListItem },
+	empty_text: string,
+	item_height: number,
+	item_spacing: number,
+	item_corner_radius: number,
+	item_icon_size: number,
+	item_icon_gap: number,
+	item_padding_x: number,
+	item_padding_y: number,
+	show_scrollbar: boolean,
+	scrollbar_width: number,
+	scrollbar_dragging: boolean,
+	background_color: Color4Value,
+	hover_background_color: Color4Value,
+	focus_background_color: Color4Value,
+	disabled_background_color: Color4Value,
+	border_color: Color4Value,
+	hover_border_color: Color4Value,
+	focus_border_color: Color4Value,
+	disabled_border_color: Color4Value,
+	text_color: Color4Value,
+	empty_text_color: Color4Value,
+	disabled_text_color: Color4Value,
+	item_background_color: Color4Value,
+	item_hover_background_color: Color4Value,
+	item_selected_background_color: Color4Value,
+	item_text_color: Color4Value,
+	item_hover_text_color: Color4Value,
+	item_selected_text_color: Color4Value,
+	scrollbar_color: Color4Value,
+	scrollbar_thumb_color: Color4Value,
+	border_width: number,
+	corner_radius: number,
+	background_image: ImageHandle?,
+	slice_left: number,
+	slice_right: number,
+	slice_top: number,
+	slice_bottom: number,
+	focus: (self: ScrollList) -> (),
+	Focus: (self: ScrollList) -> (),
+	blur: (self: ScrollList) -> (),
+	Blur: (self: ScrollList) -> (),
+	onChanged: ((entity: Entity, component: ScrollList, index: number, value: string) -> ())?,
+	onFocus: ((entity: Entity, component: ScrollList) -> ())?,
+	onBlur: ((entity: Entity, component: ScrollList) -> ())?,
 }
 
 export type Sprite2D = BaseDrawableComponent & {
@@ -1350,12 +1863,126 @@ export type Rope2D = ComponentInstance & {
 	link: (self: Rope2D, entityA: Entity, entityB: Entity) -> (),
 }
 
+export type Physics3DRaycastOptions = {
+	layer: number?,
+	mask: number?,
+	include_triggers: boolean?,
+}
+
+export type Physics3DRaycastHit = {
+	entity_id: number,
+	distance: number,
+	x: number,
+	y: number,
+	z: number,
+	normal_x: number,
+	normal_y: number,
+	normal_z: number,
+	front_face: boolean,
+	is_trigger: boolean,
+	-- Present for mesh colliders; indices are one-based for Luau.
+	triangle_index: number?,
+	barycentric: { number }?,
+}
+
+export type Physics3DBroadphasePair = {
+	first_id: number,
+	second_id: number,
+	has_trigger: boolean,
+}
+
+export type Physics3DContactQuality = "exact" | "bounds"
+
+export type Physics3DContactOptions = {
+	include_triggers: boolean?,
+	include_bounds: boolean?,
+	entity_id: number?,
+}
+
+export type Physics3DContact = {
+	first_id: number,
+	second_id: number,
+	normal_x: number,
+	normal_y: number,
+	normal_z: number,
+	penetration: number,
+	x: number,
+	y: number,
+	z: number,
+	is_trigger: boolean,
+	quality: Physics3DContactQuality,
+	exact: boolean,
+	can_resolve: boolean,
+}
+
+export type Physics3DBodyContact = {
+	self_id: number,
+	other_id: number,
+	normal_x: number,
+	normal_y: number,
+	normal_z: number,
+	penetration: number,
+	x: number,
+	y: number,
+	z: number,
+	is_trigger: boolean,
+	quality: Physics3DContactQuality,
+	exact: boolean,
+	can_resolve: boolean,
+}
+
+export type Physics3DContactCallback = (contact: Physics3DBodyContact) -> ()
+
+export type Physics3DResolveOptions = {
+	response: boolean?,
+	correction_percent: number?,
+	slop: number?,
+}
+
+export type Physics3DResolveResult = {
+	contacts: { Physics3DBodyContact },
+	contact_count: number,
+	trigger_count: number,
+	exact_count: number,
+	bounds_count: number,
+	resolved_count: number,
+	grounded: boolean,
+	correction_x: number,
+	correction_y: number,
+	correction_z: number,
+}
+
+export type Physics3DModule = {
+	raycast: (
+		origin_x: number,
+		origin_y: number,
+		origin_z: number,
+		dir_x: number,
+		dir_y: number,
+		dir_z: number,
+		max_distance: number?,
+		options: Physics3DRaycastOptions?
+	) -> Physics3DRaycastHit?,
+	-- Runs deterministic broadphase + primitive narrowphase. `bounds` contacts
+	-- are conservative candidates, not exact mesh/ellipsoid manifolds.
+	contacts: (options: Physics3DContactOptions?) -> { Physics3DContact },
+	-- Resolves only exact, non-trigger primitive contacts for one body. Called
+	-- automatically by Rigidbody3D when `auto_resolve` is true.
+	resolveBody: (
+		entity: Entity,
+		body: Rigidbody3D,
+		options: Physics3DResolveOptions?
+	) -> Physics3DResolveResult,
+	broadphasePairs: () -> { Physics3DBroadphasePair },
+}
+
 -- Quality/resolution of the 2D light map.
 export type LightQuality = "low" | "medium" | "high" | "ultra"
 
 -- Global 2D lighting controls. Settings persist across frames; toggle the whole
 -- system with `setEnabled`. Lights and occluders come from `Light2D` /
--- `LightOccluder2D` components. Applied by the software renderer.
+-- `LightOccluder2D` components. Software renders the map directly; Vulkan
+-- composites a CPU-generated map on the GPU; web capture uses the CPU path.
 export type LightingModule = {
 	setEnabled: (enabled: boolean?) -> (),
 	enable: () -> (),
@@ -1370,7 +1997,8 @@ export type LightingModule = {
 	setAmbientOcclusion: (enabled: boolean?, radius: number?, intensity: number?, samples: number?) -> (),
 	-- Toggle occluder shadows. `softness` (pixels) adds a penumbra; 0 is hard.
 	setShadows: (enabled: boolean?, softness: number?) -> (),
-	-- Glow added where light exceeds full brightness.
+	-- Glow added where light exceeds full brightness on software/web CPU paths.
+	-- The native Vulkan light-map encoding currently clamps over-bright values.
 	setBloom: (amount: number) -> (),
 	-- Output multiplier applied after lighting.
 	setExposure: (value: number) -> (),
@@ -1384,12 +2012,89 @@ export type LightingModule = {
 	reset: () -> (),
 }
 
+export type PostProcessEffectName =
+	"bloom"
+	| "pixelate"
+	| "pixelated"
+	| "pixelation"
+	| "chromatic_aberration"
+	| "chromatic_abberation"
+	| "chromatic"
+	| "motion_blur"
+	| "motionblur"
+	| "quantization"
+	| "quantize"
+	| "posterize"
+	| "vignette"
+	| "grayscale"
+	| "greyscale"
+	| "invert"
+	| "negative"
+	| "color_adjust"
+	| "brightness_contrast_saturation"
+	| "bcs"
+	| "exposure"
+	| "tonemap"
+	| "exposure_tonemap"
+
+-- Only fields used by an effect are read. All effect passes are ordered and
+-- use one-based stack indices in Luau.
+export type PostProcessOptions = {
+	enabled: boolean?,
+	threshold: number?,
+	intensity: number?,
+	radius: number?,
+	block_size: number?,
+	offset_pixels: number?,
+	angle_degrees: number?,
+	strength: number?,
+	levels: number?,
+	dither_strength: number?,
+	softness: number?,
+	amount: number?,
+	brightness: number?,
+	contrast: number?,
+	saturation: number?,
+	exposure: number?,
+	operator: ("none" | "off" | "reinhard" | "aces" | "aces_filmic")?,
+	gamma: number?,
+}
+
+export type PostProcessModule = {
+	setEnabled: (enabled: boolean?) -> (),
+	isEnabled: () -> boolean,
+	add: (kind: PostProcessEffectName, options: PostProcessOptions?) -> number,
+	remove: (index: number) -> boolean,
+	move: (fromIndex: number, toIndex: number) -> boolean,
+	setPassEnabled: (index: number, enabled: boolean) -> boolean,
+	clear: () -> (),
+	resetHistory: () -> (),
+	count: () -> number,
+}
+
+export type Environment3DModule = {
+	setSolid: (color: Color4Value) -> (),
+	setGradient: (top: Color4Value, bottom: Color4Value) -> (),
+	setEquirectangular: (image: ImageHandle, rotationDegrees: number?) -> (),
+	setEnabled: (enabled: boolean) -> (),
+	setIntensity: (intensity: number) -> (),
+	clear: () -> (),
+}
+
 export type CoreModule = {
 	Rect2D: Rect2D,
 	Light2D: Light2D,
 	LightOccluder2D: LightOccluder2D,
 	EntityScaler: EntityScaler,
 	Camera: Camera,
+	Camera3D: Camera3D,
+	Environment3D: Environment3D,
+	Skybox3D: Skybox3D,
+	MeshRenderer3D: MeshRenderer3D,
+	Light3D: Light3D,
+	ParticleSystem3D: ParticleSystem3D,
+	Rigidbody3D: Rigidbody3D,
+	Collider3D: Collider3D,
 	Shape2D: Shape2D,
 	ParticleSystem2D: ParticleSystem2D,
 	AnimationController: AnimationController,
@@ -1403,6 +2108,7 @@ export type CoreModule = {
 	Button: Button,
 	Slider: Slider,
 	Dropdown: Dropdown,
+	ScrollList: ScrollList,
 	Sprite2D: Sprite2D,
 	SpriteSheet2D: SpriteSheet2D,
 	Image2D: Image2D,
@@ -1492,6 +2198,13 @@ declare transform: TransformModule
 declare transforms: TransformModule
 declare core: CoreModule
 declare lighting: LightingModule
+declare physics3d: Physics3DModule
+declare physics3D: Physics3DModule
+declare postprocess: PostProcessModule
+declare postProcess: PostProcessModule
+declare environment3d: Environment3DModule
+declare environment3D: Environment3DModule
+declare skybox: Environment3DModule
 declare Rng: RngModule
 declare async: AsyncModule
 

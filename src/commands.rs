@@ -92,8 +92,14 @@ mod native {
                             let status_code = output.status.code().unwrap_or(-1);
                             out.set("ok", output.status.success())?;
                             super::set_status_fields(&out, status_code)?;
-                            out.set("stdout", String::from_utf8_lossy(&output.stdout).to_string())?;
-                            out.set("stderr", String::from_utf8_lossy(&output.stderr).to_string())?;
+                            out.set(
+                                "stdout",
+                                String::from_utf8_lossy(&output.stdout).to_string(),
+                            )?;
+                            out.set(
+                                "stderr",
+                                String::from_utf8_lossy(&output.stderr).to_string(),
+                            )?;
                             out.set("error", mlua::Value::Nil)?;
                         }
                         Err(error) => {

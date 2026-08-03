@@ -64,7 +64,12 @@ fn parse_headers_table(table: Table) -> mlua::Result<Vec<(String, String)>> {
 
 fn parse_request_options(table: Table) -> mlua::Result<ScriptHttpRequest> {
     let url: String = table.get("url")?;
-    let method = validate_http_method(table.get::<Option<String>>("method")?.as_deref().unwrap_or("GET"))?;
+    let method = validate_http_method(
+        table
+            .get::<Option<String>>("method")?
+            .as_deref()
+            .unwrap_or("GET"),
+    )?;
     let headers = match table.get::<Option<Table>>("headers")? {
         Some(headers) => parse_headers_table(headers)?,
         None => Vec::new(),
@@ -101,7 +106,11 @@ fn parse_request_args(args: Variadic<Value>) -> mlua::Result<(ScriptHttpRequest,
         [Value::Table(options), Value::Function(callback)] => {
             Ok((parse_request_options(options.clone())?, callback.clone()))
         }
-        [Value::String(url), Value::Table(options), Value::Function(callback)] => {
+        [
+            Value::String(url),
+            Value::Table(options),
+            Value::Function(callback),
+        ] => {
             let mut request = parse_request_options(options.clone())?;
             request.url = url.to_str()?.to_string();
             Ok((request, callback.clone()))
@@ -186,9 +195,10 @@ fn install_http_module(
                 }
                 payload.set("headers", headers)?;
 
-                let call_result = crate::lua_error::protect_lua_call("running http callback", || {
-                    callback.call::<()>(payload)
-                });
+                let call_result =
+                    crate::lua_error::protect_lua_call("running http callback", || {
+                        callback.call::<()>(payload)
+                    });
                 lua.remove_registry_value(callback_key)?;
                 if let Err(error) = call_result {
                     eprintln!(
@@ -497,29 +507,33 @@ mod native {
     }
 
     pub(crate) fn add_http_module(lua: &Lua) -> mlua::Result<()> {
-        install_http_module(lua, |request_id, request, sender| {
-            std::thread::spawn(move || {
-                let event = match perform_http_request_for_script(&request) {
-                    Ok((status, headers, body)) => HttpResponseEvent {
-                        request_id,
-                        url: request.url,
-                        status: Some(status),
-                        headers,
-                        body,
-                        error: None,
-                    },
-                    Err(error) => HttpResponseEvent {
-                        request_id,
-                        url: request.url,
-                        status: None,
-                        headers: Vec::new(),
-                        body: String::new(),
-                        error: Some(error),
-                    },
-                };
-                let _ = sender.send(event);
-            });
-        }, |_sender| {})
+        install_http_module(
+            lua,
+            |request_id, request, sender| {
+                std::thread::spawn(move || {
+                    let event = match perform_http_request_for_script(&request) {
+                        Ok((status, headers, body)) => HttpResponseEvent {
+                            request_id,
+                            url: request.url,
+                            status: Some(status),
+                            headers,
+                            body,
+                            error: None,
+                        },
+                        Err(error) => HttpResponseEvent {
+                            request_id,
+                            url: request.url,
+                            status: None,
+                            headers: Vec::new(),
+                            body: String::new(),
+                            error: Some(error),
+                        },
+                    };
+                    let _ = sender.send(event);
+                });
+            },
+            |_sender| {},
+        )
     }
 
     #[cfg(test)]
@@ -552,7 +566,7 @@ mod native {
 #[cfg(target_os = "emscripten")]
 mod native {
     use super::*;
-    use std::ffi::{c_char, c_void, CStr, CString};
+    use std::ffi::{CStr, CString, c_char, c_void};
 
     unsafe extern "C" {
         fn neolove_web_http_start(
@@ -597,14 +611,13 @@ mod native {
                 let result = (|| -> Result<(), String> {
                     let url = cstring(&request.url)?;
                     let method = cstring(&request.method)?;
-                    let headers_json = serde_json::to_string(
-                        &request
-                            .headers
-                            .iter()
-                            .cloned()
-                            .collect::<HashMap<String, String>>(),
-                    )
-                    .map_err(|error| format!("failed to encode HTTP headers: {error}"))?;
+                    let headers_json =
+                        serde_json::to_string(&request.headers.iter().cloned().collect::<HashMap<
+                            String,
+                            String,
+                        >>(
+                        ))
+                        .map_err(|error| format!("failed to encode HTTP headers: {error}"))?;
                     let headers_json = cstring(&headers_json)?;
                     let body_ptr = if request.body.is_empty() {
                         std::ptr::null()
@@ -642,9 +655,8 @@ mod native {
                 let mut request_id = 0i32;
                 let mut status = 0i32;
                 let mut ok = 0i32;
-                let has_event = unsafe {
-                    neolove_web_http_poll(&mut request_id, &mut status, &mut ok)
-                };
+                let has_event =
+                    unsafe { neolove_web_http_poll(&mut request_id, &mut status, &mut ok) };
                 if has_event == 0 {
                     break;
                 }
@@ -657,10 +669,18 @@ mod native {
                 let _ = sender.send(HttpResponseEvent {
                     request_id: request_id as u64,
                     url,
-                    status: if status >= 0 { Some(status as u16) } else { None },
+                    status: if status >= 0 {
+                        Some(status as u16)
+                    } else {
+                        None
+                    },
                     headers: headers_map.into_iter().collect(),
                     body,
-                    error: if ok != 0 && error.is_empty() { None } else { Some(error) },
+                    error: if ok != 0 && error.is_empty() {
+                        None
+                    } else {
+                        Some(error)
+                    },
                 });
             },
         )

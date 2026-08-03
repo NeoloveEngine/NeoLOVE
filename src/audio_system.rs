@@ -98,7 +98,11 @@ mod native {
             let emitter = [x, y, 0.0];
             let sink = Arc::new(
                 SpatialSink::try_new(&self.handle, emitter, left_ear, right_ear).map_err(
-                    |error| mlua::Error::external(format!("failed to create spatial audio sink: {error}")),
+                    |error| {
+                        mlua::Error::external(format!(
+                            "failed to create spatial audio sink: {error}"
+                        ))
+                    },
                 )?,
             );
             sink.set_volume(volume.clamp(0.0, 1.0));
@@ -213,11 +217,13 @@ mod native {
 
         audio.set(
             "playOnce",
-            lua.create_function(move |_lua, (sound_ud, volume): (AnyUserData, Option<f32>)| {
-                let sound = sound_ud.borrow::<SoundHandle>()?;
-                sound.ensure_uploaded()?;
-                with_audio_backend(|audio| audio.play(&sound, false, volume.unwrap_or(1.0)))
-            })?,
+            lua.create_function(
+                move |_lua, (sound_ud, volume): (AnyUserData, Option<f32>)| {
+                    let sound = sound_ud.borrow::<SoundHandle>()?;
+                    sound.ensure_uploaded()?;
+                    with_audio_backend(|audio| audio.play(&sound, false, volume.unwrap_or(1.0)))
+                },
+            )?,
         )?;
 
         audio.set(
@@ -366,7 +372,9 @@ mod native {
     ) -> mlua::Result<()> {
         let bytes = sound.bytes()?;
         if bytes.is_empty() || bytes.len() > i32::MAX as usize {
-            return Err(mlua::Error::external("sound has invalid encoded audio bytes"));
+            return Err(mlua::Error::external(
+                "sound has invalid encoded audio bytes",
+            ));
         }
         check_bridge_result(
             unsafe {
@@ -399,11 +407,13 @@ mod native {
         )?;
         audio.set(
             "playOnce",
-            lua.create_function(move |_lua, (sound_ud, volume): (AnyUserData, Option<f32>)| {
-                let sound = sound_ud.borrow::<SoundHandle>()?;
-                sound.ensure_uploaded()?;
-                play_sound(&sound, false, volume.unwrap_or(1.0))
-            })?,
+            lua.create_function(
+                move |_lua, (sound_ud, volume): (AnyUserData, Option<f32>)| {
+                    let sound = sound_ud.borrow::<SoundHandle>()?;
+                    sound.ensure_uploaded()?;
+                    play_sound(&sound, false, volume.unwrap_or(1.0))
+                },
+            )?,
         )?;
         audio.set(
             "stop",
@@ -442,13 +452,7 @@ mod native {
                 )| {
                     let sound = sound_ud.borrow::<SoundHandle>()?;
                     sound.ensure_uploaded()?;
-                    play_spatial_sound(
-                        &sound,
-                        x,
-                        y,
-                        looped.unwrap_or(false),
-                        volume.unwrap_or(1.0),
-                    )
+                    play_spatial_sound(&sound, x, y, looped.unwrap_or(false), volume.unwrap_or(1.0))
                 },
             )?,
         )?;

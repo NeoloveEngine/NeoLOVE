@@ -579,6 +579,31 @@ EM_JS(void, neolove_js_present_rgba, (const uint8_t* pixels, int width, int heig
   }
 });
 
+EM_JS(int, neolove_js_capture_rgba, (uint8_t* pixels, int width, int height), {
+  const state = Module.neoloveState;
+  const canvas = Module.canvas;
+  if (!state || !canvas || !pixels || width <= 0 || height <= 0) {
+    return 0;
+  }
+  if (!state.ctx) {
+    state.ctx = canvas.getContext("2d", { alpha: false, desynchronized: true }) || canvas.getContext("2d");
+  }
+  if (!state.ctx) {
+    return 0;
+  }
+  try {
+    const frame = state.ctx.getImageData(0, 0, width, height);
+    HEAPU8.set(frame.data, pixels);
+    return 1;
+  } catch (error) {
+    if (!state.captureFailedLogged) {
+      state.captureFailedLogged = true;
+      console.warn("NeoLOVE could not capture the web canvas for a full-frame effect", error);
+    }
+    return 0;
+  }
+});
+
 
 EM_JS(void, neolove_js_clear_canvas, (int r, int g, int b, int a), {
   const state = Module.neoloveState;
@@ -742,7 +767,9 @@ EM_JS(void, neolove_js_draw_shader, (
   const uint8_t* texture_pixels,
   int texture_width,
   int texture_height,
-  int linear_filter
+  int linear_filter,
+  int antialiasing_mode,
+  int depth_test
 ), {
   const state = Module.neoloveState;
   const canvas = Module.canvas;
@@ -756,12 +783,36 @@ EM_JS(void, neolove_js_draw_shader, (
     console.error("NeoLOVE shader uniform JSON error", error);
   }
 
-  const glCanvas = state.shaderCanvas || (state.shaderCanvas = document.createElement("canvas"));
-  if (glCanvas.width !== canvas.width || glCanvas.height !== canvas.height) {
-    glCanvas.width = canvas.width;
-    glCanvas.height = canvas.height;
+  const aaMode = Math.max(0, Math.min(2, antialiasing_mode | 0));
+  const requestedRenderScale = aaMode === 2 ? 2 : 1;
+  const contextKey = aaMode === 0 ? 0 : 1;
+  state.shaderRenderers = state.shaderRenderers || new Map();
+  let shaderRenderer = state.shaderRenderers.get(contextKey);
+  if (!shaderRenderer) {
+    const rendererCanvas = document.createElement("canvas");
+    rendererCanvas.width = 1;
+    rendererCanvas.height = 1;
+    const contextOptions = {
+      alpha: true,
+      premultipliedAlpha: false,
+      antialias: contextKey !== 0,
+      depth: true
+    };
+    const rendererGl = rendererCanvas.getContext("webgl", contextOptions)
+      || rendererCanvas.getContext("experimental-webgl", contextOptions);
+    shaderRenderer = {
+      canvas: rendererCanvas,
+      gl: rendererGl,
+      programs: new Map(),
+      textures: new Map(),
+      vertexBuffer: null,
+      whiteTexture: null,
+      whiteTextureInitialized: false
+    };
+    state.shaderRenderers.set(contextKey, shaderRenderer);
   }
-  const gl = state.shaderGl || (state.shaderGl = glCanvas.getContext("webgl", { alpha: true, premultipliedAlpha: false }) || glCanvas.getContext("experimental-webgl"));
+  const glCanvas = shaderRenderer.canvas;
+  const gl = shaderRenderer.gl;
   if (!gl) {
     if (!state.shaderMissingWebglLogged) {
       state.shaderMissingWebglLogged = true;
@@ -769,16 +820,25 @@ EM_JS(void, neolove_js_draw_shader, (
     }
     return;
   }
-  state.shaderPrograms = state.shaderPrograms || new Map();
+  const maximumRenderbufferSize = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) || 0;
+  const renderScale = requestedRenderScale === 2
+    && canvas.width * 2 <= maximumRenderbufferSize
+    && canvas.height * 2 <= maximumRenderbufferSize ? 2 : 1;
+  const targetWidth = Math.max(1, canvas.width * renderScale);
+  const targetHeight = Math.max(1, canvas.height * renderScale);
+  if (glCanvas.width !== targetWidth || glCanvas.height !== targetHeight) {
+    glCanvas.width = targetWidth;
+    glCanvas.height = targetHeight;
+  }
 
   const vertexSource = `
-attribute vec2 a_pos;
+attribute vec3 a_pos;
 attribute vec2 a_uv;
 attribute vec4 a_color;
-varying lowp vec2 uv;
-varying lowp vec4 color;
+varying mediump vec2 uv;
+varying mediump vec4 color;
 void main() {
-  gl_Position = vec4(a_pos, 0.0, 1.0);
+  gl_Position = vec4(a_pos, 1.0);
   uv = a_uv;
   color = a_color;
 }`;
@@ -794,7 +854,7 @@ void main() {
     return shader;
   };
 
-  let programInfo = state.shaderPrograms.get(fragmentSource);
+  let programInfo = shaderRenderer.programs.get(fragmentSource);
   if (!programInfo) {
     try {
       const vs = compileShader(gl.VERTEX_SHADER, vertexSource);
@@ -818,54 +878,61 @@ void main() {
         uTexture: gl.getUniformLocation(program, "Texture"),
         uniformLocations: new Map()
       };
-      state.shaderPrograms.set(fragmentSource, programInfo);
+      shaderRenderer.programs.set(fragmentSource, programInfo);
     } catch (error) {
       console.error("NeoLOVE web shader compile failed", error);
       return;
     }
   }
 
-  const packed = new Float32Array(HEAPF32.subarray(vertices_ptr >> 2, (vertices_ptr >> 2) + vertex_count * 8));
+  const packed = new Float32Array(HEAPF32.subarray(vertices_ptr >> 2, (vertices_ptr >> 2) + vertex_count * 9));
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (let index = 0; index < vertex_count; index += 1) {
-    const offset = index * 8;
+    const offset = index * 9;
     const x = packed[offset];
     const y = packed[offset + 1];
     minX = Math.min(minX, x); minY = Math.min(minY, y);
     maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
     packed[offset] = (x / Math.max(1, canvas.width)) * 2 - 1;
     packed[offset + 1] = 1 - (y / Math.max(1, canvas.height)) * 2;
+    packed[offset + 2] = Math.max(-1, Math.min(1, packed[offset + 2] * 2 - 1));
   }
 
-  const buffer = state.shaderVertexBuffer || (state.shaderVertexBuffer = gl.createBuffer());
+  const buffer = shaderRenderer.vertexBuffer || (shaderRenderer.vertexBuffer = gl.createBuffer());
   gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
   gl.bufferData(gl.ARRAY_BUFFER, packed, gl.STREAM_DRAW);
   gl.viewport(0, 0, glCanvas.width, glCanvas.height);
-  gl.disable(gl.DEPTH_TEST);
+  if (depth_test) {
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
+    gl.depthMask(true);
+  } else {
+    gl.disable(gl.DEPTH_TEST);
+  }
   gl.enable(gl.BLEND);
   gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   gl.clearColor(0, 0, 0, 0);
-  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.clearDepth(1.0);
+  gl.clear(gl.COLOR_BUFFER_BIT | (depth_test ? gl.DEPTH_BUFFER_BIT : 0));
   gl.useProgram(programInfo.program);
 
-  const stride = 8 * 4;
+  const stride = 9 * 4;
   if (programInfo.aPos >= 0) {
     gl.enableVertexAttribArray(programInfo.aPos);
-    gl.vertexAttribPointer(programInfo.aPos, 2, gl.FLOAT, false, stride, 0);
+    gl.vertexAttribPointer(programInfo.aPos, 3, gl.FLOAT, false, stride, 0);
   }
   if (programInfo.aUv >= 0) {
     gl.enableVertexAttribArray(programInfo.aUv);
-    gl.vertexAttribPointer(programInfo.aUv, 2, gl.FLOAT, false, stride, 2 * 4);
+    gl.vertexAttribPointer(programInfo.aUv, 2, gl.FLOAT, false, stride, 3 * 4);
   }
   if (programInfo.aColor >= 0) {
     gl.enableVertexAttribArray(programInfo.aColor);
-    gl.vertexAttribPointer(programInfo.aColor, 4, gl.FLOAT, false, stride, 4 * 4);
+    gl.vertexAttribPointer(programInfo.aColor, 4, gl.FLOAT, false, stride, 5 * 4);
   }
 
   let texture;
   if (texture_pixels && texture_width > 0 && texture_height > 0) {
-    state.shaderTextures = state.shaderTextures || new Map();
-    let cached = state.shaderTextures.get(texture_id);
+    let cached = shaderRenderer.textures.get(texture_id);
     if (!cached || cached.revision !== texture_revision || cached.width !== texture_width || cached.height !== texture_height) {
       if (cached) gl.deleteTexture(cached.texture);
       texture = gl.createTexture();
@@ -876,7 +943,7 @@ void main() {
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, texture_width, texture_height, 0, gl.RGBA, gl.UNSIGNED_BYTE,
         HEAPU8.subarray(texture_pixels, texture_pixels + texture_width * texture_height * 4));
       cached = { texture, revision: texture_revision, width: texture_width, height: texture_height };
-      state.shaderTextures.set(texture_id, cached);
+      shaderRenderer.textures.set(texture_id, cached);
     } else {
       texture = cached.texture;
       gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -885,10 +952,10 @@ void main() {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
   } else {
-    texture = state.shaderWhiteTexture || (state.shaderWhiteTexture = gl.createTexture());
+    texture = shaderRenderer.whiteTexture || (shaderRenderer.whiteTexture = gl.createTexture());
     gl.bindTexture(gl.TEXTURE_2D, texture);
-    if (!state.shaderWhiteTextureInitialized) {
-      state.shaderWhiteTextureInitialized = true;
+    if (!shaderRenderer.whiteTextureInitialized) {
+      shaderRenderer.whiteTextureInitialized = true;
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -926,7 +993,17 @@ void main() {
       state.ctx.save();
       state.ctx.setTransform(1, 0, 0, 1, 0, 0);
       state.ctx.globalCompositeOperation = "source-over";
-      state.ctx.drawImage(glCanvas, sx, sy, ex - sx, ey - sy, sx, sy, ex - sx, ey - sy);
+      state.ctx.drawImage(
+        glCanvas,
+        sx * renderScale,
+        sy * renderScale,
+        (ex - sx) * renderScale,
+        (ey - sy) * renderScale,
+        sx,
+        sy,
+        ex - sx,
+        ey - sy
+      );
       state.ctx.restore();
     }
   }
@@ -2168,6 +2245,10 @@ void neolove_web_present_rgba(const uint8_t* pixels, int width, int height) {
   neolove_js_present_rgba(pixels, width, height);
 }
 
+int neolove_web_capture_rgba(uint8_t* pixels, int width, int height) {
+  return neolove_js_capture_rgba(pixels, width, height);
+}
+
 void neolove_web_composite_rgba(const uint8_t* pixels, int width, int height, int x, int y) {
   neolove_js_composite_rgba(pixels, width, height, x, y);
 }
@@ -2222,10 +2303,13 @@ void neolove_web_draw_shader(
     const uint8_t* texture_pixels,
     int texture_width,
     int texture_height,
-    int linear_filter) {
+    int linear_filter,
+    int antialiasing_mode,
+    int depth_test) {
   neolove_js_draw_shader(
       fragment_source, uniforms_json, vertices, vertex_count, texture_id, texture_revision,
-      texture_pixels, texture_width, texture_height, linear_filter);
+      texture_pixels, texture_width, texture_height, linear_filter, antialiasing_mode,
+      depth_test);
 }
 
 void neolove_web_draw_text(

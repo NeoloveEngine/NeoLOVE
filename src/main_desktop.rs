@@ -1,6 +1,6 @@
-mod assets;
 mod android_module;
 mod animation;
+mod assets;
 mod audio_system;
 mod commands;
 mod core;
@@ -8,6 +8,7 @@ mod core;
 mod editor;
 #[cfg(not(neolove_packaged))]
 mod editor_ipc;
+mod environment3d;
 mod fs_module;
 #[cfg(feature = "vulkan")]
 mod gpu_renderer;
@@ -15,13 +16,18 @@ pub mod hierarchy;
 mod http;
 mod lighting;
 mod lua_error;
-mod rng;
+mod media;
+mod mesh;
 mod mobile_emulation;
 mod mobile_module;
-mod media;
+mod physics3d;
+mod particles3d;
 mod platform;
+mod post_process;
 mod prefabs;
+mod render3d;
 mod renderer;
+mod rng;
 #[path = "editor/scene.rs"]
 mod scene;
 mod servers;
@@ -30,6 +36,7 @@ mod tweening;
 #[cfg(not(neolove_packaged))]
 mod update;
 mod user_input;
+mod widget_interaction;
 pub mod window;
 
 use std::env;
@@ -60,7 +67,7 @@ use zip::write::SimpleFileOptions;
 
 #[cfg(feature = "vulkan")]
 use crate::gpu_renderer::VulkanPresenter;
-use crate::platform::SharedPlatformState;
+use crate::platform::{SharedPlatformState, lock_platform_state};
 use crate::renderer::SoftwareRenderer;
 
 const EMBED_TRAILER_MAGIC: &[u8; 16] = b"NEOLOVE_EMBED_V1";
@@ -82,6 +89,121 @@ enum DesktopPresenter {
         renderer: SoftwareRenderer,
         vulkan_error: Option<String>,
     },
+}
+
+/// Convert the physical swapchain/surface extent into the logical coordinate
+/// space used by scripts. Rendering the software path at logical resolution
+/// avoids doing 4x the lighting, post-process, and raster work on a 2x Retina
+/// display, while the final blit still covers every physical output pixel.
+fn logical_dimensions(width: u32, height: u32, scale_factor: f64) -> (u32, u32) {
+    let scale_factor = if scale_factor.is_finite() {
+        scale_factor.max(1.0)
+    } else {
+        1.0
+    };
+    (
+        ((width.max(1) as f64 / scale_factor).round() as u32).max(1),
+        ((height.max(1) as f64 / scale_factor).round() as u32).max(1),
+    )
+}
+
+fn pack_softbuffer_pixel(rgba: &[u8]) -> u32 {
+    (rgba[2] as u32) | ((rgba[1] as u32) << 8) | ((rgba[0] as u32) << 16)
+}
+
+fn sample_bilinear_channel(
+    pixels: &[u8],
+    width: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    tx: f32,
+    ty: f32,
+    channel: usize,
+) -> u8 {
+    let top = pixels[(y0 * width + x0) * 4 + channel] as f32 * (1.0 - tx)
+        + pixels[(y0 * width + x1) * 4 + channel] as f32 * tx;
+    let bottom = pixels[(y1 * width + x0) * 4 + channel] as f32 * (1.0 - tx)
+        + pixels[(y1 * width + x1) * 4 + channel] as f32 * tx;
+    (top * (1.0 - ty) + bottom * ty).round().clamp(0.0, 255.0) as u8
+}
+
+fn blit_software_pixels(
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    destination: &mut [u32],
+    destination_width: u32,
+    destination_height: u32,
+    nearest: bool,
+) {
+    let source_width = source_width.max(1) as usize;
+    let source_height = source_height.max(1) as usize;
+    let destination_width = destination_width.max(1) as usize;
+    let destination_height = destination_height.max(1) as usize;
+    if source_width == destination_width && source_height == destination_height {
+        for (dst, rgba) in destination.iter_mut().zip(source.chunks_exact(4)) {
+            *dst = pack_softbuffer_pixel(rgba);
+        }
+        return;
+    }
+
+    if nearest {
+        if destination_width % source_width == 0 && destination_height % source_height == 0 {
+            let scale_x = destination_width / source_width;
+            let scale_y = destination_height / source_height;
+            for source_y in 0..source_height {
+                let destination_y = source_y * scale_y;
+                let row_start = destination_y * destination_width;
+                for source_x in 0..source_width {
+                    let offset = (source_y * source_width + source_x) * 4;
+                    let packed = pack_softbuffer_pixel(&source[offset..offset + 4]);
+                    let start = row_start + source_x * scale_x;
+                    destination[start..start + scale_x].fill(packed);
+                }
+                let row_end = row_start + destination_width;
+                for duplicate in 1..scale_y {
+                    destination.copy_within(
+                        row_start..row_end,
+                        row_start + duplicate * destination_width,
+                    );
+                }
+            }
+            return;
+        }
+        for y in 0..destination_height {
+            let source_y = y * source_height / destination_height;
+            let destination_row =
+                &mut destination[y * destination_width..(y + 1).saturating_mul(destination_width)];
+            for (x, dst) in destination_row.iter_mut().enumerate() {
+                let source_x = x * source_width / destination_width;
+                let offset = (source_y * source_width + source_x) * 4;
+                *dst = pack_softbuffer_pixel(&source[offset..offset + 4]);
+            }
+        }
+        return;
+    }
+
+    let scale_x = source_width as f32 / destination_width as f32;
+    let scale_y = source_height as f32 / destination_height as f32;
+    for y in 0..destination_height {
+        let source_y = ((y as f32 + 0.5) * scale_y - 0.5).clamp(0.0, source_height as f32 - 1.0);
+        let y0 = source_y.floor() as usize;
+        let y1 = (y0 + 1).min(source_height - 1);
+        let ty = source_y - y0 as f32;
+        let destination_row = &mut destination[y * destination_width..(y + 1) * destination_width];
+        for (x, dst) in destination_row.iter_mut().enumerate() {
+            let source_x = ((x as f32 + 0.5) * scale_x - 0.5).clamp(0.0, source_width as f32 - 1.0);
+            let x0 = source_x.floor() as usize;
+            let x1 = (x0 + 1).min(source_width - 1);
+            let tx = source_x - x0 as f32;
+            let r = sample_bilinear_channel(source, source_width, x0, y0, x1, y1, tx, ty, 0);
+            let g = sample_bilinear_channel(source, source_width, x0, y0, x1, y1, tx, ty, 1);
+            let b = sample_bilinear_channel(source, source_width, x0, y0, x1, y1, tx, ty, 2);
+            *dst = (b as u32) | ((g as u32) << 8) | ((r as u32) << 16);
+        }
+    }
 }
 
 impl DesktopPresenter {
@@ -120,10 +242,11 @@ impl DesktopPresenter {
         let surface = unsafe { softbuffer::Surface::new(&context, window.as_ref()) }
             .map_err(|error| format!("failed to create software renderer surface: {error}"))?;
         let size = window.inner_size();
+        let (width, height) = logical_dimensions(size.width, size.height, window.scale_factor());
         Ok(Self::Software {
             _context: context,
             surface,
-            renderer: SoftwareRenderer::new(size.width, size.height),
+            renderer: SoftwareRenderer::new(width, height),
             vulkan_error,
         })
     }
@@ -145,7 +268,16 @@ impl DesktopPresenter {
             #[cfg(feature = "vulkan")]
             Self::Vulkan(presenter) => {
                 let size = window.inner_size();
-                presenter.render(platform_state, render_state, size.width, size.height)
+                let (logical_width, logical_height) =
+                    logical_dimensions(size.width, size.height, window.scale_factor());
+                presenter.render(
+                    platform_state,
+                    render_state,
+                    size.width,
+                    size.height,
+                    logical_width,
+                    logical_height,
+                )
             }
             Self::Software {
                 surface,
@@ -156,30 +288,40 @@ impl DesktopPresenter {
                 let size = window.inner_size();
                 let width = size.width.max(1);
                 let height = size.height.max(1);
-                renderer.resize(width, height);
-                renderer.render(platform_state, render_state).map_err(|error| {
-                    let mut message = format!("software renderer failed: {error}");
-                    if error.contains("custom shaders require the Vulkan renderer")
-                        && let Some(vulkan_error) = vulkan_error.as_deref()
-                    {
-                        message.push_str("\nVulkan initialization error: ");
-                        message.push_str(vulkan_error);
-                    }
-                    message
-                })?;
+                let (logical_width, logical_height) =
+                    logical_dimensions(width, height, window.scale_factor());
+                renderer.resize(logical_width, logical_height);
+                renderer
+                    .render(platform_state, render_state)
+                    .map_err(|error| {
+                        let mut message = format!("software renderer failed: {error}");
+                        if error.contains("custom shaders require the Vulkan renderer")
+                            && let Some(vulkan_error) = vulkan_error.as_deref()
+                        {
+                            message.push_str("\nVulkan initialization error: ");
+                            message.push_str(vulkan_error);
+                        }
+                        message
+                    })?;
                 surface
                     .resize(
                         NonZeroU32::new(width).expect("window width is clamped to at least 1"),
                         NonZeroU32::new(height).expect("window height is clamped to at least 1"),
                     )
                     .map_err(|error| format!("failed to resize software surface: {error}"))?;
-                let mut buffer = surface
-                    .buffer_mut()
-                    .map_err(|error| format!("failed to acquire software surface buffer: {error}"))?;
-                for (dst, rgba) in buffer.iter_mut().zip(renderer.pixels().chunks_exact(4)) {
-                    *dst =
-                        (rgba[2] as u32) | ((rgba[1] as u32) << 8) | ((rgba[0] as u32) << 16);
-                }
+                let mut buffer = surface.buffer_mut().map_err(|error| {
+                    format!("failed to acquire software surface buffer: {error}")
+                })?;
+                let nearest = lock_platform_state(platform_state).nearest_neighbor_scaling();
+                blit_software_pixels(
+                    renderer.pixels(),
+                    logical_width,
+                    logical_height,
+                    &mut buffer,
+                    width,
+                    height,
+                    nearest,
+                );
                 buffer
                     .present()
                     .map_err(|error| format!("failed to present software surface: {error}"))?;
@@ -189,8 +331,33 @@ impl DesktopPresenter {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ProjectKind {
+    #[default]
+    TwoD,
+    ThreeD,
+}
+
+impl ProjectKind {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "2d" => Some(Self::TwoD),
+            "3d" => Some(Self::ThreeD),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TwoD => "2d",
+            Self::ThreeD => "3d",
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 struct ProjectSettings {
+    kind: ProjectKind,
     package_name: Option<String>,
     start_scene: Option<String>,
     window_title: Option<String>,
@@ -368,7 +535,10 @@ fn write_text_if_changed(path: &Path, contents: &str) -> std::io::Result<bool> {
     if existing.as_deref() == Some(contents) {
         return Ok(false);
     }
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, contents)?;
@@ -414,7 +584,10 @@ fn ensure_start_menu_entry(exe: &Path) -> Result<bool, String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("failed to update Start Menu shortcut: {}", stderr.trim()));
+        return Err(format!(
+            "failed to update Start Menu shortcut: {}",
+            stderr.trim()
+        ));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).contains("updated"))
@@ -436,7 +609,10 @@ fn ensure_start_menu_entry(exe: &Path) -> Result<bool, String> {
     let script_path = macos_dir.join("NeoLOVE Hub");
     let plist_path = app_root.join("Info.plist");
 
-    let script = format!("#!/bin/sh\nexec {} hub \"$@\"\n", shell_quote(&exe.to_string_lossy()));
+    let script = format!(
+        "#!/bin/sh\nexec {} hub \"$@\"\n",
+        shell_quote(&exe.to_string_lossy())
+    );
     let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -465,11 +641,19 @@ fn ensure_start_menu_entry(exe: &Path) -> Result<bool, String> {
             script_path.display()
         )
     })?;
-    changed |= write_text_if_changed(&plist_path, plist)
-        .map_err(|e| format!("failed to write launcher plist {}: {e}", plist_path.display()))?;
+    changed |= write_text_if_changed(&plist_path, plist).map_err(|e| {
+        format!(
+            "failed to write launcher plist {}: {e}",
+            plist_path.display()
+        )
+    })?;
 
-    let metadata = fs::metadata(&script_path)
-        .map_err(|e| format!("failed to stat launcher script {}: {e}", script_path.display()))?;
+    let metadata = fs::metadata(&script_path).map_err(|e| {
+        format!(
+            "failed to stat launcher script {}: {e}",
+            script_path.display()
+        )
+    })?;
     let mut perms = metadata.permissions();
     let mode = perms.mode();
     if mode & 0o111 == 0 {
@@ -522,8 +706,12 @@ fn ensure_start_menu_entry(exe: &Path) -> Result<bool, String> {
         desktop_exec_quote(exe)
     );
 
-    write_text_if_changed(&desktop_file, &contents)
-        .map_err(|e| format!("failed to write app launcher {}: {e}", desktop_file.display()))
+    write_text_if_changed(&desktop_file, &contents).map_err(|e| {
+        format!(
+            "failed to write app launcher {}: {e}",
+            desktop_file.display()
+        )
+    })
 }
 
 fn setup_start_menu_for_neolove() -> Result<bool, String> {
@@ -543,7 +731,11 @@ fn parse_quoted(input: &str) -> Option<String> {
 }
 
 fn parse_number(input: &str) -> Option<f32> {
-    input.trim().parse::<f32>().ok().filter(|value| value.is_finite())
+    input
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
 }
 
 fn parse_bool(input: &str) -> Option<bool> {
@@ -582,6 +774,13 @@ fn parse_project_settings(project_root: &Path) -> ProjectSettings {
                     settings.package_name = Some(value);
                 }
             }
+            "project" if key == "kind" => {
+                if let Some(value) =
+                    parse_quoted(value_raw).and_then(|value| ProjectKind::parse(&value))
+                {
+                    settings.kind = value;
+                }
+            }
             "project" if key == "start_scene" => {
                 if let Some(value) = parse_quoted(value_raw) {
                     settings.start_scene = Some(value);
@@ -598,7 +797,8 @@ fn parse_project_settings(project_root: &Path) -> ProjectSettings {
                 }
             }
             "window" if key == "width" => {
-                settings.window_width = parse_number(value_raw).map(|value| value.clamp(1.0, 16384.0));
+                settings.window_width =
+                    parse_number(value_raw).map(|value| value.clamp(1.0, 16384.0));
             }
             "window" if key == "height" => {
                 settings.window_height =
@@ -831,7 +1031,8 @@ fn compress_build_payload(payload: &[u8]) -> Result<Vec<u8>, String> {
     let cursor = archive
         .finish()
         .map_err(|error| format!("failed to finalize compressed build payload: {error}"))?;
-    let mut compressed = Vec::with_capacity(COMPRESSED_PAYLOAD_MAGIC.len() + cursor.get_ref().len());
+    let mut compressed =
+        Vec::with_capacity(COMPRESSED_PAYLOAD_MAGIC.len() + cursor.get_ref().len());
     compressed.extend_from_slice(COMPRESSED_PAYLOAD_MAGIC);
     compressed.extend_from_slice(cursor.get_ref());
     Ok(compressed)
@@ -1075,9 +1276,7 @@ fn cross_target_rustflags_config(
                 "link-arg=-static-libstdc++".to_string(),
             ]);
             let flags = serde_json::to_string(&flags).ok()?;
-            Some(format!(
-                "target.x86_64-pc-windows-gnu.rustflags={flags}"
-            ))
+            Some(format!("target.x86_64-pc-windows-gnu.rustflags={flags}"))
         }
         _ => None,
     }
@@ -1089,9 +1288,7 @@ fn cross_target_cpp_stdlib(target: DesktopPackageTarget) -> Option<(&'static str
         // value as a Cargo link kind. Without `static=`, mlua-sys emits a
         // dynamic `stdc++` dependency even when GCC's own runtime flags are
         // static.
-        Some("x86_64-pc-windows-gnu") => {
-            Some(("CXXSTDLIB_x86_64_pc_windows_gnu", "static=stdc++"))
-        }
+        Some("x86_64-pc-windows-gnu") => Some(("CXXSTDLIB_x86_64_pc_windows_gnu", "static=stdc++")),
         _ => None,
     }
 }
@@ -1193,14 +1390,15 @@ fn ensure_cross_desktop_linker(
         Some("x86_64-unknown-linux-gnu") => {
             let linker = "x86_64-linux-gnu-gcc";
             if find_on_path(linker).is_none() {
-                return Err(
-                    "Linux desktop builds from this host need the cross linker \
+                return Err("Linux desktop builds from this host need the cross linker \
                      `x86_64-linux-gnu-gcc` on PATH. Install a Linux GNU cross toolchain \
                      or build from Linux/WSL, then run `neolove build --linux` again."
-                        .to_string(),
-                );
+                    .to_string());
             }
-            Ok(Some(("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER", linker)))
+            Ok(Some((
+                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+                linker,
+            )))
         }
         Some(target_triple) => Err(format!("unsupported desktop cross target: {target_triple}")),
         None => Ok(None),
@@ -1455,8 +1653,12 @@ fn emcc_path(root: &Path) -> PathBuf {
 
 fn find_emsdk_node(root: &Path) -> Result<PathBuf, String> {
     let node_root = root.join("node");
-    let entries = fs::read_dir(&node_root)
-        .map_err(|e| format!("failed to read emsdk node directory {}: {e}", node_root.display()))?;
+    let entries = fs::read_dir(&node_root).map_err(|e| {
+        format!(
+            "failed to read emsdk node directory {}: {e}",
+            node_root.display()
+        )
+    })?;
 
     let mut candidates = Vec::new();
     for entry in entries {
@@ -1493,8 +1695,8 @@ fn apply_emsdk_env(command: &mut std::process::Command, root: &Path) -> Result<(
     if let Some(existing) = env::var_os("PATH") {
         paths.extend(env::split_paths(&existing));
     }
-    let joined = env::join_paths(paths)
-        .map_err(|e| format!("failed to construct PATH for emsdk: {e}"))?;
+    let joined =
+        env::join_paths(paths).map_err(|e| format!("failed to construct PATH for emsdk: {e}"))?;
 
     command.env("EMSDK", root);
     command.env("EMSDK_NODE", node_path);
@@ -1520,8 +1722,12 @@ fn ensure_emsdk() -> Result<PathBuf, String> {
     }
 
     if root.exists() {
-        fs::remove_dir_all(&root)
-            .map_err(|e| format!("failed to clean incomplete emsdk install {}: {e}", root.display()))?;
+        fs::remove_dir_all(&root).map_err(|e| {
+            format!(
+                "failed to clean incomplete emsdk install {}: {e}",
+                root.display()
+            )
+        })?;
     }
 
     let mut git = std::process::Command::new("git");
@@ -1568,12 +1774,18 @@ fn recreate_dir(path: &Path) -> Result<(), String> {
 
 fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
     if !source.is_dir() {
-        return Err(format!("source directory does not exist: {}", source.display()));
+        return Err(format!(
+            "source directory does not exist: {}",
+            source.display()
+        ));
     }
     fs::create_dir_all(destination)
         .map_err(|e| format!("failed to create directory {}: {e}", destination.display()))?;
-    for entry in fs::read_dir(source).map_err(|e| format!("failed to read {}: {e}", source.display()))? {
-        let entry = entry.map_err(|e| format!("failed to read entry in {}: {e}", source.display()))?;
+    for entry in
+        fs::read_dir(source).map_err(|e| format!("failed to read {}: {e}", source.display()))?
+    {
+        let entry =
+            entry.map_err(|e| format!("failed to read entry in {}: {e}", source.display()))?;
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
         let kind = entry
@@ -1607,8 +1819,12 @@ fn stage_web_project(project_root: &Path, stage_dir: &Path) -> Result<(), String
             .map_err(|e| format!("failed to strip staged project prefix: {e}"))?;
         let destination = stage_dir.join(relative);
         if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create staged directory {}: {e}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "failed to create staged directory {}: {e}",
+                    parent.display()
+                )
+            })?;
         }
         fs::copy(&source, &destination).map_err(|e| {
             format!(
@@ -1633,8 +1849,8 @@ fn collect_bundle_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), Strin
     children.sort();
 
     for child in children {
-        let file_type = fs::metadata(&child)
-            .map_err(|e| format!("failed to stat {}: {e}", child.display()))?;
+        let file_type =
+            fs::metadata(&child).map_err(|e| format!("failed to stat {}: {e}", child.display()))?;
         if file_type.is_dir() {
             collect_bundle_files(&child, out)?;
         } else if file_type.is_file() {
@@ -1645,8 +1861,12 @@ fn collect_bundle_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), Strin
 }
 
 fn create_webasm_zip(bundle_dir: &Path, zip_path: &Path) -> Result<(), String> {
-    let file = File::create(zip_path)
-        .map_err(|e| format!("failed to create webasm package {}: {e}", zip_path.display()))?;
+    let file = File::create(zip_path).map_err(|e| {
+        format!(
+            "failed to create webasm package {}: {e}",
+            zip_path.display()
+        )
+    })?;
     let mut archive = zip::ZipWriter::new(file);
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
@@ -1677,9 +1897,12 @@ fn create_webasm_zip(bundle_dir: &Path, zip_path: &Path) -> Result<(), String> {
         })?;
     }
 
-    archive
-        .finish()
-        .map_err(|e| format!("failed to finalize webasm package {}: {e}", zip_path.display()))?;
+    archive.finish().map_err(|e| {
+        format!(
+            "failed to finalize webasm package {}: {e}",
+            zip_path.display()
+        )
+    })?;
 
     Ok(())
 }
@@ -2071,8 +2294,12 @@ fn build_webasm(project_root: &Path) -> Result<(PathBuf, PathBuf), String> {
 
     let stage_dir = output_dir.join(".webasm-stage");
     stage_web_project(project_root, &stage_dir)?;
-    let staged_project = fs::canonicalize(&stage_dir)
-        .map_err(|e| format!("failed to resolve staged webasm project {}: {e}", stage_dir.display()))?;
+    let staged_project = fs::canonicalize(&stage_dir).map_err(|e| {
+        format!(
+            "failed to resolve staged webasm project {}: {e}",
+            stage_dir.display()
+        )
+    })?;
 
     println!("Ensuring emsdk is installed...");
     let emsdk = ensure_emsdk()?;
@@ -2083,7 +2310,9 @@ fn build_webasm(project_root: &Path) -> Result<(PathBuf, PathBuf), String> {
     run_checked_command(&mut rustup, "installing wasm32-unknown-emscripten target")?;
 
     let engine_root = engine_source_root()?;
-    let cargo_target_dir = engine_root.join("target").join("webasm-emscripten-legacy-eh");
+    let cargo_target_dir = engine_root
+        .join("target")
+        .join("webasm-emscripten-legacy-eh");
     println!("Building NeoLOVE webasm runtime...");
     let mut cargo = std::process::Command::new("cargo");
     apply_emsdk_env(&mut cargo, &emsdk)?;
@@ -2147,9 +2376,12 @@ fn build_webasm(project_root: &Path) -> Result<(PathBuf, PathBuf), String> {
     }
 
     for artifact in &artifacts {
-        let file_name = artifact
-            .file_name()
-            .ok_or_else(|| format!("failed to resolve artifact file name for {}", artifact.display()))?;
+        let file_name = artifact.file_name().ok_or_else(|| {
+            format!(
+                "failed to resolve artifact file name for {}",
+                artifact.display()
+            )
+        })?;
         let destination = bundle_dir.join(file_name);
         fs::copy(artifact, &destination).map_err(|e| {
             format!(
@@ -2160,7 +2392,11 @@ fn build_webasm(project_root: &Path) -> Result<(PathBuf, PathBuf), String> {
         })?;
     }
 
-    fs::write(bundle_dir.join("index.html"), webasm_index_html(project_root)).map_err(|e| {
+    fs::write(
+        bundle_dir.join("index.html"),
+        webasm_index_html(project_root),
+    )
+    .map_err(|e| {
         format!(
             "failed to write webasm loader {}: {e}",
             bundle_dir.join("index.html").display()
@@ -2168,8 +2404,12 @@ fn build_webasm(project_root: &Path) -> Result<(PathBuf, PathBuf), String> {
     })?;
 
     if stage_dir.exists() {
-        fs::remove_dir_all(&stage_dir)
-            .map_err(|e| format!("failed to clean staged webasm files {}: {e}", stage_dir.display()))?;
+        fs::remove_dir_all(&stage_dir).map_err(|e| {
+            format!(
+                "failed to clean staged webasm files {}: {e}",
+                stage_dir.display()
+            )
+        })?;
     }
 
     let zip_output = output_dir.join(format!("{output_stem}-webasm.zip"));
@@ -2389,7 +2629,12 @@ fn ensure_android_cmdline_tools(sdk_root: &Path) -> Result<PathBuf, String> {
     let unzip = find_program_on_path("unzip")
         .ok_or_else(|| "Android build bootstrap requires unzip on PATH".to_string())?;
     let mut command = std::process::Command::new(unzip);
-    command.arg("-q").arg("-o").arg(&archive).arg("-d").arg(&staging);
+    command
+        .arg("-q")
+        .arg("-o")
+        .arg(&archive)
+        .arg("-d")
+        .arg(&staging);
     run_checked_command(&mut command, "extracting Android command-line tools")?;
 
     if latest.exists() {
@@ -2476,7 +2721,11 @@ fn android_build_tools_tool(sdk_root: &Path, tool: &str, script: bool) -> PathBu
     sdk_root
         .join("build-tools")
         .join(ANDROID_BUILD_TOOLS_VERSION)
-        .join(if script { script_name(tool) } else { executable_name(tool) })
+        .join(if script {
+            script_name(tool)
+        } else {
+            executable_name(tool)
+        })
 }
 
 fn ensure_android_toolchain() -> Result<AndroidToolchain, String> {
@@ -2576,11 +2825,7 @@ fn android_identifier_segment(value: &str) -> String {
     if out.is_empty() {
         out.push_str("game");
     }
-    if out
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_digit())
-    {
+    if out.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
         out.insert(0, 'g');
     }
     while out.contains("__") {
@@ -3147,12 +3392,21 @@ fn build_ios(project_root: &Path) -> Result<PathBuf, String> {
     fs::create_dir_all(&source_dir)
         .map_err(|error| format!("failed to create iOS source directory: {error}"))?;
     copy_dir_recursive(&web_bundle, &source_dir.join("webasm"))?;
-    fs::write(source_dir.join("AppDelegate.swift"), ios_app_delegate_source())
-        .map_err(|error| format!("failed to write iOS AppDelegate.swift: {error}"))?;
-    fs::write(source_dir.join("ViewController.swift"), ios_view_controller_source())
-        .map_err(|error| format!("failed to write iOS ViewController.swift: {error}"))?;
-    fs::write(source_dir.join("LocalWebServer.swift"), ios_local_web_server_source())
-        .map_err(|error| format!("failed to write iOS LocalWebServer.swift: {error}"))?;
+    fs::write(
+        source_dir.join("AppDelegate.swift"),
+        ios_app_delegate_source(),
+    )
+    .map_err(|error| format!("failed to write iOS AppDelegate.swift: {error}"))?;
+    fs::write(
+        source_dir.join("ViewController.swift"),
+        ios_view_controller_source(),
+    )
+    .map_err(|error| format!("failed to write iOS ViewController.swift: {error}"))?;
+    fs::write(
+        source_dir.join("LocalWebServer.swift"),
+        ios_local_web_server_source(),
+    )
+    .map_err(|error| format!("failed to write iOS LocalWebServer.swift: {error}"))?;
     fs::write(
         source_dir.join("Info.plist"),
         ios_info_plist(project_root, &product_name, &bundle_id),
@@ -3168,8 +3422,8 @@ fn build_ios(project_root: &Path) -> Result<PathBuf, String> {
     )
     .map_err(|error| format!("failed to write iOS Xcode project: {error}"))?;
 
-    let xcodebuild =
-        find_program_on_path("xcodebuild").ok_or_else(|| "iOS builds require xcodebuild on PATH".to_string())?;
+    let xcodebuild = find_program_on_path("xcodebuild")
+        .ok_or_else(|| "iOS builds require xcodebuild on PATH".to_string())?;
     let derived_data = ios_dir.join("DerivedData");
     let mut command = std::process::Command::new(xcodebuild);
     command
@@ -3300,6 +3554,13 @@ fn normalize_mouse_wheel_delta(delta: MouseScrollDelta) -> (f32, f32) {
     }
 }
 
+fn frame_deadline(frame_started: Instant, now: Instant, max_fps: Option<f32>) -> Option<Instant> {
+    let fps = max_fps.filter(|fps| fps.is_finite() && *fps > 0.0)?;
+    let target = Duration::from_secs_f32(1.0 / fps.max(1.0));
+    let deadline = frame_started + target;
+    (deadline > now).then_some(deadline)
+}
+
 fn with_platform_state<R>(
     platform_state: &SharedPlatformState,
     _context: &str,
@@ -3355,7 +3616,11 @@ fn show_native_error(title: &str, message: &str) {
     const MB_ICONERROR: u32 = 0x0000_0010;
 
     let caption = title.trim_end_matches(':').trim();
-    let caption = if caption.is_empty() { "NeoLOVE" } else { caption };
+    let caption = if caption.is_empty() {
+        "NeoLOVE"
+    } else {
+        caption
+    };
     let caption = to_wide(caption);
     let body = to_wide(message);
 
@@ -3507,7 +3772,11 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
     let event_loop =
         catch_desktop_panic("failed to initialize the window event loop", EventLoop::new)?;
     let title = if mobile_profile.enabled {
-        format!("{} - Mobile Emulator ({})", title, mobile_profile.orientation.as_str())
+        format!(
+            "{} - Mobile Emulator ({})",
+            title,
+            mobile_profile.orientation.as_str()
+        )
     } else {
         title
     };
@@ -3526,18 +3795,25 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
         .map(std::sync::Arc::new)
         .map_err(|error| format!("failed to create window: {error}"))?;
     let size = window.inner_size();
-    runtime.set_platform_window_state(size.width as f32, size.height as f32);
+    let (logical_width, logical_height) =
+        logical_dimensions(size.width, size.height, window.scale_factor());
+    runtime.set_platform_window_state(logical_width as f32, logical_height as f32);
 
     let platform_state = runtime.platform_state();
     let render_state = runtime.render_state();
     let mut presenter = DesktopPresenter::new(&event_loop, &window)?;
 
     let mut last_update = Instant::now();
+    let mut next_update_deadline = None;
     let mut last_snapshot = Instant::now();
     let mut cursor_grab_warning_logged = false;
     event_loop.run(move |event, _target, control_flow| {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            *control_flow = ControlFlow::Poll;
+            let now = Instant::now();
+            *control_flow = next_update_deadline
+                .filter(|deadline| *deadline > now)
+                .map(ControlFlow::WaitUntil)
+                .unwrap_or(ControlFlow::Poll);
 
             match event {
                 Event::WindowEvent { event, .. } => match event {
@@ -3545,16 +3821,35 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
                     WindowEvent::Resized(size) => {
                         if mobile_profile.enabled {
                             let (mobile_width, mobile_height) = mobile_profile.oriented_size();
-                            let requested = LogicalSize::new(mobile_width as f64, mobile_height as f64);
+                            let requested =
+                                LogicalSize::new(mobile_width as f64, mobile_height as f64);
                             window.set_inner_size(requested);
-                            runtime.set_platform_window_state(mobile_width as f32, mobile_height as f32);
+                            runtime.set_platform_window_state(
+                                mobile_width as f32,
+                                mobile_height as f32,
+                            );
                         } else {
-                            runtime.set_platform_window_state(size.width as f32, size.height as f32);
+                            let (width, height) =
+                                logical_dimensions(size.width, size.height, window.scale_factor());
+                            runtime.set_platform_window_state(width as f32, height as f32);
                         }
                         presenter.request_resize();
                     }
+                    WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                        let (width, height) = logical_dimensions(
+                            new_inner_size.width,
+                            new_inner_size.height,
+                            window.scale_factor(),
+                        );
+                        runtime.set_platform_window_state(width as f32, height as f32);
+                        presenter.request_resize();
+                    }
                     WindowEvent::CursorMoved { position, .. } => {
-                        runtime.set_platform_mouse_state(position.x as f32, position.y as f32);
+                        let scale_factor = window.scale_factor().max(1.0);
+                        runtime.set_platform_mouse_state(
+                            (position.x / scale_factor) as f32,
+                            (position.y / scale_factor) as f32,
+                        );
                     }
                     WindowEvent::MouseInput { state, button, .. } => {
                         if let Err(error) = with_platform_state(
@@ -3625,7 +3920,10 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
                                     match state {
                                         ElementState::Pressed => {
                                             if platform.input_mut().keys_down.insert(name.clone()) {
-                                                platform.input_mut().keys_pressed.insert(name.clone());
+                                                platform
+                                                    .input_mut()
+                                                    .keys_pressed
+                                                    .insert(name.clone());
                                             }
                                             platform.input_mut().last_key_pressed = Some(name);
                                         }
@@ -3643,12 +3941,20 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
                     _ => {}
                 },
                 Event::MainEventsCleared => {
+                    if let Some(deadline) = next_update_deadline
+                        && Instant::now() < deadline
+                    {
+                        *control_flow = ControlFlow::WaitUntil(deadline);
+                        return;
+                    }
+                    next_update_deadline = None;
                     let update_start = Instant::now();
                     let dt = update_start.duration_since(last_update).as_secs_f32();
                     last_update = update_start;
 
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.update(dt)))
-                    {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        runtime.update(dt)
+                    })) {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
                             exit_runtime_failure(control_flow, "Fatal Runtime Error:", &error);
@@ -3698,7 +4004,9 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
                             if let Err(error) = window.set_cursor_grab(grab_mode) {
                                 if !cursor_grab_warning_logged {
                                     let action = if mouse_locked { "lock" } else { "release" };
-                                    eprintln!("cursor grab warning: failed to {action} cursor: {error}");
+                                    eprintln!(
+                                        "cursor grab warning: failed to {action} cursor: {error}"
+                                    );
                                     cursor_grab_warning_logged = true;
                                 }
                             } else {
@@ -3711,14 +4019,6 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
                         exit_runtime_failure(control_flow, "Fatal Runtime Error:", &error);
                     }
 
-                    if let Some(max_fps) = runtime.max_fps() {
-                        let target = Duration::from_secs_f32(1.0 / max_fps.max(1.0));
-                        let elapsed = update_start.elapsed();
-                        if elapsed < target {
-                            std::thread::sleep(target - elapsed);
-                        }
-                    }
-
                     window.request_redraw();
                 }
                 Event::RedrawRequested(_) => {
@@ -3729,6 +4029,11 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
                             &format!("desktop presenter failed: {error}"),
                         );
                     }
+                    next_update_deadline =
+                        frame_deadline(last_update, Instant::now(), runtime.max_fps());
+                    if let Some(deadline) = next_update_deadline {
+                        *control_flow = ControlFlow::WaitUntil(deadline);
+                    }
                 }
                 _ => {}
             }
@@ -3738,14 +4043,24 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
             exit_runtime_failure(
                 control_flow,
                 "Rust Panic:",
-                &describe_desktop_panic("runtime panicked while processing window events", payload.as_ref()),
+                &describe_desktop_panic(
+                    "runtime panicked while processing window events",
+                    payload.as_ref(),
+                ),
             );
         }
     });
 }
 
-fn create_project_at(project_path: &Path, project_name: &str) -> Result<PathBuf, String> {
-    if let Some(parent) = project_path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+fn create_project_at(
+    project_path: &Path,
+    project_name: &str,
+    project_kind: ProjectKind,
+) -> Result<PathBuf, String> {
+    if let Some(parent) = project_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
     }
@@ -3764,6 +4079,7 @@ name = \"{}\"
 version = \"0.1.0\"
 
 [project]
+kind = \"{}\"
 start_scene = \"scene.neoscene\"
 
 [window]
@@ -3776,13 +4092,21 @@ resizable = true
 
 [dependencies]
 ",
-        project_name, project_name
+        project_name,
+        project_kind.as_str(),
+        project_name
     );
     fs::write(&toml_path, contents)
         .map_err(|error| format!("failed to write {}: {error}", toml_path.display()))?;
 
     let entry_path = project_path.join("main.luau");
-    fs::write(&entry_path, format!("print(\"Hello, {}!\")", project_name))
+    fs::write(
+        &entry_path,
+        format!(
+            "-- Generated by the NeoLOVE visual editor. Edits may be overwritten.\nprint(\"Hello, {}!\")",
+            project_name
+        ),
+    )
         .map_err(|error| format!("failed to write {}: {error}", entry_path.display()))?;
 
     let assets_path = project_path.join("assets");
@@ -3810,7 +4134,7 @@ resizable = true
     Ok(project_path.to_path_buf())
 }
 
-fn handle_new_command(project_name: &str) -> Result<PathBuf, String> {
+fn handle_new_command(project_name: &str, project_kind: ProjectKind) -> Result<PathBuf, String> {
     let project_path = resolve_from_cwd(project_name)
         .map_err(|error| format!("failed to resolve project path '{project_name}': {error}"))?;
     let display_name = project_path
@@ -3818,7 +4142,39 @@ fn handle_new_command(project_name: &str) -> Result<PathBuf, String> {
         .and_then(|value| value.to_str())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(project_name);
-    create_project_at(&project_path, display_name)
+    create_project_at(&project_path, display_name, project_kind)
+}
+
+fn parse_new_options(args: &[String]) -> Result<(ProjectKind, &str), String> {
+    let mut kind = ProjectKind::TwoD;
+    let mut explicit_kind = None;
+    let mut project_name = None;
+
+    for arg in args {
+        let candidate_kind = match arg.as_str() {
+            "--2d" => Some(ProjectKind::TwoD),
+            "--3d" => Some(ProjectKind::ThreeD),
+            _ => None,
+        };
+        if let Some(candidate_kind) = candidate_kind {
+            if explicit_kind.replace(candidate_kind).is_some() {
+                return Err("new failed: specify only one of --2d or --3d".to_string());
+            }
+            kind = candidate_kind;
+            continue;
+        }
+
+        if arg.starts_with('-') {
+            return Err(format!("new failed: unknown option '{arg}'"));
+        }
+        if project_name.replace(arg.as_str()).is_some() {
+            return Err("new failed: expected exactly one project name".to_string());
+        }
+    }
+
+    let project_name = project_name
+        .ok_or_else(|| "new failed: expected a project name after `neolove new`".to_string())?;
+    Ok((kind, project_name))
 }
 
 fn handle_api_command(project_dir: Option<&str>) -> Result<Vec<PathBuf>, String> {
@@ -3852,8 +4208,10 @@ fn print_usage() {
     println!("NeoLOVE CLI");
     println!("Usage:");
     println!("  neolove hub");
-    println!("  neolove new <project-name>");
-    println!("  neolove run [project-dir] [--mobile] [--portrait|--landscape] [--wifi|--cellular|--offline]");
+    println!("  neolove new [--2d|--3d] <project-name>");
+    println!(
+        "  neolove run [project-dir] [--mobile] [--portrait|--landscape] [--wifi|--cellular|--offline]"
+    );
     println!("  neolove editor [project-dir]");
     println!("  neolove build [project-dir] [--windows|--linux|--webasm|--android|--apk|--ios]");
     println!("  neolove api [project-dir]");
@@ -3898,7 +4256,9 @@ fn resolve_target_project_root(project_dir: Option<&str>) -> Result<PathBuf, Str
     match project_dir {
         Some(dir) => resolve_from_cwd(dir)
             .map_err(|error| format!("failed to resolve project path '{dir}': {error}")),
-        None => env::current_dir().map_err(|error| format!("failed to get current directory: {error}")),
+        None => {
+            env::current_dir().map_err(|error| format!("failed to get current directory: {error}"))
+        }
     }
 }
 
@@ -3991,8 +4351,8 @@ fn parse_run_options<'a>(
 fn run_cli() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
 
-    let current_exe =
-        env::current_exe().map_err(|error| format!("failed to resolve executable path: {error}"))?;
+    let current_exe = env::current_exe()
+        .map_err(|error| format!("failed to resolve executable path: {error}"))?;
 
     let embedded_payload = read_embedded_payload(&current_exe)
         .map_err(|error| format!("failed to read embedded payload: {error}"))?;
@@ -4060,7 +4420,9 @@ fn run_cli() -> Result<(), String> {
             "setup-start-menu" => match setup_start_menu_for_neolove() {
                 Ok(true) => println!("Application launcher entry updated."),
                 Ok(false) => println!("Application launcher entry is already up to date."),
-                Err(error) => return Err(format!("failed to set up application launcher: {error}")),
+                Err(error) => {
+                    return Err(format!("failed to set up application launcher: {error}"));
+                }
             },
             "hub" => {
                 if args.len() != 2 {
@@ -4078,21 +4440,16 @@ fn run_cli() -> Result<(), String> {
                         args.len().saturating_sub(2)
                     ));
                 }
-                let outcome = update::update_engine()
-                    .map_err(|error| format!("update failed: {error}"))?;
+                let outcome =
+                    update::update_engine().map_err(|error| format!("update failed: {error}"))?;
                 println!("{outcome}");
             }
             "new" => {
-                if args.len() != 3 {
-                    return Err(format!(
-                        "new failed: expected 1 project name argument, got {}",
-                        args.len().saturating_sub(2)
-                    ));
-                }
-                let project_path = handle_new_command(&args[2])?;
+                let (project_kind, project_name) = parse_new_options(&args[2..])?;
+                let project_path = handle_new_command(project_name, project_kind)?;
                 println!(
                     "Created project \"{}\" at {}.",
-                    args[2],
+                    project_name,
                     project_path.display()
                 );
                 println!("Set [window] fields in neolove.toml to customize the game window.");
@@ -4156,7 +4513,9 @@ fn run_cli() -> Result<(), String> {
                     } else if project_arg.is_none() {
                         project_arg = Some(arg);
                     } else {
-                        return Err("build failed: expected at most one project directory".to_string());
+                        return Err(
+                            "build failed: expected at most one project directory".to_string()
+                        );
                     }
                 }
 
@@ -4164,10 +4523,15 @@ fn run_cli() -> Result<(), String> {
                 validate_project_root(&project_root)
                     .map_err(|error| format!("build failed: {error}"))?;
 
-                if [webasm, android, ios, desktop_target != DesktopPackageTarget::Host]
-                    .into_iter()
-                    .filter(|enabled| *enabled)
-                    .count()
+                if [
+                    webasm,
+                    android,
+                    ios,
+                    desktop_target != DesktopPackageTarget::Host,
+                ]
+                .into_iter()
+                .filter(|enabled| *enabled)
+                .count()
                     > 1
                 {
                     return Err("build failed: choose only one target option".to_string());
@@ -4183,8 +4547,8 @@ fn run_cli() -> Result<(), String> {
                         .map_err(|error| format!("build failed: {error}"))?;
                     println!("Built Android APK: {}", output.display());
                 } else if ios {
-                    let output =
-                        build_ios(&project_root).map_err(|error| format!("build failed: {error}"))?;
+                    let output = build_ios(&project_root)
+                        .map_err(|error| format!("build failed: {error}"))?;
                     println!("Built iOS simulator app: {}", output.display());
                 } else {
                     let output = build_executable(&project_root, desktop_target)
@@ -4248,12 +4612,49 @@ mod build_compression_tests {
     use super::*;
 
     #[test]
+    fn hidpi_dimensions_use_logical_pixels_and_reject_invalid_scales() {
+        assert_eq!(logical_dimensions(3840, 2160, 2.0), (1920, 1080));
+        assert_eq!(logical_dimensions(3000, 2000, 1.5), (2000, 1333));
+        assert_eq!(logical_dimensions(640, 480, f64::NAN), (640, 480));
+        assert_eq!(logical_dimensions(0, 0, 2.0), (1, 1));
+    }
+
+    #[test]
+    fn fps_deadline_accounts_for_update_and_render_time() {
+        let start = Instant::now();
+        let midway = start + Duration::from_millis(5);
+        let deadline = frame_deadline(start, midway, Some(100.0)).expect("remaining frame time");
+        assert_eq!(deadline, start + Duration::from_millis(10));
+        assert!(frame_deadline(start, start + Duration::from_millis(12), Some(100.0)).is_none());
+        assert!(frame_deadline(start, midway, None).is_none());
+    }
+
+    #[test]
+    fn software_hidpi_blit_supports_nearest_and_linear_filtering() {
+        let source = [255, 0, 0, 255, 0, 255, 0, 255];
+        let mut nearest = vec![0; 8];
+        blit_software_pixels(&source, 2, 1, &mut nearest, 4, 2, true);
+        assert_eq!(nearest[0], 0x00ff0000);
+        assert_eq!(nearest[1], 0x00ff0000);
+        assert_eq!(nearest[2], 0x0000ff00);
+        assert_eq!(nearest[3], 0x0000ff00);
+        assert_eq!(&nearest[..4], &nearest[4..]);
+
+        let mut linear = vec![0; 4];
+        blit_software_pixels(&source, 2, 1, &mut linear, 4, 1, false);
+        assert_eq!(linear[0], 0x00ff0000);
+        assert_eq!(linear[3], 0x0000ff00);
+        assert_ne!(linear[1], linear[0]);
+        assert_ne!(linear[2], linear[3]);
+    }
+
+    #[test]
     fn linux_to_windows_builds_link_mingw_runtimes_statically() {
         let config = cross_target_rustflags_config(
             DesktopPackageTarget::Windows,
             Some(Path::new("/mingw/lib")),
         )
-            .expect("cross Windows target should add linker flags");
+        .expect("cross Windows target should add linker flags");
         assert!(config.contains("native=/mingw/lib"));
         assert!(config.contains("link-arg=-static-libgcc"));
         assert!(config.contains("link-arg=-static-libstdc++"));
@@ -4282,7 +4683,11 @@ mod build_compression_tests {
         .expect("write settings");
 
         let settings = parse_project_settings(&root);
-        assert_eq!(settings.start_scene.as_deref(), Some("levels/title.neoscene"));
+        assert_eq!(settings.kind, ProjectKind::TwoD);
+        assert_eq!(
+            settings.start_scene.as_deref(),
+            Some("levels/title.neoscene")
+        );
         assert_eq!(settings.window_width, Some(800.0));
         assert_eq!(settings.window_height, Some(600.0));
         assert_eq!(settings.window_fullscreen, Some(false));
@@ -4290,6 +4695,72 @@ mod build_compression_tests {
 
         let (_, _, _, _, _, resizable) = window_options_for_project(&root);
         assert!(!resizable);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn new_command_project_kind_options_are_backward_compatible() {
+        let args = ["my-game".to_string()];
+        assert_eq!(
+            parse_new_options(&args).expect("legacy new command"),
+            (ProjectKind::TwoD, "my-game")
+        );
+
+        let args = ["--2d".to_string(), "my-game".to_string()];
+        assert_eq!(
+            parse_new_options(&args).expect("explicit 2D project"),
+            (ProjectKind::TwoD, "my-game")
+        );
+
+        let args = ["--3d".to_string(), "my-game".to_string()];
+        assert_eq!(
+            parse_new_options(&args).expect("3D project"),
+            (ProjectKind::ThreeD, "my-game")
+        );
+
+        let args = ["my-game".to_string(), "--3d".to_string()];
+        assert_eq!(
+            parse_new_options(&args).expect("kind option after project name"),
+            (ProjectKind::ThreeD, "my-game")
+        );
+
+        let args = [
+            "--2d".to_string(),
+            "--3d".to_string(),
+            "my-game".to_string(),
+        ];
+        assert!(parse_new_options(&args).is_err());
+        let args = ["--unknown".to_string(), "my-game".to_string()];
+        assert!(parse_new_options(&args).is_err());
+        assert!(parse_new_options(&[]).is_err());
+    }
+
+    #[test]
+    fn project_templates_write_and_parse_the_selected_kind() {
+        let root = std::env::temp_dir().join(format!(
+            "neolove_project_kind_template_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        for (directory, kind, expected) in [
+            ("two-d", ProjectKind::TwoD, "kind = \"2d\""),
+            ("three-d", ProjectKind::ThreeD, "kind = \"3d\""),
+        ] {
+            let project = root.join(directory);
+            create_project_at(&project, "Kind Test", kind).expect("create project template");
+            let toml = std::fs::read_to_string(project.join("neolove.toml"))
+                .expect("read generated project settings");
+            assert!(toml.contains(expected), "generated settings: {toml}");
+            assert_eq!(parse_project_settings(&project).kind, kind);
+            let entry = std::fs::read_to_string(project.join("main.luau"))
+                .expect("read generated entry point");
+            assert!(
+                entry.starts_with("-- Generated by the NeoLOVE visual editor"),
+                "new projects must mark main.luau as editor-owned"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4308,14 +4779,15 @@ mod build_compression_tests {
 
         let compressed = compress_build_payload(&raw).expect("compress payload");
         assert!(compressed.len() < raw.len());
-        let output = std::env::temp_dir().join(format!(
-            "neolove_compression_test_{}",
-            std::process::id()
-        ));
+        let output =
+            std::env::temp_dir().join(format!("neolove_compression_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&output);
         std::fs::create_dir_all(&output).expect("create temp dir");
         unpack_payload(&compressed, &output).expect("unpack payload");
-        assert_eq!(std::fs::read(output.join(path)).expect("read unpacked file"), data);
+        assert_eq!(
+            std::fs::read(output.join(path)).expect("read unpacked file"),
+            data
+        );
         let _ = std::fs::remove_dir_all(output);
     }
 }

@@ -1,12 +1,13 @@
 //! Scene data model for the visual editor.
 //!
-//! A [`Scene`] is a list of [`Entity`] nodes. Each entity owns a 2D transform
-//! and any number of [`Component`]s. Components are data-driven: a built-in
-//! ("core") component is just a kind name plus a list of typed [`Prop`]s that
-//! mirror the real engine `core.*` components, so the inspector and the Luau
-//! exporter stay in lockstep with the runtime. Scenes are persisted as compact
-//! binary `*.neoscene` files, with legacy JSON reads preserved, and can be
-//! exported to a runnable `main.luau`.
+//! A [`Scene`] declares whether its project uses 2D or 3D space and contains a
+//! list of [`Entity`] nodes. Each entity owns transform data and any number of
+//! [`Component`]s. Components are data-driven: a built-in ("core") component
+//! is just a kind name plus a list of typed [`Prop`]s that mirror the real
+//! engine `core.*` components, so the inspector and the Luau exporter stay in
+//! lockstep with the runtime. Scenes are persisted as compact binary
+//! `*.neoscene` files, with legacy JSON reads preserved, and can be exported to
+//! a runnable `main.luau`.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -16,6 +17,8 @@ use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+use crate::post_process::{Effect, EffectPass, TonemapOperator};
 
 const SCENE_BINARY_MAGIC: &[u8] = b"NEOLSCN1";
 const PREFAB_BINARY_MAGIC: &[u8] = b"NEOLPFB1";
@@ -124,6 +127,10 @@ pub enum PropValue {
     ColorSequence(Vec<ColorKeypoint>),
     /// Numeric keypoints sampled over a particle's normalized lifetime.
     NumberSequence(Vec<NumberKeypoint>),
+    /// A model asset path. Kept at the end of the enum so existing bincode
+    /// discriminants remain stable. MeshRenderer3D and Collider3D consume the
+    /// path and load/cache their live MeshHandle at runtime.
+    Mesh(String),
 }
 
 impl PropValue {
@@ -153,6 +160,7 @@ impl PropValue {
             PropValue::Image(s) => format!("assets.loadImage(\"{}\")", escape_luau(s)),
             PropValue::Font(s) => format!("\"{}\"", escape_luau(s)),
             PropValue::Sound(s) => format!("assets.loadSound(\"{}\")", escape_luau(s)),
+            PropValue::Mesh(s) => format!("\"{}\"", escape_luau(s)),
             PropValue::Shader(s) => format!("shaders.loadFragment(\"{}\")", escape_luau(s)),
             PropValue::Animation(s) => format!("animation.load(\"{}\")", escape_luau(s)),
             PropValue::ColorSequence(keypoints) => format!(
@@ -261,6 +269,15 @@ impl Prop {
     }
     fn sound(name: &str, label: &str, v: &str) -> Self {
         Self::new(name, label, PropValue::Sound(v.to_string()), false)
+    }
+    fn mesh(name: &str, label: &str, v: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            label: label.to_string(),
+            value: PropValue::Mesh(v.to_string()),
+            advanced: false,
+            optional: true,
+        }
     }
     fn shader(name: &str, label: &str) -> Self {
         Self {
@@ -622,6 +639,29 @@ fn normalize_core_component(component: &mut Component) {
         }
     }
 
+    // Early 3D scene builds stored mesh paths as generic text. Upgrade them
+    // in-memory so the asset picker and drag/drop work without breaking the
+    // serialized path or the runtime's string-based mesh_path contract.
+    if matches!(name.as_str(), "MeshRenderer3D" | "Collider3D") {
+        for prop in props.iter_mut() {
+            if prop.name == "mesh_path"
+                && let PropValue::Text(path) = &prop.value
+            {
+                prop.value = PropValue::Mesh(path.clone());
+            }
+        }
+    }
+
+    if matches!(name.as_str(), "Environment3D" | "Skybox3D") {
+        for prop in props.iter_mut() {
+            if matches!(prop.name.as_str(), "texture" | "texture_path")
+                && let PropValue::Text(path) = &prop.value
+            {
+                prop.value = PropValue::Image(path.clone());
+            }
+        }
+    }
+
     if name == "ParticleSystem2D" {
         if !props.iter().any(|prop| prop.name == "image") {
             if let Some(image) = core_component_props(name)
@@ -703,6 +743,14 @@ fn normalize_core_component(component: &mut Component) {
         name.as_str(),
         "EntityScaler"
             | "Camera"
+            | "MeshRenderer3D"
+            | "Camera3D"
+            | "Light3D"
+            | "Environment3D"
+            | "Skybox3D"
+            | "ParticleSystem3D"
+            | "Rigidbody3D"
+            | "Collider3D"
             | "Panel"
             | "Frame"
             | "Button"
@@ -737,6 +785,7 @@ pub const CORE_COMPONENTS: &[&str] = &[
     "TextLabel",
     "TextInput",
     "Panel",
+    "ScrollList",
     "Button",
     "Slider",
     "Dropdown",
@@ -753,6 +802,13 @@ pub const CORE_COMPONENTS: &[&str] = &[
     "Rigidbody2D",
     "Light2D",
     "LightOccluder2D",
+    "MeshRenderer3D",
+    "Camera3D",
+    "Light3D",
+    "Environment3D",
+    "ParticleSystem3D",
+    "Rigidbody3D",
+    "Collider3D",
 ];
 
 /// Advanced / legacy core components, shown under an "Advanced" submenu.
@@ -779,6 +835,172 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
     match name {
         "Rect2D" => drawable(),
         "Camera" => vec![Prop::boolean("enabled", "Enabled", true)],
+        "MeshRenderer3D" => vec![
+            Prop::enumv(
+                "primitive",
+                "Primitive",
+                "cube",
+                &[
+                    "none", "cube", "sphere", "plane", "cylinder", "capsule", "cone",
+                ],
+                false,
+            ),
+            Prop::mesh("mesh_path", "Mesh", ""),
+            Prop::image("texture", "Texture", ""),
+            Prop::image("normal_texture", "Normal Map", ""),
+            Prop::color("color", "Tint", [255, 255, 255, 255]),
+            Prop::num_adv("metallic", "Metallic", 0.0),
+            Prop::num_adv("roughness", "Roughness", 1.0),
+            Prop::boolean("visible", "Visible", true),
+            Prop::boolean("casts_shadows", "Casts Shadows", true),
+            Prop::boolean("receives_shadows", "Receives Shadows", true),
+            Prop::boolean_adv("double_sided", "Double Sided", false),
+            Prop::num_adv("primitive_size_x", "Primitive X", 1.0),
+            Prop::num_adv("primitive_size_y", "Primitive Y", 1.0),
+            Prop::num_adv("primitive_size_z", "Primitive Z", 1.0),
+            Prop::num_adv("primitive_radius", "Primitive Radius", 0.5),
+            Prop::num_adv("primitive_height", "Primitive Height", 1.0),
+            Prop::int("primitive_segments", "Primitive Segments", 24),
+            Prop::int("primitive_rings", "Primitive Rings", 12),
+            Prop::text("animation", "Animation Clip", ""),
+            Prop::boolean("animation_autoplay", "Animation Autoplay", true),
+            Prop::boolean("animation_looping", "Animation Loop", true),
+            Prop::boolean("animation_playing", "Animation Playing", true),
+            Prop::num("animation_speed", "Animation Speed", 1.0),
+            Prop::shader("shader", "Shader"),
+        ],
+        "Camera3D" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::enumv(
+                "projection",
+                "Projection",
+                "perspective",
+                &["perspective", "orthographic"],
+                false,
+            ),
+            Prop::num("fov", "Field of View", 60.0),
+            Prop::num("orthographic_size", "Ortho Size", 10.0),
+            Prop::num_adv("near_clip", "Near Clip", 0.1),
+            Prop::num_adv("far_clip", "Far Clip", 1000.0),
+        ],
+        "Light3D" => vec![
+            Prop::enumv(
+                "kind",
+                "Kind",
+                "point",
+                &["point", "spot", "directional"],
+                false,
+            ),
+            Prop::color("color", "Color", [255, 255, 255, 255]),
+            Prop::num("intensity", "Intensity", 1.0),
+            Prop::num("range", "Range", 10.0),
+            Prop::num("spot_angle", "Spot Angle °", 45.0),
+            Prop::num_adv("spot_softness", "Spot Softness", 0.15),
+            Prop::boolean("casts_shadows", "Casts Shadows", true),
+            Prop::num_adv("shadow_bias", "Shadow Bias", 0.005),
+            Prop::boolean("visible", "Visible", true),
+        ],
+        "Environment3D" | "Skybox3D" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::enumv(
+                "mode",
+                "Mode",
+                "gradient",
+                &["solid", "gradient", "equirectangular"],
+                false,
+            ),
+            Prop::color("color", "Solid Color", [20, 24, 32, 255]),
+            Prop::color("top_color", "Top Color", [30, 47, 78, 255]),
+            Prop::color("bottom_color", "Bottom Color", [8, 10, 16, 255]),
+            Prop::image("texture", "Panorama", ""),
+            Prop::num("rotation", "Rotation °", 0.0),
+            Prop::num("intensity", "Intensity", 1.0),
+        ],
+        "ParticleSystem3D" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::boolean("visible", "Visible", true),
+            Prop::boolean("playing", "Playing", true),
+            Prop::boolean("looping", "Looping", true),
+            Prop::num("duration", "Duration", 5.0),
+            Prop::num("emission_rate", "Rate", 24.0),
+            Prop::int("max_particles", "Max Particles", 1024),
+            Prop::enumv(
+                "shape",
+                "Emitter",
+                "point",
+                &["point", "box", "sphere", "cone"],
+                false,
+            ),
+            Prop::num_adv("box_size_x", "Box X", 2.0),
+            Prop::num_adv("box_size_y", "Box Y", 2.0),
+            Prop::num_adv("box_size_z", "Box Z", 2.0),
+            Prop::num("sphere_radius", "Sphere Radius", 1.0),
+            Prop::num("cone_angle", "Cone Angle °", 30.0),
+            Prop::num("cone_length", "Cone Length", 1.0),
+            Prop::num_adv("direction_x", "Direction X", 0.0),
+            Prop::num_adv("direction_y", "Direction Y", 1.0),
+            Prop::num_adv("direction_z", "Direction Z", 0.0),
+            Prop::num("spread", "Spread °", 12.0),
+            Prop::num("lifetime", "Lifetime", 1.5),
+            Prop::num_adv("lifetime_min", "Lifetime Min", 1.0),
+            Prop::num_adv("lifetime_max", "Lifetime Max", 2.0),
+            Prop::num("speed", "Speed", 2.0),
+            Prop::num_adv("speed_min", "Speed Min", 1.0),
+            Prop::num_adv("speed_max", "Speed Max", 3.0),
+            Prop::num_adv("gravity_x", "Gravity X", 0.0),
+            Prop::num_adv("gravity_y", "Gravity Y", -9.81),
+            Prop::num_adv("gravity_z", "Gravity Z", 0.0),
+            Prop::num_adv("drag", "Drag", 0.0),
+            Prop::num("start_size", "Start Size", 0.25),
+            Prop::num("end_size", "End Size", 0.0),
+            Prop::color("start_color", "Start Color", [255, 190, 80, 255]),
+            Prop::color("end_color", "End Color", [255, 70, 20, 0]),
+            Prop::num_adv("start_rotation", "Start Rotation °", 0.0),
+            Prop::num_adv("angular_velocity", "Angular Velocity", 0.0),
+            Prop::image("texture", "Particle Texture", ""),
+            Prop::int("seed", "Seed", 0x6d2b_79f5),
+        ],
+        "Rigidbody3D" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::boolean("is_static", "Static", false),
+            Prop::num("mass", "Mass", 1.0),
+            Prop::num("gravity_scale", "Gravity Scale", 1.0),
+            Prop::num("linear_damping", "Lin Damping", 0.0),
+            Prop::num("angular_damping", "Ang Damping", 0.0),
+            Prop::boolean_adv("freeze_x", "Freeze X", false),
+            Prop::boolean_adv("freeze_y", "Freeze Y", false),
+            Prop::boolean_adv("freeze_z", "Freeze Z", false),
+            Prop::boolean_adv("freeze_rotation_x", "Freeze Rot X", false),
+            Prop::boolean_adv("freeze_rotation_y", "Freeze Rot Y", false),
+            Prop::boolean_adv("freeze_rotation_z", "Freeze Rot Z", false),
+            Prop::boolean_adv("continuous_collision", "Continuous", false),
+            Prop::boolean("auto_resolve", "Auto Resolve", true),
+            Prop::num_adv("contact_slop", "Contact Slop", 0.001),
+        ],
+        "Collider3D" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::boolean("is_trigger", "Is Trigger", false),
+            Prop::enumv(
+                "shape",
+                "Shape",
+                "box",
+                &["box", "sphere", "capsule", "mesh"],
+                false,
+            ),
+            Prop::mesh("mesh_path", "Mesh", ""),
+            Prop::boolean_adv("convex", "Convex Mesh", false),
+            Prop::num("size_x", "Size X", 1.0),
+            Prop::num("size_y", "Size Y", 1.0),
+            Prop::num("size_z", "Size Z", 1.0),
+            Prop::num("radius", "Radius", 0.5),
+            Prop::num("height", "Height", 1.0),
+            Prop::num_adv("offset_x", "Offset X", 0.0),
+            Prop::num_adv("offset_y", "Offset Y", 0.0),
+            Prop::num_adv("offset_z", "Offset Z", 0.0),
+            Prop::num_adv("restitution", "Restitution", 0.0),
+            Prop::num_adv("friction", "Friction", 0.5),
+            Prop::boolean_adv("non_physics", "Non Physics", false),
+        ],
         "Light2D" => vec![
             Prop::enumv(
                 "kind",
@@ -1215,8 +1437,16 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::color("background_color", "Background", [60, 60, 60, 255]),
             Prop::color("hover_background_color", "Bg Hover", [74, 74, 74, 255]),
             Prop::color("text_color", "Text Color", [240, 240, 240, 255]),
-            Prop::color("item_hover_background_color", "Item Hover", [42, 45, 46, 255]),
-            Prop::color("item_selected_background_color", "Item Selected", [9, 71, 113, 255]),
+            Prop::color(
+                "item_hover_background_color",
+                "Item Hover",
+                [42, 45, 46, 255],
+            ),
+            Prop::color(
+                "item_selected_background_color",
+                "Item Selected",
+                [9, 71, 113, 255],
+            ),
             Prop::boolean("visible", "Visible", true),
             Prop::num("scale", "Scale", 18.0),
             Prop::num("item_height", "Item H", 32.0),
@@ -1235,8 +1465,16 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::color_adv("menu_border_color", "Menu Border", [69, 69, 69, 255]),
             Prop::color_adv("item_background_color", "Item Bg", [37, 37, 38, 0]),
             Prop::color_adv("item_text_color", "Item Text", [204, 204, 204, 255]),
-            Prop::color_adv("item_hover_text_color", "Item Hover Text", [255, 255, 255, 255]),
-            Prop::color_adv("item_selected_text_color", "Item Sel Text", [255, 255, 255, 255]),
+            Prop::color_adv(
+                "item_hover_text_color",
+                "Item Hover Text",
+                [255, 255, 255, 255],
+            ),
+            Prop::color_adv(
+                "item_selected_text_color",
+                "Item Sel Text",
+                [255, 255, 255, 255],
+            ),
             Prop::boolean_adv("open_upwards", "Open Up", false),
             Prop::num_adv("padding_x", "Padding X", 10.0),
             Prop::num_adv("padding_y", "Padding Y", 8.0),
@@ -1267,14 +1505,35 @@ pub struct Entity {
     pub prefab_source: Option<String>,
     pub x: f32,
     pub y: f32,
-    /// Draw order; higher draws in front.
+    /// Legacy 2D draw order; higher draws in front. This remains distinct from
+    /// the entity's 3D position so existing scenes retain their render order.
     #[serde(default)]
     pub z: f32,
+    /// Position on the 3D Z axis. The existing `x` and `y` fields supply the
+    /// other two axes without changing their 2D meaning.
+    #[serde(default)]
+    pub position_z: f32,
     pub size_x: f32,
     pub size_y: f32,
+    /// Legacy clockwise 2D rotation in degrees.
     pub rotation: f32,
+    /// Three-dimensional Euler rotation in degrees.
+    #[serde(default)]
+    pub rotation_x: f32,
+    #[serde(default)]
+    pub rotation_y: f32,
+    #[serde(default)]
+    pub rotation_z: f32,
+    /// Legacy uniform 2D scale.
     #[serde(default = "one")]
     pub scale: f32,
+    /// Per-axis 3D scale, independent of the legacy uniform 2D scale.
+    #[serde(default = "one")]
+    pub scale_x: f32,
+    #[serde(default = "one")]
+    pub scale_y: f32,
+    #[serde(default = "one")]
+    pub scale_z: f32,
     #[serde(default)]
     pub anchor_x: f32,
     #[serde(default)]
@@ -1327,10 +1586,17 @@ impl Entity {
             x,
             y,
             z: 0.0,
+            position_z: 0.0,
             size_x: 100.0,
             size_y: 100.0,
             rotation: 0.0,
+            rotation_x: 0.0,
+            rotation_y: 0.0,
+            rotation_z: 0.0,
             scale: 1.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            scale_z: 1.0,
             anchor_x: 0.0,
             anchor_y: 0.0,
             position_pivot: String::new(),
@@ -1347,10 +1613,25 @@ impl Entity {
     }
 }
 
+/// The dimensional mode selected for a scene project.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SceneKind {
+    /// A two-dimensional project. This is also the mode used by legacy scenes.
+    #[default]
+    #[serde(rename = "2d")]
+    TwoD,
+    /// A three-dimensional project.
+    #[serde(rename = "3d")]
+    ThreeD,
+}
+
 /// The complete editable document.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Scene {
     pub name: String,
+    /// Whether this scene belongs to a 2D or 3D project.
+    #[serde(default)]
+    pub kind: SceneKind,
     pub background: Color,
     /// When true (the default) textures are upscaled with nearest-neighbour
     /// sampling for crisp pixel-art; when false they use bilinear filtering for
@@ -1364,9 +1645,36 @@ pub struct Scene {
     /// the viewport. Off by default so scenes render unlit until opted in.
     #[serde(default)]
     pub lighting: SceneLighting,
+    /// Ordered full-frame effects applied after scene rendering. The compact
+    /// editor wrapper deliberately stores only authored configuration; the
+    /// renderer-owned scratch buffers and safety limit never leak into scene
+    /// documents.
+    #[serde(default)]
+    pub post_process: ScenePostProcess,
     pub entities: Vec<Entity>,
     #[serde(skip)]
     next_id: u64,
+}
+
+/// Scene-authored post-processing configuration.
+///
+/// The individual passes use the renderer's authoritative [`Effect`] model,
+/// so serialized scenes and the visual editor cannot expose settings the
+/// runtime does not actually implement. Pass order is significant.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ScenePostProcess {
+    pub enabled: bool,
+    pub effects: Vec<EffectPass>,
+}
+
+impl Default for ScenePostProcess {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            effects: Vec::new(),
+        }
+    }
 }
 
 /// Scene-level lighting settings mirrored by the runtime `lighting` global.
@@ -1445,18 +1753,74 @@ fn default_antialiasing() -> String {
 
 impl Default for Scene {
     fn default() -> Self {
+        Self::new_for_kind(SceneKind::TwoD)
+    }
+}
+
+impl Scene {
+    /// Create a fresh editable scene with starter content appropriate for its
+    /// dimensional mode.
+    ///
+    /// 2D scenes deliberately retain the historic single empty entity. A 3D
+    /// scene instead starts with an editable environment, an active perspective
+    /// camera looking toward the origin, and a directional light, so imported
+    /// geometry is visible as soon as it is added.
+    pub fn new_for_kind(kind: SceneKind) -> Self {
         let mut scene = Self {
             name: "Untitled".to_string(),
+            kind,
             background: DEFAULT_SCENE_BACKGROUND,
             nearest_neighbor_scaling: true,
             antialiasing: default_antialiasing(),
             lighting: SceneLighting::default(),
+            post_process: ScenePostProcess::default(),
             entities: Vec::new(),
             next_id: 1,
         };
-        // A fresh scene starts with one empty entity so the viewport is not
-        // blank — but with no components attached.
-        scene.add_entity("Entity", 200.0, 150.0);
+
+        match kind {
+            SceneKind::TwoD => {
+                // Preserve the starter content and coordinates used by every
+                // existing 2D project.
+                scene.add_entity("Entity", 200.0, 150.0);
+            }
+            SceneKind::ThreeD => {
+                let environment_id = scene.add_entity("Environment", 0.0, 0.0).id;
+                scene
+                    .entity_mut(environment_id)
+                    .expect("newly-added environment must exist")
+                    .components
+                    .push(Component::core("Environment3D"));
+
+                let camera_id = scene.add_entity("Camera", 0.0, 2.0).id;
+                let camera = scene
+                    .entity_mut(camera_id)
+                    .expect("newly-added camera must exist");
+                camera.position_z = 6.0;
+                camera.rotation_x = -15.0;
+                camera.components.push(Component::core("Camera3D"));
+
+                let light_id = scene.add_entity("Directional Light", 4.0, 6.0).id;
+                let light = scene
+                    .entity_mut(light_id)
+                    .expect("newly-added light must exist");
+                light.position_z = 4.0;
+                light.rotation_x = -45.0;
+                light.rotation_y = -35.0;
+                let mut component = Component::core("Light3D");
+                if let Component::Core { props, .. } = &mut component {
+                    let kind = props
+                        .iter_mut()
+                        .find(|prop| prop.name == "kind")
+                        .expect("Light3D schema must define kind");
+                    let PropValue::Enum { value, .. } = &mut kind.value else {
+                        unreachable!("Light3D kind must be an enum")
+                    };
+                    *value = "directional".to_string();
+                }
+                light.components.push(component);
+            }
+        }
         scene
     }
 }
@@ -1483,10 +1847,12 @@ impl Scene {
         let next_id = entities.iter().map(|entity| entity.id).max().unwrap_or(0) + 1;
         Self {
             name: name.into(),
+            kind: SceneKind::TwoD,
             background: DEFAULT_SCENE_BACKGROUND,
             nearest_neighbor_scaling: true,
             antialiasing: default_antialiasing(),
             lighting: SceneLighting::default(),
+            post_process: ScenePostProcess::default(),
             entities,
             next_id,
         }
@@ -1684,8 +2050,15 @@ impl Scene {
                     entity.x = instance_root.x;
                     entity.y = instance_root.y;
                     entity.z = instance_root.z;
+                    entity.position_z = instance_root.position_z;
                     entity.rotation = instance_root.rotation;
+                    entity.rotation_x = instance_root.rotation_x;
+                    entity.rotation_y = instance_root.rotation_y;
+                    entity.rotation_z = instance_root.rotation_z;
                     entity.scale = instance_root.scale;
+                    entity.scale_x = instance_root.scale_x;
+                    entity.scale_y = instance_root.scale_y;
+                    entity.scale_z = instance_root.scale_z;
                     entity.anchor_x = instance_root.anchor_x;
                     entity.anchor_y = instance_root.anchor_y;
                     entity.prefab_source = Some(source.to_string());
@@ -1832,6 +2205,80 @@ impl Scene {
         ));
     }
 
+    /// Reset and rebuild the renderer's ordered post-process stack. Unlike
+    /// lighting, this is emitted even for an empty/default stack: loading a
+    /// second scene must not inherit passes or a disabled state from the first.
+    fn emit_post_process(&self, out: &mut String) {
+        out.push_str("postprocess.clear()\n");
+        out.push_str(&format!(
+            "postprocess.setEnabled({})\n",
+            self.post_process.enabled
+        ));
+
+        for pass in &self.post_process.effects {
+            let enabled = pass.enabled;
+            match &pass.effect {
+                Effect::Bloom(config) => out.push_str(&format!(
+                    "postprocess.add(\"bloom\", {{ enabled = {enabled}, threshold = {}, intensity = {}, radius = {} }})\n",
+                    fmt_num(config.threshold),
+                    fmt_num(config.intensity),
+                    config.radius,
+                )),
+                Effect::Pixelate(config) => out.push_str(&format!(
+                    "postprocess.add(\"pixelate\", {{ enabled = {enabled}, block_size = {} }})\n",
+                    config.block_size,
+                )),
+                Effect::ChromaticAberration(config) => out.push_str(&format!(
+                    "postprocess.add(\"chromatic_aberration\", {{ enabled = {enabled}, offset_pixels = {}, angle_degrees = {} }})\n",
+                    fmt_num(config.offset_pixels),
+                    fmt_num(config.angle_degrees),
+                )),
+                Effect::MotionBlur(config) => out.push_str(&format!(
+                    "postprocess.add(\"motion_blur\", {{ enabled = {enabled}, strength = {} }})\n",
+                    fmt_num(config.strength),
+                )),
+                Effect::Quantization(config) => out.push_str(&format!(
+                    "postprocess.add(\"quantization\", {{ enabled = {enabled}, levels = {}, dither_strength = {} }})\n",
+                    config.levels,
+                    fmt_num(config.dither_strength),
+                )),
+                Effect::Vignette(config) => out.push_str(&format!(
+                    "postprocess.add(\"vignette\", {{ enabled = {enabled}, strength = {}, radius = {}, softness = {} }})\n",
+                    fmt_num(config.strength),
+                    fmt_num(config.radius),
+                    fmt_num(config.softness),
+                )),
+                Effect::Grayscale(config) => out.push_str(&format!(
+                    "postprocess.add(\"grayscale\", {{ enabled = {enabled}, amount = {} }})\n",
+                    fmt_num(config.amount),
+                )),
+                Effect::Invert(config) => out.push_str(&format!(
+                    "postprocess.add(\"invert\", {{ enabled = {enabled}, amount = {} }})\n",
+                    fmt_num(config.amount),
+                )),
+                Effect::BrightnessContrastSaturation(config) => out.push_str(&format!(
+                    "postprocess.add(\"color_adjust\", {{ enabled = {enabled}, brightness = {}, contrast = {}, saturation = {} }})\n",
+                    fmt_num(config.brightness),
+                    fmt_num(config.contrast),
+                    fmt_num(config.saturation),
+                )),
+                Effect::ExposureTonemap(config) => {
+                    let operator = match config.operator {
+                        TonemapOperator::None => "none",
+                        TonemapOperator::Reinhard => "reinhard",
+                        TonemapOperator::Aces => "aces",
+                    };
+                    out.push_str(&format!(
+                        "postprocess.add(\"exposure_tonemap\", {{ enabled = {enabled}, exposure = {}, operator = \"{operator}\", gamma = {} }})\n",
+                        fmt_num(config.exposure),
+                        fmt_num(config.gamma),
+                    ));
+                }
+            }
+        }
+        out.push('\n');
+    }
+
     fn to_luau_with_image_mode(&self, image_mode: ImageEmitMode) -> String {
         let mut out = String::new();
         out.push_str("-- Generated by the NeoLOVE visual editor. Edits may be overwritten.\n");
@@ -1885,6 +2332,7 @@ impl Scene {
         ));
 
         self.emit_lighting(&mut out);
+        self.emit_post_process(&mut out);
 
         // Emit parents before children so `ecs.newEntity(..., parentVar)` works.
         let ordered = self.topological_order();
@@ -1933,11 +2381,44 @@ impl Scene {
             if entity.z != 0.0 {
                 out.push_str(&format!("{var}.z = {}\n", fmt_num(entity.z)));
             }
+            if entity.position_z != 0.0 {
+                out.push_str(&format!(
+                    "{var}.position_z = {}\n",
+                    fmt_num(entity.position_z)
+                ));
+            }
             if entity.rotation != 0.0 {
                 out.push_str(&format!("{var}.rotation = {}\n", fmt_num(entity.rotation)));
             }
+            if entity.rotation_x != 0.0 {
+                out.push_str(&format!(
+                    "{var}.rotation_x = {}\n",
+                    fmt_num(entity.rotation_x)
+                ));
+            }
+            if entity.rotation_y != 0.0 {
+                out.push_str(&format!(
+                    "{var}.rotation_y = {}\n",
+                    fmt_num(entity.rotation_y)
+                ));
+            }
+            if entity.rotation_z != 0.0 {
+                out.push_str(&format!(
+                    "{var}.rotation_z = {}\n",
+                    fmt_num(entity.rotation_z)
+                ));
+            }
             if entity.scale != 1.0 {
                 out.push_str(&format!("{var}.scale = {}\n", fmt_num(entity.scale)));
+            }
+            if entity.scale_x != 1.0 {
+                out.push_str(&format!("{var}.scale_x = {}\n", fmt_num(entity.scale_x)));
+            }
+            if entity.scale_y != 1.0 {
+                out.push_str(&format!("{var}.scale_y = {}\n", fmt_num(entity.scale_y)));
+            }
+            if entity.scale_z != 1.0 {
+                out.push_str(&format!("{var}.scale_z = {}\n", fmt_num(entity.scale_z)));
             }
             if entity.anchor_x != 0.0 {
                 out.push_str(&format!("{var}.anchor_x = {}\n", fmt_num(entity.anchor_x)));
@@ -2007,6 +2488,7 @@ impl Scene {
                                         | PropValue::Font(path)
                                         | PropValue::Image(path)
                                         | PropValue::Sound(path)
+                                        | PropValue::Mesh(path)
                                         | PropValue::Shader(path)
                                         | PropValue::Animation(path)
                                         if path.is_empty()
@@ -2284,6 +2766,17 @@ fn normalize_require_path(path: &str) -> String {
 mod tests {
     use super::*;
 
+    fn set_core_prop(component: &mut Component, name: &str, value: PropValue) {
+        let Component::Core { props, .. } = component else {
+            panic!("expected core component");
+        };
+        props
+            .iter_mut()
+            .find(|prop| prop.name == name)
+            .unwrap_or_else(|| panic!("missing core property {name}"))
+            .value = value;
+    }
+
     #[test]
     fn round_trips_through_json() {
         let scene = Scene::default();
@@ -2291,6 +2784,343 @@ mod tests {
         let restored = Scene::from_json(&json).expect("deserialize");
         assert_eq!(restored.entities.len(), scene.entities.len());
         assert_eq!(restored.name, scene.name);
+        assert_eq!(restored.kind, SceneKind::TwoD);
+    }
+
+    #[test]
+    fn dimension_aware_constructor_preserves_the_2d_starter_scene() {
+        let scene = Scene::new_for_kind(SceneKind::TwoD);
+
+        assert_eq!(scene.kind, SceneKind::TwoD);
+        assert_eq!(scene.entities.len(), 1);
+        let entity = &scene.entities[0];
+        assert_eq!(entity.name, "Entity");
+        assert_eq!((entity.x, entity.y, entity.position_z), (200.0, 150.0, 0.0));
+        assert!(entity.components.is_empty());
+    }
+
+    #[test]
+    fn dimension_aware_constructor_builds_a_usable_3d_starter_scene() {
+        let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
+
+        assert_eq!(scene.kind, SceneKind::ThreeD);
+        assert_eq!(scene.entities.len(), 3);
+        let environment = scene
+            .entities
+            .iter()
+            .find(|entity| entity.name == "Environment")
+            .expect("starter environment");
+        assert!(matches!(
+            environment.components.as_slice(),
+            [Component::Core { name, .. }] if name == "Environment3D"
+        ));
+
+        let camera = scene
+            .entities
+            .iter()
+            .find(|entity| entity.name == "Camera")
+            .expect("starter camera");
+        assert_eq!((camera.x, camera.y, camera.position_z), (0.0, 2.0, 6.0));
+        assert_eq!(camera.rotation_x, -15.0);
+        assert!(matches!(
+            camera.components.as_slice(),
+            [Component::Core { name, .. }] if name == "Camera3D"
+        ));
+
+        let light = scene
+            .entities
+            .iter()
+            .find(|entity| entity.name == "Directional Light")
+            .expect("starter directional light");
+        assert_eq!((light.x, light.y, light.position_z), (4.0, 6.0, 4.0));
+        assert_eq!((light.rotation_x, light.rotation_y), (-45.0, -35.0));
+        let [Component::Core { name, props }] = light.components.as_slice() else {
+            panic!("starter light should have exactly one core component");
+        };
+        assert_eq!(name, "Light3D");
+        assert!(matches!(
+            props.iter().find(|prop| prop.name == "kind"),
+            Some(Prop {
+                value: PropValue::Enum { value, .. },
+                ..
+            }) if value == "directional"
+        ));
+
+        let next = scene.add_entity("Mesh", 0.0, 0.0);
+        assert_eq!(next.id, 4, "starter entities must reserve stable ids");
+    }
+
+    #[test]
+    fn legacy_scenes_without_kind_default_to_2d() {
+        let legacy_json = r#"{"name":"Legacy","background":[0,0,0,255],"entities":[]}"#;
+        let restored_json = Scene::from_bytes(legacy_json.as_bytes()).expect("legacy json");
+        assert_eq!(restored_json.kind, SceneKind::TwoD);
+        assert!(restored_json.post_process.enabled);
+        assert!(restored_json.post_process.effects.is_empty());
+
+        #[derive(serde::Serialize)]
+        struct LegacyScene {
+            name: String,
+            background: Color,
+            nearest_neighbor_scaling: bool,
+            antialiasing: String,
+            lighting: SceneLighting,
+            entities: Vec<Entity>,
+        }
+
+        let legacy_binary = encode_binary_document(
+            "scene",
+            SCENE_BINARY_MAGIC,
+            &LegacyScene {
+                name: "Legacy".into(),
+                background: [0, 0, 0, 255],
+                nearest_neighbor_scaling: true,
+                antialiasing: default_antialiasing(),
+                lighting: SceneLighting::default(),
+                entities: Vec::new(),
+            },
+        )
+        .expect("legacy binary");
+        let restored_binary = Scene::from_bytes(&legacy_binary).expect("decode legacy binary");
+        assert_eq!(restored_binary.kind, SceneKind::TwoD);
+        assert!(restored_binary.post_process.enabled);
+        assert!(restored_binary.post_process.effects.is_empty());
+    }
+
+    #[test]
+    fn scene_kind_3d_round_trips_through_json_and_compressed_binary() {
+        let mut scene = Scene::default();
+        scene.kind = SceneKind::ThreeD;
+
+        let json = scene.to_json().expect("serialize json");
+        let json_document: serde_json::Value = serde_json::from_str(&json).expect("parse json");
+        assert_eq!(
+            json_document
+                .get("kind")
+                .and_then(serde_json::Value::as_str),
+            Some("3d")
+        );
+        let restored_json = Scene::from_json(&json).expect("restore json");
+        assert_eq!(restored_json.kind, SceneKind::ThreeD);
+
+        let binary = scene.to_bytes().expect("serialize compressed binary");
+        assert!(binary.starts_with(SCENE_BINARY_MAGIC));
+        let restored_binary = Scene::from_bytes(&binary).expect("restore compressed binary");
+        assert_eq!(restored_binary.kind, SceneKind::ThreeD);
+    }
+
+    #[test]
+    fn legacy_entities_default_to_identity_3d_transforms() {
+        let legacy = r#"{
+            "id": 7,
+            "name": "Legacy",
+            "x": 12.0,
+            "y": 24.0,
+            "z": 9.0,
+            "size_x": 32.0,
+            "size_y": 48.0,
+            "rotation": 15.0,
+            "scale": 2.0,
+            "components": []
+        }"#;
+        let entity: Entity = serde_json::from_str(legacy).expect("decode legacy entity");
+
+        assert_eq!(entity.z, 9.0, "legacy draw order must remain intact");
+        assert_eq!(
+            entity.rotation, 15.0,
+            "legacy 2D rotation must remain intact"
+        );
+        assert_eq!(entity.scale, 2.0, "legacy 2D scale must remain intact");
+        assert_eq!(entity.position_z, 0.0);
+        assert_eq!(
+            (entity.rotation_x, entity.rotation_y, entity.rotation_z),
+            (0.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            (entity.scale_x, entity.scale_y, entity.scale_z),
+            (1.0, 1.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn entity_3d_transforms_round_trip_through_json_and_binary() {
+        let mut scene = Scene::default();
+        scene.kind = SceneKind::ThreeD;
+        let entity = scene.entities.first_mut().expect("default entity");
+        entity.position_z = 3.5;
+        entity.rotation_x = 10.0;
+        entity.rotation_y = 20.0;
+        entity.rotation_z = 30.0;
+        entity.scale_x = 1.25;
+        entity.scale_y = 2.0;
+        entity.scale_z = 0.5;
+
+        let json = scene.to_json().expect("serialize json");
+        let binary = scene.to_bytes().expect("serialize binary");
+        for restored in [
+            Scene::from_json(&json).expect("restore json"),
+            Scene::from_bytes(&binary).expect("restore binary"),
+        ] {
+            let entity = restored.entities.first().expect("restored entity");
+            assert_eq!(entity.position_z, 3.5);
+            assert_eq!(
+                (entity.rotation_x, entity.rotation_y, entity.rotation_z),
+                (10.0, 20.0, 30.0)
+            );
+            assert_eq!(
+                (entity.scale_x, entity.scale_y, entity.scale_z),
+                (1.25, 2.0, 0.5)
+            );
+        }
+    }
+
+    #[test]
+    fn three_d_core_component_schemas_include_mesh_colliders() {
+        for name in [
+            "MeshRenderer3D",
+            "Camera3D",
+            "Light3D",
+            "Environment3D",
+            "ParticleSystem3D",
+            "Rigidbody3D",
+            "Collider3D",
+        ] {
+            assert!(
+                CORE_COMPONENTS.contains(&name),
+                "{name} is missing from CORE_COMPONENTS"
+            );
+            assert!(
+                !core_component_props(name).is_empty(),
+                "{name} has no editable schema"
+            );
+        }
+
+        let collider = core_component_props("Collider3D");
+        let shape = collider
+            .iter()
+            .find(|prop| prop.name == "shape")
+            .expect("shape");
+        assert!(matches!(
+            &shape.value,
+            PropValue::Enum { value, options }
+                if value == "box"
+                    && options == &["box", "sphere", "capsule", "mesh"]
+        ));
+        let mesh = collider
+            .iter()
+            .find(|prop| prop.name == "mesh_path")
+            .expect("mesh path");
+        assert!(mesh.optional);
+        assert_eq!(mesh.value, PropValue::Mesh(String::new()));
+    }
+
+    #[test]
+    fn three_d_transforms_and_components_export_to_luau() {
+        let mut scene = Scene::default();
+        scene.kind = SceneKind::ThreeD;
+        let entity = scene.entities.first_mut().expect("default entity");
+        entity.z = 7.0;
+        entity.position_z = 8.0;
+        entity.rotation = 9.0;
+        entity.rotation_x = 10.0;
+        entity.rotation_y = 20.0;
+        entity.rotation_z = 30.0;
+        entity.scale = 1.5;
+        entity.scale_x = 2.0;
+        entity.scale_y = 3.0;
+        entity.scale_z = 4.0;
+
+        let mut mesh = Component::core("MeshRenderer3D");
+        set_core_prop(
+            &mut mesh,
+            "mesh_path",
+            PropValue::Mesh("assets/crate.gltf".into()),
+        );
+        set_core_prop(
+            &mut mesh,
+            "texture",
+            PropValue::Image("assets/crate.png".into()),
+        );
+        let mut camera = Component::core("Camera3D");
+        set_core_prop(&mut camera, "fov", PropValue::Number(75.0));
+        let mut light = Component::core("Light3D");
+        set_core_prop(&mut light, "intensity", PropValue::Number(3.0));
+        let mut rigidbody = Component::core("Rigidbody3D");
+        set_core_prop(&mut rigidbody, "mass", PropValue::Number(10.0));
+        let mut collider = Component::core("Collider3D");
+        set_core_prop(
+            &mut collider,
+            "shape",
+            PropValue::Enum {
+                value: "mesh".into(),
+                options: vec![
+                    "box".into(),
+                    "sphere".into(),
+                    "capsule".into(),
+                    "mesh".into(),
+                ],
+            },
+        );
+        set_core_prop(
+            &mut collider,
+            "mesh_path",
+            PropValue::Mesh("assets/crate.gltf".into()),
+        );
+        entity.components = vec![mesh, camera, light, rigidbody, collider];
+
+        let luau = scene.to_luau_runtime();
+        for assignment in [
+            "ent_0.z = 7",
+            "ent_0.position_z = 8",
+            "ent_0.rotation = 9",
+            "ent_0.rotation_x = 10",
+            "ent_0.rotation_y = 20",
+            "ent_0.rotation_z = 30",
+            "ent_0.scale = 1.5",
+            "ent_0.scale_x = 2",
+            "ent_0.scale_y = 3",
+            "ent_0.scale_z = 4",
+            "ent_0_c0.mesh_path = \"assets/crate.gltf\"",
+            "ent_0_c0.texture = Images[\"assets/crate.png\"]",
+            "ent_0_c1.fov = 75",
+            "ent_0_c2.intensity = 3",
+            "ent_0_c3.mass = 10",
+            "ent_0_c4.shape = \"mesh\"",
+            "ent_0_c4.mesh_path = \"assets/crate.gltf\"",
+        ] {
+            assert!(
+                luau.contains(assignment),
+                "missing `{assignment}` in:\n{luau}"
+            );
+        }
+        for component in [
+            "MeshRenderer3D",
+            "Camera3D",
+            "Light3D",
+            "Rigidbody3D",
+            "Collider3D",
+        ] {
+            assert!(
+                luau.contains(&format!("AddComponent(core.{component})")),
+                "missing {component}:\n{luau}"
+            );
+        }
+
+        let defaults = Scene::default().to_luau_runtime();
+        for field in [
+            ".position_z =",
+            ".rotation_x =",
+            ".rotation_y =",
+            ".rotation_z =",
+            ".scale_x =",
+            ".scale_y =",
+            ".scale_z =",
+        ] {
+            assert!(
+                !defaults.contains(field),
+                "identity transform exported `{field}`"
+            );
+        }
     }
 
     #[test]
@@ -2353,15 +3183,121 @@ mod tests {
 
         // Export emits the runtime lighting calls.
         let luau = scene.to_luau_runtime();
-        assert!(luau.contains("lighting.setEnabled(true)"), "missing enable: {luau}");
-        assert!(luau.contains("lighting.setAmbient(Color4(10, 20, 30)"), "missing ambient");
+        assert!(
+            luau.contains("lighting.setEnabled(true)"),
+            "missing enable: {luau}"
+        );
+        assert!(
+            luau.contains("lighting.setAmbient(Color4(10, 20, 30)"),
+            "missing ambient"
+        );
         assert!(luau.contains("lighting.setShadows(true"), "missing shadows");
-        assert!(luau.contains("lighting.setQuality(\"high\")"), "missing quality");
+        assert!(
+            luau.contains("lighting.setQuality(\"high\")"),
+            "missing quality"
+        );
 
         // A disabled scene emits no lighting calls.
         let mut off = Scene::default();
         off.lighting.enabled = false;
         assert!(!off.to_luau_runtime().contains("lighting."));
+    }
+
+    #[test]
+    fn scene_post_process_round_trips_and_exports_every_supported_pass_in_order() {
+        use crate::post_process::{
+            BloomConfig, BrightnessContrastSaturationConfig, ChromaticAberrationConfig,
+            ExposureTonemapConfig, GrayscaleConfig, InvertConfig, MotionBlurConfig, PixelateConfig,
+            QuantizationConfig, VignetteConfig,
+        };
+
+        let mut scene = Scene::default();
+        scene.post_process.enabled = false;
+        scene.post_process.effects = vec![
+            Effect::Bloom(BloomConfig {
+                threshold: 0.6,
+                intensity: 1.25,
+                radius: 9,
+            })
+            .into(),
+            Effect::Pixelate(PixelateConfig { block_size: 5 }).into(),
+            EffectPass {
+                enabled: false,
+                effect: Effect::ChromaticAberration(ChromaticAberrationConfig {
+                    offset_pixels: 3.5,
+                    angle_degrees: 45.0,
+                }),
+            },
+            Effect::MotionBlur(MotionBlurConfig { strength: 0.35 }).into(),
+            Effect::Quantization(QuantizationConfig {
+                levels: 12,
+                dither_strength: 0.4,
+            })
+            .into(),
+            Effect::Vignette(VignetteConfig {
+                strength: 0.7,
+                radius: 0.25,
+                softness: 0.8,
+            })
+            .into(),
+            Effect::Grayscale(GrayscaleConfig { amount: 0.2 }).into(),
+            Effect::Invert(InvertConfig { amount: 0.9 }).into(),
+            Effect::BrightnessContrastSaturation(BrightnessContrastSaturationConfig {
+                brightness: 0.1,
+                contrast: 0.2,
+                saturation: -0.3,
+            })
+            .into(),
+            Effect::ExposureTonemap(ExposureTonemapConfig {
+                exposure: 1.5,
+                operator: TonemapOperator::Aces,
+                gamma: 2.4,
+            })
+            .into(),
+        ];
+
+        let json = scene.to_json().expect("serialize JSON");
+        let json_restored = Scene::from_json(&json).expect("restore JSON");
+        assert_eq!(json_restored.post_process, scene.post_process);
+        let bytes = scene.to_bytes().expect("serialize binary");
+        let binary_restored = Scene::from_bytes(&bytes).expect("restore binary");
+        assert_eq!(binary_restored.post_process, scene.post_process);
+
+        let luau = scene.to_luau_runtime();
+        let expected = [
+            "postprocess.clear()",
+            "postprocess.setEnabled(false)",
+            "postprocess.add(\"bloom\", { enabled = true, threshold = 0.6, intensity = 1.25, radius = 9 })",
+            "postprocess.add(\"pixelate\", { enabled = true, block_size = 5 })",
+            "postprocess.add(\"chromatic_aberration\", { enabled = false, offset_pixels = 3.5, angle_degrees = 45 })",
+            "postprocess.add(\"motion_blur\", { enabled = true, strength = 0.35 })",
+            "postprocess.add(\"quantization\", { enabled = true, levels = 12, dither_strength = 0.4 })",
+            "postprocess.add(\"vignette\", { enabled = true, strength = 0.7, radius = 0.25, softness = 0.8 })",
+            "postprocess.add(\"grayscale\", { enabled = true, amount = 0.2 })",
+            "postprocess.add(\"invert\", { enabled = true, amount = 0.9 })",
+            "postprocess.add(\"color_adjust\", { enabled = true, brightness = 0.1, contrast = 0.2, saturation = -0.3 })",
+            "postprocess.add(\"exposure_tonemap\", { enabled = true, exposure = 1.5, operator = \"aces\", gamma = 2.4 })",
+        ];
+        let mut previous = 0;
+        for call in expected {
+            let position = luau
+                .find(call)
+                .unwrap_or_else(|| panic!("missing `{call}` in:\n{luau}"));
+            assert!(position >= previous, "post-process calls changed order");
+            previous = position;
+        }
+    }
+
+    #[test]
+    fn legacy_scene_without_post_process_gets_an_empty_enabled_stack() {
+        let legacy = r#"{"name":"Old","background":[0,0,0,255],"entities":[]}"#;
+        let restored = Scene::from_bytes(legacy.as_bytes()).expect("legacy scene");
+        assert!(restored.post_process.enabled);
+        assert!(restored.post_process.effects.is_empty());
+
+        let luau = restored.to_luau_runtime();
+        assert!(luau.contains("postprocess.clear()\npostprocess.setEnabled(true)"));
+        assert!(!luau.contains("postprocess.add("));
     }
 
     #[test]
@@ -2438,10 +3374,12 @@ mod tests {
     fn core_component_exports_real_engine_calls() {
         let mut scene = Scene {
             name: "Test".into(),
+            kind: SceneKind::TwoD,
             background: [10, 20, 30, 255],
             nearest_neighbor_scaling: true,
             antialiasing: default_antialiasing(),
             lighting: SceneLighting::default(),
+            post_process: ScenePostProcess::default(),
             entities: Vec::new(),
             next_id: 1,
         };
@@ -2566,6 +3504,45 @@ mod tests {
     }
 
     #[test]
+    fn old_text_mesh_paths_upgrade_to_typed_mesh_assets() {
+        let mut scene = Scene::default();
+        scene.kind = SceneKind::ThreeD;
+        let id = scene.entities[0].id;
+        let mut renderer = Component::core("MeshRenderer3D");
+        let Component::Core { props, .. } = &mut renderer else {
+            unreachable!()
+        };
+        props
+            .iter_mut()
+            .find(|prop| prop.name == "mesh_path")
+            .expect("mesh path")
+            .value = PropValue::Text("assets/legacy.obj".into());
+        scene
+            .entity_mut(id)
+            .expect("entity")
+            .components
+            .push(renderer);
+
+        let restored = Scene::from_json(&scene.to_json().expect("serialize")).expect("restore");
+        let Component::Core { props, .. } = &restored.entities[0].components[0] else {
+            unreachable!()
+        };
+        assert!(matches!(
+            &props
+                .iter()
+                .find(|prop| prop.name == "mesh_path")
+                .expect("mesh path")
+                .value,
+            PropValue::Mesh(path) if path == "assets/legacy.obj"
+        ));
+        assert!(
+            restored
+                .to_luau_runtime()
+                .contains(".mesh_path = \"assets/legacy.obj\"")
+        );
+    }
+
+    #[test]
     fn old_particle_colors_upgrade_to_lifetime_sequences() {
         let mut scene = Scene::default();
         let id = scene.entities[0].id;
@@ -2633,10 +3610,12 @@ mod tests {
     fn parents_are_emitted_before_children() {
         let mut scene = Scene {
             name: "T".into(),
+            kind: SceneKind::TwoD,
             background: [0, 0, 0, 255],
             nearest_neighbor_scaling: true,
             antialiasing: default_antialiasing(),
             lighting: SceneLighting::default(),
+            post_process: ScenePostProcess::default(),
             entities: Vec::new(),
             next_id: 1,
         };
@@ -2694,10 +3673,12 @@ mod tests {
     fn script_component_exports_public_variables() {
         let mut scene = Scene {
             name: "S".into(),
+            kind: SceneKind::TwoD,
             background: [0, 0, 0, 255],
             nearest_neighbor_scaling: true,
             antialiasing: default_antialiasing(),
             lighting: SceneLighting::default(),
+            post_process: ScenePostProcess::default(),
             entities: Vec::new(),
             next_id: 1,
         };
@@ -2974,10 +3955,12 @@ mod tests {
     fn textbox_font_is_optional_in_export() {
         let mut scene = Scene {
             name: "F".into(),
+            kind: SceneKind::TwoD,
             background: [0, 0, 0, 255],
             nearest_neighbor_scaling: true,
             antialiasing: default_antialiasing(),
             lighting: SceneLighting::default(),
+            post_process: ScenePostProcess::default(),
             entities: Vec::new(),
             next_id: 1,
         };
@@ -3054,7 +4037,11 @@ mod tests {
                 ..
             }) if name == "enabled"
         ));
-        scene.entity_mut(id).expect("entity").components.push(camera);
+        scene
+            .entity_mut(id)
+            .expect("entity")
+            .components
+            .push(camera);
 
         let luau = scene.to_luau();
         assert!(luau.contains("AddComponent(core.Camera)"));
@@ -3105,7 +4092,9 @@ mod tests {
         let luau = restored.to_luau_runtime();
         assert!(luau.contains("ent_0[\"health\"] = 100"));
         assert!(luau.contains("ent_0[\"display name\"] = \"Hero\""));
-        assert!(luau.contains("ent_0[\"inventory\"] = {[\"icon\"] = assets.loadImage(\"assets/item.png\")}"));
+        assert!(luau.contains(
+            "ent_0[\"inventory\"] = {[\"icon\"] = assets.loadImage(\"assets/item.png\")}"
+        ));
         assert!(luau.contains("ent_0[\"target\"] = ent_1"));
         assert!(luau.contains("ent_0[\"renderer\"] = ent_1_c0"));
 
@@ -3133,11 +4122,8 @@ mod tests {
             .iter_mut()
             .find(|prop| prop.name == "options")
             .expect("dropdown options");
-        options.value = PropValue::StringList(vec![
-            "Solo".into(),
-            "Team \"Blue\"".into(),
-            "Solo".into(),
-        ]);
+        options.value =
+            PropValue::StringList(vec!["Solo".into(), "Team \"Blue\"".into(), "Solo".into()]);
         scene
             .entity_mut(id)
             .expect("entity")
@@ -3154,9 +4140,11 @@ mod tests {
                 if values.iter().map(String::as_str).collect::<Vec<_>>()
                     == vec!["Solo", "Team \"Blue\"", "Solo"]
         ));
-        assert!(restored
-            .to_luau()
-            .contains(".options = {\"Solo\", \"Team \\\"Blue\\\"\", \"Solo\"}"));
+        assert!(
+            restored
+                .to_luau()
+                .contains(".options = {\"Solo\", \"Team \\\"Blue\\\"\", \"Solo\"}")
+        );
     }
 
     #[test]
@@ -3288,7 +4276,9 @@ mod tests {
         assert!(matches!(bg.value, PropValue::Color([131, 131, 131, 255])));
         // The new hover colour is merged in.
         assert!(
-            props.iter().any(|prop| prop.name == "hover_background_color"),
+            props
+                .iter()
+                .any(|prop| prop.name == "hover_background_color"),
             "hover_background_color should be added"
         );
     }

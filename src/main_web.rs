@@ -4,6 +4,7 @@ mod animation;
 mod audio_system;
 mod commands;
 mod core;
+mod environment3d;
 mod fs_module;
 pub mod hierarchy;
 mod http;
@@ -13,8 +14,13 @@ mod rng;
 mod mobile_emulation;
 mod mobile_module;
 mod media;
+mod mesh;
+mod particles3d;
+mod physics3d;
 mod platform;
+mod post_process;
 mod prefabs;
+mod render3d;
 mod renderer;
 #[allow(dead_code)]
 #[path = "editor/scene.rs"]
@@ -23,6 +29,7 @@ mod servers;
 mod shader;
 mod tweening;
 mod user_input;
+mod widget_interaction;
 pub mod window;
 
 use std::env;
@@ -59,6 +66,8 @@ unsafe extern "C" {
     fn neolove_web_take_char(buffer: *mut c_char, capacity: i32) -> i32;
     fn neolove_web_begin_frame();
     fn neolove_web_clear_canvas(r: i32, g: i32, b: i32, a: i32);
+    fn neolove_web_capture_rgba(pixels: *mut u8, width: i32, height: i32) -> i32;
+    fn neolove_web_present_rgba(pixels: *const u8, width: i32, height: i32);
     fn neolove_web_composite_rgba(pixels: *const u8, width: i32, height: i32, x: i32, y: i32);
     fn neolove_web_draw_image(
         image_id: usize,
@@ -91,6 +100,8 @@ unsafe extern "C" {
         texture_width: i32,
         texture_height: i32,
         linear_filter: i32,
+        antialiasing_mode: i32,
+        depth_test: i32,
     );
     fn neolove_web_draw_text(
         text: *const c_char,
@@ -347,6 +358,36 @@ impl WebApp {
         }
         let commands = crate::renderer::drain_commands_and_remember(&self.render_state)
             .map_err(|error| format!("failed to drain render commands: {error}"))?;
+        let (
+            lighting,
+            lights,
+            occluders,
+            lights_3d,
+            environment_3d,
+            camera_3d,
+            postprocess_active,
+        ) = {
+            let mut state = self
+                .render_state
+                .lock()
+                .map_err(|_| "render state lock poisoned".to_string())?;
+            let (lighting, lights, occluders) = state.take_lighting();
+            let lights_3d = state.take_lights_3d();
+            let environment_3d = state.environment_3d();
+            let camera_3d = state.camera_3d();
+            let postprocess = state.post_process();
+            let postprocess_active = postprocess.enabled
+                && postprocess.effects.iter().any(|effect| effect.enabled);
+            (
+                lighting,
+                lights,
+                occluders,
+                lights_3d,
+                environment_3d,
+                camera_3d,
+                postprocess_active,
+            )
+        };
         let (pixel_commands, text_commands) = split_text_commands(commands.as_ref());
         if tick_index <= WEB_DEBUG_TICK_LIMIT {
             let (rects, triangles, circles, images) = summarize_pixel_commands(&pixel_commands);
@@ -360,16 +401,52 @@ impl WebApp {
                 images
             ));
         }
-        render_web_commands_in_order(&mut self.renderer, &self.platform_state, &pixel_commands)
-            .map_err(|error| format!("web renderer failed: {error}"))?;
-        {
-            let (lighting, lights, occluders) = self
-                .render_state
-                .lock()
-                .map_err(|_| "render state lock poisoned".to_string())?
-                .take_lighting();
-            self.renderer
-                .apply_lighting_pass(&lighting, &lights, &occluders);
+        render_web_commands_in_order(
+            &mut self.renderer,
+            &self.platform_state,
+            &pixel_commands,
+            &lights_3d,
+            &environment_3d,
+            camera_3d,
+        )
+        .map_err(|error| format!("web renderer failed: {error}"))?;
+
+        // Browser-native images, custom WebGL shaders, software chunks, and
+        // text all meet on the visible canvas. Only read that canvas back when
+        // a full-frame pass is actually enabled; ordinary frames retain the
+        // direct GPU/Canvas path with no synchronization cost.
+        let full_frame_pass = lighting.enabled || postprocess_active;
+        let mut text_drawn = false;
+        if full_frame_pass {
+            draw_web_text_commands(&text_commands);
+            text_drawn = true;
+            let captured = unsafe {
+                neolove_web_capture_rgba(
+                    self.renderer.pixels_mut().as_mut_ptr(),
+                    width as i32,
+                    height as i32,
+                )
+            };
+            if captured != 0 {
+                self.renderer
+                    .apply_lighting_pass(&lighting, &lights, &occluders);
+                if postprocess_active {
+                    self.renderer
+                        .apply_post_process_pass(&self.render_state)
+                        .map_err(|error| format!("web post-process failed: {error}"))?;
+                }
+                unsafe {
+                    neolove_web_present_rgba(
+                        self.renderer.pixels().as_ptr(),
+                        width as i32,
+                        height as i32,
+                    );
+                }
+            } else {
+                debug_log(
+                    "full-frame canvas capture failed; keeping the directly rendered web frame",
+                );
+            }
         }
         if tick_index <= WEB_DEBUG_TICK_LIMIT {
             let clear = lock_platform_state(&self.platform_state).clear_color();
@@ -431,7 +508,9 @@ impl WebApp {
                 text_commands.len()
             ));
         }
-        draw_web_text_commands(&text_commands);
+        if !text_drawn {
+            draw_web_text_commands(&text_commands);
+        }
         if tick_index <= WEB_DEBUG_TICK_LIMIT {
             debug_log(&format!("tick stage {tick_index}: after draw_web_text_commands"));
         }
@@ -533,31 +612,54 @@ fn render_web_commands_in_order(
     renderer: &mut SoftwareRenderer,
     platform: &SharedPlatformState,
     commands: &[&DrawCommand],
+    lights_3d: &[crate::render3d::Light3D],
+    environment: &crate::environment3d::Environment3D,
+    camera: crate::render3d::Camera3D,
 ) -> Result<(), String> {
-    let clear = lock_platform_state(platform).clear_color();
-    unsafe {
-        neolove_web_clear_canvas(clear.r as i32, clear.g as i32, clear.b as i32, clear.a as i32);
+    let (clear, antialiasing) = {
+        let state = lock_platform_state(platform);
+        (state.clear_color(), state.antialiasing())
+    };
+    renderer.set_antialiasing(antialiasing);
+    let viewport = renderer.dimensions();
+    if environment.enabled {
+        renderer.draw_environment_background(environment, camera, clear);
+        unsafe {
+            neolove_web_present_rgba(
+                renderer.pixels().as_ptr(),
+                viewport.0 as i32,
+                viewport.1 as i32,
+            );
+        }
+    } else {
+        unsafe {
+            neolove_web_clear_canvas(
+                clear.r as i32,
+                clear.g as i32,
+                clear.b as i32,
+                clear.a as i32,
+            );
+        }
     }
 
-    let viewport = renderer.dimensions();
     let mut pending = Vec::new();
     for &command in commands {
         if !crate::renderer::command_intersects_viewport(command, viewport.0, viewport.1) {
             continue;
         }
         if is_web_native_image(command) {
-            flush_software_chunk(renderer, viewport, &pending)?;
+            flush_software_chunk(renderer, viewport, &pending, lights_3d)?;
             pending.clear();
             draw_web_image(command)?;
         } else if command_has_shader(command) {
-            flush_software_chunk(renderer, viewport, &pending)?;
+            flush_software_chunk(renderer, viewport, &pending, lights_3d)?;
             pending.clear();
-            draw_web_shader_command(command)?;
+            draw_web_shader_command(command, lights_3d, viewport, antialiasing)?;
         } else {
             pending.push(command);
         }
     }
-    let result = flush_software_chunk(renderer, viewport, &pending);
+    let result = flush_software_chunk(renderer, viewport, &pending, lights_3d);
     renderer.resize(viewport.0, viewport.1);
     result
 }
@@ -628,13 +730,33 @@ fn flush_software_chunk(
     renderer: &mut SoftwareRenderer,
     viewport: (u32, u32),
     commands: &[&DrawCommand],
+    lights_3d: &[crate::render3d::Light3D],
 ) -> Result<(), String> {
     if commands.is_empty() {
         return Ok(());
     }
-    let Some(bounds) = crate::renderer::commands_dirty_bounds(commands.iter().copied(), viewport)
-    else {
-        return Ok(());
+    let bounds = if commands
+        .iter()
+        .any(|command| {
+            matches!(
+                command,
+                DrawCommand::Mesh3D(_) | DrawCommand::Particles3D(_)
+            )
+        })
+    {
+        crate::renderer::DirtyBounds {
+            x: 0,
+            y: 0,
+            w: viewport.0,
+            h: viewport.1,
+        }
+    } else {
+        let Some(bounds) =
+            crate::renderer::commands_dirty_bounds(commands.iter().copied(), viewport)
+        else {
+            return Ok(());
+        };
+        bounds
     };
     renderer.resize(bounds.w, bounds.h);
     renderer.clear_transparent();
@@ -648,7 +770,7 @@ fn flush_software_chunk(
             )
         })
         .collect();
-    renderer.draw_unshaded_commands(&translated)?;
+    renderer.draw_commands_with_3d_lights(&translated, lights_3d)?;
     unsafe {
         neolove_web_composite_rgba(
             renderer.pixels().as_ptr(),
@@ -667,12 +789,19 @@ fn command_has_shader(command: &DrawCommand) -> bool {
         | DrawCommand::Triangle { shader, .. }
         | DrawCommand::Circle { shader, .. }
         | DrawCommand::Image { shader, .. } => shader.is_some(),
+        DrawCommand::Mesh3D(command) => command.shader.is_some(),
+        DrawCommand::Particles3D(_) => false,
         DrawCommand::Text(_) => false,
     }
 }
 
-fn draw_web_shader_command(command: &DrawCommand) -> Result<(), String> {
-    let (shader, vertices, texture) = match command {
+fn draw_web_shader_command(
+    command: &DrawCommand,
+    lights_3d: &[crate::render3d::Light3D],
+    viewport: (u32, u32),
+    antialiasing: crate::platform::Antialiasing,
+) -> Result<(), String> {
+    let (shader, vertices, texture, depth_test) = match command {
         DrawCommand::Rect {
             x,
             y,
@@ -698,6 +827,7 @@ fn draw_web_shader_command(command: &DrawCommand) -> Result<(), String> {
                     *color,
                 ),
                 None,
+                false,
             )
         }
         DrawCommand::Triangle {
@@ -713,6 +843,7 @@ fn draw_web_shader_command(command: &DrawCommand) -> Result<(), String> {
                 *color,
             ),
             None,
+            false,
         ),
         DrawCommand::Circle {
             center,
@@ -742,7 +873,7 @@ fn draw_web_shader_command(command: &DrawCommand) -> Result<(), String> {
                     [0.0, 1.0],
                 ));
             }
-            (shader, web_vertices(&points, *color), None)
+            (shader, web_vertices(&points, *color), None, false)
         }
         DrawCommand::Image {
             image,
@@ -782,6 +913,40 @@ fn draw_web_shader_command(command: &DrawCommand) -> Result<(), String> {
                 shader,
                 web_quad_vertices(corners, [[u0, v0], [u1, v0], [u1, v1], [u0, v1]], *tint),
                 Some((image, *filter)),
+                false,
+            )
+        }
+        DrawCommand::Mesh3D(command) if command.shader.is_some() => {
+            let shader = command
+                .shader
+                .as_ref()
+                .ok_or_else(|| "mesh shader disappeared during rendering".to_string())?;
+            let mut triangles = crate::render3d::project_mesh(command, lights_3d)?;
+            triangles.sort_by(|left, right| right.depth.total_cmp(&left.depth));
+            let mut vertices = Vec::with_capacity(triangles.len() * 3 * 9);
+            for triangle in triangles {
+                for vertex in triangle.vertices {
+                    vertices.extend_from_slice(&[
+                        (vertex.ndc[0] * 0.5 + 0.5) * viewport.0 as f32,
+                        (0.5 - vertex.ndc[1] * 0.5) * viewport.1 as f32,
+                        vertex.ndc[2],
+                        vertex.uv[0],
+                        vertex.uv[1],
+                        vertex.color[0],
+                        vertex.color[1],
+                        vertex.color[2],
+                        vertex.color[3],
+                    ]);
+                }
+            }
+            (
+                shader,
+                vertices,
+                command
+                    .texture
+                    .as_ref()
+                    .map(|image| (image, crate::renderer::TextureFilter::Linear)),
+                true,
             )
         }
         other => return flush_unexpected_unshaded(other),
@@ -792,6 +957,11 @@ fn draw_web_shader_command(command: &DrawCommand) -> Result<(), String> {
         .map_err(|error| format!("invalid shader source for web: {error}"))?;
     let uniforms_json = CString::new(snapshot.uniforms_json.replace('\0', " "))
         .map_err(|error| format!("invalid shader uniforms for web: {error}"))?;
+    let antialiasing_mode = match antialiasing {
+        crate::platform::Antialiasing::Off => 0,
+        crate::platform::Antialiasing::Standard => 1,
+        crate::platform::Antialiasing::High => 2,
+    };
 
     if let Some((image, filter)) = texture {
         let revision = image.revision().map_err(|error| error.to_string())?;
@@ -802,13 +972,15 @@ fn draw_web_shader_command(command: &DrawCommand) -> Result<(), String> {
                     fragment_source.as_ptr(),
                     uniforms_json.as_ptr(),
                     vertices.as_ptr(),
-                    (vertices.len() / 8) as i32,
+                    (vertices.len() / 9) as i32,
                     image_id,
                     revision as f64,
                     pixels.as_raw().as_ptr(),
                     pixels.width() as i32,
                     pixels.height() as i32,
                     i32::from(matches!(filter, crate::renderer::TextureFilter::Linear)),
+                    antialiasing_mode,
+                    i32::from(depth_test),
                 );
             })
             .map_err(|error| error.to_string())
@@ -818,13 +990,15 @@ fn draw_web_shader_command(command: &DrawCommand) -> Result<(), String> {
                 fragment_source.as_ptr(),
                 uniforms_json.as_ptr(),
                 vertices.as_ptr(),
-                (vertices.len() / 8) as i32,
+                (vertices.len() / 9) as i32,
                 0,
                 0.0,
                 std::ptr::null(),
                 0,
                 0,
                 0,
+                antialiasing_mode,
+                i32::from(depth_test),
             );
         }
         Ok(())
@@ -876,10 +1050,10 @@ fn web_vertices(
         color.b as f32 / 255.0,
         color.a as f32 / 255.0,
     ];
-    let mut vertices = Vec::with_capacity(points.len() * 8);
+    let mut vertices = Vec::with_capacity(points.len() * 9);
     for (point, uv) in points {
         vertices.extend_from_slice(&[
-            point.x, point.y, uv[0], uv[1], rgba[0], rgba[1], rgba[2], rgba[3],
+            point.x, point.y, 0.0, uv[0], uv[1], rgba[0], rgba[1], rgba[2], rgba[3],
         ]);
     }
     vertices
@@ -914,6 +1088,7 @@ fn summarize_pixel_commands(commands: &[&DrawCommand]) -> (usize, usize, usize, 
             DrawCommand::Triangle { .. } => triangles += 1,
             DrawCommand::Circle { .. } => circles += 1,
             DrawCommand::Image { .. } => images += 1,
+            DrawCommand::Mesh3D(_) | DrawCommand::Particles3D(_) => triangles += 1,
             DrawCommand::Text(_) => {}
         }
     }

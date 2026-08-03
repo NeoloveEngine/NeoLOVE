@@ -224,12 +224,14 @@ impl OccluderIndex {
         if occluders.len() > OCCLUDERS_PER_LEAF {
             let span_x = max_x - min_x;
             let span_y = max_y - min_y;
-            if span_x >= span_y {
-                occluders.sort_unstable_by(|a, b| a.cx.total_cmp(&b.cx));
-            } else {
-                occluders.sort_unstable_by(|a, b| a.cy.total_cmp(&b.cy));
-            }
             let middle = occluders.len() / 2;
+            // Only the median split matters to the hierarchy. Partitioning in
+            // place avoids fully sorting every subtree during construction.
+            if span_x >= span_y {
+                let _ = occluders.select_nth_unstable_by(middle, |a, b| a.cx.total_cmp(&b.cx));
+            } else {
+                let _ = occluders.select_nth_unstable_by(middle, |a, b| a.cy.total_cmp(&b.cy));
+            }
             let (left_occluders, right_occluders) = occluders.split_at_mut(middle);
             let left = Self::build_node(left_occluders, start, nodes);
             let right = Self::build_node(right_occluders, start + middle, nodes);
@@ -331,14 +333,13 @@ fn prepared_occluder_bounds(occluders: &[PreparedOccluder]) -> (f32, f32, f32, f
 /// Resolution of the intermediate light map relative to the framebuffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LightQuality {
-    /// Quarter resolution: fastest, softest.
+    /// Quarter resolution within its texel budget: fastest, softest.
     Low,
-    /// Half resolution: the default balance.
+    /// Half resolution within its texel budget: the default balance.
     Medium,
-    /// Full resolution.
+    /// Full resolution while affordable, then adaptively downsampled.
     High,
-    /// Adaptive high-detail map with extra shadow/AO samples. It stays full
-    /// resolution below the texel budget and scales smoothly on dense displays.
+    /// Adaptive high-detail map with extra shadow/AO samples.
     Ultra,
 }
 
@@ -376,19 +377,28 @@ impl LightQuality {
         }
     }
 
-    /// Ultra retains one light texel per framebuffer pixel while that is
-    /// affordable, then adapts to display density so 1080p, 1440p, and 4K do
-    /// not multiply CPU work without bound. Both presenters linearly upscale
-    /// the result, and shadow/AO fields retain their independent detail.
-    fn downsample_for_frame(self, width: usize, height: usize) -> usize {
-        let base = self.downsample();
-        if self != Self::Ultra {
-            return base;
+    /// Maximum intermediate light-map texels for this tier. The budgets roughly
+    /// double from low through high, so lower quality modes can never allocate
+    /// a more detailed map than a higher mode. High and Ultra deliberately
+    /// share the same map budget; Ultra spends its additional work on
+    /// shadow/AO samples.
+    fn texel_budget(self) -> usize {
+        match self {
+            Self::Low => 262_144,
+            Self::Medium => 524_288,
+            Self::High | Self::Ultra => 1_000_000,
         }
-        const ULTRA_TEXEL_BUDGET: usize = 1_000_000;
-        let mut scale = base;
-        while width.div_ceil(scale).saturating_mul(height.div_ceil(scale))
-            > ULTRA_TEXEL_BUDGET
+    }
+
+    /// Retain the tier's normal scale while it is affordable, then adapt to
+    /// display density so high-DPI and 4K framebuffers do not multiply CPU work
+    /// and cached memory without bound. Presenters linearly upscale the result,
+    /// while shadow/AO fields retain their independent detail.
+    fn downsample_for_frame(self, width: usize, height: usize) -> usize {
+        let mut scale = self.downsample();
+        let maximum_scale = width.max(height).max(scale);
+        while width.div_ceil(scale).saturating_mul(height.div_ceil(scale)) > self.texel_budget()
+            && scale < maximum_scale
         {
             scale += 1;
         }
@@ -786,8 +796,9 @@ fn build_shadow_fields(
     fb_height: usize,
     lightmap_scale: usize,
 ) -> Vec<Option<ShadowField>> {
-    let mut fields: Vec<Option<ShadowField>> =
-        std::iter::repeat_with(|| None).take(prepared.len()).collect();
+    let mut fields: Vec<Option<ShadowField>> = std::iter::repeat_with(|| None)
+        .take(prepared.len())
+        .collect();
     if fb_width.saturating_mul(fb_height) < 4096
         || occluders.is_empty()
         || !prepared.iter().any(|light| light.cast_shadows)
@@ -809,11 +820,7 @@ fn build_shadow_fields(
                     let light = &prepared[start + offset];
                     if light.cast_shadows {
                         *slot = Some(build_shadow_field(
-                            light,
-                            occluders,
-                            fb_width,
-                            fb_height,
-                            step,
+                            light, occluders, fb_width, fb_height, step,
                         ));
                     }
                 }
@@ -949,14 +956,17 @@ impl LightMapCache {
             && self.occluders == occluders
     }
 
-    fn prepare(
+    /// Synchronize the exact cache key without eagerly building a float map.
+    /// The GPU path can consequently return its encoded image without keeping
+    /// a second full-size representation alive or rebuilding the float source.
+    fn update_inputs(
         &mut self,
         width: u32,
         height: u32,
         config: &LightConfig,
         lights: &[Light],
         occluders: &[Occluder],
-    ) -> (u64, Arc<LightMap>) {
+    ) -> u64 {
         if !self.matches(width, height, config, lights, occluders) {
             self.width = width;
             self.height = height;
@@ -965,6 +975,23 @@ impl LightMapCache {
             self.lights.extend_from_slice(lights);
             self.occluders.clear();
             self.occluders.extend_from_slice(occluders);
+            self.map = None;
+            self.image = None;
+            self.generation = self.generation.wrapping_add(1);
+        }
+        self.generation
+    }
+
+    fn prepare(
+        &mut self,
+        width: u32,
+        height: u32,
+        config: &LightConfig,
+        lights: &[Light],
+        occluders: &[Occluder],
+    ) -> (u64, Arc<LightMap>) {
+        let generation = self.update_inputs(width, height, config, lights, occluders);
+        if self.map.is_none() {
             self.map = Some(Arc::new(build_light_map(
                 width as usize,
                 height as usize,
@@ -972,11 +999,9 @@ impl LightMapCache {
                 lights,
                 occluders,
             )));
-            self.image = None;
-            self.generation = self.generation.wrapping_add(1);
         }
         (
-            self.generation,
+            generation,
             Arc::clone(self.map.as_ref().expect("prepared light map missing")),
         )
     }
@@ -1039,10 +1064,10 @@ struct ShadowField {
 impl ShadowField {
     #[inline]
     fn sample(&self, px: f32, py: f32) -> f32 {
-        let fx = ((px - self.origin_x) * self.inv_step)
-            .clamp(0.0, self.width.saturating_sub(1) as f32);
-        let fy = ((py - self.origin_y) * self.inv_step)
-            .clamp(0.0, self.height.saturating_sub(1) as f32);
+        let fx =
+            ((px - self.origin_x) * self.inv_step).clamp(0.0, self.width.saturating_sub(1) as f32);
+        let fy =
+            ((py - self.origin_y) * self.inv_step).clamp(0.0, self.height.saturating_sub(1) as f32);
         if !self.smooth {
             let x = fx.round() as usize;
             let y = fy.round() as usize;
@@ -1079,7 +1104,11 @@ impl AoField {
         }
         let occlusion = sample_u8_field(&self.occlusion, self.width, self.height, fx, fy);
         let factor = 1.0 - self.intensity * occlusion;
-        [ambient[0] * factor, ambient[1] * factor, ambient[2] * factor]
+        [
+            ambient[0] * factor,
+            ambient[1] * factor,
+            ambient[2] * factor,
+        ]
     }
 }
 
@@ -1487,13 +1516,7 @@ fn build_light_map(
             config.ao_radius,
         )
     });
-    let shadow_fields = build_shadow_fields(
-        &prepared,
-        &occluders,
-        fb_width,
-        fb_height,
-        scale,
-    );
+    let shadow_fields = build_shadow_fields(&prepared, &occluders, fb_width, fb_height, scale);
 
     let mut data = vec![0.0f32; lw * lh * 3];
     let half = scale as f32 * 0.5;
@@ -1702,6 +1725,9 @@ pub(crate) fn apply_lighting_cached(
     }
 
     let (_, map) = cache.prepare(width, height, config, lights, occluders);
+    // Software compositing only needs the float map. If this cache was
+    // previously used by the GPU path, do not retain both full representations.
+    cache.image = None;
     let lightmap = map.data.as_slice();
     let lw = map.width;
     let lh = map.height;
@@ -1814,8 +1840,13 @@ pub(crate) fn render_light_map_cached(
     if fb_width == 0 || fb_height == 0 || config.is_noop(lights, occluders) {
         return None;
     }
-    let (generation, map) = cache.prepare(fb_width, fb_height, config, lights, occluders);
-    if cache.image.is_none() {
+    let generation = cache.update_inputs(fb_width, fb_height, config, lights, occluders);
+    if let Some(image) = &cache.image {
+        return Some((generation, Arc::clone(image)));
+    }
+
+    let (_, map) = cache.prepare(fb_width, fb_height, config, lights, occluders);
+    {
         let exposure = if config.exposure > 0.0 {
             config.exposure
         } else {
@@ -1856,6 +1887,9 @@ pub(crate) fn render_light_map_cached(
             rgba,
         }));
     }
+    // The encoded RGBA8 map is now the GPU cache. Releasing its float source
+    // cuts steady-state light-map storage from 16 to 4 bytes per texel.
+    cache.map = None;
     Some((
         generation,
         Arc::clone(cache.image.as_ref().expect("encoded light map missing")),
@@ -1992,6 +2026,57 @@ mod tests {
         }
     }
 
+    fn varied_occluders(count: usize) -> Vec<Occluder> {
+        (0..count)
+            .map(|index| Occluder {
+                // Deliberately repeat coordinates so median partitioning also
+                // exercises equal comparison keys on both split axes.
+                cx: (index.wrapping_mul(73) % 97) as f32 * 4.0 - 192.0,
+                cy: (index.wrapping_mul(151) % 89) as f32 * 4.0 - 176.0,
+                half_w: 0.75 + (index.wrapping_mul(11) % 19) as f32 * 0.45,
+                half_h: 1.0 + (index.wrapping_mul(17) % 23) as f32 * 0.35,
+                rotation: ((index.wrapping_mul(29) % 360) as f32).to_radians(),
+                shape: if index % 3 == 0 {
+                    OccluderShape::Circle
+                } else {
+                    OccluderShape::Box
+                },
+            })
+            .collect()
+    }
+
+    fn build_node_with_recursive_sorts(
+        occluders: &mut [PreparedOccluder],
+        start: usize,
+        nodes: &mut Vec<OccluderNode>,
+    ) -> usize {
+        let (min_x, min_y, max_x, max_y) = prepared_occluder_bounds(occluders);
+        let node_index = nodes.len();
+        nodes.push(OccluderNode {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            kind: OccluderNodeKind::Leaf {
+                start,
+                len: occluders.len(),
+            },
+        });
+        if occluders.len() > OCCLUDERS_PER_LEAF {
+            if max_x - min_x >= max_y - min_y {
+                occluders.sort_unstable_by(|a, b| a.cx.total_cmp(&b.cx));
+            } else {
+                occluders.sort_unstable_by(|a, b| a.cy.total_cmp(&b.cy));
+            }
+            let middle = occluders.len() / 2;
+            let (left_occluders, right_occluders) = occluders.split_at_mut(middle);
+            let left = build_node_with_recursive_sorts(left_occluders, start, nodes);
+            let right = build_node_with_recursive_sorts(right_occluders, start + middle, nodes);
+            nodes[node_index].kind = OccluderNodeKind::Branch { left, right };
+        }
+        node_index
+    }
+
     #[test]
     fn disabled_config_leaves_pixels_untouched() {
         let mut pixels = solid_gray(4, 4, 200);
@@ -2002,16 +2087,71 @@ mod tests {
     }
 
     #[test]
-    fn ultra_adapts_only_when_the_full_resolution_map_exceeds_its_budget() {
+    fn quality_scales_remain_unchanged_for_low_resolution_frames() {
+        for (width, height) in [(640, 480), (1280, 720)] {
+            assert_eq!(LightQuality::Low.downsample_for_frame(width, height), 4);
+            assert_eq!(LightQuality::Medium.downsample_for_frame(width, height), 2);
+            assert_eq!(LightQuality::High.downsample_for_frame(width, height), 1);
+            assert_eq!(LightQuality::Ultra.downsample_for_frame(width, height), 1);
+        }
+
+        // 1080p keeps the established quarter/half-resolution maps for the
+        // lower tiers; only the formerly unbounded full-resolution tier needs
+        // to adapt here.
+        assert_eq!(LightQuality::Low.downsample_for_frame(1920, 1080), 4);
+        assert_eq!(LightQuality::Medium.downsample_for_frame(1920, 1080), 2);
+    }
+
+    #[test]
+    fn dense_frame_quality_budgets_are_bounded_and_monotonic() {
         assert_eq!(LightQuality::Ultra.downsample_for_frame(1280, 720), 1);
         assert_eq!(LightQuality::Ultra.downsample_for_frame(1920, 1080), 2);
         assert_eq!(LightQuality::Ultra.downsample_for_frame(2560, 1440), 2);
         assert_eq!(LightQuality::Ultra.downsample_for_frame(3840, 2160), 3);
 
-        // Other quality levels keep their explicit, predictable scales.
-        assert_eq!(LightQuality::High.downsample_for_frame(3840, 2160), 1);
-        assert_eq!(LightQuality::Medium.downsample_for_frame(3840, 2160), 2);
-        assert_eq!(LightQuality::Low.downsample_for_frame(3840, 2160), 4);
+        assert_eq!(LightQuality::High.downsample_for_frame(3840, 2160), 3);
+        assert_eq!(LightQuality::Medium.downsample_for_frame(3840, 2160), 4);
+        assert_eq!(LightQuality::Low.downsample_for_frame(3840, 2160), 6);
+
+        let qualities = [
+            LightQuality::Low,
+            LightQuality::Medium,
+            LightQuality::High,
+            LightQuality::Ultra,
+        ];
+        for (width, height) in [
+            (1920usize, 1080usize),
+            (2560, 1440),
+            (3440, 1440),
+            (3840, 2160),
+            (7680, 4320),
+            (8192, 512),
+        ] {
+            let mut previous_scale = usize::MAX;
+            let mut previous_texels = 0usize;
+            for quality in qualities {
+                let scale = quality.downsample_for_frame(width, height);
+                let texels = width.div_ceil(scale).saturating_mul(height.div_ceil(scale));
+                assert!(
+                    texels <= quality.texel_budget(),
+                    "{quality:?} produced {texels} texels at {width}x{height}"
+                );
+                assert!(
+                    scale <= previous_scale,
+                    "{quality:?} scale {scale} was coarser than the preceding tier at {width}x{height}"
+                );
+                assert!(
+                    texels >= previous_texels,
+                    "{quality:?} allocated fewer texels than the preceding tier at {width}x{height}"
+                );
+                previous_scale = scale;
+                previous_texels = texels;
+            }
+
+            let high_scale = LightQuality::High.downsample_for_frame(width, height);
+            let ultra_scale = LightQuality::Ultra.downsample_for_frame(width, height);
+            assert_eq!(high_scale, ultra_scale);
+        }
     }
 
     #[test]
@@ -2249,6 +2389,89 @@ mod tests {
     }
 
     #[test]
+    fn varied_occluder_bvh_and_sampler_match_linear_reference() {
+        let occluders = varied_occluders(257);
+        let index = OccluderIndex::new(&occluders);
+        let linear_segment = |start: (f32, f32), end: (f32, f32)| {
+            index.occluders.iter().any(|occ| {
+                point_segment_dist_sq(occ.cx, occ.cy, start, end) <= occ.bound_radius_sq
+                    && local_segment_hits(
+                        occ,
+                        to_local(occ, start.0, start.1),
+                        to_local(occ, end.0, end.1),
+                    )
+            })
+        };
+        let linear_point = |x: f32, y: f32| {
+            index
+                .occluders
+                .iter()
+                .any(|occ| point_in_occluder(occ, x, y))
+        };
+
+        let mut config = LightConfig::default();
+        config.enabled = true;
+        config.ambient_intensity = 0.0;
+        config.soft_shadows = 0.0;
+        let light = Light {
+            x: -240.0,
+            y: -160.0,
+            radius: 640.0,
+            color: Color::rgba(210, 145, 80, 255),
+            intensity: 1.35,
+            falloff: 2.0,
+            ..Light::default()
+        };
+        let sampler = LightSampler::new(&config, &[light], &occluders);
+
+        for query in 0..600usize {
+            let start = (
+                (query.wrapping_mul(43) % 601) as f32 - 300.0,
+                (query.wrapping_mul(97) % 503) as f32 - 251.0,
+            );
+            let end = (
+                (query.wrapping_mul(181) % 659) as f32 - 329.0,
+                (query.wrapping_mul(67) % 557) as f32 - 278.0,
+            );
+            assert_eq!(
+                index.segment_occluded(start, end),
+                linear_segment(start, end),
+                "ray query {query} differed"
+            );
+            assert_eq!(
+                index.contains_point(end.0, end.1),
+                linear_point(end.0, end.1),
+                "point query {query} differed"
+            );
+
+            let (actual_r, actual_g, actual_b) = sampler.sample(end.0, end.1);
+            let contribution = attenuation(&light, end.0, end.1) * light.intensity;
+            let visibility =
+                if contribution < MIN_CONTRIBUTION || linear_segment((light.x, light.y), end) {
+                    0.0
+                } else {
+                    1.0
+                };
+            let expected = contribution * visibility;
+            let expected_rgb = [
+                light.color.r as f32 / 255.0 * expected,
+                light.color.g as f32 / 255.0 * expected,
+                light.color.b as f32 / 255.0 * expected,
+            ];
+            for (channel, (actual, expected)) in [actual_r, actual_g, actual_b]
+                .into_iter()
+                .zip(expected_rgb)
+                .enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() < 2e-6,
+                    "sampler query {query} channel {channel} differed: {actual} vs {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rolling_blur_matches_naive_window_blur() {
         let (w, h, radius, iterations) = (19usize, 13usize, 4usize, 2usize);
         let mut optimized: Vec<f32> = (0..w * h * 3)
@@ -2306,17 +2529,37 @@ mod tests {
         let mut cache = LightMapCache::default();
 
         let (first_generation, first) =
-            render_light_map_cached(64, 64, &config, &lights, &[], &mut cache).unwrap();
+            render_light_map_cached(64, 64, &config, &lights, &[], &mut cache)
+                .expect("enabled lighting should produce a light map");
+        assert!(
+            cache.map.is_none(),
+            "GPU cache should release its float source"
+        );
+        assert!(cache.image.is_some());
         let (same_generation, same) =
-            render_light_map_cached(64, 64, &config, &lights, &[], &mut cache).unwrap();
+            render_light_map_cached(64, 64, &config, &lights, &[], &mut cache)
+                .expect("unchanged lighting should reuse a light map");
         assert_eq!(first_generation, same_generation);
         assert!(Arc::ptr_eq(&first, &same));
 
         lights[0].x += 1.0;
         let (moved_generation, moved) =
-            render_light_map_cached(64, 64, &config, &lights, &[], &mut cache).unwrap();
+            render_light_map_cached(64, 64, &config, &lights, &[], &mut cache)
+                .expect("moved lighting should produce a light map");
         assert_ne!(first_generation, moved_generation);
         assert!(!Arc::ptr_eq(&first, &moved));
+        assert!(cache.map.is_none(), "GPU cache should retain only RGBA8");
+
+        let mut pixels = solid_gray(64, 64, 128);
+        apply_lighting_cached(&mut pixels, 64, 64, &config, &lights, &[], &mut cache);
+        assert!(
+            cache.map.is_some(),
+            "software cache should retain its float map"
+        );
+        assert!(
+            cache.image.is_none(),
+            "software cache should release GPU RGBA8"
+        );
     }
 
     #[test]
@@ -2367,6 +2610,40 @@ mod tests {
 
     #[test]
     #[ignore = "performance benchmark; run in release mode with --ignored --nocapture"]
+    fn benchmark_occluder_index_construction() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for count in [256usize, 1_024, 4_096, 16_384] {
+            let occluders = varied_occluders(count);
+            let prepared = OccluderIndex::new(&occluders).occluders;
+            let iterations = (131_072 / count).clamp(8, 512);
+
+            let recursive_sort_start = Instant::now();
+            for _ in 0..iterations {
+                let mut input = black_box(prepared.clone());
+                let mut nodes = Vec::with_capacity(input.len().saturating_mul(2));
+                build_node_with_recursive_sorts(&mut input, 0, &mut nodes);
+                black_box((input, nodes));
+            }
+            let recursive_sort = recursive_sort_start.elapsed() / iterations as u32;
+
+            let median_partition_start = Instant::now();
+            for _ in 0..iterations {
+                let mut input = black_box(prepared.clone());
+                let mut nodes = Vec::with_capacity(input.len().saturating_mul(2));
+                OccluderIndex::build_node(&mut input, 0, &mut nodes);
+                black_box((input, nodes));
+            }
+            let median_partition = median_partition_start.elapsed() / iterations as u32;
+            eprintln!(
+                "occluder BVH ({count} entries): recursive sort {recursive_sort:?}/build; median partition {median_partition:?}/build"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "performance benchmark; run in release mode with --ignored --nocapture"]
     fn benchmark_ultra_dynamic_light_maps() {
         use std::time::Instant;
 
@@ -2405,14 +2682,8 @@ mod tests {
             let started = Instant::now();
             for frame in 0..3 {
                 lights[0].x += 0.25 + frame as f32 * 0.01;
-                let _ = render_light_map_cached(
-                    1920,
-                    1080,
-                    &config,
-                    &lights,
-                    &occluders,
-                    &mut cache,
-                );
+                let _ =
+                    render_light_map_cached(1920, 1080, &config, &lights, &occluders, &mut cache);
             }
             eprintln!("ultra {label}: {:?}/frame", started.elapsed() / 3);
         };

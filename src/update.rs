@@ -1,8 +1,8 @@
 use std::fmt;
-use std::path::{Path, PathBuf};
-use std::process::Command;
 #[cfg(unix)]
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 #[cfg(windows)]
 use std::process::Stdio;
 
@@ -18,9 +18,13 @@ pub(crate) struct AvailableUpdate {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum UpdateOutcome {
     UpToDate,
-    Updated { revision: String },
+    Updated {
+        revision: String,
+    },
     #[cfg(windows)]
-    Scheduled { revision: String },
+    Scheduled {
+        revision: String,
+    },
 }
 
 impl fmt::Display for UpdateOutcome {
@@ -97,7 +101,9 @@ fn tracking_target(root: &Path) -> Result<(String, String, String), String> {
         "resolving the upstream branch",
     )?;
     if remote.is_empty() || remote == "." || remote_ref.is_empty() {
-        return Err(format!("branch '{branch}' does not track a remote Git branch"));
+        return Err(format!(
+            "branch '{branch}' does not track a remote Git branch"
+        ));
     }
     Ok((branch, remote, remote_ref))
 }

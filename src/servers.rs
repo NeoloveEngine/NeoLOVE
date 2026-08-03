@@ -87,9 +87,16 @@ mod native {
 
     #[derive(Debug)]
     enum ServerInboundEvent {
-        Connected { client_key: String },
-        Payload { client_key: String, payload: Vec<u8> },
-        Disconnected { client_key: String },
+        Connected {
+            client_key: String,
+        },
+        Payload {
+            client_key: String,
+            payload: Vec<u8>,
+        },
+        Disconnected {
+            client_key: String,
+        },
     }
 
     #[derive(Debug)]
@@ -1034,9 +1041,11 @@ mod native {
         if let Some(sender) = local_event {
             let _ = sender.send(ClientEvent::Kicked(reason));
         }
-        let _ = shared.inbound_sender.send(ServerInboundEvent::Disconnected {
-            client_key: client_key.to_string(),
-        });
+        let _ = shared
+            .inbound_sender
+            .send(ServerInboundEvent::Disconnected {
+                client_key: client_key.to_string(),
+            });
         Ok(())
     }
 
@@ -1059,9 +1068,11 @@ mod native {
         };
         shared.condvar.notify_all();
         if changed {
-            let _ = shared.inbound_sender.send(ServerInboundEvent::Disconnected {
-                client_key: client_key.to_string(),
-            });
+            let _ = shared
+                .inbound_sender
+                .send(ServerInboundEvent::Disconnected {
+                    client_key: client_key.to_string(),
+                });
         }
         changed
     }
@@ -2067,8 +2078,9 @@ mod native {
         options: Option<Table>,
     ) -> mlua::Result<Table> {
         let bind_host = match &options {
-            Some(options) => get_option_string(options, &["host"])?
-                .unwrap_or_else(|| "127.0.0.1".to_string()),
+            Some(options) => {
+                get_option_string(options, &["host"])?.unwrap_or_else(|| "127.0.0.1".to_string())
+            }
             None => "127.0.0.1".to_string(),
         };
         let cert_path = match &options {
@@ -2081,11 +2093,14 @@ mod native {
         };
         let tls_config = match (cert_path, key_path) {
             (Some(cert_path), Some(key_path)) => {
-                let cert_path = canonicalize_project_path(root, &cert_path)
-                    .map_err(mlua::Error::external)?;
-                let key_path = canonicalize_project_path(root, &key_path)
-                    .map_err(mlua::Error::external)?;
-                Some(build_server_tls_config(&cert_path, &key_path).map_err(mlua::Error::external)?)
+                let cert_path =
+                    canonicalize_project_path(root, &cert_path).map_err(mlua::Error::external)?;
+                let key_path =
+                    canonicalize_project_path(root, &key_path).map_err(mlua::Error::external)?;
+                Some(
+                    build_server_tls_config(&cert_path, &key_path)
+                        .map_err(mlua::Error::external)?,
+                )
             }
             (None, None) => None,
             _ => {
@@ -2412,11 +2427,9 @@ mod native {
                         let definition = lua.registry_value::<Table>(&inline.definition)?;
                         loop {
                             match inline.receiver.try_recv() {
-                                Ok(event) => events.push((
-                                    definition.clone(),
-                                    hosted.shared.clone(),
-                                    event,
-                                )),
+                                Ok(event) => {
+                                    events.push((definition.clone(), hosted.shared.clone(), event))
+                                }
                                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                             }
                         }

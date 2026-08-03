@@ -1,12 +1,13 @@
 #![allow(dead_code)]
 
 use crate::assets::ImageHandle;
-use crate::platform::{lock_platform_state, Antialiasing, Color, SharedPlatformState};
+use crate::platform::{Antialiasing, Color, SharedPlatformState, lock_platform_state};
 use fontdue::Font;
 use image::{ImageBuffer, Rgba, RgbaImage};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -159,11 +160,29 @@ pub(crate) enum DrawCommand {
         filter: TextureFilter,
         shader: Option<crate::shader::ShaderHandle>,
     },
+    Mesh3D(crate::render3d::Mesh3DCommand),
+    Particles3D(crate::particles3d::ParticleSystem3DCommand),
     Text(TextRenderRequest),
+}
+
+struct InteractionSurfaceId(usize);
+
+impl Default for InteractionSurfaceId {
+    fn default() -> Self {
+        static NEXT_SURFACE_ID: AtomicUsize = AtomicUsize::new(1);
+        Self(NEXT_SURFACE_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Drop for InteractionSurfaceId {
+    fn drop(&mut self) {
+        crate::widget_interaction::remove_surface(self.0);
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct RenderState {
+    interaction_surface: InteractionSurfaceId,
     commands: Vec<DrawCommand>,
     overlay_commands: Vec<DrawCommand>,
     last_frame_commands: Option<Arc<[DrawCommand]>>,
@@ -176,6 +195,8 @@ pub(crate) struct RenderState {
     // lit image (it re-renders from `last_frame_commands`).
     last_frame_lights: Vec<crate::lighting::Light>,
     last_frame_occluders: Vec<crate::lighting::Occluder>,
+    lights_3d: Vec<crate::render3d::Light3D>,
+    last_frame_lights_3d: Vec<crate::render3d::Light3D>,
     // Camera selection persists across frames, while the offset is resolved
     // afresh by the camera pre-pass. Scene commands stay in world space until
     // they are drained; editor/debug overlays are intentionally screen-space.
@@ -183,12 +204,29 @@ pub(crate) struct RenderState {
     camera_seen_this_frame: bool,
     fallback_camera: Option<(usize, Vec2)>,
     camera_offset: Vec2,
+    active_camera_3d: Option<usize>,
+    camera_3d_seen_this_frame: bool,
+    fallback_camera_3d: Option<(usize, crate::render3d::Camera3D)>,
+    camera_3d: crate::render3d::Camera3D,
+    environment_3d: crate::environment3d::Environment3D,
+    environment_3d_owner: Option<usize>,
+    post_process: crate::post_process::PostProcessStack,
 }
 
 pub(crate) type SharedRenderState = Arc<Mutex<RenderState>>;
 
 pub(crate) fn new_shared_render_state() -> SharedRenderState {
     Arc::new(Mutex::new(RenderState::default()))
+}
+
+/// Stable widget-interaction identity owned for the render state's lifetime.
+pub(crate) fn interaction_surface_id(render_state: &SharedRenderState) -> usize {
+    match render_state.lock() {
+        Ok(state) => state.interaction_surface.0,
+        // The immutable id remains valid even if unrelated render work poisoned
+        // the mutex, so cleanup and widget routing can still agree on the key.
+        Err(poisoned) => poisoned.into_inner().interaction_surface.0,
+    }
 }
 
 #[derive(Clone)]
@@ -286,6 +324,10 @@ impl RenderState {
         self.occluders.push(occluder);
     }
 
+    pub(crate) fn queue_light_3d(&mut self, light: crate::render3d::Light3D) {
+        self.lights_3d.push(light);
+    }
+
     /// Start resolving the camera for a new rendered frame. The last resolved
     /// offset remains available until this point so input dispatched earlier in
     /// the frame still matches the image the player can currently see.
@@ -293,6 +335,8 @@ impl RenderState {
         self.camera_seen_this_frame = false;
         self.fallback_camera = None;
         self.camera_offset = Vec2::default();
+        self.camera_3d_seen_this_frame = false;
+        self.fallback_camera_3d = None;
     }
 
     /// Offer an enabled Camera component to the camera pre-pass. The explicitly
@@ -316,39 +360,122 @@ impl RenderState {
         self.camera_seen_this_frame = true;
     }
 
+    pub(crate) fn submit_camera_3d(&mut self, id: usize, camera: crate::render3d::Camera3D) {
+        if self.fallback_camera_3d.is_none() {
+            self.fallback_camera_3d = Some((id, camera));
+        }
+        if self.active_camera_3d == Some(id) {
+            self.camera_3d = camera;
+            self.camera_3d_seen_this_frame = true;
+        }
+    }
+
+    pub(crate) fn activate_camera_3d(&mut self, id: usize, camera: crate::render3d::Camera3D) {
+        self.active_camera_3d = Some(id);
+        self.camera_3d = camera;
+        self.camera_3d_seen_this_frame = true;
+    }
+
     pub(crate) fn clear_camera(&mut self, id: usize) {
         if self.active_camera == Some(id) {
             self.active_camera = None;
             self.camera_offset = Vec2::default();
             self.camera_seen_this_frame = false;
         }
-        if self.fallback_camera.is_some_and(|(candidate, _)| candidate == id) {
+        if self
+            .fallback_camera
+            .is_some_and(|(candidate, _)| candidate == id)
+        {
             self.fallback_camera = None;
+        }
+        if self.active_camera_3d == Some(id) {
+            self.active_camera_3d = None;
+            self.camera_3d = crate::render3d::Camera3D::default();
+            self.camera_3d_seen_this_frame = false;
+        }
+        if self
+            .fallback_camera_3d
+            .is_some_and(|(candidate, _)| candidate == id)
+        {
+            self.fallback_camera_3d = None;
         }
     }
 
     pub(crate) fn is_camera_active(&self, id: usize) -> bool {
-        self.active_camera == Some(id)
+        self.active_camera == Some(id) || self.active_camera_3d == Some(id)
     }
 
     /// Complete camera selection. With no enabled Camera component, the offset
     /// is exactly (0, 0), preserving NeoLOVE's original screen-space rendering.
     pub(crate) fn finish_camera_frame(&mut self) {
-        if self.camera_seen_this_frame {
-            return;
+        if !self.camera_seen_this_frame {
+            if let Some((id, offset)) = self.fallback_camera {
+                self.active_camera = Some(id);
+                self.camera_offset = offset;
+                self.camera_seen_this_frame = true;
+            } else {
+                self.active_camera = None;
+                self.camera_offset = Vec2::default();
+            }
         }
-        if let Some((id, offset)) = self.fallback_camera {
-            self.active_camera = Some(id);
-            self.camera_offset = offset;
-            self.camera_seen_this_frame = true;
-        } else {
-            self.active_camera = None;
-            self.camera_offset = Vec2::default();
+        if !self.camera_3d_seen_this_frame {
+            if let Some((id, camera)) = self.fallback_camera_3d {
+                self.active_camera_3d = Some(id);
+                self.camera_3d = camera;
+                self.camera_3d_seen_this_frame = true;
+            } else {
+                self.active_camera_3d = None;
+                self.camera_3d = crate::render3d::Camera3D::default();
+            }
         }
     }
 
     pub(crate) fn camera_offset(&self) -> Vec2 {
         self.camera_offset
+    }
+
+    pub(crate) fn camera_3d(&self) -> crate::render3d::Camera3D {
+        self.camera_3d
+    }
+
+    pub(crate) fn set_environment_3d(
+        &mut self,
+        owner: Option<usize>,
+        environment: crate::environment3d::Environment3D,
+    ) {
+        self.environment_3d = environment;
+        self.environment_3d_owner = owner;
+    }
+
+    pub(crate) fn clear_environment_3d(&mut self, owner: Option<usize>) {
+        if owner.is_none() || self.environment_3d_owner == owner {
+            self.environment_3d = crate::environment3d::Environment3D::default();
+            self.environment_3d_owner = None;
+        }
+    }
+
+    pub(crate) fn environment_3d(&self) -> crate::environment3d::Environment3D {
+        self.environment_3d.clone()
+    }
+
+    pub(crate) fn edit_post_process(
+        &mut self,
+        edit: impl FnOnce(&mut crate::post_process::PostProcessStack),
+    ) {
+        edit(&mut self.post_process);
+    }
+
+    pub(crate) fn post_process(&self) -> &crate::post_process::PostProcessStack {
+        &self.post_process
+    }
+
+    pub(crate) fn apply_post_process(
+        &mut self,
+        width: usize,
+        height: usize,
+        pixels: &mut [u8],
+    ) -> Result<(), crate::post_process::PostProcessError> {
+        self.post_process.apply_in_place(width, height, pixels)
     }
 
     pub(crate) fn lighting_config(&self) -> crate::lighting::LightConfig {
@@ -390,6 +517,16 @@ impl RenderState {
         self.last_frame_lights = lights.clone();
         self.last_frame_occluders = occluders.clone();
         (self.lighting, lights, occluders)
+    }
+
+    pub(crate) fn take_lights_3d(&mut self) -> Vec<crate::render3d::Light3D> {
+        let lights = std::mem::take(&mut self.lights_3d);
+        self.last_frame_lights_3d = lights.clone();
+        lights
+    }
+
+    pub(crate) fn last_frame_lights_3d(&self) -> Vec<crate::render3d::Light3D> {
+        self.last_frame_lights_3d.clone()
     }
 
     /// The persistent config plus the previous frame's lights/occluders, for
@@ -647,6 +784,8 @@ fn command_uses_custom_shader(command: &DrawCommand) -> bool {
         | DrawCommand::Triangle { shader, .. }
         | DrawCommand::Circle { shader, .. }
         | DrawCommand::Image { shader, .. } => shader.is_some(),
+        DrawCommand::Mesh3D(command) => command.shader.is_some(),
+        DrawCommand::Particles3D(_) => false,
         DrawCommand::Text(_) => false,
     }
 }
@@ -1593,6 +1732,7 @@ fn command_bounds(command: &DrawCommand) -> Option<Rect> {
                 *dest, *pivot, *rotation,
             )))
         }
+        DrawCommand::Mesh3D(_) | DrawCommand::Particles3D(_) => None,
         DrawCommand::Text(request) => {
             if request.bounds.w <= 0.0 || request.bounds.h <= 0.0 {
                 return Some(request.bounds);
@@ -1740,6 +1880,8 @@ pub(crate) fn translate_command(command: DrawCommand, dx: f32, dy: f32) -> DrawC
             filter,
             shader,
         },
+        DrawCommand::Mesh3D(command) => DrawCommand::Mesh3D(command),
+        DrawCommand::Particles3D(command) => DrawCommand::Particles3D(command),
         DrawCommand::Text(mut request) => {
             request.bounds.x += dx;
             request.bounds.y += dy;
@@ -1753,6 +1895,15 @@ pub(crate) fn translate_command(command: DrawCommand, dx: f32, dy: f32) -> DrawC
 pub(crate) fn command_intersects_viewport(command: &DrawCommand, width: u32, height: u32) -> bool {
     if width == 0 || height == 0 {
         return false;
+    }
+    if matches!(
+        command,
+        DrawCommand::Mesh3D(_) | DrawCommand::Particles3D(_)
+    ) {
+        // Mesh bounds are projected in the backend preparation pass. Frustum
+        // rejection there is both tighter and cheaper than fabricating a 2D
+        // world-space rectangle here.
+        return true;
     }
 
     let Some(bounds) = command_bounds(command) else {
@@ -1768,12 +1919,40 @@ pub(crate) fn command_intersects_viewport(command: &DrawCommand, width: u32, hei
     rect_intersects_viewport(bounds, width, height)
 }
 
+fn perspective_correct_weights(
+    vertices: &[crate::render3d::ProjectedVertex; 3],
+    barycentric: [f32; 3],
+) -> Option<[f32; 3]> {
+    let mut weights = [0.0; 3];
+    let mut denominator = 0.0;
+    for corner in 0..3 {
+        let clip_w = vertices[corner].clip_position[3];
+        if clip_w.abs() <= f32::EPSILON || !clip_w.is_finite() {
+            return None;
+        }
+        weights[corner] = barycentric[corner] / clip_w;
+        denominator += weights[corner];
+    }
+    if denominator.abs() <= f32::EPSILON || !denominator.is_finite() {
+        return None;
+    }
+    for weight in &mut weights {
+        *weight /= denominator;
+    }
+    Some(weights)
+}
+
 pub(crate) struct SoftwareRenderer {
     width: u32,
     height: u32,
     pixels: Vec<u8>,
+    depth: Vec<f32>,
+    three_d_aa_scratch: Vec<u8>,
+    three_d_aa_bounds: Option<(u32, u32, u32, u32)>,
     antialiasing: Antialiasing,
     light_cache: crate::lighting::LightMapCache,
+    environment_cache_key: Option<crate::environment3d::SoftwareEnvironmentCacheKey>,
+    environment_cache_pixels: Vec<u8>,
 }
 
 impl SoftwareRenderer {
@@ -1782,25 +1961,61 @@ impl SoftwareRenderer {
             width: width.max(1),
             height: height.max(1),
             pixels: vec![0; width.max(1) as usize * height.max(1) as usize * 4],
+            // Most NeoLOVE projects and editor panels only submit 2D commands.
+            // Allocate the four-byte-per-pixel depth surface on the first 3D
+            // frame instead of making every high-resolution renderer pay for it.
+            depth: Vec::new(),
+            // The software 3D edge filter needs an immutable copy of the
+            // framebuffer. Keep it lazy so established 2D-only projects do
+            // not pay another four bytes per logical pixel.
+            three_d_aa_scratch: Vec::new(),
+            three_d_aa_bounds: None,
             antialiasing: Antialiasing::High,
             light_cache: crate::lighting::LightMapCache::default(),
+            environment_cache_key: None,
+            environment_cache_pixels: Vec::new(),
         }
     }
 
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
-        self.width = width.max(1);
-        self.height = height.max(1);
+        let width = width.max(1);
+        let height = height.max(1);
+        if self.width == width && self.height == height {
+            return;
+        }
+        self.width = width;
+        self.height = height;
         self.pixels
             .resize(self.width as usize * self.height as usize * 4, 0);
+        // A future 3D frame recreates this at the new dimensions. Dropping it
+        // here also releases an old high-resolution allocation when a project
+        // switches back to a resized 2D viewport.
+        self.depth = Vec::new();
+        self.three_d_aa_scratch = Vec::new();
+        self.three_d_aa_bounds = None;
         self.light_cache = crate::lighting::LightMapCache::default();
+        self.environment_cache_key = None;
+        self.environment_cache_pixels.clear();
     }
 
     pub(crate) fn pixels(&self) -> &[u8] {
         &self.pixels
     }
 
+    #[cfg(target_os = "emscripten")]
+    pub(crate) fn pixels_mut(&mut self) -> &mut [u8] {
+        &mut self.pixels
+    }
+
     pub(crate) fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    pub(crate) fn set_antialiasing(&mut self, antialiasing: Antialiasing) {
+        self.antialiasing = antialiasing;
+        if matches!(antialiasing, Antialiasing::Off) {
+            self.three_d_aa_scratch = Vec::new();
+        }
     }
 
     pub(crate) fn render(
@@ -1808,16 +2023,37 @@ impl SoftwareRenderer {
         platform: &SharedPlatformState,
         render_state: &SharedRenderState,
     ) -> Result<(), String> {
-        let (commands, lighting, lights, occluders) = {
+        let (commands, lighting, lights, occluders, lights_3d, environment, camera_3d) = {
             let mut state = render_state
                 .lock()
                 .map_err(|_| "render state lock poisoned".to_string())?;
             let commands = state.drain_without_remembering();
             let (lighting, lights, occluders) = state.take_lighting();
-            (commands, lighting, lights, occluders)
+            let lights_3d = state.take_lights_3d();
+            let environment = state.environment_3d();
+            let camera_3d = state.camera_3d();
+            (
+                commands,
+                lighting,
+                lights,
+                occluders,
+                lights_3d,
+                environment,
+                camera_3d,
+            )
         };
-        self.render_command_slice(platform, &commands)?;
+        self.render_command_slice(
+            platform,
+            &commands,
+            &lights_3d,
+            Some((&environment, camera_3d)),
+        )?;
         self.apply_lighting_pass(&lighting, &lights, &occluders);
+        render_state
+            .lock()
+            .map_err(|_| "render state lock poisoned".to_string())?
+            .apply_post_process(self.width as usize, self.height as usize, &mut self.pixels)
+            .map_err(|error| error.to_string())?;
         render_state
             .lock()
             .map_err(|_| "render state lock poisoned".to_string())?
@@ -1844,18 +2080,34 @@ impl SoftwareRenderer {
         );
     }
 
+    pub(crate) fn apply_post_process_pass(
+        &mut self,
+        render_state: &SharedRenderState,
+    ) -> Result<(), String> {
+        render_state
+            .lock()
+            .map_err(|_| "render state lock poisoned".to_string())?
+            .apply_post_process(self.width as usize, self.height as usize, &mut self.pixels)
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn render_commands(
         &mut self,
         platform: &SharedPlatformState,
         commands: &[DrawCommand],
     ) -> Result<(), String> {
-        self.render_command_slice(platform, commands)
+        self.render_command_slice(platform, commands, &[], None)
     }
 
     fn render_command_slice(
         &mut self,
         platform: &SharedPlatformState,
         commands: &[DrawCommand],
+        lights_3d: &[crate::render3d::Light3D],
+        environment: Option<(
+            &crate::environment3d::Environment3D,
+            crate::render3d::Camera3D,
+        )>,
     ) -> Result<(), String> {
         if commands.iter().any(command_uses_custom_shader) {
             #[cfg(target_os = "emscripten")]
@@ -1872,10 +2124,14 @@ impl SoftwareRenderer {
 
         let state = lock_platform_state(platform);
         let clear = state.clear_color();
-        self.antialiasing = state.antialiasing();
+        self.set_antialiasing(state.antialiasing());
         drop(state);
-        self.clear_to_color(clear);
-        self.draw_unshaded_commands(commands)
+        if let Some((environment, camera)) = environment {
+            self.draw_environment_background(environment, camera, clear);
+        } else {
+            self.clear_to_color(clear);
+        }
+        self.draw_unshaded_commands_with_lights(commands, lights_3d)
     }
 
     pub(crate) fn clear_to_color(&mut self, clear: Color) {
@@ -1891,20 +2147,302 @@ impl SoftwareRenderer {
         self.clear_to_color(Color::rgba(0, 0, 0, 0));
     }
 
+    pub(crate) fn draw_environment_background(
+        &mut self,
+        environment: &crate::environment3d::Environment3D,
+        camera: crate::render3d::Camera3D,
+        fallback: Color,
+    ) {
+        let cacheable_panorama = environment.enabled
+            && environment.mode == crate::environment3d::EnvironmentMode3D::Equirectangular
+            && environment
+                .equirectangular
+                .as_ref()
+                .is_some_and(|image| image.revision().is_ok());
+        if !cacheable_panorama {
+            crate::environment3d::render_software_background(
+                environment,
+                camera,
+                self.width as usize,
+                self.height as usize,
+                &mut self.pixels,
+                fallback,
+            );
+            // Do not make ordinary 2D/solid/gradient games retain a second
+            // full-resolution framebuffer. Leaving panorama mode releases its
+            // cache allocation immediately.
+            self.environment_cache_key = None;
+            self.environment_cache_pixels = Vec::new();
+            return;
+        }
+        let key = crate::environment3d::software_cache_key(
+            environment,
+            camera,
+            self.width as usize,
+            self.height as usize,
+            fallback,
+        );
+        if self.environment_cache_key.as_ref() == Some(&key)
+            && self.environment_cache_pixels.len() == self.pixels.len()
+        {
+            self.pixels.copy_from_slice(&self.environment_cache_pixels);
+        } else {
+            crate::environment3d::render_software_background(
+                environment,
+                camera,
+                self.width as usize,
+                self.height as usize,
+                &mut self.pixels,
+                fallback,
+            );
+            self.environment_cache_pixels.resize(self.pixels.len(), 0);
+            self.environment_cache_pixels.copy_from_slice(&self.pixels);
+            self.environment_cache_key = Some(key);
+        }
+    }
+
     pub(crate) fn draw_unshaded_commands(
         &mut self,
         commands: &[DrawCommand],
     ) -> Result<(), String> {
+        self.draw_unshaded_commands_with_lights(commands, &[])
+    }
+
+    pub(crate) fn draw_commands_with_3d_lights(
+        &mut self,
+        commands: &[DrawCommand],
+        lights_3d: &[crate::render3d::Light3D],
+    ) -> Result<(), String> {
+        self.draw_unshaded_commands_with_lights(commands, lights_3d)
+    }
+
+    fn draw_unshaded_commands_with_lights(
+        &mut self,
+        commands: &[DrawCommand],
+        lights_3d: &[crate::render3d::Light3D],
+    ) -> Result<(), String> {
         if commands.iter().any(command_uses_custom_shader) {
             return Err("draw_unshaded_commands received a shader command".to_string());
         }
+        let has_3d = commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::Mesh3D(_) | DrawCommand::Particles3D(_)
+            )
+        });
+        if has_3d {
+            self.prepare_depth_buffer();
+        } else if !self.three_d_aa_scratch.is_empty() {
+            // Switching back to a 2D-only scene releases the optional
+            // full-resolution copy instead of permanently raising its memory
+            // floor after one 3D frame.
+            self.three_d_aa_scratch = Vec::new();
+        }
+        // Opaque 3D geometry owns the depth buffer and is rendered before the
+        // existing 2D command stream. This makes canvas/UI components natural
+        // overlays without changing their long-standing z/order behavior.
         for command in commands {
+            let DrawCommand::Mesh3D(mesh) = command else {
+                continue;
+            };
+            self.draw_mesh_3d(mesh, lights_3d)?;
+        }
+        // Transparent billboards are submitted after all opaque meshes. Each
+        // emitter's projected triangles are sorted back-to-front while the
+        // existing depth buffer still rejects particles hidden by geometry.
+        for command in commands {
+            let DrawCommand::Particles3D(particles) = command else {
+                continue;
+            };
+            self.draw_particles_3d(particles)?;
+        }
+        if has_3d {
+            self.apply_3d_antialiasing();
+        }
+        for command in commands {
+            if matches!(
+                command,
+                DrawCommand::Mesh3D(_) | DrawCommand::Particles3D(_)
+            ) {
+                continue;
+            }
             if !command_intersects_viewport(&command, self.width, self.height) {
                 continue;
             }
             self.draw_command(command)?;
         }
         Ok(())
+    }
+
+    fn prepare_depth_buffer(&mut self) {
+        let pixel_count = self.width as usize * self.height as usize;
+        if self.depth.len() == pixel_count {
+            self.depth.fill(f32::INFINITY);
+        } else {
+            self.depth = vec![f32::INFINITY; pixel_count];
+        }
+        self.three_d_aa_bounds = None;
+    }
+
+    fn include_3d_aa_bounds(&mut self, min_x: u32, min_y: u32, max_x: u32, max_y: u32) {
+        self.three_d_aa_bounds = Some(match self.three_d_aa_bounds {
+            Some((old_min_x, old_min_y, old_max_x, old_max_y)) => (
+                old_min_x.min(min_x),
+                old_min_y.min(min_y),
+                old_max_x.max(max_x),
+                old_max_y.max(max_y),
+            ),
+            None => (min_x, min_y, max_x, max_y),
+        });
+    }
+
+    /// Smooth software-rendered 3D silhouette and high-contrast material
+    /// edges. The pass is deliberately placed before the 2D command stream so
+    /// canvas/UI overlays retain their existing pixel and ordering behavior.
+    /// Native Vulkan uses multisampling instead of this framebuffer filter.
+    fn apply_3d_antialiasing(&mut self) {
+        let base_strength = match self.antialiasing {
+            Antialiasing::Off => {
+                self.three_d_aa_scratch = Vec::new();
+                return;
+            }
+            Antialiasing::Standard => 0.38,
+            Antialiasing::High => 0.62,
+        };
+        let high_quality = matches!(self.antialiasing, Antialiasing::High);
+        let width = self.width as usize;
+        let height = self.height as usize;
+        if width < 3 || height < 3 || self.depth.len() != width * height {
+            return;
+        }
+
+        let Some((min_x, min_y, max_x, max_y)) = self.three_d_aa_bounds else {
+            self.three_d_aa_scratch = Vec::new();
+            return;
+        };
+        let start_x = min_x.saturating_sub(1).max(1) as usize;
+        let start_y = min_y.saturating_sub(1).max(1) as usize;
+        let end_x = max_x.saturating_add(1).min(self.width.saturating_sub(2)) as usize;
+        let end_y = max_y.saturating_add(1).min(self.height.saturating_sub(2)) as usize;
+        if start_x > end_x || start_y > end_y {
+            return;
+        }
+
+        self.three_d_aa_scratch.resize(self.pixels.len(), 0);
+        // Only copy the geometry union plus the one-pixel neighborhood read by
+        // the filter. Large mostly-empty 3D viewports avoid a full-frame memory
+        // copy while the scratch allocation remains reusable.
+        let copy_start_x = start_x.saturating_sub(1);
+        let copy_end_x = (end_x + 1).min(width - 1);
+        for y in start_y.saturating_sub(1)..=(end_y + 1).min(height - 1) {
+            let start = (y * width + copy_start_x) * 4;
+            let end = (y * width + copy_end_x + 1) * 4;
+            self.three_d_aa_scratch[start..end].copy_from_slice(&self.pixels[start..end]);
+        }
+
+        let source = &self.three_d_aa_scratch;
+        let depth = &self.depth;
+        let pixels = &mut self.pixels;
+        let luma = |pixel_index: usize| -> f32 {
+            let offset = pixel_index * 4;
+            // Integer-friendly Rec. 709 weights, normalized only when the
+            // edge strength is calculated below.
+            (source[offset] as f32 * 54.0
+                + source[offset + 1] as f32 * 183.0
+                + source[offset + 2] as f32 * 19.0)
+                / 256.0
+        };
+
+        for y in start_y..=end_y {
+            for x in start_x..=end_x {
+                let center = y * width + x;
+                let west = center - 1;
+                let east = center + 1;
+                let north = center - width;
+                let south = center + width;
+                let neighbors = [west, east, north, south];
+
+                // Ignore sky/environment-only pixels. At least one sample in
+                // the cross must belong to rasterized 3D geometry.
+                if !depth[center].is_finite()
+                    && neighbors.iter().all(|index| !depth[*index].is_finite())
+                {
+                    continue;
+                }
+
+                let center_luma = luma(center);
+                let west_luma = luma(west);
+                let east_luma = luma(east);
+                let north_luma = luma(north);
+                let south_luma = luma(south);
+                let minimum_luma = center_luma
+                    .min(west_luma)
+                    .min(east_luma)
+                    .min(north_luma)
+                    .min(south_luma);
+                let maximum_luma = center_luma
+                    .max(west_luma)
+                    .max(east_luma)
+                    .max(north_luma)
+                    .max(south_luma);
+                let luma_range = maximum_luma - minimum_luma;
+
+                let center_is_geometry = depth[center].is_finite();
+                let depth_edge = neighbors.iter().any(|index| {
+                    let neighbor_is_geometry = depth[*index].is_finite();
+                    center_is_geometry != neighbor_is_geometry
+                        || (center_is_geometry
+                            && neighbor_is_geometry
+                            && (depth[center] - depth[*index]).abs()
+                                > 0.002 * (1.0 + depth[center].abs()))
+                });
+                let threshold = (maximum_luma * 0.08).max(10.0);
+                if !depth_edge && luma_range <= threshold {
+                    continue;
+                }
+
+                // Blend across the strongest luminance gradient. Standard is
+                // intentionally lighter; High also includes the perpendicular
+                // pair for a more stable diagonal silhouette.
+                let horizontal_gradient = (west_luma - east_luma).abs();
+                let vertical_gradient = (north_luma - south_luma).abs();
+                let primary = if horizontal_gradient >= vertical_gradient {
+                    [west, east]
+                } else {
+                    [north, south]
+                };
+                let secondary = if horizontal_gradient >= vertical_gradient {
+                    [north, south]
+                } else {
+                    [west, east]
+                };
+                let edge_factor = if depth_edge {
+                    1.0
+                } else {
+                    ((luma_range - threshold) / (255.0 - threshold).max(1.0)).clamp(0.2, 1.0)
+                };
+                let blend_strength = base_strength * edge_factor;
+                let destination_offset = center * 4;
+                for channel in 0..4 {
+                    let primary_average = (source[primary[0] * 4 + channel] as f32
+                        + source[primary[1] * 4 + channel] as f32)
+                        * 0.5;
+                    let target = if high_quality {
+                        let secondary_average = (source[secondary[0] * 4 + channel] as f32
+                            + source[secondary[1] * 4 + channel] as f32)
+                            * 0.5;
+                        primary_average * 0.75 + secondary_average * 0.25
+                    } else {
+                        primary_average
+                    };
+                    let current = source[destination_offset + channel] as f32;
+                    pixels[destination_offset + channel] =
+                        (current + (target - current) * blend_strength)
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
     }
 
     fn draw_command(&mut self, command: &DrawCommand) -> Result<(), String> {
@@ -1959,9 +2497,171 @@ impl SoftwareRenderer {
                 *tint,
                 *filter,
             )?,
+            DrawCommand::Mesh3D(_) | DrawCommand::Particles3D(_) => {}
             DrawCommand::Text(request) => self.draw_text(&request)?,
         }
         Ok(())
+    }
+
+    fn draw_mesh_3d(
+        &mut self,
+        command: &crate::render3d::Mesh3DCommand,
+        lights: &[crate::render3d::Light3D],
+    ) -> Result<(), String> {
+        let triangles = crate::render3d::project_mesh(command, lights)?;
+        let texture = command
+            .texture
+            .as_ref()
+            .map(|image| {
+                image
+                    .snapshot()
+                    .map(|snapshot| snapshot.into_parts().2)
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        for triangle in triangles {
+            self.rasterize_projected_triangle(&triangle, texture.as_deref());
+        }
+        Ok(())
+    }
+
+    fn draw_particles_3d(
+        &mut self,
+        command: &crate::particles3d::ParticleSystem3DCommand,
+    ) -> Result<(), String> {
+        let triangles = crate::render3d::project_particles(command)?;
+        let texture = command
+            .texture
+            .as_ref()
+            .map(|image| {
+                image
+                    .snapshot()
+                    .map(|snapshot| snapshot.into_parts().2)
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        for triangle in triangles {
+            self.rasterize_projected_triangle(&triangle, texture.as_deref());
+        }
+        Ok(())
+    }
+
+    fn rasterize_projected_triangle(
+        &mut self,
+        triangle: &crate::render3d::ProjectedTriangle,
+        texture: Option<&RgbaImage>,
+    ) {
+        let to_screen = |ndc: [f32; 3]| -> [f32; 3] {
+            [
+                (ndc[0] * 0.5 + 0.5) * self.width as f32,
+                (0.5 - ndc[1] * 0.5) * self.height as f32,
+                ndc[2],
+            ]
+        };
+        let points = [
+            to_screen(triangle.vertices[0].ndc),
+            to_screen(triangle.vertices[1].ndc),
+            to_screen(triangle.vertices[2].ndc),
+        ];
+        let edge = |a: [f32; 3], b: [f32; 3], x: f32, y: f32| {
+            (x - a[0]) * (b[1] - a[1]) - (y - a[1]) * (b[0] - a[0])
+        };
+        let area = edge(points[0], points[1], points[2][0], points[2][1]);
+        if area.abs() <= f32::EPSILON || !area.is_finite() {
+            return;
+        }
+        let min_x = points
+            .iter()
+            .map(|point| point[0])
+            .fold(f32::INFINITY, f32::min)
+            .floor()
+            .max(0.0) as u32;
+        let max_x = points
+            .iter()
+            .map(|point| point[0])
+            .fold(f32::NEG_INFINITY, f32::max)
+            .ceil()
+            .min(self.width.saturating_sub(1) as f32) as u32;
+        let min_y = points
+            .iter()
+            .map(|point| point[1])
+            .fold(f32::INFINITY, f32::min)
+            .floor()
+            .max(0.0) as u32;
+        let max_y = points
+            .iter()
+            .map(|point| point[1])
+            .fold(f32::NEG_INFINITY, f32::max)
+            .ceil()
+            .min(self.height.saturating_sub(1) as f32) as u32;
+        if min_x > max_x || min_y > max_y {
+            return;
+        }
+        self.include_3d_aa_bounds(min_x, min_y, max_x, max_y);
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let sample_x = x as f32 + 0.5;
+                let sample_y = y as f32 + 0.5;
+                let w0 = edge(points[1], points[2], sample_x, sample_y) / area;
+                let w1 = edge(points[2], points[0], sample_x, sample_y) / area;
+                let w2 = 1.0 - w0 - w1;
+                if w0 < -0.0001 || w1 < -0.0001 || w2 < -0.0001 {
+                    continue;
+                }
+                let depth = points[0][2] * w0 + points[1][2] * w1 + points[2][2] * w2;
+                if !(0.0..=1.0).contains(&depth) {
+                    continue;
+                }
+                let pixel_index = y as usize * self.width as usize + x as usize;
+                if depth >= self.depth[pixel_index] {
+                    continue;
+                }
+
+                let Some(attribute_weights) =
+                    perspective_correct_weights(&triangle.vertices, [w0, w1, w2])
+                else {
+                    continue;
+                };
+                let mut color = [0.0; 4];
+                let mut uv = [0.0; 2];
+                for corner in 0..3 {
+                    let weight = attribute_weights[corner];
+                    for channel in 0..4 {
+                        color[channel] += triangle.vertices[corner].color[channel] * weight;
+                    }
+                    for axis in 0..2 {
+                        uv[axis] += triangle.vertices[corner].uv[axis] * weight;
+                    }
+                }
+                if let Some(texture) = texture
+                    && texture.width() > 0
+                    && texture.height() > 0
+                {
+                    let texture_x = (uv[0].rem_euclid(1.0)
+                        * texture.width().saturating_sub(1) as f32)
+                        .round() as u32;
+                    let texture_y = ((1.0 - uv[1]).clamp(0.0, 1.0)
+                        * texture.height().saturating_sub(1) as f32)
+                        .round() as u32;
+                    let texel = texture.get_pixel(texture_x, texture_y).0;
+                    for channel in 0..4 {
+                        color[channel] *= texel[channel] as f32 / 255.0;
+                    }
+                }
+                let source = Color::rgba(
+                    (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (color[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+                );
+                let offset = pixel_index * 4;
+                blend(&mut self.pixels[offset..offset + 4], source);
+                if source.a > 0 {
+                    self.depth[pixel_index] = depth;
+                }
+            }
+        }
     }
 
     fn to_world(&self, x: f32, y: f32, pivot_x: f32, pivot_y: f32, rotation: f32) -> Vec2 {
@@ -2433,6 +3133,42 @@ mod tests {
     }
 
     #[test]
+    fn software_environment_cache_reuses_static_panorama_and_invalidates_for_camera() {
+        let panorama = RgbaImage::from_fn(8, 4, |x, y| Rgba([x as u8 * 20, y as u8 * 30, 90, 255]));
+        let environment = crate::environment3d::Environment3D {
+            enabled: true,
+            mode: crate::environment3d::EnvironmentMode3D::Equirectangular,
+            equirectangular: Some(ImageHandle::from_rgba_image(panorama)),
+            ..crate::environment3d::Environment3D::default()
+        };
+        let mut renderer = SoftwareRenderer::new(16, 8);
+        let camera = crate::render3d::Camera3D::default();
+        renderer.draw_environment_background(&environment, camera, Color::rgba(0, 0, 0, 255));
+        let first = renderer.pixels.clone();
+        let first_key = renderer.environment_cache_key.clone();
+        renderer.pixels.fill(0);
+        renderer.draw_environment_background(&environment, camera, Color::rgba(0, 0, 0, 255));
+        assert_eq!(renderer.pixels, first);
+        assert_eq!(renderer.environment_cache_key, first_key);
+
+        let mut rotated = camera;
+        rotated.euler.y = 45.0;
+        renderer.draw_environment_background(&environment, rotated, Color::rgba(0, 0, 0, 255));
+        assert_ne!(renderer.environment_cache_key, first_key);
+
+        renderer.draw_environment_background(
+            &crate::environment3d::Environment3D::default(),
+            rotated,
+            Color::rgba(1, 2, 3, 255),
+        );
+        assert!(renderer.environment_cache_key.is_none());
+        assert!(
+            renderer.environment_cache_pixels.is_empty(),
+            "ordinary frames must not retain a second full-size framebuffer"
+        );
+    }
+
+    #[test]
     fn camera_translates_scene_commands_but_not_overlays_and_falls_back_to_origin() {
         let mut state = RenderState::default();
         state.begin_camera_frame();
@@ -2490,6 +3226,76 @@ mod tests {
         assert!(state.is_camera_active(2));
         assert_eq!(state.camera_offset().x, 30.0);
         assert_eq!(state.camera_offset().y, 40.0);
+    }
+
+    #[test]
+    fn same_size_resize_preserves_cached_light_map() {
+        let mut renderer = SoftwareRenderer::new(64, 48);
+        let config = crate::lighting::LightConfig {
+            enabled: true,
+            ambient_intensity: 0.25,
+            ..crate::lighting::LightConfig::default()
+        };
+        let (_, first) = crate::lighting::render_light_map_cached(
+            64,
+            48,
+            &config,
+            &[],
+            &[],
+            &mut renderer.light_cache,
+        )
+        .expect("enabled non-neutral lighting should produce a light map");
+
+        renderer.resize(64, 48);
+
+        let (_, second) = crate::lighting::render_light_map_cached(
+            64,
+            48,
+            &config,
+            &[],
+            &[],
+            &mut renderer.light_cache,
+        )
+        .expect("same-size resize should retain the cached light map");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "same-size resize rebuilt an unchanged light map"
+        );
+    }
+
+    #[test]
+    fn changed_size_resize_updates_pixels_and_light_map() {
+        let mut renderer = SoftwareRenderer::new(64, 48);
+        let config = crate::lighting::LightConfig {
+            enabled: true,
+            ambient_intensity: 0.25,
+            ..crate::lighting::LightConfig::default()
+        };
+        let (_, first) = crate::lighting::render_light_map_cached(
+            64,
+            48,
+            &config,
+            &[],
+            &[],
+            &mut renderer.light_cache,
+        )
+        .expect("enabled non-neutral lighting should produce a light map");
+
+        renderer.resize(32, 24);
+
+        assert_eq!(renderer.dimensions(), (32, 24));
+        assert_eq!(renderer.pixels().len(), 32 * 24 * 4);
+        let (_, resized) = crate::lighting::render_light_map_cached(
+            32,
+            24,
+            &config,
+            &[],
+            &[],
+            &mut renderer.light_cache,
+        )
+        .expect("resized renderer should build a light map for its new dimensions");
+        assert!(!std::sync::Arc::ptr_eq(&first, &resized));
+        assert_eq!((resized.width, resized.height), (16, 12));
     }
 
     #[test]
@@ -2898,5 +3704,250 @@ mod tests {
                 .chunks_exact(4)
                 .any(|pixel| pixel[3] > 0 && pixel[3] < 255)
         );
+    }
+
+    #[test]
+    fn software_mesh_attributes_use_perspective_correct_weights() {
+        let vertex = |clip_w| crate::render3d::ProjectedVertex {
+            clip_position: [0.0, 0.0, 0.0, clip_w],
+            ndc: [0.0; 3],
+            uv: [0.0; 2],
+            color: [1.0; 4],
+        };
+        let vertices = [vertex(1.0), vertex(2.0), vertex(4.0)];
+        let weights = perspective_correct_weights(&vertices, [0.25, 0.25, 0.5])
+            .expect("valid perspective weights");
+        assert!((weights[0] - 0.5).abs() < 1e-6);
+        assert!((weights[1] - 0.25).abs() < 1e-6);
+        assert!((weights[2] - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn software_renderer_draws_projected_mesh_with_depth() {
+        use crate::mesh::{MeshData, MeshHandle, Submesh, Vertex};
+
+        let mesh = MeshHandle::new(
+            MeshData::new(
+                "triangle",
+                vec![
+                    Vertex::from_position([-0.8, -0.8, 0.0]),
+                    Vertex::from_position([0.8, -0.8, 0.0]),
+                    Vertex::from_position([0.0, 0.8, 0.0]),
+                ],
+                vec![0, 1, 2],
+                vec![Submesh {
+                    name: "triangle".into(),
+                    first_index: 0,
+                    index_count: 3,
+                    material: None,
+                }],
+                Vec::new(),
+                true,
+            )
+            .expect("mesh data"),
+        )
+        .expect("mesh handle");
+        let camera = crate::render3d::Camera3D::default();
+        let command = |z, tint| {
+            DrawCommand::Mesh3D(crate::render3d::Mesh3DCommand {
+                mesh: mesh.clone(),
+                model: crate::render3d::Mat4::translation(crate::render3d::Vec3::new(0.0, 0.0, z)),
+                view_projection: camera.view_projection(1.0),
+                tint,
+                texture: None,
+                shader: None,
+                double_sided: true,
+            })
+        };
+        let near = command(2.0, Color::rgba(255, 0, 0, 255));
+        let far = command(-2.0, Color::rgba(0, 255, 0, 255));
+        let platform = crate::platform::new_shared_platform_state();
+        lock_platform_state(&platform).set_clear_color(Color::rgba(0, 0, 0, 255));
+        let mut renderer = SoftwareRenderer::new(64, 64);
+        renderer
+            .render_commands(&platform, &[near, far])
+            .expect("render overlapping meshes");
+        let center = (32usize * 64 + 32) * 4;
+        assert!(
+            renderer.pixels()[center] > renderer.pixels()[center + 1],
+            "far mesh overwrote a nearer mesh: {:?}",
+            &renderer.pixels()[center..center + 4]
+        );
+        assert!(renderer.depth[32 * 64 + 32].is_finite());
+    }
+
+    #[test]
+    fn software_3d_antialiasing_respects_global_quality_without_touching_2d_overlays() {
+        use crate::mesh::{MeshData, MeshHandle, Submesh, Vertex};
+
+        let mesh = MeshHandle::new(
+            MeshData::new(
+                "antialiased triangle",
+                vec![
+                    Vertex::from_position([-0.73, -0.67, 0.0]),
+                    Vertex::from_position([0.78, -0.61, 0.0]),
+                    Vertex::from_position([-0.08, 0.81, 0.0]),
+                ],
+                vec![0, 1, 2],
+                vec![Submesh {
+                    name: "triangle".into(),
+                    first_index: 0,
+                    index_count: 3,
+                    material: None,
+                }],
+                Vec::new(),
+                true,
+            )
+            .expect("mesh data"),
+        )
+        .expect("mesh handle");
+        let camera = crate::render3d::Camera3D::default();
+        let mesh_command = DrawCommand::Mesh3D(crate::render3d::Mesh3DCommand {
+            mesh,
+            model: crate::render3d::Mat4::translation(crate::render3d::Vec3::new(0.0, 0.0, 2.0)),
+            view_projection: camera.view_projection(1.0),
+            tint: Color::WHITE,
+            texture: None,
+            shader: None,
+            double_sided: true,
+        });
+        let platform = crate::platform::new_shared_platform_state();
+        {
+            let mut state = lock_platform_state(&platform);
+            state.set_clear_color(Color::rgba(0, 0, 0, 0));
+            state.set_antialiasing(Antialiasing::Off);
+        }
+        let mut renderer = SoftwareRenderer::new(64, 64);
+        renderer
+            .render_commands(&platform, std::slice::from_ref(&mesh_command))
+            .expect("hard 3D triangle");
+        assert!(
+            renderer
+                .pixels()
+                .chunks_exact(4)
+                .all(|pixel| matches!(pixel[3], 0 | 255)),
+            "off mode must retain center-sampled 3D coverage"
+        );
+        assert!(renderer.three_d_aa_scratch.is_empty());
+
+        lock_platform_state(&platform).set_antialiasing(Antialiasing::High);
+        let overlay = DrawCommand::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 8.0,
+            h: 64.0,
+            rotation: 0.0,
+            offset: Vec2::default(),
+            color: Color::rgba(20, 40, 60, 255),
+            shader: None,
+        };
+        renderer
+            .render_commands(&platform, &[mesh_command, overlay])
+            .expect("smoothed 3D triangle with 2D overlay");
+        assert!(
+            renderer
+                .pixels()
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] > 0 && pixel[3] < 255),
+            "high mode must generate partial 3D edge coverage"
+        );
+        for y in 0..64usize {
+            let offset = (y * 64 + 4) * 4;
+            assert_eq!(
+                &renderer.pixels()[offset..offset + 4],
+                &[20, 40, 60, 255],
+                "the 2D overlay must be drawn after the 3D AA pass"
+            );
+        }
+    }
+
+    #[test]
+    fn software_renderer_does_not_allocate_depth_for_2d_frames() {
+        let platform = crate::platform::new_shared_platform_state();
+        lock_platform_state(&platform).set_clear_color(Color::rgba(1, 2, 3, 255));
+        let mut renderer = SoftwareRenderer::new(640, 360);
+        assert!(renderer.depth.is_empty());
+        assert_eq!(renderer.depth.capacity(), 0);
+        assert!(renderer.three_d_aa_scratch.is_empty());
+        assert_eq!(renderer.three_d_aa_scratch.capacity(), 0);
+
+        renderer
+            .render_commands(
+                &platform,
+                &[DrawCommand::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 32.0,
+                    h: 32.0,
+                    rotation: 0.0,
+                    offset: Vec2::default(),
+                    color: Color::WHITE,
+                    shader: None,
+                }],
+            )
+            .expect("render 2D frame");
+        assert!(renderer.depth.is_empty());
+        assert_eq!(renderer.depth.capacity(), 0);
+        assert!(renderer.three_d_aa_scratch.is_empty());
+        assert_eq!(renderer.three_d_aa_scratch.capacity(), 0);
+
+        renderer.resize(800, 450);
+        assert!(renderer.depth.is_empty());
+        assert_eq!(renderer.depth.capacity(), 0);
+    }
+
+    #[test]
+    fn software_textured_mesh_observes_image_edits_on_the_next_draw() {
+        use crate::mesh::{MeshData, MeshHandle, Submesh, Vertex};
+
+        let mesh = MeshHandle::new(
+            MeshData::new(
+                "textured triangle",
+                vec![
+                    Vertex::from_position([-0.8, -0.8, 0.0]),
+                    Vertex::from_position([0.8, -0.8, 0.0]),
+                    Vertex::from_position([0.0, 0.8, 0.0]),
+                ],
+                vec![0, 1, 2],
+                vec![Submesh {
+                    name: "triangle".into(),
+                    first_index: 0,
+                    index_count: 3,
+                    material: None,
+                }],
+                Vec::new(),
+                true,
+            )
+            .expect("mesh data"),
+        )
+        .expect("mesh handle");
+        let texture =
+            ImageHandle::from_rgba_image(RgbaImage::from_pixel(1, 1, Rgba([255, 0, 0, 255])));
+        let camera = crate::render3d::Camera3D::default();
+        let command = DrawCommand::Mesh3D(crate::render3d::Mesh3DCommand {
+            mesh,
+            model: crate::render3d::Mat4::translation(crate::render3d::Vec3::new(0.0, 0.0, 2.0)),
+            view_projection: camera.view_projection(1.0),
+            tint: Color::WHITE,
+            texture: Some(texture.clone()),
+            shader: None,
+            double_sided: true,
+        });
+        let platform = crate::platform::new_shared_platform_state();
+        lock_platform_state(&platform).set_clear_color(Color::rgba(0, 0, 0, 255));
+        let mut renderer = SoftwareRenderer::new(64, 64);
+        renderer
+            .render_commands(&platform, std::slice::from_ref(&command))
+            .expect("render red texture");
+        let center = (32usize * 64 + 32) * 4;
+        assert!(renderer.pixels()[center] > renderer.pixels()[center + 1]);
+
+        texture
+            .replace_rgba_image(RgbaImage::from_pixel(1, 1, Rgba([0, 255, 0, 255])))
+            .expect("edit live texture");
+        renderer
+            .render_commands(&platform, &[command])
+            .expect("render edited green texture");
+        assert!(renderer.pixels()[center + 1] > renderer.pixels()[center]);
     }
 }

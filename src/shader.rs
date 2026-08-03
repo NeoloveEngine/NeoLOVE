@@ -12,6 +12,33 @@ pub(crate) struct ShaderUniforms {
     textures: HashMap<String, crate::assets::ImageHandle>,
 }
 
+impl ShaderUniforms {
+    fn set_floats(&mut self, name: String, values: Vec<f32>) -> Result<(), String> {
+        if !self.floats.contains_key(&name) && self.floats.len() >= MAX_SHADER_FLOAT_UNIFORMS {
+            return Err(format!(
+                "shader already stores the maximum of {MAX_SHADER_FLOAT_UNIFORMS} float/vector uniforms"
+            ));
+        }
+        self.floats.insert(name, values);
+        Ok(())
+    }
+
+    fn set_texture(
+        &mut self,
+        name: String,
+        image: crate::assets::ImageHandle,
+    ) -> Result<(), String> {
+        if !self.textures.contains_key(&name) && self.textures.len() >= MAX_SHADER_TEXTURE_UNIFORMS
+        {
+            return Err(format!(
+                "shader already stores the maximum of {MAX_SHADER_TEXTURE_UNIFORMS} extra texture uniforms"
+            ));
+        }
+        self.textures.insert(name, image);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ShaderHandle {
     #[allow(dead_code)]
@@ -21,9 +48,7 @@ pub(crate) struct ShaderHandle {
     pub(crate) uniforms: Arc<Mutex<ShaderUniforms>>,
 }
 
-#[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
 pub(crate) const MAX_SHADER_FLOAT_UNIFORMS: usize = 16;
-#[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
 pub(crate) const MAX_SHADER_TEXTURE_UNIFORMS: usize = 4;
 
 #[cfg(target_os = "emscripten")]
@@ -57,6 +82,9 @@ void main() {
     out_uv = uv;
 }"#;
 
+const THREE_D_SHADERS_AVAILABLE: bool =
+    cfg!(target_os = "emscripten") || cfg!(all(not(target_os = "emscripten"), feature = "vulkan"));
+
 fn resolve_path(root: &Path, input: &str) -> PathBuf {
     let path = PathBuf::from(input);
     if path.is_absolute() {
@@ -72,6 +100,35 @@ fn load_shader_from_sources(vertex_source: &str, fragment_source: &str) -> Shade
         fragment_source: fragment_source.to_string(),
         uniforms: Arc::new(Mutex::new(ShaderUniforms::default())),
     }
+}
+
+/// Convert NeoLOVE's portable fragment dialect to WebGL 1 GLSL. Shader assets
+/// created by the editor use `#version 450` so the Vulkan path can parse them;
+/// WebGL 1 instead needs no version directive and explicit matching varyings.
+/// Keeping this normalization here also makes one shader asset usable for 2D
+/// drawables and MeshRenderer3D on both GPU backends.
+#[cfg(any(target_os = "emscripten", test))]
+fn build_web_fragment_source(fragment_source: &str) -> String {
+    let mut body = Vec::new();
+    for raw_line in fragment_source.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.starts_with("#version") || trimmed.starts_with("precision ") {
+            continue;
+        }
+        if trimmed.starts_with("varying ")
+            && (trimmed.ends_with(" uv;") || trimmed.ends_with(" color;"))
+        {
+            continue;
+        }
+        body.push(raw_line.replace("texture(", "texture2D("));
+    }
+
+    format!(
+        "precision mediump float;\n\
+varying mediump vec2 uv;\n\
+varying mediump vec4 color;\n{}\n",
+        body.join("\n")
+    )
 }
 
 #[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
@@ -266,7 +323,7 @@ impl ShaderHandle {
             .map_err(|_| "shader uniform lock poisoned".to_string())?;
 
         Ok(WebShaderSnapshot {
-            fragment_source: self.fragment_source.clone(),
+            fragment_source: build_web_fragment_source(&self.fragment_source),
             uniforms_json: serde_json::json!({ "floats": &uniforms.floats }).to_string(),
         })
     }
@@ -279,8 +336,9 @@ impl UserData for ShaderHandle {
                 .uniforms
                 .lock()
                 .map_err(|_| mlua::Error::external("shader uniform lock poisoned"))?;
-            uniforms.floats.insert(name, vec![x]);
-            Ok(())
+            uniforms
+                .set_floats(name, vec![x])
+                .map_err(mlua::Error::external)
         });
         methods.add_method(
             "setUniform2f",
@@ -289,8 +347,9 @@ impl UserData for ShaderHandle {
                     .uniforms
                     .lock()
                     .map_err(|_| mlua::Error::external("shader uniform lock poisoned"))?;
-                uniforms.floats.insert(name, vec![x, y]);
-                Ok(())
+                uniforms
+                    .set_floats(name, vec![x, y])
+                    .map_err(mlua::Error::external)
             },
         );
         methods.add_method(
@@ -300,8 +359,9 @@ impl UserData for ShaderHandle {
                     .uniforms
                     .lock()
                     .map_err(|_| mlua::Error::external("shader uniform lock poisoned"))?;
-                uniforms.floats.insert(name, vec![x, y, z]);
-                Ok(())
+                uniforms
+                    .set_floats(name, vec![x, y, z])
+                    .map_err(mlua::Error::external)
             },
         );
         methods.add_method(
@@ -311,8 +371,9 @@ impl UserData for ShaderHandle {
                     .uniforms
                     .lock()
                     .map_err(|_| mlua::Error::external("shader uniform lock poisoned"))?;
-                uniforms.floats.insert(name, vec![x, y, z, w]);
-                Ok(())
+                uniforms
+                    .set_floats(name, vec![x, y, z, w])
+                    .map_err(mlua::Error::external)
             },
         );
         methods.add_method(
@@ -322,16 +383,17 @@ impl UserData for ShaderHandle {
                     .uniforms
                     .lock()
                     .map_err(|_| mlua::Error::external("shader uniform lock poisoned"))?;
-                uniforms.floats.insert(
-                    name,
-                    vec![
-                        color.get::<f32>("r")?,
-                        color.get::<f32>("g")?,
-                        color.get::<f32>("b")?,
-                        color.get::<f32>("a")?,
-                    ],
-                );
-                Ok(())
+                uniforms
+                    .set_floats(
+                        name,
+                        vec![
+                            color.get::<f32>("r")? / 255.0,
+                            color.get::<f32>("g")? / 255.0,
+                            color.get::<f32>("b")? / 255.0,
+                            color.get::<f32>("a")? / 255.0,
+                        ],
+                    )
+                    .map_err(mlua::Error::external)
             },
         );
         methods.add_method(
@@ -343,8 +405,9 @@ impl UserData for ShaderHandle {
                     .uniforms
                     .lock()
                     .map_err(|_| mlua::Error::external("shader uniform lock poisoned"))?;
-                uniforms.textures.insert(name, image.clone());
-                Ok(())
+                uniforms
+                    .set_texture(name, image.clone())
+                    .map_err(mlua::Error::external)
             },
         );
     }
@@ -369,20 +432,21 @@ pub(crate) fn add_shader_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()
     )?;
 
     let fragment_root = env_root.clone();
-    shaders.set(
-        "loadFragment",
-        lua.create_function(
-            move |lua, (fragment_path, _options): (String, Option<Table>)| {
-                let fragment_source =
-                    fs::read_to_string(resolve_path(&fragment_root, &fragment_path))
-                        .map_err(mlua::Error::external)?;
-                lua.create_userdata(load_shader_from_sources(
-                    DEFAULT_VERTEX_SHADER,
-                    &fragment_source,
-                ))
-            },
-        )?,
+    let load_fragment = lua.create_function(
+        move |lua, (fragment_path, _options): (String, Option<Table>)| {
+            let fragment_source = fs::read_to_string(resolve_path(&fragment_root, &fragment_path))
+                .map_err(mlua::Error::external)?;
+            lua.create_userdata(load_shader_from_sources(
+                DEFAULT_VERTEX_SHADER,
+                &fragment_source,
+            ))
+        },
     )?;
+    shaders.set("loadFragment", load_fragment.clone())?;
+    // MeshRenderer3D consumes the same programmable fragment stage as the 2D
+    // drawables. The explicit alias makes that contract discoverable without
+    // introducing a second shader representation or cache.
+    shaders.set("load3DFragment", load_fragment)?;
 
     shaders.set(
         "fromSource",
@@ -393,18 +457,100 @@ pub(crate) fn add_shader_module(lua: &Lua, env_root: PathBuf) -> mlua::Result<()
         )?,
     )?;
 
-    shaders.set(
-        "fromFragmentSource",
-        lua.create_function(
-            move |lua, (fragment_source, _options): (String, Option<Table>)| {
-                lua.create_userdata(load_shader_from_sources(
-                    DEFAULT_VERTEX_SHADER,
-                    &fragment_source,
-                ))
-            },
-        )?,
+    let from_fragment_source = lua.create_function(
+        move |lua, (fragment_source, _options): (String, Option<Table>)| {
+            lua.create_userdata(load_shader_from_sources(
+                DEFAULT_VERTEX_SHADER,
+                &fragment_source,
+            ))
+        },
     )?;
+    shaders.set("fromFragmentSource", from_fragment_source.clone())?;
+    shaders.set("from3DFragmentSource", from_fragment_source)?;
+
+    let supports_3d = lua.create_function(|_lua, ()| Ok(THREE_D_SHADERS_AVAILABLE))?;
+    shaders.set("supports3D", supports_3d.clone())?;
+    shaders.set("supports3DShaders", supports_3d)?;
 
     lua.globals().set("shaders", shaders)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn three_d_fragment_aliases_share_the_fragment_shader_contract() {
+        let lua = Lua::new();
+        add_shader_module(&lua, PathBuf::from(".")).expect("shader module");
+        let shaders: Table = lua.globals().get("shaders").expect("shaders global");
+
+        let create: mlua::Function = shaders
+            .get("from3DFragmentSource")
+            .expect("3D source constructor");
+        let shader: AnyUserData = create
+            .call((
+                "#version 450\nvoid main() { gl_FragColor = color; }",
+                mlua::Value::Nil,
+            ))
+            .expect("3D fragment handle");
+        lua.globals()
+            .set("materialShader", shader.clone())
+            .expect("shader test global");
+        lua.load("materialShader:setUniformColor('Tint', { r = 255, g = 128, b = 0, a = 64 })")
+            .exec()
+            .expect("color uniform");
+        let shader = shader.borrow::<ShaderHandle>().expect("shader userdata");
+        assert_eq!(shader.vertex_source, DEFAULT_VERTEX_SHADER);
+        assert!(shader.fragment_source.contains("gl_FragColor"));
+        let uniforms = shader.uniforms.lock().expect("uniforms");
+        let tint = uniforms.floats.get("Tint").expect("Tint uniform");
+        assert_eq!(tint[0], 1.0);
+        assert!((tint[1] - 128.0 / 255.0).abs() < 1e-6);
+        assert_eq!(tint[2], 0.0);
+        assert!((tint[3] - 64.0 / 255.0).abs() < 1e-6);
+        drop(uniforms);
+        drop(shader);
+
+        let supports: bool = shaders
+            .get::<mlua::Function>("supports3DShaders")
+            .expect("capability query")
+            .call(())
+            .expect("capability result");
+        assert_eq!(supports, THREE_D_SHADERS_AVAILABLE);
+        assert!(shaders.contains_key("load3DFragment").expect("load alias"));
+    }
+
+    #[test]
+    fn portable_fragment_source_is_normalized_for_webgl_one() {
+        let source = build_web_fragment_source(
+            "#version 450\nprecision highp float;\nuniform sampler2D Texture;\n\
+             void main() { gl_FragColor = texture(Texture, uv) * color; }",
+        );
+        assert!(!source.contains("#version"));
+        assert_eq!(source.matches("precision ").count(), 1);
+        assert!(source.contains("varying mediump vec2 uv;"));
+        assert!(source.contains("varying mediump vec4 color;"));
+        assert!(source.contains("texture2D(Texture, uv)"));
+    }
+
+    #[test]
+    fn uniform_storage_has_backend_portable_limits() {
+        let mut uniforms = ShaderUniforms::default();
+        for index in 0..MAX_SHADER_FLOAT_UNIFORMS {
+            uniforms
+                .set_floats(format!("Value{index}"), vec![index as f32])
+                .expect("uniform within limit");
+        }
+        assert!(
+            uniforms
+                .set_floats("Overflow".to_string(), vec![0.0])
+                .expect_err("uniform overflow")
+                .contains("maximum")
+        );
+        uniforms
+            .set_floats("Value0".to_string(), vec![42.0])
+            .expect("replacing a uniform does not consume a slot");
+    }
 }

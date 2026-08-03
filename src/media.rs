@@ -1647,7 +1647,13 @@ mod backend {
                 channels: AtomicUsize::new(1),
             };
             push_audio(&[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0], &audio);
-            let samples: Vec<_> = audio.queue.lock().unwrap().iter().copied().collect();
+            let samples: Vec<_> = audio
+                .queue
+                .lock()
+                .expect("audio queue lock should remain available")
+                .iter()
+                .copied()
+                .collect();
             assert_eq!(samples, vec![2.0, 3.0, 4.0, 5.0]);
             assert_eq!(audio.dropped_samples.load(Ordering::Relaxed), 4);
         }
@@ -1681,9 +1687,21 @@ mod backend {
 
             stop_stream(&backend);
 
-            assert!(audio.queue.lock().unwrap().is_empty());
+            assert!(
+                audio
+                    .queue
+                    .lock()
+                    .expect("audio queue lock should remain available")
+                    .is_empty()
+            );
             assert_eq!(audio.dropped_samples.load(Ordering::Relaxed), 0);
-            assert!(video.latest.lock().unwrap().is_none());
+            assert!(
+                video
+                    .latest
+                    .lock()
+                    .expect("video frame lock should remain available")
+                    .is_none()
+            );
             assert_eq!(video.dropped_frames.load(Ordering::Relaxed), 0);
         }
     }
@@ -2455,13 +2473,13 @@ mod tests {
                 request_id: 7,
                 result: Err(MediaError::cancelled()),
             })
-            .unwrap();
+            .expect("cancelled device event should enter the test queue");
         sender
             .send(BackendEvent::Devices {
                 request_id: 7,
                 result: Ok(Vec::new()),
             })
-            .unwrap();
+            .expect("duplicate device event should enter the test queue");
         let state = Rc::new(RefCell::new(MediaState {
             pending,
             sender,
@@ -2510,8 +2528,10 @@ mod tests {
     #[test]
     fn stopping_stream_wipes_retained_camera_image_without_unloading_it() {
         let (backend, _stopped) = backend::test_stream();
-        let image =
-            ImageHandle::from_rgba_image(RgbaImage::from_raw(1, 1, vec![7, 8, 9, 255]).unwrap());
+        let image = ImageHandle::from_rgba_image(
+            RgbaImage::from_raw(1, 1, vec![7, 8, 9, 255])
+                .expect("one RGBA pixel should form a 1x1 image"),
+        );
         let retained = image.clone();
         let stream = MediaStreamInner {
             backend,

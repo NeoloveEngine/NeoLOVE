@@ -79,7 +79,12 @@ fn parse_direction(value: Option<String>) -> mlua::Result<EaseDirection> {
         return Ok(EaseDirection::Out);
     };
 
-    match value.trim().to_ascii_lowercase().replace(['_', '-'], "").as_str() {
+    match value
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '-'], "")
+        .as_str()
+    {
         "in" => Ok(EaseDirection::In),
         "out" => Ok(EaseDirection::Out),
         "inout" => Ok(EaseDirection::InOut),

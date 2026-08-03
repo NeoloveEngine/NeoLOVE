@@ -37,7 +37,8 @@ contract.
 | Files and processes | `fs`, `commands`, `command` |
 | Networking | `http`, `servers` |
 | Gameplay helpers | `async`, `prefabs`, `prefab`, `tweening`, `tween`, `animation`, `animations` |
-| Rendering | `shaders`, `lighting` |
+| Rendering | `shaders`, `lighting`, `postprocess`, `postProcess`, `environment3d`, `environment3D`, `skybox` |
+| 3D physics | `physics3d`, `physics3D` |
 | Global helpers | `Color4`, `Inspector`, `die`, `softrequire`, `Rng` |
 | Editor declaration names | `IComponentPicker`, `IEntity`, `IComponent`, `IImage`, `IAudio`, `IShader`, `IAnimation` |
 
@@ -482,6 +483,18 @@ remapped when a prefab is instantiated or an entity subtree is duplicated.
 - Multi-selection, grouping, visibility isolation, locking, alignment, z-order,
   size normalization, and window-fit operations.
 - Tile painting while a `Tilemap2D` is selected.
+- In 3D scenes, RMB drag looks around, WASD/QE flies, Shift boosts, and MMB
+  pans. A short RMB click opens the selected-entity or empty-viewport context
+  menu; crossing the drag threshold suppresses the menu.
+- The 3D Move gizmo has X/Y/Z axis handles and a free center drag; Scale has
+  X/Y/Z handles and a uniform center handle; Rotate has X/Y/Z rings that edit
+  the corresponding Euler angles. The grid-snapping toggle applies to 3D
+  transforms as well as 2D tools.
+- The adaptive 3D ground grid follows the camera with bounded fine/coarse line
+  budgets, producing an effectively infinite view without unbounded draw work.
+  Its lines are clipped at the camera near plane before projection.
+- Camera sensitivity, movement speed, FOV, and inverted vertical mouse look
+  are configurable under global Editor Settings.
 
 Holding `Ctrl` while moving a parent preserves descendant world positions.
 Holding `Ctrl` during corner resize preserves aspect ratio. Arrow-key nudging
@@ -653,6 +666,10 @@ than intended for manual editing.
 | `mobile_wifi` | boolean | `true` |
 | `mobile_cellular` | boolean | `false` |
 | `mobile_low_power` | boolean | `false` |
+| `viewport_camera_sensitivity` | number (`0.05..8`) | `1` |
+| `viewport_camera_speed` | number (`0.1..1000`) | `10` |
+| `viewport_camera_fov` | degrees (`20..140`) | `60` |
+| `viewport_invert_mouse_look` | boolean | `false` |
 
 Named `theme_name` values are `dark_plus`, `gruvbox_dark`, `dracula`,
 `monokai`, `solarized_dark`, `light_plus`, and `custom`. Changing presets does
@@ -860,6 +877,9 @@ Aliases reference the same module or operation unless noted:
 | `tweening` | `tween` |
 | `animation` | `animations` |
 | `transform` | `transforms` |
+| `postprocess` | `postProcess` |
+| `physics3d` | `physics3D` |
+| `environment3d` | `environment3D`, `skybox` |
 | `microphone` | `media.microphone` |
 | `microphone.listDevices` | `microphone.enumerateDevices` |
 | `core.Panel` | `core.Frame` |
@@ -1055,7 +1075,7 @@ export type AppModule = {
 | `maxFps` | `nil` | Positive finite desktop/web frame cap. `nil` is uncapped. Prefer the setter. |
 | `showFps` | `true` | Whether the presenter draws its FPS indicator. Prefer the setter. |
 | `nearestNeighborScaling` | `true` | `true` selects nearest-neighbor image filtering; `false` selects linear filtering. |
-| `antiAliasing` | `high` | Global geometry and default text quality. The runtime also reads lowercase `antialiasing` as a fallback. |
+| `antiAliasing` | `high` | Global 2D geometry, 3D mesh/particle, custom-shader, and default text quality. The runtime also reads lowercase `antialiasing` as a fallback. |
 
 ## Function reference
 
@@ -1074,6 +1094,12 @@ Replacing the global `app` table is supported: the functions look up the
 current table when called. Desktop frame pacing also reads the current table.
 The parser maps `none`, `disabled`, and `pixel` to `off`; `fast`, `normal`, and
 `on` to `standard`; and every other string to `high`.
+
+The setting is live: changing it rebuilds Vulkan multisample attachments when
+needed, selects the software 3D edge pass, and selects the browser shader
+surface on the next frame. Hardware sample availability can make a backend
+fall back to a lower level; the detailed backend table is in
+[Rendering Details](#anti-aliasing).
 
 ```luau
 app.setMaxFps(120)
@@ -2513,8 +2539,12 @@ export type ShadersModule = {
     DEFAULT_VERTEX_SHADER: string,
     load: (vertexPath: string, fragmentPath: string, options: ShaderLoadOptions?) -> ShaderHandle,
     loadFragment: (fragmentPath: string, options: ShaderLoadOptions?) -> ShaderHandle,
+    load3DFragment: (fragmentPath: string, options: ShaderLoadOptions?) -> ShaderHandle,
     fromSource: (vertexSource: string, fragmentSource: string, options: ShaderLoadOptions?) -> ShaderHandle,
     fromFragmentSource: (fragmentSource: string, options: ShaderLoadOptions?) -> ShaderHandle,
+    from3DFragmentSource: (fragmentSource: string, options: ShaderLoadOptions?) -> ShaderHandle,
+    supports3D: () -> boolean,
+    supports3DShaders: () -> boolean,
 }
 
 export type ShaderHandle = {
@@ -2529,20 +2559,31 @@ export type ShaderHandle = {
 
 | Function | Parameters | Returns | Behavior and edge cases |
 | --- | --- | --- | --- |
-| `shaders.load(vertexPath, fragmentPath, options?)` | Two project resource paths and optional compatibility options. | Compiled `ShaderHandle`. | Reads and compiles both sources. Missing/escaping paths, UTF-8/I/O failures, unsupported renderer, and compile/link errors raise with diagnostics. |
-| `shaders.loadFragment(fragmentPath, options?)` | Fragment path and optional options. | Compiled `ShaderHandle`. | Uses `DEFAULT_VERTEX_SHADER` for the vertex stage; otherwise has the same failures as `load`. |
-| `shaders.fromSource(vertexSource, fragmentSource, options?)` | Complete GLSL source strings and optional options. | Compiled `ShaderHandle`. | Compiles directly without filesystem resolution. Empty/invalid source and backend failures raise. |
-| `shaders.fromFragmentSource(fragmentSource, options?)` | Fragment GLSL and optional options. | Compiled `ShaderHandle`. | Pairs the source with the default vertex shader. |
+| `shaders.load(vertexPath, fragmentPath, options?)` | Two project resource paths and optional compatibility options. | `ShaderHandle`. | Reads both sources immediately. The current renderer retains the vertex source for compatibility but uses its fixed projected-vertex stage; use a fragment constructor for portable 2D/3D shaders. Missing/escaping paths and UTF-8/I/O failures raise immediately. |
+| `shaders.loadFragment(fragmentPath, options?)` | Fragment path and optional options. | `ShaderHandle`. | Reads the fragment and pairs it with `DEFAULT_VERTEX_SHADER`. Backend compilation is lazy at the first draw. |
+| `shaders.load3DFragment(fragmentPath, options?)` | Fragment path and optional options. | `ShaderHandle`. | Explicit 3D-material alias of `loadFragment`; assign the result to `MeshRenderer3D.shader`. The same handle can also be used by a 2D drawable. |
+| `shaders.fromSource(vertexSource, fragmentSource, options?)` | Complete GLSL source strings and optional options. | `ShaderHandle`. | Stores both strings without filesystem resolution. The fixed projected-vertex limitation above still applies. |
+| `shaders.fromFragmentSource(fragmentSource, options?)` | Fragment GLSL and optional options. | `ShaderHandle`. | In-memory counterpart of `loadFragment`. |
+| `shaders.from3DFragmentSource(fragmentSource, options?)` | Fragment GLSL and optional options. | `ShaderHandle`. | Explicit 3D-material alias of `fromFragmentSource`. |
+| `shaders.supports3D()` / `supports3DShaders()` | None. | `boolean`. | `true` for WebGL exports and binaries compiled with the `vulkan` feature; `false` for software-only native binaries. A Vulkan initialization failure can still force a capable binary onto the unsupported software fallback. |
+
+Shader handles are lightweight source/uniform objects. File reads happen in
+the `load...` call, while GLSL parsing, compilation, linking, and pipeline-cache
+creation happen lazily when a compatible renderer first draws the handle.
+Consequently, syntax and driver errors are reported by that draw rather than by
+the constructor. Compiled Vulkan/WebGL programs are cached by normalized source
+until the relevant render resources are rebuilt.
 
 The current runtime accepts `options` for compatibility but does not require
 its `uniforms`, `images`/`textures`, or `pipelines` lists to create uniform
 slots. Unknown option keys are ignored. `DEFAULT_VERTEX_SHADER` is a readable
-string containing the built-in GLSL; assigning a new value does not rewrite an
-already compiled shader.
+string containing the projected-vertex contract; assigning a new value does
+not rewrite existing handles or the renderer's fixed vertex stage.
 
-Float uniform storage is bounded to 16 named entries and texture uniforms to 4.
-`setUniformColor` converts byte channels to normalized floats. `setTexture`
-requires a live uploaded image.
+Float/vector uniform storage is bounded to 16 distinct names and extra texture
+storage to 4 distinct names. Replacing an existing name does not consume a new
+slot. `setUniformColor` converts `Color4` byte channels to normalized floats.
+`setTexture` requires a live uploaded image.
 
 | Handle method | Parameters | Returns | Behavior and edge cases |
 | --- | --- | --- | --- |
@@ -2551,7 +2592,37 @@ requires a live uploaded image.
 | `shader:setUniform3f(name, x, y, z)` | Name and three numbers. | `()` | Same rules, three components. |
 | `shader:setUniform4f(name, x, y, z, w)` | Name and four numbers. | `()` | Same rules, four components. |
 | `shader:setUniformColor(name, color)` | Name and `Color4Value`. | `()` | Converts byte channels to `0..1` floats and stores a four-component uniform. Invalid/missing color channels raise. |
-| `shader:setTexture(name, image)` | Sampler name and live `ImageHandle`. | `()` | Stores/replaces one texture binding. The image is uploaded as needed by rendering; unloaded images raise. More than four distinct texture names raises. |
+| `shader:setTexture(name, image)` | Sampler name and live `ImageHandle`. | `()` | Stores/replaces one extra texture binding. The image is uploaded as needed by rendering; unloaded images raise. More than four distinct names raises. Extra named samplers are currently Vulkan-only; `Texture` itself comes from the drawable/mesh `texture` field. |
+
+## Portable fragment contract
+
+NeoLOVE supplies `uv` (`vec2`) and `color` (`vec4`) to the fragment stage.
+For a 3D mesh, `color` already contains the mesh tint, vertex color, and current
+diffuse-light result; `uv` is perspective-correct. Declare the base sampler as
+`uniform sampler2D Texture;`. Float, `vec2`, `vec3`, and `vec4` uniforms must be
+declared one per line so the Vulkan binding rewriter can assign deterministic
+slots. `gl_FragCoord.z` is available for screen/depth effects, although its
+numeric mapping is backend-specific.
+
+The portable asset dialect uses `#version 450`, `texture2D`, and
+`gl_FragColor`. Vulkan rewrites those compatibility forms into its descriptor
+layout. Web exports strip the desktop version/precision directives, inject the
+matching WebGL 1 varyings, and normalize `texture` calls to `texture2D`. Do not
+redeclare `uv` or `color` in portable assets.
+
+```glsl
+#version 450
+
+uniform sampler2D Texture;
+uniform vec4 Tint;
+uniform float Pulse;
+
+void main() {
+    vec4 base = texture2D(Texture, uv) * color;
+    float rim = smoothstep(0.15, 0.85, 1.0 - gl_FragCoord.z);
+    gl_FragColor = vec4(base.rgb * Tint.rgb * (1.0 + rim * Pulse), base.a * Tint.a);
+}
+```
 
 ```luau
 local tintShader = shaders.loadFragment("shaders/tint.frag")
@@ -2565,8 +2636,9 @@ image.shader = tintShader
 ```
 
 Custom shaders require a Vulkan-feature desktop build. WebAssembly supports
-fragment shaders for rectangles, primitive shapes, and images through WebGL;
-the built-in sampler is named `Texture`.
+the same portable fragment contract for rectangles, primitive shapes, images,
+and `MeshRenderer3D` through WebGL. The native software renderer reports an
+actionable error instead of silently drawing a shader incorrectly.
 
 <!-- page: lighting | 2D Lighting -->
 # 2D Lighting
@@ -3473,6 +3545,218 @@ They are visible because components are Luau tables, but gameplay must not call,
 replace, serialize independently, or depend on those fields.
 :::
 
+<!-- page: rendering-3d | 3D Rendering, Animation, and Particles -->
+# 3D Rendering, Animation, and Particles
+
+3D entities reuse `x` and `y`, add `position_z`, and use XYZ Euler degrees in
+`rotation_x`, `rotation_y`, and `rotation_z`. Per-axis scale is stored in
+`scale_x`, `scale_y`, and `scale_z`. These fields are independent from the
+legacy 2D `rotation`, uniform `scale`, and draw-order `z` fields.
+
+## Cameras, lights, and mesh renderers
+
+`core.Camera3D` supports perspective and orthographic projection, `fov`,
+`orthographic_size`, and near/far clipping. The first enabled camera is the
+fallback; `camera:SetActive()` selects another camera explicitly. The editor
+draws a camera-body, lens, viewfinder, and frustum proxy for camera entities.
+
+`core.Light3D` supports `point`, `spot`, and `directional` lights. Intensity,
+range, spot angle/softness, color, and Euler-authored direction are evaluated
+by the current diffuse 3D lighting path.
+
+`core.MeshRenderer3D` accepts a `MeshHandle`, `mesh_path`, base texture, tint,
+custom mesh shader, and `double_sided` rendering. An imported `mesh_path` takes
+precedence over its generic primitive controls:
+
+```luau
+local model = ecs.newEntity("Model", ecs.root, 0, 0)
+local renderer = model:AddComponent(core.MeshRenderer3D)
+renderer.primitive = "sphere" -- cube, sphere, plane, cylinder, capsule, cone
+renderer.primitive_radius = 0.75
+renderer.primitive_segments = 32
+renderer.primitive_rings = 16
+```
+
+New visual-editor mesh components default to a cube. A component created
+directly with `AddComponent` defaults to `primitive = "none"` so the established
+`renderer.mesh = assets.loadMesh(...)` script pattern remains an explicit
+manual mesh and is not replaced on its first update.
+
+Scripts can obtain the same cached geometry with
+`assets.primitiveMesh(kind, options)`. Options include uniform/axis sizes,
+radius, height, segments, and rings. Sizes must be positive; segments are
+bounded to `3..1024`, rings to `1..512`, spheres require at least two rings,
+and capsule height must be at least twice its radius.
+
+## Custom 3D material shaders
+
+Assign any fragment `ShaderHandle` to `MeshRenderer3D.shader`. The explicit
+`load3DFragment` and `from3DFragmentSource` names are aliases of the shared
+fragment constructors, so materials and 2D drawables use one uniform API and
+pipeline cache:
+
+```luau
+local model = ecs.newEntity("Shader model", ecs.root, 0, 0)
+local renderer = model:AddComponent(core.MeshRenderer3D)
+renderer.mesh = assets.loadMesh("assets/model.glb")
+renderer.texture = assets.loadImage("assets/model_albedo.png")
+
+if shaders.supports3DShaders() then
+    local material = shaders.load3DFragment("shaders/rim.frag")
+    material:setUniformColor("Tint", Color4(160, 210, 255))
+    material:setUniform1f("Pulse", 0.35)
+    renderer.shader = material
+else
+    print("This native build uses the software-only shader fallback")
+end
+
+app.setAntiAliasing("high")
+```
+
+The sibling [`3d-shaders-aa`](../samples/3d-shaders-aa) sample is a runnable
+version with a procedural material, capability fallback, live uniforms, and
+keys `1`/`2`/`3` for the three AA modes.
+
+When `texture` is absent, the built-in `Texture` sampler receives opaque white.
+Mesh UVs are perspective-correct and the supplied `color` includes current CPU
+diffuse lighting, so a fragment shader can preserve it by multiplying its base
+sample by `color`. See [Portable fragment contract](#portable-fragment-contract)
+for the complete input, declaration, uniform-limit, and GLSL rules.
+
+| Backend | 3D shader behavior |
+| --- | --- |
+| Vulkan-feature desktop | Fragment programs compile lazily, use the existing depth-tested mesh pipeline, and inherit the selected device MSAA sample count. |
+| Web export | Portable fragments are normalized for WebGL 1. Projected depth is tested within each mesh command; separate WebGL mesh commands are composited in submission order and do not share depth with software-rendered meshes. |
+| Native software-only/fallback | Unshaded meshes render normally, including software 3D antialiasing. A mesh with `shader` raises an actionable renderer error because arbitrary GLSL is not interpreted on the CPU. |
+
+The current programmable stage is fragment-only. Mesh projection and lighting
+are prepared before submission, and stored custom vertex sources do not replace
+that stage. Use entity transforms, mesh editing, skinning, or particles to
+change geometry; use the shader for material/color/texture/depth effects.
+
+## 3D antialiasing
+
+`app.setAntiAliasing("off" | "standard" | "high")` applies to meshes,
+3D particles, and custom mesh shaders as well as existing 2D drawing. Vulkan
+uses supported multisampling, ordinary web meshes use the software 3D path,
+and custom web shaders select an antialiased/supersampled WebGL surface. The
+software 3D filter uses luminance and depth discontinuities after opaque meshes
+and transparent particle billboards, then the normal 2D stream draws on top;
+it therefore cannot soften UI overlays. See the backend quality table under
+[Anti-aliasing](#anti-aliasing).
+
+## Imported and live-edited meshes
+
+`assets.loadMesh` supports OBJ, glTF 2.0 (`.gltf`), binary glTF (`.glb`), and
+ASCII/binary FBX geometry. `assets.newMesh(vertices, indices?)` creates a mesh
+from one-based Luau tables. Mesh handles are shared, revisioned assets:
+
+```luau
+local mesh = assets.loadMesh("assets/terrain.glb")
+mesh:setPosition(1, -1, 0.5, 0, true)
+mesh:setMaterialColor(1, Color4(255, 180, 120))
+mesh:setMaterialTexture(1, "base_color", "assets/albedo.png")
+renderer.mesh = mesh
+```
+
+`getVertex`, `setVertex`, `getIndex`, `setIndex`, `replaceGeometry`, and
+`recomputeNormals` update geometry atomically. A failed validation leaves the
+previous snapshot intact. Mesh colliders and every renderer using the identity
+observe successful revisions. Image handles are revisioned too, so editing the
+assigned texture in a script is visible without replacing it.
+
+## Armatures and imported animation
+
+glTF/GLB imports one flattened skin per asset, joint weights, inverse-bind
+matrices, and LINEAR/STEP translation, quaternion-rotation, and scale clips.
+ASCII FBX supports a practical single-skinned-geometry subset built from
+Model/Skin/Cluster objects and XYZ animation curves.
+
+`MeshHandle` exposes `animationNames`, `animationDuration`, `jointCount`,
+`sampleAnimation`, `playAnimation`, `updateAnimation`, `pauseAnimation`, and
+`stopAnimation`. Cached handles share a pose; call `cloneDetached()` before
+manually animating several instances independently.
+
+The `MeshRenderer3D` fields `animation`, `animation_autoplay`,
+`animation_looping`, `animation_playing`, and `animation_speed` provide
+component-managed playback. Setting `animation` causes the component to take
+an independent detached pose automatically. `PlayAnimation(clip?)`,
+`PauseAnimation()`, and `StopAnimation()` have lowercase aliases.
+Component-managed `animation_speed` must be finite and non-negative; reverse
+initialization is not implemented. The lower-level `MeshHandle` methods remain
+available when a script needs complete manual sampling control.
+
+```luau
+renderer.mesh = assets.loadMesh("assets/character.glb")
+renderer.animation = "Walk"
+renderer.animation_looping = true
+renderer:PlayAnimation()
+```
+
+Skinning currently runs on the CPU and publishes a new immutable vertex
+snapshot. Multi-skin flattened assets, morph targets, glTF CUBICSPLINE,
+compressed/sparse accessors, and binary-FBX armature/animation data are not yet
+supported. Use ASCII FBX 7.x or glTF 2.0 when animation is required.
+
+## Environment and skybox control
+
+`core.Environment3D` (`core.Skybox3D` alias) renders before depth-tested
+geometry. Its modes are `solid`, `gradient`, and `equirectangular`. A panorama
+follows camera rotation but ignores camera translation. The component fields
+are `enabled`, `mode`, `color`, `top_color`, `bottom_color`, `texture`,
+`texture_path`, `rotation`, and `intensity`.
+
+Scripts without an environment entity can use the identical global aliases
+`environment3d`, `environment3D`, and `skybox`:
+
+```luau
+skybox.setGradient(Color4(30, 47, 78), Color4(8, 10, 16))
+skybox.setEquirectangular(assets.loadImage("assets/panorama.png"), 20)
+skybox.setIntensity(1.2)
+skybox.setEnabled(true)
+-- skybox.clear() removes the script-owned environment.
+```
+
+Only equirectangular panoramas are currently supported; six-face cubemaps are
+not. The software/web panorama representation is cached by image revision.
+
+## `core.ParticleSystem3D`
+
+Each 3D emitter owns a fixed-capacity native pool (up to 100,000 particles)
+and submits one camera-facing billboard batch. It supports point, box, sphere,
+and cone emission; deterministic seeds; duration/looping; emission rate and
+manual bursts; lifetime/speed ranges; gravity and drag; size/color fades;
+rotation; and an optional texture.
+
+```luau
+local sparks = emitter:AddComponent(core.ParticleSystem3D)
+sparks.shape = "cone"
+sparks.max_particles = 4096
+sparks.playing = false
+sparks:Emit(256)
+```
+
+`Play`, `Pause`, `Stop`, and `Emit(count?)` have lowercase aliases.
+`particle_count` is engine-derived. Simulation and per-emitter transparency
+sorting are CPU-side; particles are not globally sorted between emitters.
+
+## Backend and resolution behavior
+
+The software renderer lazily allocates depth and 3D-AA scratch surfaces only
+when needed and samples textures from immutable copy-on-write snapshots. Its
+3D edge pass runs before 2D overlays. Vulkan uses a depth-tested, configurable
+MSAA GPU raster path, although mesh projection/lighting and skinning remain
+CPU-side and projected triangles are streamed rather than retained as indexed
+GPU meshes. WebAssembly composites ordinary meshes through the antialiased
+software path and depth-tested custom-shader meshes through WebGL; high-quality
+WebGL shader AA uses bounded 2× supersampling when device limits permit it.
+
+Native editor/runtime framebuffers use logical pixels at high-DPI scale factors
+and expand once for presentation. Lighting quality tiers enforce bounded,
+monotonic light-map texel budgets at 4K and 8K. These changes reduce resolution
+scaling costs, but they are not a claim of universal performance superiority
+over other engines; project-specific profiling is still required.
+
 <!-- page: layout-effects | Layout, Effects, and Audio Components -->
 # Layout, Effects, and Audio Components
 
@@ -4002,11 +4286,8 @@ end
 field:focus()
 ```
 
-::: warning
-UI callbacks receive the owning `entity` first and the component instance
-second. The current generated declaration file omits that second parameter;
-the implemented callback signatures above are authoritative.
-:::
+The generated declaration file uses these same callback signatures, including
+the owning `entity` first and the component instance second.
 
 <!-- page: ui-components | UI Components -->
 # UI Components
@@ -4811,15 +5092,19 @@ tiles, particles, and custom shader textures use the same global choice.
 
 ## Anti-aliasing
 
-| Mode | Software geometry | Text |
-| --- | --- | --- |
-| `off` | hard single-sample edges | hard masks |
-| `standard` | 2× edge coverage | normal grayscale glyph rasterization |
-| `high` | 4× geometry edge coverage | 2× supersampled glyphs with premultiplied downsampling |
+| Mode | Software 2D | Software 3D | Vulkan geometry / 3D shaders | WebGL custom 3D shaders | Text |
+| --- | --- | --- | --- | --- | --- |
+| `off` | Hard single-sample edges. | Center-sampled triangle coverage; no 3D scratch surface. | 1× rasterization. | Context antialiasing disabled; 1× surface. | Hard masks. |
+| `standard` | 2× edge coverage. | Light depth/luminance-aware edge smoothing. | Requests 2× MSAA, falling back to 1× if unsupported. | Requests browser WebGL multisampling at 1× surface resolution. | Normal grayscale glyph rasterization. |
+| `high` | 4× geometry edge coverage. | Stronger depth/luminance-aware diagonal smoothing. | Requests 4× MSAA, then 2×/1× according to device support. | Browser multisampling plus a 2×-per-axis shader surface when renderbuffer limits allow; otherwise standard surface resolution. | 2× supersampled glyphs with premultiplied downsampling. |
 
-Vulkan selects the best supported device MSAA level for geometry. Text still
-uses the selected text path because glyphs are rasterized before upload.
-Individual text components may override the global mode.
+Ordinary unshaded web meshes use the software 3D column. The software 3D pass
+runs after meshes and 3D particles but before the established 2D command
+stream, so a canvas, HUD, or editor overlay is not blurred by mesh AA. Vulkan
+sample-count changes recreate the compatible render pass, depth/MSAA
+attachments, built-in pipeline, and cached custom fragment pipelines. Text is
+rasterized before upload and individual text components may override the global
+mode.
 
 ## Transforms and ordering
 
@@ -4991,7 +5276,11 @@ created before user interaction.
 ## A custom shader fails on desktop
 
 Install/build NeoLOVE with `--features vulkan`. If Vulkan initialization falls
-back to software, inspect the warning for driver/runtime details.
+back to software, inspect the warning for driver/runtime details. Check
+`shaders.supports3DShaders()` before assigning an optional 3D material, and
+remember that parsing/driver compilation is lazy: a syntax error is reported
+when the shader is first drawn. Custom vertex stages are not currently applied;
+use `load3DFragment` for the supported mesh-material path.
 
 ## A table or component field seems absent from autocomplete
 

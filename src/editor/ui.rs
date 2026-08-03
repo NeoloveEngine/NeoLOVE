@@ -9,12 +9,13 @@
 //! another. It has no external GUI dependency, keeping the editor self-contained
 //! within the engine crate.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use fontdue::Font;
+use fontdue::{Font, Metrics};
 use serde::{Deserialize, Serialize};
 
 /// Open Sans — a clean, highly legible proportional sans-serif used for all
@@ -23,6 +24,13 @@ const EDITOR_FONT_BYTES: &[u8] = include_bytes!("assets/OpenSans-Regular.ttf");
 
 /// Google Material Icons, rendered by codepoint for editor glyphs.
 const ICON_FONT_BYTES: &[u8] = include_bytes!("assets/MaterialIcons-Regular.ttf");
+
+/// UI labels reuse a very small set of font sizes and characters. Caching the
+/// coverage masks avoids asking `fontdue` to rasterize the same glyph hundreds
+/// of times every redraw. Both limits are deliberately conservative: custom
+/// fonts and unusual Unicode input cannot grow editor memory without bound.
+const GLYPH_CACHE_ENTRY_LIMIT: usize = 1_024;
+const GLYPH_CACHE_BYTE_LIMIT: usize = 8 * 1024 * 1024;
 
 /// Named Google Material Icons codepoints used across the editor.
 pub mod icon {
@@ -188,21 +196,21 @@ impl Default for Theme {
     fn default() -> Self {
         // Visual Studio Code "Dark+" palette.
         Self {
-            panel: [37, 37, 38, 255],         // #252526 side bar
-            panel_alt: [45, 45, 45, 255],     // #2d2d2d
-            toolbar: [60, 60, 60, 255],       // #3c3c3c title bar
-            viewport_bg: [30, 30, 30, 255],   // #1e1e1e editor
-            border: [69, 69, 69, 255],        // #454545
-            text: [212, 212, 212, 255],       // #d4d4d4
-            text_dim: [133, 133, 133, 255],   // #858585
-            button: [14, 99, 156, 255],       // #0e639c
+            panel: [37, 37, 38, 255],          // #252526 side bar
+            panel_alt: [45, 45, 45, 255],      // #2d2d2d
+            toolbar: [60, 60, 60, 255],        // #3c3c3c title bar
+            viewport_bg: [30, 30, 30, 255],    // #1e1e1e editor
+            border: [69, 69, 69, 255],         // #454545
+            text: [212, 212, 212, 255],        // #d4d4d4
+            text_dim: [133, 133, 133, 255],    // #858585
+            button: [14, 99, 156, 255],        // #0e639c
             button_hover: [17, 119, 187, 255], // #1177bb
-            button_active: [9, 71, 113, 255], // #094771 selection
-            field: [60, 60, 60, 255],         // #3c3c3c input
+            button_active: [9, 71, 113, 255],  // #094771 selection
+            field: [60, 60, 60, 255],          // #3c3c3c input
             field_focus: [45, 45, 45, 255],
-            accent: [0, 122, 204, 255],        // #007acc
-            selection: [255, 199, 89, 255],    // viewport gizmo amber
-            danger: [241, 76, 76, 255],        // #f14c4c
+            accent: [0, 122, 204, 255],     // #007acc
+            selection: [255, 199, 89, 255], // viewport gizmo amber
+            danger: [241, 76, 76, 255],     // #f14c4c
             splitter: [51, 51, 51, 255],
             splitter_hover: [0, 122, 204, 255],
             header: [51, 51, 51, 255],
@@ -262,6 +270,133 @@ fn round_rect_sdf(rect: Rect, radius: f32, cx: f32, cy: f32) -> f32 {
 pub struct Fonts {
     pub text: Arc<Font>,
     pub icons: Arc<Font>,
+    glyph_cache: Arc<Mutex<GlyphRasterCache>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum FontFace {
+    Text,
+    Icons,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GlyphCacheKey {
+    face: FontFace,
+    character: char,
+    size_bits: u32,
+}
+
+#[derive(Debug)]
+struct CachedGlyph {
+    metrics: Metrics,
+    bitmap: Box<[u8]>,
+}
+
+#[derive(Debug)]
+struct GlyphCacheEntry {
+    glyph: Arc<CachedGlyph>,
+    last_used: u64,
+}
+
+#[derive(Debug)]
+struct GlyphRasterCache {
+    entries: HashMap<GlyphCacheKey, GlyphCacheEntry>,
+    bitmap_bytes: usize,
+    clock: u64,
+    entry_limit: usize,
+    byte_limit: usize,
+}
+
+impl GlyphRasterCache {
+    fn new(entry_limit: usize, byte_limit: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            bitmap_bytes: 0,
+            clock: 0,
+            entry_limit,
+            byte_limit,
+        }
+    }
+
+    fn get(&mut self, key: GlyphCacheKey) -> Option<Arc<CachedGlyph>> {
+        self.clock = self.clock.wrapping_add(1);
+        let entry = self.entries.get_mut(&key)?;
+        entry.last_used = self.clock;
+        Some(Arc::clone(&entry.glyph))
+    }
+
+    fn insert(&mut self, key: GlyphCacheKey, glyph: Arc<CachedGlyph>) {
+        let bytes = glyph.bitmap.len();
+        if self.entry_limit == 0 || bytes > self.byte_limit {
+            return;
+        }
+        if let Some(existing) = self.entries.remove(&key) {
+            self.bitmap_bytes = self
+                .bitmap_bytes
+                .saturating_sub(existing.glyph.bitmap.len());
+        }
+        while !self.entries.is_empty()
+            && (self.entries.len() >= self.entry_limit
+                || self.bitmap_bytes.saturating_add(bytes) > self.byte_limit)
+        {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.bitmap_bytes = self.bitmap_bytes.saturating_sub(removed.glyph.bitmap.len());
+            }
+        }
+        self.clock = self.clock.wrapping_add(1);
+        self.bitmap_bytes = self.bitmap_bytes.saturating_add(bytes);
+        self.entries.insert(
+            key,
+            GlyphCacheEntry {
+                glyph,
+                last_used: self.clock,
+            },
+        );
+    }
+}
+
+impl Fonts {
+    fn rasterize_cached(&self, face: FontFace, character: char, size: f32) -> Arc<CachedGlyph> {
+        let key = GlyphCacheKey {
+            face,
+            character,
+            size_bits: size.to_bits(),
+        };
+        if let Ok(mut cache) = self.glyph_cache.lock()
+            && let Some(glyph) = cache.get(key)
+        {
+            return glyph;
+        }
+
+        // Rasterize outside the lock so separate editor windows never block
+        // each other on the expensive part of a cache miss.
+        let font = match face {
+            FontFace::Text => &self.text,
+            FontFace::Icons => &self.icons,
+        };
+        let (metrics, bitmap) = font.rasterize(character, size);
+        let glyph = Arc::new(CachedGlyph {
+            metrics,
+            bitmap: bitmap.into_boxed_slice(),
+        });
+        if let Ok(mut cache) = self.glyph_cache.lock() {
+            // Another window may have populated the same key meanwhile. Reuse
+            // that allocation and discard this duplicate if so.
+            if let Some(existing) = cache.get(key) {
+                return existing;
+            }
+            cache.insert(key, Arc::clone(&glyph));
+        }
+        glyph
+    }
 }
 
 /// An active rotation applied to subsequent drawing: rotate by `angle`
@@ -280,7 +415,7 @@ pub struct Painter<'a> {
     width: usize,
     height: usize,
     font: Arc<Font>,
-    icon_font: Arc<Font>,
+    fonts: Fonts,
     /// Clip bounds in pixels: `[x0, y0, x1, y1)`.
     clip: [i64; 4],
     /// When set, fills and images are rasterized rotated about a pivot so the
@@ -294,8 +429,8 @@ impl<'a> Painter<'a> {
             buffer,
             width,
             height,
-            font: fonts.text,
-            icon_font: fonts.icons,
+            font: Arc::clone(&fonts.text),
+            fonts,
             clip: [0, 0, width as i64, height as i64],
             rot: None,
         }
@@ -418,68 +553,182 @@ impl<'a> Painter<'a> {
             if coverage <= 0.0 {
                 None
             } else {
-                Some([color[0], color[1], color[2], (color[3] as f32 * coverage) as u8])
+                Some([
+                    color[0],
+                    color[1],
+                    color[2],
+                    (color[3] as f32 * coverage) as u8,
+                ])
             }
         });
     }
 
     /// Fill a triangle given its three (screen-space) vertices.
-    pub fn fill_triangle(&mut self, p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), color: Rgba) {
-        if color[3] == 0 {
+    pub fn fill_triangle(
+        &mut self,
+        mut p0: (f32, f32),
+        mut p1: (f32, f32),
+        mut p2: (f32, f32),
+        color: Rgba,
+    ) {
+        if color[3] == 0
+            || ![p0.0, p0.1, p1.0, p1.1, p2.0, p2.1]
+                .iter()
+                .all(|value| value.is_finite())
+        {
             return;
         }
+
+        if let Some(rot) = self.rot {
+            let transform = |point: (f32, f32)| {
+                let dx = point.0 - rot.px;
+                let dy = point.1 - rot.py;
+                (
+                    rot.px + dx * rot.cos - dy * rot.sin,
+                    rot.py + dx * rot.sin + dy * rot.cos,
+                )
+            };
+            p0 = transform(p0);
+            p1 = transform(p1);
+            p2 = transform(p2);
+        }
+
         let area = edge(p0, p1, p2);
         if area.abs() < 1e-6 {
             return;
         }
         let sign = area.signum();
-        let min_x = p0.0.min(p1.0).min(p2.0) - 1.0;
-        let max_x = p0.0.max(p1.0).max(p2.0) + 1.0;
-        let min_y = p0.1.min(p1.1).min(p2.1) - 1.0;
-        let max_y = p0.1.max(p1.1).max(p2.1) + 1.0;
-        let bounds = Rect::new(min_x, min_y, max_x - min_x, max_y - min_y);
-        self.rasterize_shape(bounds, |x, y| {
-            let pt = (x, y);
-            let w0 = edge(p1, p2, pt) * sign;
-            let w1 = edge(p2, p0, pt) * sign;
-            let w2 = edge(p0, p1, pt) * sign;
-            if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
-                Some(color)
-            } else {
-                None
+        let x0 = (p0.0.min(p1.0).min(p2.0).floor() as i64).max(self.clip[0]);
+        let x1 = (p0.0.max(p1.0).max(p2.0).ceil() as i64).min(self.clip[2]);
+        let y0 = (p0.1.min(p1.1).min(p2.1).floor() as i64).max(self.clip[1]);
+        let y1 = (p0.1.max(p1.1).max(p2.1).ceil() as i64).min(self.clip[3]);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+
+        // Edge functions are affine, so advance them with additions instead
+        // of recomputing three cross products for every framebuffer pixel.
+        // Large projected quads commonly cover the whole 3D viewport; this
+        // keeps their raster cost close to the unavoidable number of writes.
+        let sample = (x0 as f32 + 0.5, y0 as f32 + 0.5);
+        let row_w0 = edge(p1, p2, sample) * sign;
+        let row_w1 = edge(p2, p0, sample) * sign;
+        let row_w2 = edge(p0, p1, sample) * sign;
+        let x_step0 = -(p2.1 - p1.1) * sign;
+        let x_step1 = -(p0.1 - p2.1) * sign;
+        let x_step2 = -(p1.1 - p0.1) * sign;
+        let y_step0 = (p2.0 - p1.0) * sign;
+        let y_step1 = (p0.0 - p2.0) * sign;
+        let y_step2 = (p1.0 - p0.0) * sign;
+        let opaque = color[3] == 255;
+        let packed = pack(color);
+
+        for y in y0..y1 {
+            let row_offset = y as usize * self.width;
+            let row_delta = (y - y0) as f32;
+            let mut w0 = row_w0 + y_step0 * row_delta;
+            let mut w1 = row_w1 + y_step1 * row_delta;
+            let mut w2 = row_w2 + y_step2 * row_delta;
+            for x in x0..x1 {
+                if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
+                    let pixel = &mut self.buffer[row_offset + x as usize];
+                    if opaque {
+                        *pixel = packed;
+                    } else {
+                        *pixel = blend(*pixel, color);
+                    }
+                }
+                w0 += x_step0;
+                w1 += x_step1;
+                w2 += x_step2;
             }
-        });
+        }
     }
 
     /// Stroke an antialiased one-pixel line segment.
-    pub fn stroke_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, color: Rgba) {
-        if color[3] == 0 {
+    pub fn stroke_line(&mut self, mut x0: f32, mut y0: f32, mut x1: f32, mut y1: f32, color: Rgba) {
+        if color[3] == 0 || ![x0, y0, x1, y1].iter().all(|value| value.is_finite()) {
             return;
         }
+
+        // A line remains a line under the painter's rigid transform. Applying
+        // it to the two endpoints up front lets the fast screen-space walker
+        // below replace the old rotated-bounding-box scan as well.
+        if let Some(rot) = self.rot {
+            let transform = |x: f32, y: f32| {
+                let dx = x - rot.px;
+                let dy = y - rot.py;
+                (
+                    rot.px + dx * rot.cos - dy * rot.sin,
+                    rot.py + dx * rot.sin + dy * rot.cos,
+                )
+            };
+            (x0, y0) = transform(x0, y0);
+            (x1, y1) = transform(x1, y1);
+        }
+
         let dx = x1 - x0;
         let dy = y1 - y0;
         let len_sq = dx * dx + dy * dy;
         if len_sq <= 1e-6 {
+            let previous = self.rot.take();
             self.fill_circle(x0, y0, 0.75, color);
+            self.rot = previous;
             return;
         }
-        let min_x = x0.min(x1) - 1.5;
-        let max_x = x0.max(x1) + 1.5;
-        let min_y = y0.min(y1) - 1.5;
-        let max_y = y0.max(y1) + 1.5;
-        let bounds = Rect::new(min_x, min_y, max_x - min_x, max_y - min_y);
-        self.rasterize_shape(bounds, |x, y| {
-            let t = (((x - x0) * dx + (y - y0) * dy) / len_sq).clamp(0.0, 1.0);
+
+        // Only visit a narrow strip around the segment. The previous generic
+        // shape rasterizer visited every pixel in a line's axis-aligned bounds;
+        // a viewport-sized diagonal therefore did O(width * height) work. This
+        // path is O(max(width, height)) while retaining the same exact
+        // distance-to-segment antialiasing at each candidate pixel.
+        let clip = self.clip;
+        let mut plot = |x: i64, y: i64| {
+            if x < clip[0] || x >= clip[2] || y < clip[1] || y >= clip[3] {
+                return;
+            }
+            let sample_x = x as f32 + 0.5;
+            let sample_y = y as f32 + 0.5;
+            let t = (((sample_x - x0) * dx + (sample_y - y0) * dy) / len_sq).clamp(0.0, 1.0);
             let px = x0 + dx * t;
             let py = y0 + dy * t;
-            let dist = ((x - px).powi(2) + (y - py).powi(2)).sqrt();
+            let dist = ((sample_x - px).powi(2) + (sample_y - py).powi(2)).sqrt();
             let coverage = (1.0 - dist).clamp(0.0, 1.0);
-            if coverage <= 0.0 {
-                None
-            } else {
-                Some([color[0], color[1], color[2], (color[3] as f32 * coverage) as u8])
+            if coverage > 0.0 {
+                self.put(
+                    x,
+                    y,
+                    [
+                        color[0],
+                        color[1],
+                        color[2],
+                        (color[3] as f32 * coverage) as u8,
+                    ],
+                );
             }
-        });
+        };
+
+        if dx.abs() >= dy.abs() {
+            let start = ((x0.min(x1) - 1.0).floor() as i64).max(clip[0]);
+            let end = ((x0.max(x1) + 1.0).ceil() as i64).min(clip[2] - 1);
+            for x in start..=end {
+                let t = ((x as f32 + 0.5 - x0) / dx).clamp(0.0, 1.0);
+                let centre = (y0 + dy * t - 0.5).floor() as i64;
+                for y in centre - 1..=centre + 1 {
+                    plot(x, y);
+                }
+            }
+        } else {
+            let start = ((y0.min(y1) - 1.0).floor() as i64).max(clip[1]);
+            let end = ((y0.max(y1) + 1.0).ceil() as i64).min(clip[3] - 1);
+            for y in start..=end {
+                let t = ((y as f32 + 0.5 - y0) / dy).clamp(0.0, 1.0);
+                let centre = (x0 + dx * t - 0.5).floor() as i64;
+                for x in centre - 1..=centre + 1 {
+                    plot(x, y);
+                }
+            }
+        }
     }
 
     pub fn width(&self) -> f32 {
@@ -558,8 +807,12 @@ impl<'a> Painter<'a> {
         let height = self.height;
         let x0 = (rect.x.floor() as i64).max(self.clip[0]).max(0);
         let y0 = (rect.y.floor() as i64).max(self.clip[1]).max(0);
-        let x1 = (rect.right().ceil() as i64).min(self.clip[2]).min(width as i64);
-        let y1 = (rect.bottom().ceil() as i64).min(self.clip[3]).min(height as i64);
+        let x1 = (rect.right().ceil() as i64)
+            .min(self.clip[2])
+            .min(width as i64);
+        let y1 = (rect.bottom().ceil() as i64)
+            .min(self.clip[3])
+            .min(height as i64);
         if x1 <= x0 || y1 <= y0 {
             return;
         }
@@ -683,7 +936,11 @@ impl<'a> Painter<'a> {
                     (p[2] as u32 * tint[2] as u32 / 255) as u8,
                     a,
                 ];
-                self.put(px, py, c);
+                if a == 255 {
+                    self.buffer[py as usize * self.width + px as usize] = pack(c);
+                } else {
+                    self.put(px, py, c);
+                }
             }
         }
     }
@@ -708,6 +965,21 @@ impl<'a> Painter<'a> {
         let y0 = (rect.y.floor() as i64).max(self.clip[1]);
         let x1 = (rect.right().ceil() as i64).min(self.clip[2]);
         let y1 = (rect.bottom().ceil() as i64).min(self.clip[3]);
+        // Empty and reversed rectangles used to be harmless because the
+        // per-pixel ranges below simply had no iterations.  Keep that
+        // behaviour before constructing an opaque row slice, whose bounds
+        // must be ordered.
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        if color[3] == 255 {
+            let packed = pack(color);
+            for y in y0..y1 {
+                let row = y as usize * self.width;
+                self.buffer[row + x0 as usize..row + x1 as usize].fill(packed);
+            }
+            return;
+        }
         for y in y0..y1 {
             let row = y as usize * self.width;
             for x in x0..x1 {
@@ -733,7 +1005,12 @@ impl<'a> Painter<'a> {
                 if coverage <= 0.0 {
                     None
                 } else {
-                    Some([color[0], color[1], color[2], (color[3] as f32 * coverage) as u8])
+                    Some([
+                        color[0],
+                        color[1],
+                        color[2],
+                        (color[3] as f32 * coverage) as u8,
+                    ])
                 }
             });
             return;
@@ -779,7 +1056,12 @@ impl<'a> Painter<'a> {
                 if coverage <= 0.0 {
                     None
                 } else {
-                    Some([color[0], color[1], color[2], (color[3] as f32 * coverage) as u8])
+                    Some([
+                        color[0],
+                        color[1],
+                        color[2],
+                        (color[3] as f32 * coverage) as u8,
+                    ])
                 }
             });
             return;
@@ -817,10 +1099,11 @@ impl<'a> Painter<'a> {
         let baseline = y + ascent;
         let mut pen = x;
         for ch in text.chars() {
-            let (metrics, bitmap) = self.font.rasterize(ch, size);
+            let glyph = self.fonts.rasterize_cached(FontFace::Text, ch, size);
+            let metrics = glyph.metrics;
             let gx = pen + metrics.xmin as f32;
             let gy = baseline - (metrics.height as f32 + metrics.ymin as f32);
-            self.blit_coverage(gx, gy, metrics.width, metrics.height, &bitmap, color);
+            self.blit_coverage(gx, gy, metrics.width, metrics.height, &glyph.bitmap, color);
             pen += metrics.advance_width;
         }
     }
@@ -909,10 +1192,11 @@ impl<'a> Painter<'a> {
 
     /// Draw a Material Icons glyph, with its box centered on `(cx, cy)`.
     pub fn icon_centered(&mut self, cx: f32, cy: f32, glyph: char, size: f32, color: Rgba) {
-        let (metrics, bitmap) = self.icon_font.rasterize(glyph, size);
+        let glyph = self.fonts.rasterize_cached(FontFace::Icons, glyph, size);
+        let metrics = glyph.metrics;
         let gx = cx - metrics.width as f32 / 2.0;
         let gy = cy - metrics.height as f32 / 2.0;
-        self.blit_coverage(gx, gy, metrics.width, metrics.height, &bitmap, color);
+        self.blit_coverage(gx, gy, metrics.width, metrics.height, &glyph.bitmap, color);
     }
 
     fn blit_coverage(&mut self, x: f32, y: f32, w: usize, h: usize, bitmap: &[u8], color: Rgba) {
@@ -1030,6 +1314,16 @@ pub struct FrameInput {
     pub double_click: bool,
     /// Right button pressed this frame (opens context menus).
     pub right_pressed: bool,
+    /// Right button is currently held. The 3D scene view uses this for mouse
+    /// look; the existing one-shot `right_pressed` context-menu path remains
+    /// unchanged for 2D scenes.
+    pub right_down: bool,
+    /// Right button transitioned to released this frame. The 3D viewport uses
+    /// this edge to distinguish a context click from a fly-look drag.
+    pub right_released: bool,
+    /// Pointer/fly input crossed the context-click threshold during this RMB
+    /// gesture, including when press and release were coalesced into one frame.
+    pub right_dragged: bool,
     /// Middle button is currently held (pans the viewport).
     pub middle_down: bool,
     /// Middle button transitioned to pressed this frame.
@@ -1082,6 +1376,17 @@ pub struct FrameInput {
     pub nudge_x: f32,
     pub nudge_y: f32,
     pub nudge_big: bool,
+    /// Continuous 3D fly-camera movement keys. They are intentionally kept
+    /// separate from text input and one-shot editor shortcuts.
+    pub key_w: bool,
+    pub key_a: bool,
+    pub key_s: bool,
+    pub key_d: bool,
+    pub key_q: bool,
+    pub key_e: bool,
+    /// Physical pixels per logical window point. Viewport interaction divides
+    /// pointer travel by this so camera sensitivity is DPI-independent.
+    pub display_scale: f32,
 }
 
 /// The result of running an editable text field for one frame.
@@ -1215,10 +1520,7 @@ impl<'a> Ui<'a> {
         // held pointer (for example, opening a colour picker by pressing its
         // swatch). With no existing owner it is safe for that new control to
         // claim the drag immediately.
-        if self.pointer_capture.is_none()
-            && self.input.mouse_down
-            && self.hovered(rect)
-        {
+        if self.pointer_capture.is_none() && self.input.mouse_down && self.hovered(rect) {
             self.pointer_capture = Some(id.to_string());
         }
         if !self.input.mouse_down {
@@ -1241,13 +1543,15 @@ impl<'a> Ui<'a> {
         self.button_colored(rect, label, base, text)
     }
 
-    pub fn button_colored(&mut self, rect: Rect, label: &str, base: Rgba, text_color: Rgba) -> bool {
+    pub fn button_colored(
+        &mut self,
+        rect: Rect,
+        label: &str,
+        base: Rgba,
+        text_color: Rgba,
+    ) -> bool {
         let hovered = self.hovered(rect);
-        let bg = if hovered {
-            lighten(base, 0.12)
-        } else {
-            base
-        };
+        let bg = if hovered { lighten(base, 0.12) } else { base };
         let text_color = readable_text_color(bg, text_color);
         let radius = self.theme.corner_radius;
         self.painter.fill_round_rect(rect, radius, bg);
@@ -1255,8 +1559,14 @@ impl<'a> Ui<'a> {
         let tw = self.painter.text_width(label, size);
         let tx = rect.x + (rect.w - tw) / 2.0;
         let ty = rect.y + (rect.h - size) / 2.0;
-        self.painter
-            .text_clipped(tx.max(rect.x + 4.0), ty, label, size, text_color, rect.w - 8.0);
+        self.painter.text_clipped(
+            tx.max(rect.x + 4.0),
+            ty,
+            label,
+            size,
+            text_color,
+            rect.w - 8.0,
+        );
         hovered && self.input.mouse_pressed
     }
 
@@ -1269,7 +1579,8 @@ impl<'a> Ui<'a> {
             self.theme.button
         };
         let text_color = readable_text_color(bg, self.theme.text);
-        self.painter.fill_round_rect(rect, self.theme.corner_radius, bg);
+        self.painter
+            .fill_round_rect(rect, self.theme.corner_radius, bg);
         let icon_w = 22.0_f32.min(rect.w.max(0.0));
         self.painter.text_clipped(
             rect.x + 8.0,
@@ -1294,7 +1605,8 @@ impl<'a> Ui<'a> {
         let hovered = self.hovered(rect);
         let base = self.theme.button;
         let bg = if hovered { lighten(base, 0.12) } else { base };
-        self.painter.fill_round_rect(rect, self.theme.corner_radius, bg);
+        self.painter
+            .fill_round_rect(rect, self.theme.corner_radius, bg);
         let text_color = readable_text_color(bg, self.theme.text);
         let icon_size = 16.0;
         let cy = rect.y + rect.h / 2.0;
@@ -1318,14 +1630,29 @@ impl<'a> Ui<'a> {
 
     /// A compact square button containing only a Material icon. `active`
     /// highlights it (e.g. a toggle that is on).
-    pub fn icon_toggle(&mut self, rect: Rect, glyph: char, active: bool, tooltip_color: Rgba) -> bool {
+    pub fn icon_toggle(
+        &mut self,
+        rect: Rect,
+        glyph: char,
+        active: bool,
+        tooltip_color: Rgba,
+    ) -> bool {
         let hovered = self.hovered(rect);
-        let base = if active { self.theme.accent } else { self.theme.button };
+        let base = if active {
+            self.theme.accent
+        } else {
+            self.theme.button
+        };
         let bg = if hovered { lighten(base, 0.12) } else { base };
-        self.painter.fill_round_rect(rect, self.theme.corner_radius, bg);
+        self.painter
+            .fill_round_rect(rect, self.theme.corner_radius, bg);
         let color = readable_text_color(
             bg,
-            if active { [255, 255, 255, 255] } else { tooltip_color },
+            if active {
+                [255, 255, 255, 255]
+            } else {
+                tooltip_color
+            },
         );
         self.painter.icon_centered(
             rect.x + rect.w / 2.0,
@@ -1352,9 +1679,18 @@ impl<'a> Ui<'a> {
             self.theme.header
         };
         self.painter.fill_round_rect(rect, 3.0, bg);
-        let tri = if expanded { icon::EXPAND_MORE } else { icon::CHEVRON_RIGHT };
-        self.painter
-            .icon_centered(rect.x + 12.0, rect.y + rect.h / 2.0, tri, 16.0, self.theme.text);
+        let tri = if expanded {
+            icon::EXPAND_MORE
+        } else {
+            icon::CHEVRON_RIGHT
+        };
+        self.painter.icon_centered(
+            rect.x + 12.0,
+            rect.y + rect.h / 2.0,
+            tri,
+            16.0,
+            self.theme.text,
+        );
         self.painter.text_clipped(
             rect.x + 24.0,
             rect.y + (rect.h - 14.0) / 2.0,
@@ -1377,7 +1713,11 @@ impl<'a> Ui<'a> {
         if hovered {
             self.painter.fill_rect(rect, self.theme.button_active);
         }
-        let color = if danger { self.theme.danger } else { self.theme.text };
+        let color = if danger {
+            self.theme.danger
+        } else {
+            self.theme.text
+        };
         let mut tx = rect.x + 10.0;
         if glyph != '\0' {
             self.painter
@@ -1410,8 +1750,11 @@ impl<'a> Ui<'a> {
             2.0,
             self.theme.accent,
         );
-        self.painter
-            .fill_round_rect(Rect::new(knob_x - 5.0, rect.y + rect.h / 2.0 - 6.0, 10.0, 12.0), 5.0, self.theme.text);
+        self.painter.fill_round_rect(
+            Rect::new(knob_x - 5.0, rect.y + rect.h / 2.0 - 6.0, 10.0, 12.0),
+            5.0,
+            self.theme.text,
+        );
         let drag_id = format!(
             "slider:{:08x}:{:08x}:{:08x}:{:08x}",
             rect.x.to_bits(),
@@ -1433,7 +1776,8 @@ impl<'a> Ui<'a> {
         // colour is drawn with its real alpha on top, letting the pattern show
         // through translucent swatches.
         let prev = self.painter.push_clip(rect);
-        self.painter.fill_round_rect(rect, 3.0, [255, 255, 255, 255]);
+        self.painter
+            .fill_round_rect(rect, 3.0, [255, 255, 255, 255]);
         let cell = (rect.h * 0.5).max(3.0);
         let cols = (rect.w / cell).ceil() as i32;
         let rows = (rect.h / cell).ceil() as i32;
@@ -1441,7 +1785,12 @@ impl<'a> Ui<'a> {
             for c in 0..cols {
                 if (r + c) % 2 == 1 {
                     self.painter.fill_rect(
-                        Rect::new(rect.x + c as f32 * cell, rect.y + r as f32 * cell, cell, cell),
+                        Rect::new(
+                            rect.x + c as f32 * cell,
+                            rect.y + r as f32 * cell,
+                            cell,
+                            cell,
+                        ),
                         [176, 176, 176, 255],
                     );
                 }
@@ -1534,7 +1883,11 @@ impl<'a> Ui<'a> {
         }
         let text_color = readable_text_color(
             bg,
-            if selected { [255, 255, 255, 255] } else { self.theme.text },
+            if selected {
+                [255, 255, 255, 255]
+            } else {
+                self.theme.text
+            },
         );
         self.painter.text_clipped(
             rect.x + 8.0 + indent,
@@ -1556,7 +1909,11 @@ impl<'a> Ui<'a> {
     pub fn checkbox(&mut self, rect: Rect, value: bool) -> Option<bool> {
         let hovered = self.hovered(rect);
         let radius = (self.theme.corner_radius - 1.0).max(0.0);
-        let base = if value { self.theme.accent } else { self.theme.field };
+        let base = if value {
+            self.theme.accent
+        } else {
+            self.theme.field
+        };
         let bg = if hovered { lighten(base, 0.1) } else { base };
         self.painter.fill_round_rect(rect, radius, bg);
         self.painter
@@ -1667,7 +2024,9 @@ impl<'a> Ui<'a> {
                 self.edit_selection_anchor = None;
                 changed = true;
             }
-            if self.input.paste && let Some(text) = read_clipboard() {
+            if self.input.paste
+                && let Some(text) = read_clipboard()
+            {
                 let pasted = normalize_pasted_text(&text);
                 if !pasted.is_empty() {
                     insert_text_at_cursor(
@@ -1682,19 +2041,18 @@ impl<'a> Ui<'a> {
 
             let len = char_len(&self.edit_buffer);
             let extend_selection = self.input.shift;
-            let move_cursor = |next: usize,
-                               cursor: &mut usize,
-                               selection_anchor: &mut Option<usize>| {
-                if extend_selection {
-                    if selection_anchor.is_none() {
-                        *selection_anchor = Some(*cursor);
+            let move_cursor =
+                |next: usize, cursor: &mut usize, selection_anchor: &mut Option<usize>| {
+                    if extend_selection {
+                        if selection_anchor.is_none() {
+                            *selection_anchor = Some(*cursor);
+                        }
+                    } else {
+                        *selection_anchor = None;
                     }
-                } else {
-                    *selection_anchor = None;
-                }
-                *cursor = next.min(len);
-                clamp_empty_selection(selection_anchor, *cursor);
-            };
+                    *cursor = next.min(len);
+                    clamp_empty_selection(selection_anchor, *cursor);
+                };
             if self.input.home {
                 move_cursor(0, &mut self.edit_cursor, &mut self.edit_selection_anchor);
             }
@@ -1779,7 +2137,12 @@ impl<'a> Ui<'a> {
         let ty = rect.y + (rect.h - size) / 2.0;
         let text_color = self.theme.text;
         if focused {
-            let clip = Rect::new(rect.x + 4.0, rect.y + 1.0, (rect.w - 8.0).max(0.0), rect.h - 2.0);
+            let clip = Rect::new(
+                rect.x + 4.0,
+                rect.y + 1.0,
+                (rect.w - 8.0).max(0.0),
+                rect.h - 2.0,
+            );
             let previous_clip = self.painter.push_clip(clip);
             if let Some((start, end)) =
                 selection_range(self.edit_cursor, self.edit_selection_anchor)
@@ -1803,11 +2166,14 @@ impl<'a> Ui<'a> {
                 );
             }
             self.painter.text(text_x, ty, &display, size, text_color);
-            let caret_x = (text_x + text_prefix_width(&self.painter, &display, size, self.edit_cursor))
-                .min(rect.right() - 4.0)
-                .max(rect.x + 4.0);
-            self.painter
-                .fill_rect(Rect::new(caret_x, rect.y + 4.0, 1.0, rect.h - 8.0), text_color);
+            let caret_x = (text_x
+                + text_prefix_width(&self.painter, &display, size, self.edit_cursor))
+            .min(rect.right() - 4.0)
+            .max(rect.x + 4.0);
+            self.painter.fill_rect(
+                Rect::new(caret_x, rect.y + 4.0, 1.0, rect.h - 8.0),
+                text_color,
+            );
             self.painter.set_clip_raw(previous_clip);
         } else {
             self.painter
@@ -1972,9 +2338,8 @@ fn read_clipboard_with_platform_helper() -> Option<String> {
 fn read_clipboard_with_platform_helper() -> Option<String> {
     const READ: &str =
         "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Raw";
-    try_read_clipboard_command("powershell", &["-NoProfile", "-Command", READ]).or_else(|| {
-        try_read_clipboard_command("powershell.exe", &["-NoProfile", "-Command", READ])
-    })
+    try_read_clipboard_command("powershell", &["-NoProfile", "-Command", READ])
+        .or_else(|| try_read_clipboard_command("powershell.exe", &["-NoProfile", "-Command", READ]))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -2061,7 +2426,11 @@ fn try_write_clipboard_command(program: &str, args: &[&str], text: &str) -> bool
 
 /// Lighten a color toward white by `t` in `[0, 1]`, preserving alpha.
 fn lighten(color: Rgba, t: f32) -> Rgba {
-    let mix = |c: u8| (c as f32 + (255.0 - c as f32) * t).round().clamp(0.0, 255.0) as u8;
+    let mix = |c: u8| {
+        (c as f32 + (255.0 - c as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
     [mix(color[0]), mix(color[1]), mix(color[2]), color[3]]
 }
 
@@ -2122,7 +2491,14 @@ pub fn load_fonts_from_path(text_font_path: Option<&Path>) -> Result<Fonts, Stri
     let icons = Font::from_bytes(ICON_FONT_BYTES, fontdue::FontSettings::default())
         .map(Arc::new)
         .map_err(|e| format!("failed to load icon font: {e}"))?;
-    Ok(Fonts { text, icons })
+    Ok(Fonts {
+        text,
+        icons,
+        glyph_cache: Arc::new(Mutex::new(GlyphRasterCache::new(
+            GLYPH_CACHE_ENTRY_LIMIT,
+            GLYPH_CACHE_BYTE_LIMIT,
+        ))),
+    })
 }
 
 #[cfg(test)]
@@ -2147,6 +2523,48 @@ mod tests {
     #[test]
     fn pack_orders_channels_for_softbuffer() {
         assert_eq!(pack([0x12, 0x34, 0x56, 0xff]), 0x123456);
+    }
+
+    #[test]
+    fn glyph_rasters_are_shared_and_font_faces_stay_separate() {
+        let fonts = load_fonts().expect("load fonts");
+        let first = fonts.rasterize_cached(FontFace::Text, 'A', 14.0);
+        let second = fonts.rasterize_cached(FontFace::Text, 'A', 14.0);
+        let icon = fonts.rasterize_cached(FontFace::Icons, 'A', 14.0);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &icon));
+        assert_eq!(
+            fonts.glyph_cache.lock().expect("glyph cache").entries.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn glyph_raster_cache_evicts_lru_entries_to_stay_bounded() {
+        let mut cache = GlyphRasterCache::new(2, 5);
+        let key = |character| GlyphCacheKey {
+            face: FontFace::Text,
+            character,
+            size_bits: 14.0f32.to_bits(),
+        };
+        let glyph = || {
+            Arc::new(CachedGlyph {
+                metrics: Metrics::default(),
+                bitmap: vec![255, 128].into_boxed_slice(),
+            })
+        };
+
+        cache.insert(key('a'), glyph());
+        cache.insert(key('b'), glyph());
+        assert!(cache.get(key('a')).is_some(), "refresh a's LRU age");
+        cache.insert(key('c'), glyph());
+
+        assert!(cache.entries.contains_key(&key('a')));
+        assert!(!cache.entries.contains_key(&key('b')));
+        assert!(cache.entries.contains_key(&key('c')));
+        assert!(cache.entries.len() <= 2);
+        assert!(cache.bitmap_bytes <= 5);
     }
 
     #[test]
@@ -2190,6 +2608,50 @@ mod tests {
     }
 
     #[test]
+    fn diagonal_line_only_rasterizes_its_narrow_coverage_strip() {
+        let mut buf = vec![0u32; 128 * 96];
+        let fonts = load_fonts().expect("load fonts");
+        let mut painter = Painter::new(&mut buf, 128, 96, fonts);
+        painter.stroke_line(2.0, 2.0, 125.0, 92.0, [255, 255, 255, 255]);
+
+        assert_ne!(buf[47 * 128 + 64], 0, "the diagonal midpoint is covered");
+        assert_eq!(buf[90 * 128 + 4], 0, "pixels far from the line stay clear");
+        assert!(
+            buf.iter().filter(|pixel| **pixel != 0).count() < 512,
+            "a one-pixel line should touch O(length) pixels"
+        );
+    }
+
+    #[test]
+    fn opaque_fill_rect_replaces_only_the_clipped_rows() {
+        let mut buf = vec![0x010203u32; 6 * 4];
+        let fonts = load_fonts().expect("load fonts");
+        let mut painter = Painter::new(&mut buf, 6, 4, fonts);
+        let previous = painter.push_clip(Rect::new(2.0, 1.0, 3.0, 2.0));
+        painter.fill_rect(Rect::new(0.0, 0.0, 6.0, 4.0), [0x12, 0x34, 0x56, 255]);
+        painter.set_clip_raw(previous);
+
+        assert_eq!(buf[1 * 6 + 2], 0x123456);
+        assert_eq!(buf[2 * 6 + 4], 0x123456);
+        assert_eq!(buf[0], 0x010203);
+        assert_eq!(buf[3 * 6 + 5], 0x010203);
+    }
+
+    #[test]
+    fn opaque_fill_rect_ignores_empty_and_reversed_rectangles() {
+        let original = vec![0x010203u32; 6 * 4];
+        let mut buf = original.clone();
+        let fonts = load_fonts().expect("load fonts");
+        let mut painter = Painter::new(&mut buf, 6, 4, fonts);
+
+        painter.fill_rect(Rect::new(4.0, 1.0, -3.0, 2.0), [255, 255, 255, 255]);
+        painter.fill_rect(Rect::new(1.0, 3.0, 2.0, -2.0), [255, 255, 255, 255]);
+        painter.fill_rect(Rect::new(2.0, 2.0, 0.0, 1.0), [255, 255, 255, 255]);
+
+        assert_eq!(buf, original);
+    }
+
+    #[test]
     fn composite_light_multiplies_scene_by_light() {
         let mut buf = vec![0u32; 4 * 4];
         let fonts = load_fonts().expect("load fonts");
@@ -2197,10 +2659,18 @@ mod tests {
         // Fill mid-gray, then light: left half fully dark, right half over-bright.
         painter.fill_rect(Rect::new(0.0, 0.0, 4.0, 4.0), [128, 128, 128, 255]);
         painter.composite_light(Rect::new(0.0, 0.0, 4.0, 4.0), 0.0, |px, _py| {
-            if px < 2.0 { (0.0, 0.0, 0.0) } else { (4.0, 4.0, 4.0) }
+            if px < 2.0 {
+                (0.0, 0.0, 0.0)
+            } else {
+                (4.0, 4.0, 4.0)
+            }
         });
         // Dark side is multiplied to black; bright side clamps to full white.
-        assert_eq!(buf[0] & 0xff, 0, "unlit background is darkened, not left bright");
+        assert_eq!(
+            buf[0] & 0xff,
+            0,
+            "unlit background is darkened, not left bright"
+        );
         assert_eq!(buf[3] & 0xff, 0xff, "over-bright light clamps to full");
     }
 

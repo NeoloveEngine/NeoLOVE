@@ -44,7 +44,10 @@ fn flatten_lua_error(error: &mlua::Error) -> (String, Option<String>) {
     match error {
         mlua::Error::CallbackError { traceback, cause } => {
             let (message, nested_traceback) = flatten_lua_error(cause.as_ref());
-            (message, nested_traceback.or_else(|| format_traceback(traceback)))
+            (
+                message,
+                nested_traceback.or_else(|| format_traceback(traceback)),
+            )
         }
         mlua::Error::WithContext { context, cause } => {
             let (message, traceback) = flatten_lua_error(cause.as_ref());

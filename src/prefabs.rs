@@ -34,7 +34,12 @@ fn is_reserved_entity_key(value: &Value) -> bool {
     )
 }
 
-fn clone_table_contents(lua: &Lua, source: &Table, target: &Table, state: &mut CloneState) -> mlua::Result<()> {
+fn clone_table_contents(
+    lua: &Lua,
+    source: &Table,
+    target: &Table,
+    state: &mut CloneState,
+) -> mlua::Result<()> {
     for pair in source.pairs::<Value, Value>() {
         let (key, value) = pair?;
         let cloned_key = clone_value_with_state(lua, key, state)?;
@@ -316,7 +321,10 @@ fn apply_entity_state_recursive(
         }
     }
     entity.raw_set("__neolove_physics_component_count", physics_component_count)?;
-    entity.raw_set("__neolove_has_physics_components", physics_component_count > 0)?;
+    entity.raw_set(
+        "__neolove_has_physics_components",
+        physics_component_count > 0,
+    )?;
 
     if let Ok(source_children) = source.raw_get::<Table>("children") {
         for child in source_children.sequence_values::<Table>() {
@@ -593,7 +601,10 @@ fn build_ui_dialog(lua: &Lua) -> mlua::Result<Table> {
     body.set("size_x", 320.0)?;
     body.set("size_y", 92.0)?;
     let body_text = build_component_template(lua, &core_component(lua, "TextBox")?, None)?;
-    body_text.set("text", "Dialogs can be assembled as prefab trees with exact component state preserved.")?;
+    body_text.set(
+        "text",
+        "Dialogs can be assembled as prefab trees with exact component state preserved.",
+    )?;
     body_text.set("size_mode", "entity")?;
     body_text.set("scale", 18.0)?;
     body_text.set("min_scale", 12.0)?;
@@ -680,7 +691,10 @@ fn json_string<'a>(value: &'a JsonValue, field: &str, path: &str) -> mlua::Resul
 }
 
 fn json_number(value: &JsonValue, field: &str, default: f64) -> f64 {
-    value.get(field).and_then(JsonValue::as_f64).unwrap_or(default)
+    value
+        .get(field)
+        .and_then(JsonValue::as_f64)
+        .unwrap_or(default)
 }
 
 fn editor_value_to_lua(lua: &Lua, value: &JsonValue, path: &str) -> mlua::Result<Option<Value>> {
@@ -716,13 +730,18 @@ fn editor_value_to_lua(lua: &Lua, value: &JsonValue, path: &str) -> mlua::Result
                 .as_array()
                 .ok_or_else(|| prefab_json_error(path, "invalid color component property"))?;
             if channels.len() != 4 {
-                return Err(prefab_json_error(path, "color component property must have four channels"));
+                return Err(prefab_json_error(
+                    path,
+                    "color component property must have four channels",
+                ));
             }
             let channel = |index: usize| {
                 channels[index]
                     .as_u64()
                     .and_then(|value| u8::try_from(value).ok())
-                    .ok_or_else(|| prefab_json_error(path, "color channel must be between 0 and 255"))
+                    .ok_or_else(|| {
+                        prefab_json_error(path, "color channel must be between 0 and 255")
+                    })
             };
             Ok(Some(Value::Table(color4(
                 lua,
@@ -786,13 +805,18 @@ fn editor_variable_to_lua(
                 .as_array()
                 .ok_or_else(|| prefab_json_error(path, "invalid color script variable"))?;
             if channels.len() != 4 {
-                return Err(prefab_json_error(path, "color script variable must have four channels"));
+                return Err(prefab_json_error(
+                    path,
+                    "color script variable must have four channels",
+                ));
             }
             let channel = |index: usize| {
                 channels[index]
                     .as_u64()
                     .and_then(|value| u8::try_from(value).ok())
-                    .ok_or_else(|| prefab_json_error(path, "color channel must be between 0 and 255"))
+                    .ok_or_else(|| {
+                        prefab_json_error(path, "color channel must be between 0 and 255")
+                    })
             };
             Ok(Value::Table(color4(
                 lua,
@@ -865,11 +889,7 @@ fn editor_variable_to_lua(
             let table = lua.create_table()?;
             for value in values {
                 table.push(editor_variable_to_lua(
-                    lua,
-                    value,
-                    path,
-                    entities,
-                    components,
+                    lua, value, path, entities, components,
                 )?)?;
             }
             Ok(Value::Table(table))
@@ -883,9 +903,9 @@ fn editor_variable_to_lua(
                 let key = entry
                     .get("key")
                     .ok_or_else(|| prefab_json_error(path, "dictionary entry is missing 'key'"))?;
-                let value = entry
-                    .get("value")
-                    .ok_or_else(|| prefab_json_error(path, "dictionary entry is missing 'value'"))?;
+                let value = entry.get("value").ok_or_else(|| {
+                    prefab_json_error(path, "dictionary entry is missing 'value'")
+                })?;
                 table.raw_set(
                     editor_variable_key_to_lua(lua, key, path)?,
                     editor_variable_to_lua(lua, value, path, entities, components)?,
@@ -939,16 +959,14 @@ fn load_editor_component(
                 .ok_or_else(|| prefab_json_error(path, "core component is missing 'props'"))?;
             for prop in props {
                 let name = json_string(prop, "name", path)?;
-                let optional = prop.get("optional").and_then(JsonValue::as_bool).unwrap_or(false);
-                let value = prop
-                    .get("value")
-                    .ok_or_else(|| prefab_json_error(path, "component property is missing 'value'"))?;
-                if optional
-                    && matches!(
-                        value.get("v").and_then(JsonValue::as_str),
-                        Some("")
-                    )
-                {
+                let optional = prop
+                    .get("optional")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                let value = prop.get("value").ok_or_else(|| {
+                    prefab_json_error(path, "component property is missing 'value'")
+                })?;
+                if optional && matches!(value.get("v").and_then(JsonValue::as_str), Some("")) {
                     continue;
                 }
                 if let Some(value) = editor_value_to_lua(lua, value, path)? {
@@ -960,7 +978,10 @@ fn load_editor_component(
         "Script" => {
             let module_path = json_string(source, "path", path)?;
             if module_path.is_empty() {
-                return Err(prefab_json_error(path, "script component has no module path"));
+                return Err(prefab_json_error(
+                    path,
+                    "script component has no module path",
+                ));
             }
             let prototype: Table = project_require.call(normalize_require_path(module_path))?;
             let mut state = CloneState::default();
@@ -979,8 +1000,8 @@ fn load_neoprefab(
     path: &str,
     project_require: &Function,
 ) -> mlua::Result<Table> {
-    let entities = crate::scene::prefab_from_bytes(bytes)
-        .map_err(|error| prefab_json_error(path, error))?;
+    let entities =
+        crate::scene::prefab_from_bytes(bytes).map_err(|error| prefab_json_error(path, error))?;
     let document =
         serde_json::to_value(&entities).map_err(|error| prefab_json_error(path, error))?;
     let entities = document
@@ -1057,7 +1078,10 @@ fn load_neoprefab(
         }
         template.set(
             "enabled",
-            source.get("enabled").and_then(JsonValue::as_bool).unwrap_or(true),
+            source
+                .get("enabled")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true),
         )?;
         template.set("children", lua.create_table()?)?;
         let components = lua.create_table()?;
@@ -1103,13 +1127,7 @@ fn load_neoprefab(
                     .ok_or_else(|| prefab_json_error(path, "attached value is missing 'value'"))?;
                 entity.raw_set(
                     name,
-                    editor_variable_to_lua(
-                        lua,
-                        value,
-                        path,
-                        &templates,
-                        &component_templates,
-                    )?,
+                    editor_variable_to_lua(lua, value, path, &templates, &component_templates)?,
                 )?;
             }
         }
@@ -1132,7 +1150,9 @@ fn load_neoprefab(
             let variables = component_source
                 .get("variables")
                 .and_then(JsonValue::as_array)
-                .ok_or_else(|| prefab_json_error(path, "script component is missing 'variables'"))?;
+                .ok_or_else(|| {
+                    prefab_json_error(path, "script component is missing 'variables'")
+                })?;
             for variable in variables {
                 let name = json_string(variable, "name", path)?;
                 if name.is_empty() {
@@ -1143,13 +1163,7 @@ fn load_neoprefab(
                     .ok_or_else(|| prefab_json_error(path, "script variable is missing 'value'"))?;
                 component.raw_set(
                     name,
-                    editor_variable_to_lua(
-                        lua,
-                        value,
-                        path,
-                        &templates,
-                        &component_templates,
-                    )?,
+                    editor_variable_to_lua(lua, value, path, &templates, &component_templates)?,
                 )?;
             }
         }
@@ -1173,7 +1187,10 @@ fn load_neoprefab(
     if roots.len() != 1 {
         return Err(prefab_json_error(
             path,
-            format!("prefab must contain exactly one root entity, found {}", roots.len()),
+            format!(
+                "prefab must contain exactly one root entity, found {}",
+                roots.len()
+            ),
         ));
     }
     Ok(roots.remove(0))
@@ -1210,12 +1227,14 @@ pub(crate) fn add_prefab_module(lua: &Lua, project_root: &Path) -> mlua::Result<
         .set_name(format!("@{}", project_root.join("main").display()))
         .eval()?;
 
-    let capture = lua.create_function(move |lua, entity: Table| capture_entity_tree_template(lua, &entity))?;
+    let capture =
+        lua.create_function(move |lua, entity: Table| capture_entity_tree_template(lua, &entity))?;
     module.set("capture", capture)?;
 
-    let component = lua.create_function(move |lua, (source, overrides): (Table, Option<Table>)| {
-        build_component_template(lua, &source, overrides)
-    })?;
+    let component =
+        lua.create_function(move |lua, (source, overrides): (Table, Option<Table>)| {
+            build_component_template(lua, &source, overrides)
+        })?;
     module.set("component", component)?;
 
     let load_project_require = project_require.clone();
@@ -1256,10 +1275,11 @@ pub(crate) fn add_prefab_module(lua: &Lua, project_root: &Path) -> mlua::Result<
     module.set("remove", remove)?;
 
     let registry_instantiate = registry.clone();
-    let instantiate = lua.create_function(move |lua, (source, parent): (Value, Option<Table>)| {
-        let source = resolve_source(&registry_instantiate, source)?;
-        instantiate_entity_tree_from_source(lua, &source, parent)
-    })?;
+    let instantiate =
+        lua.create_function(move |lua, (source, parent): (Value, Option<Table>)| {
+            let source = resolve_source(&registry_instantiate, source)?;
+            instantiate_entity_tree_from_source(lua, &source, parent)
+        })?;
     module.set("instantiate", instantiate.clone())?;
     module.set("duplicate", instantiate)?;
 
@@ -1362,14 +1382,20 @@ mod tests {
 
         let clone_components: Table = clone.get("components")?;
         let clone_components_ref: Table = clone.get("componentsRef")?;
-        assert_eq!(clone_components_ref.to_pointer(), clone_components.to_pointer());
+        assert_eq!(
+            clone_components_ref.to_pointer(),
+            clone_components.to_pointer()
+        );
         let clone_component: Table = clone_components.get(1)?;
         let owner: Table = clone_component.get("entity")?;
         assert_eq!(owner.to_pointer(), clone.to_pointer());
 
         let clone_shared_root: Table = clone.get("shared")?;
         let clone_shared_component: Table = clone_component.get("config")?;
-        assert_eq!(clone_shared_root.to_pointer(), clone_shared_component.to_pointer());
+        assert_eq!(
+            clone_shared_root.to_pointer(),
+            clone_shared_component.to_pointer()
+        );
         assert_ne!(clone_shared_root.to_pointer(), shared.to_pointer());
         assert!(clone_shared_root.metatable().is_some());
 

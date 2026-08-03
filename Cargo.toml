@@ -73,7 +73,10 @@ rmp-serde = "1.3.1"
 cc = "1.2.43"
 
 [profile.release]
-opt-level = "s"
+# Games favor sustained frame time over minimum executable size. Fat LTO and a
+# single codegen unit retain cross-crate optimization while level 3 enables the
+# vectorization and loop transforms used by lighting, physics, and mesh code.
+opt-level = 3
 lto = "fat"
 codegen-units = 1
 # Strip symbols in release builds so the engine executable and exported desktop

@@ -11,6 +11,8 @@ mod commands;
 #[cfg(target_os = "android")]
 mod core;
 #[cfg(target_os = "android")]
+mod environment3d;
+#[cfg(target_os = "android")]
 mod fs_module;
 #[cfg(target_os = "android")]
 pub mod hierarchy;
@@ -18,20 +20,32 @@ pub mod hierarchy;
 mod http;
 #[cfg(target_os = "android")]
 mod lighting;
+#[cfg(target_os = "android")]
 mod lua_error;
-mod rng;
+#[cfg(target_os = "android")]
+mod media;
+#[cfg(target_os = "android")]
+mod mesh;
 #[cfg(target_os = "android")]
 mod mobile_emulation;
 #[cfg(target_os = "android")]
 mod mobile_module;
 #[cfg(target_os = "android")]
-mod media;
+mod particles3d;
+#[cfg(target_os = "android")]
+mod physics3d;
 #[cfg(target_os = "android")]
 mod platform;
 #[cfg(target_os = "android")]
+mod post_process;
+#[cfg(target_os = "android")]
 mod prefabs;
 #[cfg(target_os = "android")]
+mod render3d;
+#[cfg(target_os = "android")]
 mod renderer;
+#[cfg(target_os = "android")]
+mod rng;
 #[cfg(target_os = "android")]
 #[allow(dead_code)]
 #[path = "editor/scene.rs"]
@@ -44,6 +58,8 @@ mod shader;
 mod tweening;
 #[cfg(target_os = "android")]
 mod user_input;
+#[cfg(target_os = "android")]
+mod widget_interaction;
 #[cfg(target_os = "android")]
 pub mod window;
 

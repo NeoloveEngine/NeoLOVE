@@ -1,16 +1,19 @@
+use crate::mesh::{
+    MeshData, MeshHandle, MeshMaterial, PrimitiveOptions, Submesh, TextureBinding, Vertex,
+};
 use crate::platform::Color;
-use crate::platform::{lock_platform_state, SharedPlatformState};
-use crate::renderer::{last_frame_commands, SharedRenderState, SoftwareRenderer};
+use crate::platform::{SharedPlatformState, lock_platform_state};
+use crate::renderer::{SharedRenderState, SoftwareRenderer, last_frame_commands};
 use base64::Engine as _;
 use image::{Rgba, RgbaImage};
 use mlua::{Lua, Table, UserData, UserDataMethods, Value, Variadic};
+#[cfg(not(target_os = "emscripten"))]
+use rodio::{Decoder as AudioDecoder, Source};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-#[cfg(not(target_os = "emscripten"))]
-use rodio::{Decoder as AudioDecoder, Source};
 
 #[derive(Debug)]
 struct ImageAsset {
@@ -19,7 +22,7 @@ struct ImageAsset {
         allow(dead_code)
     )]
     id: usize,
-    image: RgbaImage,
+    image: Arc<RgbaImage>,
     unloaded: bool,
     revision: u64,
     export_root: Option<PathBuf>,
@@ -27,6 +30,24 @@ struct ImageAsset {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ImageHandle(Arc<Mutex<ImageAsset>>);
+
+/// Immutable pixels captured from a particular image revision.
+///
+/// Pixel edits use `Arc::make_mut`, so a renderer can keep this snapshot for
+/// the duration of a draw without holding the asset mutex or observing a
+/// partially-written texture. The next snapshot sees the edited revision.
+#[derive(Clone, Debug)]
+pub(crate) struct ImageSnapshot {
+    identity: usize,
+    revision: u64,
+    pixels: Arc<RgbaImage>,
+}
+
+impl ImageSnapshot {
+    pub(crate) fn into_parts(self) -> (usize, u64, Arc<RgbaImage>) {
+        (self.identity, self.revision, self.pixels)
+    }
+}
 
 fn next_image_id() -> usize {
     static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -53,6 +74,7 @@ pub(crate) struct AssetManager {
     images: HashMap<PathBuf, Weak<Mutex<ImageAsset>>>,
     encoded_images: HashMap<String, Weak<Mutex<ImageAsset>>>,
     sounds: HashMap<PathBuf, Weak<Mutex<SoundAsset>>>,
+    meshes: HashMap<PathBuf, MeshHandle>,
 }
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
@@ -86,11 +108,14 @@ pub(crate) fn decode_base64_png(value: &str) -> Result<Option<(String, Vec<u8>)>
     } else {
         value
     };
-    let normalized: String = payload.chars().filter(|character| !character.is_ascii_whitespace()).collect();
+    let normalized: String = payload
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect();
     let looks_encoded = normalized.len() >= 12
-        && normalized
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_'));
+        && normalized.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
+        });
     if !explicit && !looks_encoded {
         return Ok(None);
     }
@@ -134,6 +159,130 @@ fn color4_table_to_color(table: Table) -> mlua::Result<Color> {
         b.clamp(0.0, 255.0) as u8,
         a.clamp(0.0, 255.0) as u8,
     ))
+}
+
+fn mesh_number(table: &Table, name: &str, sequence_index: i64, default: f32) -> f32 {
+    table
+        .get::<f32>(name)
+        .or_else(|_| table.get::<f32>(sequence_index))
+        .ok()
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+}
+
+fn mesh_vertex_from_table(table: &Table) -> mlua::Result<Vertex> {
+    let position = table.get::<Option<Table>>("position")?;
+    let normal = table.get::<Option<Table>>("normal")?;
+    let uv = table.get::<Option<Table>>("uv")?;
+    let tangent = table.get::<Option<Table>>("tangent")?;
+    let position_table = position.as_ref().unwrap_or(table);
+    let vertex = Vertex {
+        position: [
+            mesh_number(position_table, "x", 1, 0.0),
+            mesh_number(position_table, "y", 2, 0.0),
+            mesh_number(position_table, "z", 3, 0.0),
+        ],
+        normal: normal.as_ref().map_or([0.0; 3], |normal| {
+            [
+                mesh_number(normal, "x", 1, 0.0),
+                mesh_number(normal, "y", 2, 0.0),
+                mesh_number(normal, "z", 3, 0.0),
+            ]
+        }),
+        uv: uv.as_ref().map_or(
+            [
+                mesh_number(table, "u", 7, 0.0),
+                mesh_number(table, "v", 8, 0.0),
+            ],
+            |uv| {
+                [
+                    mesh_number(uv, "u", 1, mesh_number(uv, "x", 1, 0.0)),
+                    mesh_number(uv, "v", 2, mesh_number(uv, "y", 2, 0.0)),
+                ]
+            },
+        ),
+        tangent: tangent.as_ref().map_or([1.0, 0.0, 0.0, 1.0], |tangent| {
+            [
+                mesh_number(tangent, "x", 1, 1.0),
+                mesh_number(tangent, "y", 2, 0.0),
+                mesh_number(tangent, "z", 3, 0.0),
+                mesh_number(tangent, "w", 4, 1.0),
+            ]
+        }),
+    };
+    if vertex
+        .position
+        .iter()
+        .chain(vertex.normal.iter())
+        .chain(vertex.uv.iter())
+        .chain(vertex.tangent.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(mlua::Error::external(
+            "mesh vertex attributes must be finite numbers",
+        ));
+    }
+    Ok(vertex)
+}
+
+fn mesh_vertices_from_table(table: Table) -> mlua::Result<Vec<Vertex>> {
+    let capacity = table.raw_len();
+    let mut vertices = Vec::with_capacity(capacity);
+    for value in table.sequence_values::<Table>() {
+        vertices.push(mesh_vertex_from_table(&value?)?);
+    }
+    Ok(vertices)
+}
+
+fn mesh_indices_from_table(table: Option<Table>, vertex_count: usize) -> mlua::Result<Vec<u32>> {
+    let Some(table) = table else {
+        if !vertex_count.is_multiple_of(3) {
+            return Err(mlua::Error::external(
+                "newMesh without indices requires a vertex count divisible by three",
+            ));
+        }
+        return (0..vertex_count)
+            .map(|index| {
+                u32::try_from(index)
+                    .map_err(|_| mlua::Error::external("mesh exceeds the u32 vertex limit"))
+            })
+            .collect();
+    };
+    let mut indices = Vec::with_capacity(table.raw_len());
+    for value in table.sequence_values::<i64>() {
+        let value = value?;
+        if value <= 0 {
+            return Err(mlua::Error::external(
+                "mesh indices use Lua's one-based indexing and must be positive",
+            ));
+        }
+        indices.push(
+            u32::try_from(value - 1)
+                .map_err(|_| mlua::Error::external("mesh index exceeds the u32 limit"))?,
+        );
+    }
+    Ok(indices)
+}
+
+fn mesh_vertex_to_table(lua: &Lua, vertex: Vertex) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    for (name, value) in [
+        ("x", vertex.position[0]),
+        ("y", vertex.position[1]),
+        ("z", vertex.position[2]),
+        ("nx", vertex.normal[0]),
+        ("ny", vertex.normal[1]),
+        ("nz", vertex.normal[2]),
+        ("u", vertex.uv[0]),
+        ("v", vertex.uv[1]),
+        ("tx", vertex.tangent[0]),
+        ("ty", vertex.tangent[1]),
+        ("tz", vertex.tangent[2]),
+        ("tw", vertex.tangent[3]),
+    ] {
+        table.set(name, value)?;
+    }
+    Ok(table)
 }
 
 fn value_to_f32(value: &Value) -> Option<f32> {
@@ -270,7 +419,7 @@ impl ImageHandle {
     pub(crate) fn from_rgba_image(image: RgbaImage) -> Self {
         Self(Arc::new(Mutex::new(ImageAsset {
             id: next_image_id(),
-            image,
+            image: Arc::new(image),
             unloaded: false,
             revision: 0,
             export_root: None,
@@ -285,7 +434,7 @@ impl ImageHandle {
             .0
             .lock()
             .map_err(|_| mlua::Error::external("image lock poisoned"))?;
-        image.image = replacement;
+        image.image = Arc::new(replacement);
         image.unloaded = false;
         image.revision = image.revision.wrapping_add(1);
         Ok(())
@@ -297,7 +446,6 @@ impl ImageHandle {
         (image.id, image.revision)
     }
 
-    #[cfg(any(target_os = "emscripten", feature = "vulkan"))]
     pub(crate) fn id(&self) -> mlua::Result<usize> {
         let image = self
             .0
@@ -314,7 +462,7 @@ impl ImageHandle {
         if image.unloaded {
             return Err(mlua::Error::external("image is unloaded"));
         }
-        Ok(f(&image.image))
+        Ok(f(image.image.as_ref()))
     }
 
     #[cfg(test)]
@@ -326,7 +474,9 @@ impl ImageHandle {
         if image.unloaded {
             return Err(mlua::Error::external("image is unloaded"));
         }
-        Ok(f(&mut image.image))
+        let result = f(Arc::make_mut(&mut image.image));
+        image.revision = image.revision.wrapping_add(1);
+        Ok(result)
     }
 
     pub(crate) fn dimensions(&self) -> mlua::Result<(u32, u32)> {
@@ -346,7 +496,7 @@ impl ImageHandle {
 
     pub(crate) fn unload(&self) {
         if let Ok(mut image) = self.0.lock() {
-            image.image = RgbaImage::new(0, 0);
+            image.image = Arc::new(RgbaImage::new(0, 0));
             image.unloaded = true;
             image.revision = image.revision.wrapping_add(1);
         }
@@ -356,7 +506,6 @@ impl ImageHandle {
         self.with_image(|_| ())
     }
 
-    #[cfg(any(target_os = "emscripten", feature = "vulkan"))]
     pub(crate) fn revision(&self) -> mlua::Result<u64> {
         let image = self
             .0
@@ -366,6 +515,21 @@ impl ImageHandle {
             return Err(mlua::Error::external("image is unloaded"));
         }
         Ok(image.revision)
+    }
+
+    pub(crate) fn snapshot(&self) -> mlua::Result<ImageSnapshot> {
+        let image = self
+            .0
+            .lock()
+            .map_err(|_| mlua::Error::external("image lock poisoned"))?;
+        if image.unloaded {
+            return Err(mlua::Error::external("image is unloaded"));
+        }
+        Ok(ImageSnapshot {
+            identity: image.id,
+            revision: image.revision,
+            pixels: Arc::clone(&image.image),
+        })
     }
 
     #[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
@@ -382,16 +546,22 @@ impl ImageHandle {
             if image.unloaded {
                 return Err(mlua::Error::external("image is unloaded"));
             }
-            (image.image.clone(), image.export_root.clone())
+            (Arc::clone(&image.image), image.export_root.clone())
         };
         let export_root = export_root
             .ok_or_else(|| mlua::Error::external("image export is unavailable for this handle"))?;
         let path = resolve_export_path(&export_root, user_path, "png")?;
         ensure_parent_dir(&path)
             .map_err(|error| asset_io_error("create export directory for image", &path, error))?;
-        image::DynamicImage::ImageRgba8(image)
-            .save_with_format(&path, image::ImageFormat::Png)
-            .map_err(|error| asset_io_error("write png image", &path, error))
+        image::save_buffer_with_format(
+            &path,
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .map_err(|error| asset_io_error("write png image", &path, error))
     }
 }
 
@@ -476,7 +646,8 @@ impl SoundHandle {
             if sound.unloaded {
                 return Err(mlua::Error::external("sound is unloaded"));
             }
-            let bytes = if sound.sample_rate > 0 && sound.channels > 0 && !sound.samples.is_empty() {
+            let bytes = if sound.sample_rate > 0 && sound.channels > 0 && !sound.samples.is_empty()
+            {
                 encode_wav_bytes(sound.sample_rate, sound.channels, &sound.samples)?
             } else if sound.bytes.starts_with(b"RIFF") {
                 sound.bytes.clone()
@@ -531,9 +702,11 @@ impl UserData for ImageHandle {
             if x >= image.image.width() || y >= image.image.height() {
                 return Err(mlua::Error::external("pixel out of bounds"));
             }
-            image
-                .image
-                .put_pixel(x, y, Rgba([color.r, color.g, color.b, color.a]));
+            Arc::make_mut(&mut image.image).put_pixel(
+                x,
+                y,
+                Rgba([color.r, color.g, color.b, color.a]),
+            );
             image.revision = image.revision.wrapping_add(1);
             Ok(())
         });
@@ -547,7 +720,7 @@ impl UserData for ImageHandle {
                 return Err(mlua::Error::external("image is unloaded"));
             }
             {
-                for pixel in image.image.pixels_mut() {
+                for pixel in Arc::make_mut(&mut image.image).pixels_mut() {
                     *pixel = Rgba([color.r, color.g, color.b, color.a]);
                 }
             }
@@ -638,6 +811,327 @@ impl UserData for SoundHandle {
     }
 }
 
+impl UserData for MeshHandle {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("revision", |_lua, this, ()| {
+            this.revision().map_err(mlua::Error::external)
+        });
+        methods.add_method("identity", |_lua, this, ()| Ok(this.identity() as u64));
+        methods.add_method("vertexCount", |_lua, this, ()| {
+            this.with_read(|mesh, _| mesh.vertices.len() as u64)
+                .map_err(mlua::Error::external)
+        });
+        methods.add_method("indexCount", |_lua, this, ()| {
+            this.with_read(|mesh, _| mesh.indices.len() as u64)
+                .map_err(mlua::Error::external)
+        });
+        methods.add_method("triangleCount", |_lua, this, ()| {
+            this.with_read(|mesh, _| (mesh.indices.len() / 3) as u64)
+                .map_err(mlua::Error::external)
+        });
+        methods.add_method("bounds", |lua, this, ()| {
+            let bounds = this
+                .with_read(|mesh, _| mesh.bounds)
+                .map_err(mlua::Error::external)?;
+            let table = lua.create_table()?;
+            for (name, value) in [
+                ("min_x", bounds.min[0]),
+                ("min_y", bounds.min[1]),
+                ("min_z", bounds.min[2]),
+                ("max_x", bounds.max[0]),
+                ("max_y", bounds.max[1]),
+                ("max_z", bounds.max[2]),
+                ("center_x", bounds.center[0]),
+                ("center_y", bounds.center[1]),
+                ("center_z", bounds.center[2]),
+                ("radius", bounds.radius),
+            ] {
+                table.set(name, value)?;
+            }
+            Ok(table)
+        });
+        methods.add_method("getVertex", |lua, this, index: i64| {
+            if index <= 0 {
+                return Err(mlua::Error::external(
+                    "mesh vertices use Lua's one-based indexing",
+                ));
+            }
+            let vertex = this
+                .with_read(|mesh, _| mesh.vertices.get(index as usize - 1).copied())
+                .map_err(mlua::Error::external)?
+                .ok_or_else(|| mlua::Error::external("mesh vertex index out of bounds"))?;
+            mesh_vertex_to_table(lua, vertex)
+        });
+        methods.add_method(
+            "setVertex",
+            |_lua, this, (index, value, normals): (i64, Table, Option<bool>)| {
+                if index <= 0 {
+                    return Err(mlua::Error::external(
+                        "mesh vertices use Lua's one-based indexing",
+                    ));
+                }
+                let vertex = mesh_vertex_from_table(&value)?;
+                this.set_vertex(index as usize - 1, vertex, normals.unwrap_or(false))
+                    .map_err(mlua::Error::external)
+            },
+        );
+        methods.add_method(
+            "setPosition",
+            |_lua, this, (index, x, y, z, normals): (i64, f32, f32, f32, Option<bool>)| {
+                if index <= 0 || ![x, y, z].iter().all(|value| value.is_finite()) {
+                    return Err(mlua::Error::external(
+                        "setPosition expects a positive index and finite coordinates",
+                    ));
+                }
+                let existing = this
+                    .with_read(|mesh, _| mesh.vertices.get(index as usize - 1).copied())
+                    .map_err(mlua::Error::external)?
+                    .ok_or_else(|| mlua::Error::external("mesh vertex index out of bounds"))?;
+                this.set_vertex(
+                    index as usize - 1,
+                    Vertex {
+                        position: [x, y, z],
+                        ..existing
+                    },
+                    normals.unwrap_or(true),
+                )
+                .map_err(mlua::Error::external)
+            },
+        );
+        methods.add_method("getIndex", |_lua, this, index: i64| {
+            if index <= 0 {
+                return Err(mlua::Error::external(
+                    "mesh indices use Lua's one-based indexing",
+                ));
+            }
+            this.with_read(|mesh, _| mesh.indices.get(index as usize - 1).copied())
+                .map_err(mlua::Error::external)?
+                .map(|value| value as u64 + 1)
+                .ok_or_else(|| mlua::Error::external("mesh index out of bounds"))
+        });
+        methods.add_method("setIndex", |_lua, this, (index, vertex): (i64, i64)| {
+            if index <= 0 || vertex <= 0 {
+                return Err(mlua::Error::external(
+                    "mesh indices use Lua's one-based indexing",
+                ));
+            }
+            let destination = index as usize - 1;
+            let vertex = u32::try_from(vertex - 1)
+                .map_err(|_| mlua::Error::external("mesh vertex index exceeds u32"))?;
+            this.mutate_recomputing_normals(move |mesh| {
+                let index = mesh.indices.get_mut(destination).ok_or_else(|| {
+                    crate::mesh::MeshError::InvalidData("mesh index is out of bounds".to_string())
+                })?;
+                *index = vertex;
+                Ok(())
+            })
+            .map_err(mlua::Error::external)
+        });
+        methods.add_method(
+            "replaceGeometry",
+            |_lua, this, (vertices, indices): (Table, Option<Table>)| {
+                let vertices = mesh_vertices_from_table(vertices)?;
+                let indices = mesh_indices_from_table(indices, vertices.len())?;
+                this.replace_geometry(vertices, indices)
+                    .map_err(mlua::Error::external)
+            },
+        );
+        methods.add_method("recomputeNormals", |_lua, this, ()| {
+            this.recompute_normals().map_err(mlua::Error::external)
+        });
+        methods.add_method("materialCount", |_lua, this, ()| {
+            this.with_read(|mesh, _| mesh.materials.len() as u64)
+                .map_err(mlua::Error::external)
+        });
+        methods.add_method("getMaterial", |lua, this, index: i64| {
+            if index <= 0 {
+                return Err(mlua::Error::external(
+                    "mesh materials use Lua's one-based indexing",
+                ));
+            }
+            let material = this
+                .with_read(|mesh, _| mesh.materials.get(index as usize - 1).cloned())
+                .map_err(mlua::Error::external)?
+                .ok_or_else(|| mlua::Error::external("mesh material index out of bounds"))?;
+            let table = lua.create_table()?;
+            table.set("name", material.name)?;
+            table.set("metallic", material.metallic)?;
+            table.set("roughness", material.roughness)?;
+            table.set("double_sided", material.double_sided)?;
+            table.set(
+                "base_color_texture",
+                material.base_color_texture.map(|binding| binding.source),
+            )?;
+            table.set(
+                "normal_texture",
+                material.normal_texture.map(|binding| binding.source),
+            )?;
+            let color = lua.create_table()?;
+            color.set("r", material.base_color[0] * 255.0)?;
+            color.set("g", material.base_color[1] * 255.0)?;
+            color.set("b", material.base_color[2] * 255.0)?;
+            color.set("a", material.base_color[3] * 255.0)?;
+            table.set("base_color", color)?;
+            Ok(table)
+        });
+        methods.add_method(
+            "setMaterialTexture",
+            |_lua,
+             this,
+             (index, slot, source, tex_coord): (i64, String, Option<String>, Option<u32>)| {
+                if index <= 0 {
+                    return Err(mlua::Error::external(
+                        "mesh materials use Lua's one-based indexing",
+                    ));
+                }
+                let index = index as usize - 1;
+                let slot = slot
+                    .trim()
+                    .to_ascii_lowercase()
+                    .replace(['-', ' '], "_");
+                this.mutate(move |mesh| {
+                    while mesh.materials.len() <= index {
+                        mesh.materials.push(MeshMaterial::default());
+                    }
+                    let material = &mut mesh.materials[index];
+                    let binding = source.map(|source| TextureBinding {
+                        source,
+                        tex_coord: tex_coord.unwrap_or(0),
+                    });
+                    match slot.as_str() {
+                        "base" | "base_color" | "albedo" | "diffuse" => {
+                            material.base_color_texture = binding
+                        }
+                        "normal" | "normal_map" => material.normal_texture = binding,
+                        "metallic_roughness" | "orm" => {
+                            material.metallic_roughness_texture = binding
+                        }
+                        "emissive" | "emission" => material.emissive_texture = binding,
+                        _ => {
+                            return Err(crate::mesh::MeshError::InvalidData(format!(
+                                "unknown material texture slot '{slot}'"
+                            )));
+                        }
+                    }
+                    Ok(())
+                })
+                .map_err(mlua::Error::external)
+            },
+        );
+        methods.add_method(
+            "setMaterialColor",
+            |_lua, this, (index, color): (i64, Table)| {
+                if index <= 0 {
+                    return Err(mlua::Error::external(
+                        "mesh materials use Lua's one-based indexing",
+                    ));
+                }
+                let index = index as usize - 1;
+                let color = color4_table_to_color(color)?;
+                this.mutate(move |mesh| {
+                    while mesh.materials.len() <= index {
+                        mesh.materials.push(MeshMaterial::default());
+                    }
+                    mesh.materials[index].base_color = [
+                        color.r as f32 / 255.0,
+                        color.g as f32 / 255.0,
+                        color.b as f32 / 255.0,
+                        color.a as f32 / 255.0,
+                    ];
+                    Ok(())
+                })
+                .map_err(mlua::Error::external)
+            },
+        );
+        methods.add_method("cloneDetached", |lua, this, ()| {
+            lua.create_userdata(this.detached_clone().map_err(mlua::Error::external)?)
+        });
+        methods.add_method("animationNames", |lua, this, ()| {
+            let output = lua.create_table()?;
+            for name in this.animation_names().map_err(mlua::Error::external)? {
+                output.push(name)?;
+            }
+            Ok(output)
+        });
+        methods.add_method("animationDuration", |_lua, this, name: String| {
+            this.animation_duration(&name)
+                .map_err(mlua::Error::external)
+        });
+        methods.add_method(
+            "sampleAnimation",
+            |_lua, this, (name, time, looped): (String, f32, Option<bool>)| {
+                this.sample_animation(&name, time, looped.unwrap_or(false))
+                    .map_err(mlua::Error::external)
+            },
+        );
+        methods.add_method(
+            "playAnimation",
+            |_lua, this, (name, looped, speed): (String, Option<bool>, Option<f32>)| {
+                this.play_animation(&name, looped.unwrap_or(true), speed.unwrap_or(1.0))
+                    .map_err(mlua::Error::external)
+            },
+        );
+        methods.add_method("updateAnimation", |_lua, this, delta: f32| {
+            this.advance_animation(delta).map_err(mlua::Error::external)
+        });
+        methods.add_method("pauseAnimation", |_lua, this, paused: Option<bool>| {
+            this.set_animation_paused(paused.unwrap_or(true))
+                .map_err(mlua::Error::external)
+        });
+        methods.add_method("stopAnimation", |_lua, this, ()| {
+            this.stop_animation().map_err(mlua::Error::external)
+        });
+        methods.add_method("jointCount", |_lua, this, ()| {
+            this.with_read(|mesh, _| {
+                mesh.armature
+                    .as_ref()
+                    .map(|armature| armature.joints.len() as u64)
+                    .unwrap_or(0)
+            })
+            .map_err(mlua::Error::external)
+        });
+    }
+}
+
+fn primitive_options_from_table(table: Option<Table>) -> mlua::Result<PrimitiveOptions> {
+    let Some(table) = table else {
+        return Ok(PrimitiveOptions::default());
+    };
+    let mut options = PrimitiveOptions::default();
+    let uniform_size = table.get::<Option<f32>>("size")?;
+    if let Some(size) = uniform_size {
+        options.size = [size; 3];
+    }
+    options.size[0] = table
+        .get::<Option<f32>>("width")?
+        .or(table.get::<Option<f32>>("size_x")?)
+        .unwrap_or(options.size[0]);
+    options.size[1] = table
+        .get::<Option<f32>>("height")?
+        .or(table.get::<Option<f32>>("size_y")?)
+        .unwrap_or(options.size[1]);
+    options.size[2] = table
+        .get::<Option<f32>>("depth")?
+        .or(table.get::<Option<f32>>("length")?)
+        .or(table.get::<Option<f32>>("size_z")?)
+        .unwrap_or(options.size[2]);
+    options.radius = table
+        .get::<Option<f32>>("radius")?
+        .unwrap_or(options.radius);
+    options.height = table
+        .get::<Option<f32>>("height")?
+        .unwrap_or(options.height);
+    options.segments = table
+        .get::<Option<u32>>("segments")?
+        .or(table.get::<Option<u32>>("segments_x")?)
+        .unwrap_or(options.segments);
+    options.rings = table
+        .get::<Option<u32>>("rings")?
+        .or(table.get::<Option<u32>>("segments_z")?)
+        .unwrap_or(options.rings);
+    Ok(options)
+}
+
 impl AssetManager {
     #[cfg(test)]
     pub(crate) fn new(env_root: PathBuf) -> Self {
@@ -651,6 +1145,7 @@ impl AssetManager {
             images: HashMap::new(),
             encoded_images: HashMap::new(),
             sounds: HashMap::new(),
+            meshes: HashMap::new(),
         }
     }
 
@@ -715,7 +1210,7 @@ impl AssetManager {
             .to_rgba8();
         let handle = Arc::new(Mutex::new(ImageAsset {
             id: next_image_id(),
-            image,
+            image: Arc::new(image),
             unloaded: false,
             revision: 0,
             export_root: Some(self.data_root.clone()),
@@ -741,16 +1236,54 @@ impl AssetManager {
         self.load_decoded_png(cache_key, bytes)
     }
 
-    fn load_decoded_png(
-        &mut self,
-        cache_key: String,
-        bytes: Vec<u8>,
-    ) -> mlua::Result<ImageHandle> {
-        if let Some(existing) = self
-            .encoded_images
-            .get(&cache_key)
-            .and_then(Weak::upgrade)
-        {
+    pub(crate) fn load_mesh(&mut self, user_path: &str) -> mlua::Result<MeshHandle> {
+        let resolved = self.resolve_path(user_path);
+        let cache_key = Self::canonical_for_cache(&resolved);
+        if let Some(mesh) = self.meshes.get(&cache_key) {
+            return Ok(mesh.clone());
+        }
+        let mesh = crate::mesh::import_from_path(&resolved).map_err(|error| {
+            mlua::Error::external(format!(
+                "failed to import mesh '{}' (resolved to '{}'): {error}",
+                user_path,
+                resolved.display()
+            ))
+        })?;
+        self.meshes.insert(cache_key, mesh.clone());
+        Ok(mesh)
+    }
+
+    pub(crate) fn new_mesh(
+        &self,
+        vertices: Vec<Vertex>,
+        indices: Vec<u32>,
+    ) -> mlua::Result<MeshHandle> {
+        let index_count = u32::try_from(indices.len())
+            .map_err(|_| mlua::Error::external("mesh exceeds the u32 index limit"))?;
+        let submeshes = if indices.is_empty() {
+            Vec::new()
+        } else {
+            vec![Submesh {
+                name: "Mesh".to_string(),
+                first_index: 0,
+                index_count,
+                material: None,
+            }]
+        };
+        let mesh = MeshData::new(
+            "Runtime Mesh",
+            vertices,
+            indices,
+            submeshes,
+            Vec::new(),
+            true,
+        )
+        .map_err(mlua::Error::external)?;
+        MeshHandle::new(mesh).map_err(mlua::Error::external)
+    }
+
+    fn load_decoded_png(&mut self, cache_key: String, bytes: Vec<u8>) -> mlua::Result<ImageHandle> {
+        if let Some(existing) = self.encoded_images.get(&cache_key).and_then(Weak::upgrade) {
             let unloaded = existing
                 .lock()
                 .map_err(|_| mlua::Error::external("image lock poisoned"))?
@@ -760,11 +1293,13 @@ impl AssetManager {
             }
         }
         let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
-            .map_err(|error| mlua::Error::external(format!("failed to decode base64 PNG: {error}")))?
+            .map_err(|error| {
+                mlua::Error::external(format!("failed to decode base64 PNG: {error}"))
+            })?
             .to_rgba8();
         let handle = Arc::new(Mutex::new(ImageAsset {
             id: next_image_id(),
-            image,
+            image: Arc::new(image),
             unloaded: false,
             revision: 0,
             export_root: Some(self.data_root.clone()),
@@ -779,7 +1314,7 @@ impl AssetManager {
         let image = RgbaImage::from_pixel(width as u32, height as u32, pixel);
         ImageHandle(Arc::new(Mutex::new(ImageAsset {
             id: next_image_id(),
-            image,
+            image: Arc::new(image),
             unloaded: false,
             revision: 0,
             export_root: Some(self.data_root.clone()),
@@ -789,7 +1324,7 @@ impl AssetManager {
     fn image_from_rgba(&self, image: RgbaImage) -> ImageHandle {
         ImageHandle(Arc::new(Mutex::new(ImageAsset {
             id: next_image_id(),
-            image,
+            image: Arc::new(image),
             unloaded: false,
             revision: 0,
             export_root: Some(self.data_root.clone()),
@@ -846,7 +1381,11 @@ impl AssetManager {
             }
             let decoder = AudioDecoder::new(Cursor::new(file_bytes.clone())).map_err(|error| {
                 asset_decode_error(
-                    if extension == "wav" { "wav file" } else { "sound" },
+                    if extension == "wav" {
+                        "wav file"
+                    } else {
+                        "sound"
+                    },
                     &resolved,
                     error,
                 )
@@ -922,6 +1461,12 @@ impl AssetManager {
         true
     }
 
+    pub(crate) fn unload_mesh_path(&mut self, user_path: &str) -> bool {
+        let resolved = self.resolve_path(user_path);
+        let cache_key = Self::canonical_for_cache(&resolved);
+        self.meshes.remove(&cache_key).is_some()
+    }
+
     pub(crate) fn gc(&mut self) -> (usize, usize) {
         let before_images = self.images.len() + self.encoded_images.len();
         let before_sounds = self.sounds.len();
@@ -963,6 +1508,46 @@ pub(crate) fn add_assets_module_with_data_root(
         )?;
     }
 
+    assets.set(
+        "primitiveMesh",
+        lua.create_function(move |lua, (kind, options): (String, Option<Table>)| {
+            let options = primitive_options_from_table(options)?;
+            let handle =
+                crate::mesh::primitive_mesh(&kind, options).map_err(mlua::Error::external)?;
+            lua.create_userdata(handle)
+        })?,
+    )?;
+
+    {
+        let manager = manager.clone();
+        assets.set(
+            "loadMesh",
+            lua.create_function(move |lua, path: String| {
+                let handle = manager
+                    .lock()
+                    .map_err(|_| mlua::Error::external("asset manager lock poisoned"))?
+                    .load_mesh(&path)?;
+                lua.create_userdata(handle)
+            })?,
+        )?;
+    }
+
+    {
+        let manager = manager.clone();
+        assets.set(
+            "newMesh",
+            lua.create_function(move |lua, (vertices, indices): (Table, Option<Table>)| {
+                let vertices = mesh_vertices_from_table(vertices)?;
+                let indices = mesh_indices_from_table(indices, vertices.len())?;
+                let handle = manager
+                    .lock()
+                    .map_err(|_| mlua::Error::external("asset manager lock poisoned"))?
+                    .new_mesh(vertices, indices)?;
+                lua.create_userdata(handle)
+            })?,
+        )?;
+    }
+
     {
         let manager = manager.clone();
         assets.set(
@@ -974,9 +1559,7 @@ pub(crate) fn add_assets_module_with_data_root(
                     ));
                 }
                 if x2 <= x || y2 <= y {
-                    return Err(mlua::Error::external(
-                        "snapPhoto expects x2 > x and y2 > y",
-                    ));
+                    return Err(mlua::Error::external("snapPhoto expects x2 > x and y2 > y"));
                 }
 
                 let window = lock_platform_state(&platform).window();
@@ -1157,6 +1740,19 @@ pub(crate) fn add_assets_module_with_data_root(
     {
         let manager = manager.clone();
         assets.set(
+            "unloadMesh",
+            lua.create_function(move |_lua, path: String| {
+                Ok(manager
+                    .lock()
+                    .map_err(|_| mlua::Error::external("asset manager lock poisoned"))?
+                    .unload_mesh_path(&path))
+            })?,
+        )?;
+    }
+
+    {
+        let manager = manager.clone();
+        assets.set(
             "gc",
             lua.create_function(move |_lua, ()| {
                 let (images, sounds) = manager
@@ -1198,6 +1794,31 @@ mod tests {
     }
 
     #[test]
+    fn image_snapshots_share_pixels_and_preserve_live_mutation_revisions() -> mlua::Result<()> {
+        let handle =
+            ImageHandle::from_rgba_image(RgbaImage::from_pixel(2, 1, Rgba([10, 20, 30, 255])));
+        let (identity, revision, first_pixels) = handle.snapshot()?.into_parts();
+        let (same_identity, same_revision, second_pixels) = handle.snapshot()?.into_parts();
+        assert_eq!(same_identity, identity);
+        assert_eq!(same_revision, revision);
+        assert!(
+            Arc::ptr_eq(&first_pixels, &second_pixels),
+            "unchanged snapshots should share their pixel allocation"
+        );
+
+        handle.with_image_mut(|image| {
+            image.put_pixel(0, 0, Rgba([200, 100, 50, 255]));
+        })?;
+        let (edited_identity, edited_revision, edited_pixels) = handle.snapshot()?.into_parts();
+        assert_eq!(edited_identity, identity);
+        assert_eq!(edited_revision, revision.wrapping_add(1));
+        assert!(!Arc::ptr_eq(&first_pixels, &edited_pixels));
+        assert_eq!(first_pixels.get_pixel(0, 0).0, [10, 20, 30, 255]);
+        assert_eq!(edited_pixels.get_pixel(0, 0).0, [200, 100, 50, 255]);
+        Ok(())
+    }
+
+    #[test]
     fn load_image_accepts_raw_and_data_uri_base64_png() -> mlua::Result<()> {
         let root = temp_root("asset_base64_png");
         let mut manager = AssetManager::new(root);
@@ -1209,7 +1830,10 @@ mod tests {
         assert_eq!(raw.sample_rgba(1, 0)?, [0, 255, 0, 128]);
 
         let uri = manager.load_image(&format!("data:image/png;base64,{encoded}"))?;
-        assert!(Arc::ptr_eq(&raw.0, &uri.0), "equivalent encodings should share the cache");
+        assert!(
+            Arc::ptr_eq(&raw.0, &uri.0),
+            "equivalent encodings should share the cache"
+        );
         Ok(())
     }
 
@@ -1223,6 +1847,50 @@ mod tests {
             .expect_err("non-PNG data must fail")
             .to_string();
         assert!(error.contains("not a PNG"));
+    }
+
+    #[test]
+    fn primitive_mesh_api_is_cached_and_detachable_from_lua() -> mlua::Result<()> {
+        let root = temp_root("primitive_mesh_api");
+        fs::create_dir_all(&root).map_err(mlua::Error::external)?;
+        let lua = Lua::new();
+        add_assets_module_with_data_root(
+            &lua,
+            root.clone(),
+            root.clone(),
+            crate::platform::new_shared_platform_state(),
+            crate::renderer::new_shared_render_state(),
+        )?;
+        let result: Table = lua
+            .load(
+                r#"
+                local cube = assets.primitiveMesh("cube")
+                local cached = assets.primitiveMesh("box")
+                local detached = cube:cloneDetached()
+                local sphere = assets.primitiveMesh("sphere", {
+                    radius = 2,
+                    segments = 12,
+                    rings = 6,
+                })
+                return {
+                    cube_vertices = cube:vertexCount(),
+                    cube_triangles = cube:triangleCount(),
+                    cached = cube:identity() == cached:identity(),
+                    detached = cube:identity() ~= detached:identity(),
+                    sphere_triangles = sphere:triangleCount(),
+                    animations = #cube:animationNames(),
+                }
+                "#,
+            )
+            .eval()?;
+        assert_eq!(result.get::<u64>("cube_vertices")?, 24);
+        assert_eq!(result.get::<u64>("cube_triangles")?, 12);
+        assert!(result.get::<bool>("cached")?);
+        assert!(result.get::<bool>("detached")?);
+        assert_eq!(result.get::<u64>("sphere_triangles")?, 120);
+        assert_eq!(result.get::<u64>("animations")?, 0);
+        fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
     }
 
     #[test]
@@ -1258,13 +1926,7 @@ mod tests {
             .map_err(mlua::Error::external)?;
 
         let lua = Lua::new();
-        add_assets_module_with_data_root(
-            &lua,
-            root.clone(),
-            root.clone(),
-            platform,
-            render_state,
-        )?;
+        add_assets_module_with_data_root(&lua, root.clone(), root.clone(), platform, render_state)?;
         let assets: Table = lua.globals().get("assets")?;
         let snap: mlua::Function = assets.get("snapPhoto")?;
         let userdata: mlua::AnyUserData = snap.call((-2.0, 0.0, 3.0, 2.0))?;
@@ -1414,6 +2076,34 @@ mod tests {
 
         assert!(error.contains("failed to decode wav file"));
         assert!(error.contains(invalid_path.to_string_lossy().as_ref()));
+
+        fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mesh_assets_cache_identity_and_share_live_edits() -> mlua::Result<()> {
+        let root = temp_root("asset_mesh_cache");
+        let assets_dir = root.join("assets");
+        fs::create_dir_all(&assets_dir).map_err(mlua::Error::external)?;
+        fs::write(
+            assets_dir.join("triangle.obj"),
+            b"v -1 -1 0\nv 1 -1 0\nv 0 1 0\nf 1 2 3\n",
+        )
+        .map_err(mlua::Error::external)?;
+
+        let mut manager = AssetManager::new(root.clone());
+        let first = manager.load_mesh("triangle.obj")?;
+        let second = manager.load_mesh("triangle.obj")?;
+        assert_eq!(first.identity(), second.identity());
+        let revision = first
+            .set_vertex(0, Vertex::from_position([-2.0, -1.0, 0.0]), true)
+            .map_err(mlua::Error::external)?;
+        assert_eq!(revision, 1);
+        let position = second
+            .with_read(|mesh, _| mesh.vertices[0].position)
+            .map_err(mlua::Error::external)?;
+        assert_eq!(position, [-2.0, -1.0, 0.0]);
 
         fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())

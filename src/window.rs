@@ -603,6 +603,22 @@ pub(crate) fn attach_entity_methods(lua: &Lua, entity: &Table) -> mlua::Result<(
     entity.set("getWorldRotation", get_world_rotation.clone())?;
     entity.set("GetWorldRotation", get_world_rotation)?;
 
+    let get_world_position_3d = lua.create_function(move |lua, entity: Table| {
+        let transform: Table = lua.globals().get("transform")?;
+        let function: Function = transform.get("getWorldPosition3D")?;
+        function.call::<(f32, f32, f32)>(entity)
+    })?;
+    entity.set("getWorldPosition3D", get_world_position_3d.clone())?;
+    entity.set("GetWorldPosition3D", get_world_position_3d)?;
+
+    let get_world_rotation_3d = lua.create_function(move |lua, entity: Table| {
+        let transform: Table = lua.globals().get("transform")?;
+        let function: Function = transform.get("getWorldRotation3D")?;
+        function.call::<(f32, f32, f32)>(entity)
+    })?;
+    entity.set("getWorldRotation3D", get_world_rotation_3d.clone())?;
+    entity.set("GetWorldRotation3D", get_world_rotation_3d)?;
+
     let is_inside =
         lua.create_function(move |_lua, (entity, world_x, world_y): (Table, f32, f32)| {
             point_hits_entity(&entity, world_x, world_y)
@@ -644,7 +660,11 @@ pub(crate) fn create_entity_table(
     table.set("name", name)?;
     table.set("x", x)?;
     table.set("y", y)?;
+    table.set("position_z", 0.0)?;
     table.set("rotation", 0.0)?;
+    table.set("rotation_x", 0.0)?;
+    table.set("rotation_y", 0.0)?;
+    table.set("rotation_z", 0.0)?;
     table.set("rotation_pivot", "topleft")?;
     table.set("rotation_pivot_x", Value::Nil)?;
     table.set("rotation_pivot_y", Value::Nil)?;
@@ -652,6 +672,9 @@ pub(crate) fn create_entity_table(
     table.set("size_x", 32.0)?;
     table.set("size_y", 32.0)?;
     table.set("scale", 1.0)?;
+    table.set("scale_x", 1.0)?;
+    table.set("scale_y", 1.0)?;
+    table.set("scale_z", 1.0)?;
     table.set("anchor_x", 0.0)?;
     table.set("anchor_y", 0.0)?;
     table.set("pivot_x", Value::Nil)?;
@@ -1028,6 +1051,78 @@ pub fn get_global_size(entity: &Table) -> mlua::Result<(f32, f32)> {
     let h: f32 = entity.get("size_y")?;
     let scale = get_global_scale(entity)?;
     Ok((w * scale, h * scale))
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GlobalTransform3D {
+    pub model: crate::render3d::Mat4,
+    pub position: crate::render3d::Vec3,
+    pub scale: crate::render3d::Vec3,
+    /// Additive world Euler angles in degrees. The model matrix remains the
+    /// authoritative transform for geometry; this value is used for camera and
+    /// light directions, whose authored controls are Euler-based.
+    pub euler: crate::render3d::Vec3,
+}
+
+fn finite_entity_number(entity: &Table, field: &str, default: f32) -> f32 {
+    entity
+        .get::<f32>(field)
+        .ok()
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+}
+
+pub(crate) fn get_global_transform_3d(entity: &Table) -> mlua::Result<GlobalTransform3D> {
+    use crate::render3d::{Mat4, Vec3};
+
+    let mut chain = Vec::<Table>::new();
+    let mut current = entity.clone();
+    loop {
+        chain.push(current.clone());
+        if let Ok(Some(parent)) = current.get::<Option<Table>>("parent") {
+            current = parent;
+        } else {
+            break;
+        }
+    }
+
+    let mut model = Mat4::identity();
+    let mut world_euler = Vec3::ZERO;
+    for current in chain.into_iter().rev() {
+        let position = Vec3::new(
+            finite_entity_number(&current, "x", 0.0),
+            finite_entity_number(&current, "y", 0.0),
+            finite_entity_number(&current, "position_z", 0.0),
+        );
+        let euler = Vec3::new(
+            finite_entity_number(&current, "rotation_x", 0.0),
+            finite_entity_number(&current, "rotation_y", 0.0),
+            finite_entity_number(&current, "rotation_z", 0.0),
+        );
+        let scale = Vec3::new(
+            finite_entity_number(&current, "scale_x", 1.0),
+            finite_entity_number(&current, "scale_y", 1.0),
+            finite_entity_number(&current, "scale_z", 1.0),
+        );
+        model = model.mul(Mat4::trs(position, euler, scale));
+        world_euler.x += euler.x;
+        world_euler.y += euler.y;
+        world_euler.z += euler.z;
+    }
+
+    let values = model.values;
+    let axis_length = |column: usize| {
+        (values[0][column] * values[0][column]
+            + values[1][column] * values[1][column]
+            + values[2][column] * values[2][column])
+            .sqrt()
+    };
+    Ok(GlobalTransform3D {
+        position: model.transform_point(Vec3::ZERO),
+        scale: Vec3::new(axis_length(0), axis_length(1), axis_length(2)),
+        model,
+        euler: world_euler,
+    })
 }
 
 pub fn get_global_transform(entity: &Table) -> mlua::Result<(f32, f32, f32)> {
@@ -1988,6 +2083,13 @@ impl Runtime {
         Ok(Antialiasing::parse(&value))
     }
 
+    fn resolve_app_nearest_neighbor_scaling(&self) -> mlua::Result<bool> {
+        Ok(self
+            .app_table()?
+            .raw_get::<Option<bool>>("nearestNeighborScaling")?
+            .unwrap_or(true))
+    }
+
     #[cfg(not(target_os = "emscripten"))]
     fn resolve_app_max_fps(&self) -> mlua::Result<Option<f32>> {
         let app = self.app_table()?;
@@ -2553,6 +2655,18 @@ impl Runtime {
                 let rotation = get_global_rotation(&entity)?;
                 Ok(rotation)
             })?;
+            let get_world_position_3d = self.lua.create_function(move |_lua, entity: Table| {
+                let transform = get_global_transform_3d(&entity)?;
+                Ok((
+                    transform.position.x,
+                    transform.position.y,
+                    transform.position.z,
+                ))
+            })?;
+            let get_world_rotation_3d = self.lua.create_function(move |_lua, entity: Table| {
+                let transform = get_global_transform_3d(&entity)?;
+                Ok((transform.euler.x, transform.euler.y, transform.euler.z))
+            })?;
             let look_at = self.lua.create_function(
                 move |_lua, (from_x, from_y, to_x, to_y): (f32, f32, f32, f32)| {
                     Ok(look_at_rotation(from_x, from_y, to_x, to_y))
@@ -2732,6 +2846,10 @@ impl Runtime {
 
             transforms.set("getWorldPosition", get_world_position)?;
             transforms.set("getWorldRotation", get_world_rotation)?;
+            transforms.set("getWorldPosition3D", get_world_position_3d.clone())?;
+            transforms.set("get_world_position_3d", get_world_position_3d)?;
+            transforms.set("getWorldRotation3D", get_world_rotation_3d.clone())?;
+            transforms.set("get_world_rotation_3d", get_world_rotation_3d)?;
             transforms.set("lookAt", look_at.clone())?;
             transforms.set("look_at", look_at)?;
 
@@ -4523,7 +4641,7 @@ impl Runtime {
         }
 
         panic_stage.set("begin_ui_frame");
-        crate::core::begin_ui_frame();
+        crate::core::begin_ui_frame(&self.render_state);
         if let Some(trace) = web_trace {
             web_debug_log(&format!("runtime.update {trace}: after begin_ui_frame"));
         }
@@ -4646,10 +4764,19 @@ impl Runtime {
                 describe_lua_error(&error)
             )
         })?;
+        let nearest_neighbor_scaling =
+            self.resolve_app_nearest_neighbor_scaling()
+                .map_err(|error| {
+                    format!(
+                        "failed to resolve app output scaling mode:\n{}",
+                        describe_lua_error(&error)
+                    )
+                })?;
         {
             let mut platform = lock_platform_state(&self.platform);
             platform.set_clear_color(clear);
             platform.set_antialiasing(antialiasing);
+            platform.set_nearest_neighbor_scaling(nearest_neighbor_scaling);
         }
         panic_stage.set("systems loop");
         if let Some(trace) = web_trace {
@@ -5991,9 +6118,12 @@ mod tests {
             .first()
             .expect("runtime component snapshot");
         assert_eq!(component.name, "RuntimeProbe");
-        assert!(component.fields.iter().any(|(name, value)| {
-            name == "tint" && value == "Color4(10, 20, 30, 40)"
-        }));
+        assert!(
+            component
+                .fields
+                .iter()
+                .any(|(name, value)| { name == "tint" && value == "Color4(10, 20, 30, 40)" })
+        );
         assert!(component.fields.iter().any(|(name, value)| {
             name == "settings" && value.contains("mode = fast") && value.contains("speed = 12")
         }));
@@ -6061,6 +6191,111 @@ mod tests {
         play.call::<()>(component.clone())?;
         runtime.update(0.25).map_err(mlua::Error::external)?;
         assert_eq!(component.get::<usize>("particle_count")?, 5);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn live_3d_project_batches_many_primitives_particles_and_environment() -> mlua::Result<()> {
+        use std::time::Instant;
+
+        const MESH_COUNT: usize = 192;
+        let (mut runtime, root) = start_test_runtime("live_3d_project")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                local environmentEntity = ecs.newEntity("Environment", ecs.root, 0, 0)
+                local environment = environmentEntity:AddComponent(core.Environment3D)
+                environment.mode = "gradient"
+                environment.top_color = Color4(30, 50, 90)
+                environment.bottom_color = Color4(5, 8, 14)
+
+                local cameraEntity = ecs.newEntity("Camera", ecs.root, 0, 0)
+                cameraEntity.position_z = 18
+                cameraEntity:AddComponent(core.Camera3D)
+
+                local lightEntity = ecs.newEntity("Sun", ecs.root, 0, 4)
+                lightEntity.position_z = 5
+                local light = lightEntity:AddComponent(core.Light3D)
+                light.kind = "directional"
+                light.intensity = 1.25
+
+                liveFirstRenderer = nil
+                liveLastRenderer = nil
+                for index = 1, 192 do
+                    local entity = ecs.newEntity("Cube " .. index, ecs.root, 0, 0)
+                    entity.x = ((index - 1) % 16) - 7.5
+                    entity.y = math.floor((index - 1) / 16) - 5.5
+                    entity.position_z = -((index - 1) % 4) * 0.2
+                    local renderer = entity:AddComponent(core.MeshRenderer3D)
+                    renderer.primitive = "cube"
+                    renderer.primitive_size_x = 0.7
+                    renderer.primitive_size_y = 0.7
+                    renderer.primitive_size_z = 0.7
+                    if index == 1 then liveFirstRenderer = renderer end
+                    if index == 192 then liveLastRenderer = renderer end
+                end
+
+                local particleEntity = ecs.newEntity("Sparks", ecs.root, 0, 0)
+                liveParticles = particleEntity:AddComponent(core.ParticleSystem3D)
+                liveParticles.playing = false
+                liveParticles.max_particles = 2048
+                liveParticles.lifetime_min = 10
+                liveParticles.lifetime_max = 10
+                liveParticles:Emit(2048)
+                "#,
+            )
+            .set_name("@live_3d_project/main.luau")
+            .exec()?;
+
+        let started = Instant::now();
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        let elapsed = started.elapsed();
+        runtime
+            .lua
+            .load(
+                r#"
+                assert(liveFirstRenderer.mesh ~= nil)
+                assert(liveLastRenderer.mesh ~= nil)
+                assert(liveFirstRenderer.mesh:identity() == liveLastRenderer.mesh:identity(),
+                    "equivalent primitive meshes should share cached geometry")
+                assert(liveParticles.particle_count == 2048)
+                "#,
+            )
+            .exec()?;
+
+        let commands = crate::renderer::drain_commands(&runtime.render_state())
+            .map_err(mlua::Error::external)?;
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, crate::renderer::DrawCommand::Mesh3D(_)))
+                .count(),
+            MESH_COUNT
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, crate::renderer::DrawCommand::Particles3D(_)))
+                .count(),
+            1,
+            "one emitter should remain one renderer command even at capacity"
+        );
+        let environment = runtime
+            .render_state()
+            .lock()
+            .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+            .environment_3d();
+        assert!(environment.enabled);
+        assert_eq!(
+            environment.mode,
+            crate::environment3d::EnvironmentMode3D::Gradient
+        );
+        eprintln!(
+            "live 3D project update: {MESH_COUNT} primitive entities + 2048 particles in {elapsed:?}"
+        );
 
         std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())
@@ -6225,7 +6460,10 @@ mod tests {
         // clobber velocity-driven motion): +600px/s over 1/60s ≈ +10px.
         let body: Table = runtime.lua.globals().get("body")?;
         let x = body.get::<f32>("x")?;
-        assert!(x > 105.0, "expected velocity to advance x past 105, got {x}");
+        assert!(
+            x > 105.0,
+            "expected velocity to advance x past 105, got {x}"
+        );
         assert_close(body.get::<f32>("y")?, 100.0);
 
         std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
@@ -6606,8 +6844,7 @@ mod tests {
     #[test]
     fn runtime_loads_and_instantiates_editor_neoprefab_files() -> mlua::Result<()> {
         use crate::scene::{
-            AttachedValue, Component, ComponentReference, DictionaryEntry, Scene, VarKey,
-            VarValue,
+            AttachedValue, Component, ComponentReference, DictionaryEntry, Scene, VarKey, VarValue,
         };
 
         let (runtime, root) = start_test_runtime("load_neoprefab")?;
@@ -6633,7 +6870,10 @@ mod tests {
             .entity_mut(child_id)
             .expect("prefab child")
             .parent = Some(root_id);
-        prefab_scene.entity_mut(root_id).expect("prefab root").values = vec![
+        prefab_scene
+            .entity_mut(root_id)
+            .expect("prefab root")
+            .values = vec![
             AttachedValue {
                 name: "score".into(),
                 value: VarValue::Number(42.0),
@@ -6698,7 +6938,10 @@ mod tests {
         let child_ref: Table = instance.get("childRef")?;
         assert_eq!(child_ref.to_pointer(), child.to_pointer());
         let renderer: Table = instance.get("renderer")?;
-        assert_eq!(renderer.to_pointer(), components.get::<Table>(1)?.to_pointer());
+        assert_eq!(
+            renderer.to_pointer(),
+            components.get::<Table>(1)?.to_pointer()
+        );
         let settings: Table = instance.get("settings")?;
         assert!(settings.get::<bool>("aggressive")?);
 

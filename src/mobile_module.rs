@@ -1,6 +1,6 @@
 use mlua::Lua;
 
-use crate::platform::{lock_platform_state, SharedPlatformState};
+use crate::platform::{SharedPlatformState, lock_platform_state};
 
 fn is_real_mobile() -> bool {
     cfg!(target_os = "android") || cfg!(target_os = "ios")

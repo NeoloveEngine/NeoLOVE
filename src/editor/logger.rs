@@ -68,8 +68,12 @@ impl LoggerWindow {
         let split = (w * 0.46).round();
 
         let tree_rect = Rect::new(0.0, main_top, split, main_bottom - main_top);
-        let inspector_rect =
-            Rect::new(split + 1.0, main_top, w - split - 1.0, main_bottom - main_top);
+        let inspector_rect = Rect::new(
+            split + 1.0,
+            main_top,
+            w - split - 1.0,
+            main_bottom - main_top,
+        );
         let log_rect = Rect::new(0.0, main_bottom, w, log_h);
 
         self.draw_hierarchy(ui, tree_rect, &entities);
@@ -87,7 +91,8 @@ impl LoggerWindow {
         } else {
             ("Waiting for game…", ui.theme.text_dim)
         };
-        ui.painter.text_clipped(PAD, 8.0, status, TEXT, color, 130.0);
+        ui.painter
+            .text_clipped(PAD, 8.0, status, TEXT, color, 130.0);
         ui.painter.text_clipped(
             150.0,
             8.0,
@@ -109,18 +114,11 @@ impl LoggerWindow {
 
     fn draw_hierarchy(&mut self, ui: &mut Ui, rect: Rect, entities: &[EntitySnapshot]) {
         ui.painter.fill_rect(rect, ui.theme.panel);
-        ui.painter.fill_rect(
-            Rect::new(rect.x, rect.y, rect.w, ROW_H),
-            ui.theme.header,
-        );
+        ui.painter
+            .fill_rect(Rect::new(rect.x, rect.y, rect.w, ROW_H), ui.theme.header);
         ui.label(rect.x + PAD, rect.y + 4.0, "Hierarchy", ui.theme.text_dim);
 
-        let body = Rect::new(
-            rect.x,
-            rect.y + ROW_H,
-            rect.w,
-            (rect.h - ROW_H).max(0.0),
-        );
+        let body = Rect::new(rect.x, rect.y + ROW_H, rect.w, (rect.h - ROW_H).max(0.0));
         let ordered = ordered_with_depth(entities);
         let content_h = ordered.len() as f32 * ROW_H;
         self.tree_scroll = apply_scroll(ui, body, self.tree_scroll, content_h);
@@ -148,10 +146,8 @@ impl LoggerWindow {
 
     fn draw_inspector(&mut self, ui: &mut Ui, rect: Rect, entities: &[EntitySnapshot]) {
         ui.painter.fill_rect(rect, ui.theme.panel_alt);
-        ui.painter.fill_rect(
-            Rect::new(rect.x, rect.y, rect.w, ROW_H),
-            ui.theme.header,
-        );
+        ui.painter
+            .fill_rect(Rect::new(rect.x, rect.y, rect.w, ROW_H), ui.theme.header);
         ui.label(rect.x + PAD, rect.y + 4.0, "Inspector", ui.theme.text_dim);
 
         let body = Rect::new(rect.x, rect.y + ROW_H, rect.w, (rect.h - ROW_H).max(0.0));
@@ -184,7 +180,10 @@ impl LoggerWindow {
             // Compatibility with snapshots produced by older runtimes.
             lines.push((format!("x = {:.2}    y = {:.2}", entity.x, entity.y), false));
             lines.push((
-                format!("rotation = {:.3}    scale = {:.3}", entity.rotation, entity.scale),
+                format!(
+                    "rotation = {:.3}    scale = {:.3}",
+                    entity.rotation, entity.scale
+                ),
                 false,
             ));
             lines.push((format!("enabled = {}", entity.enabled), false));
@@ -207,7 +206,11 @@ impl LoggerWindow {
         let mut y = body.y + 4.0 - self.inspector_scroll;
         for (text, header) in &lines {
             if y + ROW_H >= body.y && y <= body.bottom() && !text.is_empty() {
-                let color = if *header { ui.theme.text } else { ui.theme.text_dim };
+                let color = if *header {
+                    ui.theme.text
+                } else {
+                    ui.theme.text_dim
+                };
                 ui.painter
                     .text_clipped(body.x + PAD, y, text, TEXT, color, body.w - PAD * 2.0);
             }

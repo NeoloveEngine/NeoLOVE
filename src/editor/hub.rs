@@ -71,13 +71,8 @@ pub fn run_hub() -> Result<(), String> {
                 handle_hub_event(event, &window, &mut input, control_flow);
             }
             Event::RedrawRequested(_) => {
-                if let Err(error) = redraw_hub(
-                    &window,
-                    &mut surface,
-                    &mut hub,
-                    &mut input,
-                    &fonts,
-                ) {
+                if let Err(error) = redraw_hub(&window, &mut surface, &mut hub, &mut input, &fonts)
+                {
                     eprintln!("Hub render error: {error}");
                     *control_flow = ControlFlow::Exit;
                     return;
@@ -119,6 +114,7 @@ struct HubApp {
     config: EditorConfig,
     config_path: PathBuf,
     project_name: String,
+    project_kind: crate::ProjectKind,
     parent_dir: String,
     status: String,
     recents: Vec<RecentProject>,
@@ -164,6 +160,7 @@ impl HubApp {
             config,
             config_path,
             project_name: "my-game".to_string(),
+            project_kind: crate::ProjectKind::TwoD,
             parent_dir: default_projects_dir().to_string_lossy().to_string(),
             status: String::new(),
             recents: load_recent_projects(),
@@ -196,14 +193,17 @@ impl HubApp {
             ui.set_input_clip(Rect::new(-1.0, -1.0, 0.0, 0.0));
         }
 
-        ui.painter.text(24.0, 22.0, "NeoLOVE Hub", 22.0, ui.theme.text);
-        ui.painter.text(26.0, 50.0, "Projects", 13.0, ui.theme.text_dim);
+        ui.painter
+            .text(24.0, 22.0, "NeoLOVE Hub", 22.0, ui.theme.text);
+        ui.painter
+            .text(26.0, 50.0, "Projects", 13.0, ui.theme.text_dim);
         let settings = Rect::new((w - 196.0).max(24.0), 24.0, 172.0, 32.0);
         let settings_clicked = ui.icon_button(settings, icon::TUNE, "Editor Settings");
         if !modal_open && settings_clicked {
             self.open_settings();
         }
-        ui.painter.fill_rect(Rect::new(24.0, 70.0, w - 48.0, 1.0), line);
+        ui.painter
+            .fill_rect(Rect::new(24.0, 70.0, w - 48.0, 1.0), line);
 
         if compact {
             let top = Rect::new(18.0, 90.0, w - 36.0, 218.0);
@@ -265,6 +265,37 @@ impl HubApp {
             17.0,
             ui.theme.text,
         );
+
+        let kind_gap = 4.0;
+        let kind_w = 44.0;
+        let kind_x = area.right() - 14.0 - kind_w * 2.0 - kind_gap;
+        let kind_y = area.y + 13.0;
+        let two_d = ui.button_colored(
+            Rect::new(kind_x, kind_y, kind_w, 30.0),
+            "2D",
+            if self.project_kind == crate::ProjectKind::TwoD {
+                ui.theme.accent
+            } else {
+                ui.theme.button
+            },
+            ui.theme.text,
+        );
+        let three_d = ui.button_colored(
+            Rect::new(kind_x + kind_w + kind_gap, kind_y, kind_w, 30.0),
+            "3D",
+            if self.project_kind == crate::ProjectKind::ThreeD {
+                ui.theme.accent
+            } else {
+                ui.theme.button
+            },
+            ui.theme.text,
+        );
+        if interactive && two_d {
+            self.project_kind = crate::ProjectKind::TwoD;
+        }
+        if interactive && three_d {
+            self.project_kind = crate::ProjectKind::ThreeD;
+        }
 
         let field_w = (area.w - 28.0).max(80.0);
         let mut y = area.y + 58.0;
@@ -409,7 +440,7 @@ impl HubApp {
         }
 
         let project_path = PathBuf::from(parent).join(name);
-        match crate::create_project_at(&project_path, name) {
+        match crate::create_project_at(&project_path, name, self.project_kind) {
             Ok(path) => self.open_project(path),
             Err(error) => self.status = error,
         }
@@ -450,7 +481,8 @@ impl HubApp {
             return;
         };
 
-        ui.painter.fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 135]);
+        ui.painter
+            .fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 135]);
         let width = (w - 32.0).min(560.0).max(360.0);
         let height = (h - 24.0).min(460.0).max(340.0);
         let compact = height < 430.0;
@@ -466,7 +498,8 @@ impl HubApp {
             .text(px + 16.0, py + 14.0, "Editor Settings", 17.0, ui.theme.text);
 
         let mut y = py + if compact { 40.0 } else { 46.0 };
-        ui.painter.text(px + 16.0, y, "Theme", 14.0, ui.theme.text_dim);
+        ui.painter
+            .text(px + 16.0, y, "Theme", 14.0, ui.theme.text_dim);
         y += if compact { 16.0 } else { 18.0 };
         let theme_area = Rect::new(px + 16.0, y, width - 32.0, theme_area_h);
         ui.painter.fill_rect(theme_area, ui.theme.field);
@@ -481,7 +514,8 @@ impl HubApp {
         }
 
         y = theme_area.bottom() + if compact { 10.0 } else { 12.0 };
-        ui.painter.text(px + 16.0, y + 4.0, "Font Path", 13.0, ui.theme.text_dim);
+        ui.painter
+            .text(px + 16.0, y + 4.0, "Font Path", 13.0, ui.theme.text_dim);
         let font_result = ui.text_field(
             "hub_editor_font_path",
             Rect::new(px + 106.0, y, width - 122.0, 22.0),
@@ -544,7 +578,10 @@ impl HubApp {
 
         match app::save_config(&self.config_path, &self.config) {
             Ok(()) => {
-                self.status = format!("Saved editor settings ({})", app::theme_label(&draft.theme_name));
+                self.status = format!(
+                    "Saved editor settings ({})",
+                    app::theme_label(&draft.theme_name)
+                );
                 self.settings = None;
                 self.focus = None;
                 self.edit_buffer.clear();
