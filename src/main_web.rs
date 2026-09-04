@@ -363,6 +363,7 @@ impl WebApp {
             lights,
             occluders,
             lights_3d,
+            reflection_probes_3d,
             environment_3d,
             camera_3d,
             postprocess_active,
@@ -373,6 +374,7 @@ impl WebApp {
                 .map_err(|_| "render state lock poisoned".to_string())?;
             let (lighting, lights, occluders) = state.take_lighting();
             let lights_3d = state.take_lights_3d();
+            let reflection_probes_3d = state.take_reflection_probes_3d();
             let environment_3d = state.environment_3d();
             let camera_3d = state.camera_3d();
             let postprocess = state.post_process();
@@ -383,6 +385,7 @@ impl WebApp {
                 lights,
                 occluders,
                 lights_3d,
+                reflection_probes_3d,
                 environment_3d,
                 camera_3d,
                 postprocess_active,
@@ -406,6 +409,7 @@ impl WebApp {
             &self.platform_state,
             &pixel_commands,
             &lights_3d,
+            &reflection_probes_3d,
             &environment_3d,
             camera_3d,
         )
@@ -613,6 +617,7 @@ fn render_web_commands_in_order(
     platform: &SharedPlatformState,
     commands: &[&DrawCommand],
     lights_3d: &[crate::render3d::Light3D],
+    reflection_probes_3d: &[crate::render3d::ReflectionProbe3D],
     environment: &crate::environment3d::Environment3D,
     camera: crate::render3d::Camera3D,
 ) -> Result<(), String> {
@@ -642,24 +647,59 @@ fn render_web_commands_in_order(
         }
     }
 
+    let ambient_occlusion = (environment.enabled && environment.ambient_occlusion.enabled)
+        .then(|| environment.ambient_occlusion.sanitized());
+    let ambient_occluders = ambient_occlusion
+        .map(|_| crate::render3d::gather_ambient_occluders_3d(commands.iter().copied()))
+        .unwrap_or_default();
     let mut pending = Vec::new();
-    for &command in commands {
+    for (source_index, &command) in commands.iter().enumerate() {
         if !crate::renderer::command_intersects_viewport(command, viewport.0, viewport.1) {
             continue;
         }
         if is_web_native_image(command) {
-            flush_software_chunk(renderer, viewport, &pending, lights_3d)?;
+            flush_software_chunk(
+                renderer,
+                viewport,
+                &pending,
+                lights_3d,
+                reflection_probes_3d,
+                environment,
+            )?;
             pending.clear();
             draw_web_image(command)?;
         } else if command_has_shader(command) {
-            flush_software_chunk(renderer, viewport, &pending, lights_3d)?;
+            flush_software_chunk(
+                renderer,
+                viewport,
+                &pending,
+                lights_3d,
+                reflection_probes_3d,
+                environment,
+            )?;
             pending.clear();
-            draw_web_shader_command(command, lights_3d, viewport, antialiasing)?;
+            draw_web_shader_command(
+                command,
+                lights_3d,
+                environment,
+                ambient_occlusion,
+                &ambient_occluders,
+                source_index,
+                viewport,
+                antialiasing,
+            )?;
         } else {
             pending.push(command);
         }
     }
-    let result = flush_software_chunk(renderer, viewport, &pending, lights_3d);
+    let result = flush_software_chunk(
+        renderer,
+        viewport,
+        &pending,
+        lights_3d,
+        reflection_probes_3d,
+        environment,
+    );
     renderer.resize(viewport.0, viewport.1);
     result
 }
@@ -731,6 +771,8 @@ fn flush_software_chunk(
     viewport: (u32, u32),
     commands: &[&DrawCommand],
     lights_3d: &[crate::render3d::Light3D],
+    reflection_probes_3d: &[crate::render3d::ReflectionProbe3D],
+    environment: &crate::environment3d::Environment3D,
 ) -> Result<(), String> {
     if commands.is_empty() {
         return Ok(());
@@ -770,7 +812,12 @@ fn flush_software_chunk(
             )
         })
         .collect();
-    renderer.draw_commands_with_3d_lights(&translated, lights_3d)?;
+    renderer.draw_commands_with_3d_scene(
+        &translated,
+        lights_3d,
+        reflection_probes_3d,
+        Some(environment),
+    )?;
     unsafe {
         neolove_web_composite_rgba(
             renderer.pixels().as_ptr(),
@@ -798,6 +845,10 @@ fn command_has_shader(command: &DrawCommand) -> bool {
 fn draw_web_shader_command(
     command: &DrawCommand,
     lights_3d: &[crate::render3d::Light3D],
+    environment: &crate::environment3d::Environment3D,
+    ambient_occlusion: Option<crate::environment3d::AmbientOcclusion3D>,
+    ambient_occluders: &[crate::render3d::AmbientOccluder3D],
+    source_index: usize,
     viewport: (u32, u32),
     antialiasing: crate::platform::Antialiasing,
 ) -> Result<(), String> {
@@ -922,6 +973,28 @@ fn draw_web_shader_command(
                 .as_ref()
                 .ok_or_else(|| "mesh shader disappeared during rendering".to_string())?;
             let mut triangles = crate::render3d::project_mesh(command, lights_3d)?;
+            if command.receives_shadows
+                && let Some(settings) = ambient_occlusion
+                && let Ok(receiver) = crate::render3d::mesh_world_bounds_3d(command)
+            {
+                let selected = crate::render3d::select_ambient_occluders_3d(
+                    source_index,
+                    receiver,
+                    ambient_occluders,
+                );
+                crate::render3d::apply_ambient_occlusion_to_projected_triangles(
+                    &mut triangles,
+                    settings,
+                    &selected,
+                );
+            }
+            if environment.enabled && environment.fog.enabled {
+                crate::render3d::apply_fog_to_projected_triangles(
+                    &mut triangles,
+                    command.camera_position,
+                    environment.fog.sanitized(),
+                );
+            }
             triangles.sort_by(|left, right| right.depth.total_cmp(&left.depth));
             let mut vertices = Vec::with_capacity(triangles.len() * 3 * 9);
             for triangle in triangles {

@@ -253,6 +253,7 @@ neolove
 neolove hub
 neolove new <project-name>
 neolove run [project-dir] [run options]
+neolove validate-3d [project-dir] --baseline <png> [validation options]
 neolove editor [project-dir]
 neolove build [project-dir] [target option]
 neolove api [project-dir]
@@ -278,6 +279,7 @@ the corresponding explicit setup command was requested.
 | `hub` | none | Opens the graphical project launcher. |
 | `new` | exactly one project name | Creates the project, template settings, API declarations, and starter files. |
 | `run` | zero or one project path, then run options in any order | Validates `main.luau` and starts the game. |
+| `validate-3d` | zero or one project path, required baseline path, then validation options | Runs the isolated real 3D runtime headlessly, captures one lossless frame, writes a structured report, and exits nonzero on runtime or visual failure. |
 | `editor` | zero or one project path | Opens a directory in the visual editor; `main.luau` is not required. |
 | `build` | zero or one project path plus at most one target | Validates `main.luau` and writes a package under `dist/`. |
 | `api` | zero or one project path | Rewrites `types/neolove_engine_api.d.luau`; also rewrites a root copy if one already exists. |
@@ -307,6 +309,37 @@ options fail with a command-specific message.
 All mobile-state options except `--no-low-power` also enable emulation. The
 emulated window is non-resizable and not fullscreen. Keyboard events are
 suppressed, although the mouse remains available for touch-style testing.
+
+## Complete `validate-3d` option reference
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--baseline PATH` | required | PNG to create or compare. `--baseline=PATH` is also accepted. |
+| `--backend auto\|software\|vulkan` | `auto` | Selects native Vulkan with fallback, forces software, or forces Vulkan. Forced Vulkan fails actionably when unavailable. |
+| `--width N` | `960` | Capture width in `64..8192`. |
+| `--height N` | `540` | Capture height in `64..8192`. |
+| `--write-baseline` | off | Writes the captured PNG and its `*-baseline.json` backend/dimension sidecar instead of comparing. `--set-baseline` is an alias. |
+| `--report PATH` | beside baseline | JSON report path. The default suffix is `-latest-report.json`. |
+| `--diff PATH` | beside baseline | Highlighted failure-diff path. The default suffix is `-latest-diff.png`. |
+| `--timeout-ms N` | `30000` | Bounded frame-capture timeout in `100..300000` milliseconds. |
+
+The command uses the same isolated runtime, native Vulkan readback/software
+fallback, and tolerance profiles as editor Game View. It fails for a child
+runtime error, startup/timeout failure, dimension mismatch, changed-pixel
+threshold breach, or mean-RGB-error breach. It always writes JSON metrics after
+a completed comparison and writes the highlighted PNG on failure.
+
+```sh
+# Create the canonical software reference once.
+neolove validate-3d . --baseline test-artifacts/pbr.png \
+  --backend software --width 320 --height 180 --write-baseline
+
+# CI jobs can validate each supported presenter. A failing comparison exits 1.
+neolove validate-3d . --baseline test-artifacts/pbr.png \
+  --backend software --width 320 --height 180
+neolove validate-3d . --baseline test-artifacts/pbr.png \
+  --backend vulkan --width 320 --height 180
+```
 
 ### Mobile environment variables
 
@@ -347,10 +380,14 @@ install scripts honor `NEOLOVE_VULKAN` as documented under Installation.
 
 ## Desktop
 
-Desktop export first builds a compact packaged runtime, then appends a
-compressed copy of the project. At launch the runtime extracts resources to a
-temporary resource directory and uses `<game>_data` beside the executable for
-writes.
+Desktop export first builds a compact packaged runtime and appends a compressed
+copy of the project. The complete native image is then Deflate-compressed inside
+a small launcher. On first launch it is atomically cached in the operating
+system's user cache directory; later launches reuse the cache. Project resources
+use a separate temporary resource directory and writes still use `<game>_data`
+beside the distributed executable. A project marked `kind = "2d"` omits 3D
+component and material registration from its specialized runtime; change the
+kind to `3d` before building a project that consumes those APIs.
 
 The output is `dist/<project-output-name>` on Unix-like targets and
 `dist/<project-output-name>.exe` on Windows. Exported Windows executables use
@@ -483,18 +520,91 @@ remapped when a prefab is instantiated or an entity subtree is duplicated.
 - Multi-selection, grouping, visibility isolation, locking, alignment, z-order,
   size normalization, and window-fit operations.
 - Tile painting while a `Tilemap2D` is selected.
-- In 3D scenes, RMB drag looks around, WASD/QE flies, Shift boosts, and MMB
-  pans. A short RMB click opens the selected-entity or empty-viewport context
-  menu; crossing the drag threshold suppresses the menu.
-- The 3D Move gizmo has X/Y/Z axis handles and a free center drag; Scale has
-  X/Y/Z handles and a uniform center handle; Rotate has X/Y/Z rings that edit
-  the corresponding Euler angles. The grid-snapping toggle applies to 3D
-  transforms as well as 2D tools.
+- In 3D scenes, Alt+LMB orbits around the active selection (or the last framed
+  target), RMB drag looks around, WASD/QE flies, Shift boosts, and MMB pans. A
+  short RMB click opens the selected-entity or empty-viewport context menu;
+  crossing the drag threshold suppresses the menu. Mouse look and orbit are
+  display-scale independent.
+- The 3D Move gizmo has X/Y/Z axis handles, selectable XY/XZ/YZ plane handles,
+  and a camera-facing free center drag. Its Local/World toolbar control changes
+  the movement basis explicitly. Multi-selected objects convert the shared
+  world displacement through their own parent transforms, so nested negative
+  and non-uniform scales remain stable. Scale has X/Y/Z handles and a uniform
+  center handle; Rotate has X/Y/Z rings that edit the corresponding Euler
+  angles. The grid-snapping toggle applies to both dimensions, while the
+  adjacent numeric field stores an independent 3D world-unit increment instead
+  of reusing the 2D pixel grid. Ctrl-drag a selected move handle or selected
+  object to duplicate its subtree and place the copy; duplication and movement
+  undo together as one command.
+- **Tools → Scene View** exposes Surface/Pivot Snap, Vertex Snap, and Align to
+  Surface Normal for 3D scenes. Surface placement uses the visible transformed
+  mesh triangle under the cursor with perspective-correct world interpolation;
+  Vertex Snap refines it to a nearby visible vertex. Transformed box, sphere,
+  capsule, and mesh colliders are collision-aware placement surfaces even
+  without a mesh renderer. Collider surface preparation shares the viewport's
+  bounded triangle budget.
+  Locked meshes remain valid placement targets without becoming selectable.
+  Multi-selection keeps its world offsets while the active pivot lands on the
+  target, and optional normal alignment rotates each object's local +Y through
+  its parent hierarchy.
+- **Tools → Scene View** also switches perspective/orthographic projection,
+  selects Top/Front/Right orthographic views, and stores or recalls four camera
+  bookmarks. The viewport orientation widget exposes the same axis views and a
+  clickable PERSP/ORTHO badge. Orthographic wheel zoom changes the persisted
+  world-space half-height rather than dollying the camera.
+- The same menu independently toggles editor-only wireframe, surface-normal,
+  tangent, UV-seam, transformed mesh-bound, entity-pivot, world-origin/axis,
+  collider-shape, rigid-body, trigger, authored-raycast, particle-bound,
+  camera-frustum, light-range, spot-cone, runtime-shadow-frustum, and viewport-
+  statistics overlays. Shadow frustums reuse the native renderer's exact
+  camera-fitted directional and spot projection calculation.
+  Normal and tangent drawing are each bounded to 2,048 sampled surfaces per
+  frame; UV seam matching and output are independently bounded. The statistics strip reports
+  Scene View CPU time, mesh draws, projected triangles, lights, and prepared
+  snap surfaces; it does not claim unavailable runtime GPU or residency data.
+- Dragging from empty 3D viewport space performs a visible marquee selection
+  over projected mesh bounds and component proxies. Ctrl or Shift makes the
+  marquee additive; modifier-click toggles an entity. Hidden and locked objects
+  remain excluded, and meshes with many projected triangles are deduplicated.
 - The adaptive 3D ground grid follows the camera with bounded fine/coarse line
   budgets, producing an effectively infinite view without unbounded draw work.
   Its lines are clipped at the camera near plane before projection.
 - Camera sensitivity, movement speed, FOV, and inverted vertical mouse look
   are configurable under global Editor Settings.
+
+The current lightweight 3D Scene view is an authoring aid, not the final visual
+authority for textures, custom shaders, shadows, or post-processing that it does
+not draw. For a 3D document, **Run** writes the current unsaved scene to an
+isolated project-local preview cache, starts the real runtime in a hidden child
+process, and switches the viewport to **Game View**. Vulkan builds use native
+HDR/tonemap rendering plus GPU readback when available and otherwise use the
+same real software renderer as a normal software run. The authored
+scene and entry point are not overwritten. Game View receives lossless PNG
+frames, forwards focused mouse/keyboard/text input, and reports runtime update
+and render time. Its toolbar controls pause/resume, one deterministic 1/60-second
+update, restart, and stop. When an entity with `Camera3D` is selected, the camera
+button beside Run starts the staged scene with only that camera enabled.
+
+Stopping discards the isolated runtime and removes its staged files; runtime
+mutations are never copied into the authored scene. Live hierarchy, component
+snapshots, and logs still travel over the same localhost session. The live pane
+uses explicit authored source ids (not runtime allocation order), links structured
+diagnostics to entities/components/scripts, and can validate the current document
+against the runtime's immutable post-load/pre-update state. **Set Base** stores a
+canonical Game View PNG; **Compare** applies explicit pixel tolerances and writes
+JSON metrics plus a highlighted diff on failure. A JSON sidecar records the
+baseline backend: same-backend comparisons allow at most 1% pixels over an
+8-channel delta, while cross-backend comparisons allow 3% for measured
+MSAA/software edge-coverage differences; both retain the 1.5 mean-RGB-error
+limit. Set
+`NEOLOVE_EDITOR_EMBEDDED_BACKEND=vulkan` or `software` to force a validation
+backend; the default is Vulkan with software fallback. The validator exposed
+and drove a native front-face winding repair; the representative corrected PBR
+frame now measures 0.991 mean RGB error between software and Vulkan. Scene View
+capture, complete profiler streams, and a broader representative-scene matrix
+remain incomplete. Linux CI runs the repository PBR fixture through software
+and Mesa/Lavapipe Vulkan with the headless `validate-3d` gate. Non-3D projects
+retain their established Run behavior.
 
 Holding `Ctrl` while moving a parent preserves descendant world positions.
 Holding `Ctrl` during corner resize preserves aspect ratio. Arrow-key nudging
@@ -578,6 +688,10 @@ project in VS Code.
   edits only the prefab. Saving it refreshes linked instances in open and
   on-disk scenes while retaining each instance root's placement.
 - Double-click `.neoanim` to open the Bezier animation editor.
+- In a 3D project, **New 3D Material** and **New Physics Material** create the
+  runtime's versioned `.neomaterial` and `.neophysicsmaterial` assets.
+  Double-click either format to edit it with validation and a visible dirty
+  state. Collider physics-material fields use a typed searchable picker.
 - A selected `Tilemap2D` enters Paint mode from the Inspector; dragging writes
   the selected tile id, and `-1` erases.
 - Image, font, sound, shader, and animation Inspector fields use searchable
@@ -1428,6 +1542,16 @@ completed frame.
 Global: `audio`
 
 ```luau
+export type SpatialAudio3DOptions = {
+    voice_id: number?,
+    looping: boolean?,
+    volume: number?,
+    min_distance: number?,
+    max_distance: number?,
+    rolloff: number?,
+    distance_model: "inverse" | "linear" | "exponential"?,
+}
+
 export type AudioModule = {
     play: (sound: SoundHandle, looped: boolean?, volume: number?) -> (),
     playOnce: (sound: SoundHandle, volume: number?) -> (),
@@ -1436,6 +1560,10 @@ export type AudioModule = {
     playSpatial: (sound: SoundHandle, x: number, y: number, looped: boolean?, volume: number?) -> (),
     setPosition: (sound: SoundHandle, x: number, y: number) -> boolean,
     setListenerPosition: (x: number, y: number) -> (),
+    playSpatial3D: (sound: SoundHandle, x: number, y: number, z: number, options: SpatialAudio3DOptions?) -> number,
+    updateSpatial3D: (voiceId: number, x: number, y: number, z: number, options: SpatialAudio3DOptions?) -> boolean,
+    stopSpatial3D: (voiceId: number) -> (),
+    setListener3D: (x: number, y: number, z: number, forwardX: number, forwardY: number, forwardZ: number, upX: number, upY: number, upZ: number, earDistance: number?) -> (),
 }
 ```
 
@@ -1448,10 +1576,18 @@ export type AudioModule = {
 | `playSpatial(sound, x, y, looped?, volume?)` | Live sound, world-space emitter position, optional loop flag and gain. | `()` | Starts/restarts tracked 2D spatial playback. Attenuation depends on distance from the current listener. Non-finite coordinates are invalid. |
 | `setPosition(sound, x, y)` | Sound and new world-space emitter coordinates. | `true` when an active spatial emitter moved; `false` when none exists. | Non-spatial playback does not count as an emitter. |
 | `setListenerPosition(x, y)` | World-space listener coordinates. | `()` | Affects current and future spatial playback. The listener is global; the Camera component does not move it automatically. |
+| `playSpatial3D(sound, x, y, z, options?)` | Live sound, world-space position, and optional voice/loop/gain/distance settings. | Independent numeric voice id. | Starts a native 3D voice. Reusing an explicit `voice_id` replaces only that voice, so separate entities may share one sound. Distances sanitize to `min_distance >= 0.001`, `max_distance >= min_distance`; volume clamps to `0..1` and rolloff to non-negative. Snake-case fields and the declared camel-case aliases are accepted. |
+| `updateSpatial3D(voiceId, x, y, z, options?)` | Existing voice, current position, and live settings. | `true` while the voice exists. | Moves the emitter and applies edited gain/attenuation without restarting playback. Returns `false` for a missing or completed native one-shot. |
+| `stopSpatial3D(voiceId)` | Voice returned by `playSpatial3D`. | `()` | Stops only that 3D voice; it does not stop another source using the same sound asset. |
+| `setListener3D(...)` | Position, forward/up vectors, and optional ear separation. | `()` | Updates current and future 3D voices. Native output uses oriented listener-relative stereo plus the same WebAudio distance equations used by the browser. Prefer `AudioListener3D` for automatic world-transform synchronization. |
 
 Volume is clamped to `0..1`. Browser playback is subject to user-gesture
 autoplay restrictions. `SpatialSound2D` is preferable when the emitter should
 follow an entity automatically.
+
+For 3D scenes, prefer `AudioSource3D` and `AudioListener3D`. Their component
+updates resolve the same nested world transforms used by rendering and physics,
+and each source owns an independent voice even when sounds are shared.
 
 ```luau
 local bell = assets.loadSound("assets/bell.wav")
@@ -2908,6 +3044,8 @@ export type EcsModule = {
     deleteEntity: (entity: Entity) -> (),
     duplicateEntity: (targetEntity: Entity, parent: Entity) -> Entity,
     findFirstChild: (parent: Entity, name: string) -> Entity?,
+    findByTag: (tag: string) -> { Entity },
+    findByLayer: (layer: number) -> { Entity },
     root: Entity,
     addComponent: (entity: Entity, component: Component) -> ComponentInstance,
     removeComponent: (entity: Entity, target: number | ComponentInstance) -> boolean,
@@ -2926,6 +3064,8 @@ window. Do not delete it or overwrite its engine-managed identity/collections.
 | `ecs.deleteEntity(entity)` | Live non-root entity. | `()` | Recursively unregisters descendants, detaches from its parent, and disconnects listeners. The entity table may still be referenced by Luau but is no longer live. Re-deleting/stale/root entities is invalid or a no-op according to registry state; component destroy callbacks are not guaranteed, as warned below. |
 | `ecs.duplicateEntity(targetEntity, parent)` | Source entity and explicit destination parent. | Root of a fresh deep-copy subtree. | Uses prefab capture/instantiate semantics, remapping internal references and queueing custom `awake`. A source/destination that is stale or would violate hierarchy constraints raises. |
 | `ecs.findFirstChild(parent, name)` | Parent and exact, case-sensitive direct-child name. | First matching `Entity`, or `nil`. | Does not recurse and makes no uniqueness guarantee. Current child-array order decides among duplicates. |
+| `ecs.findByTag(tag)` (`FindByTag` alias) | Non-empty tag after trimming. | New id-sorted entity array. | Matches enabled `Tag` components by exact trimmed text. Disabled tags and empty queries do not match. |
+| `ecs.findByLayer(layer)` (`FindByLayer` alias) | Integer logical layer. | New id-sorted entity array. | Matches enabled `Layer` components. It is gameplay metadata, not a render or collision filter. |
 | `ecs.addComponent(entity, component)` | Live entity and component prototype table. | New `ComponentInstance`. | Deep-copies the prototype, attaches instance helpers/entity, runs core setup immediately, and queues custom `awake`. Prototype functions/tables follow the engine copy rules. Invalid core/custom definitions raise without returning a partial instance. |
 | `ecs.removeComponent(entity, target)` | Live owner plus 1-based component index or exact attached instance. | `true` if removed; `false` if absent/invalid index. | Runs `destroy` or fallback `onDestroy`, removes it, and clears `instance.entity`. Callback errors can propagate/report while removal is underway. |
 | `ecs.addSystem(system)` | Mutable system table. | `()` | Calls optional `system:awake()` synchronously, then registers it for per-frame `update`. If `awake` errors, registration does not complete normally. Adding the same table twice creates duplicate scheduling unless user code prevents it. |
@@ -2999,6 +3139,10 @@ export type Entity = {
     Duplicate: (self: Entity, parent: Entity?) -> Entity,
     findFirstChild: (self: Entity, name: string) -> Entity?,
     FindFirstChild: (self: Entity, name: string) -> Entity?,
+    hasTag: (self: Entity, tag: string) -> boolean,
+    HasTag: (self: Entity, tag: string) -> boolean,
+    isInLayer: (self: Entity, layer: number) -> boolean,
+    IsInLayer: (self: Entity, layer: number) -> boolean,
     getWorldPosition: (self: Entity) -> (number, number),
     GetWorldPosition: (self: Entity) -> (number, number),
     getWorldRotation: (self: Entity) -> number,
@@ -3058,6 +3202,8 @@ rotation, anchors, and pivots; boundary points count as inside.
 | `entity:removeComponent(target)` (`RemoveComponent` alias) | 1-based index or exact component instance. | Removal `boolean`. | Equivalent to the ECS function. Indexes are evaluated against the current list, so earlier removals shift later indexes. |
 | `entity:duplicate(parent?)` (`Duplicate` alias) | Optional destination parent. | New copied `Entity`. | Defaults to the current parent, then `ecs.root` when unparented. The new entity is independent but internal references within its copied subtree are remapped consistently. |
 | `entity:findFirstChild(name)` (`FindFirstChild` alias) | Exact direct-child name. | Matching entity or `nil`. | Equivalent to `ecs.findFirstChild(self, name)`; not recursive. |
+| `entity:hasTag(tag)` (`HasTag` alias) | Non-empty tag after trimming. | `boolean`. | Tests enabled dimension-independent `Tag` components on this entity. Comparison is exact and case-sensitive after trimming both values. |
+| `entity:isInLayer(layer)` (`IsInLayer` alias) | Integer logical layer. | `boolean`. | Tests enabled dimension-independent `Layer` components on this entity. It does not inspect `Collider2D/3D.layer` or `RenderLayer3D.mask`. |
 | `entity:getWorldPosition()` (`GetWorldPosition` alias) | None. | World top-left `x, y`. | Resolves anchors, pivots, parent scale/rotation, and hierarchy. Values are computed from current mutable fields; a cyclic/corrupt parent chain is invalid. |
 | `entity:getWorldRotation()` (`GetWorldRotation` alias) | None. | World rotation in radians. | Sums local rotations through ancestors. It does not normalize to `0..2π`. |
 | `entity:isInside(worldX, worldY)` (`IsInside` alias) | World-space point. | `boolean`. | Tests transformed bounds including rotation and scale; edges count as inside. Non-positive global size has no interior. Sprite transparency/masks are ignored—use `Spritebox2D:IsInside` for its pixel mask. |
@@ -3165,7 +3311,7 @@ export type TransformModule = {
 | `transform.getWorldRotation(entity)` | Entity to resolve. | Rotation in radians. | Adds rotations through the parent chain without normalizing. Scale/pivots do not change this scalar result. |
 | `transform.lookAt(fromX, fromY, toX, toY)` (`look_at` alias) | World-space start and target coordinates. | Facing angle in radians. | Uses `atan2(toY-fromY, toX-fromX)`: zero faces positive X and positive angles turn toward positive Y. Coincident points return the platform's defined zero-angle result. Non-finite input yields non-finite/platform math and should be avoided. |
 | `transform.GetEntitiesInFront(worldX, worldY, minimumZ?)` (`getEntitiesInFront` alias) | World-space query point and optional inclusive minimum z. | New array of matching entities. | Tests all live non-root transformed bounds, sorted descending z then descending id (frontmost first). Omitted minimum accepts all z. Boundaries count; non-rendering/invisible entities can still match because this is a geometry query. |
-| `transform.doTheyOverlap(entities)` | Array of entities. | `true` if any pair's global AABBs overlap, else `false`. | Fewer than two valid entries returns false. It compares global axis-aligned bounds, so rotated rectangles can produce broad-phase false positives; Spritebox masks and component visibility are ignored. Duplicate references can overlap themselves according to the pair traversal and should be removed by callers. |
+| `transform.doTheyOverlap(entities)` | Array of entities (2D, 3D, or a mix). | `true` if any pair's world volumes intersect, else `false`. | Fewer than two valid entries returns false. Each entity resolves to one world-space oriented box using its own anchors, position/rotation pivots and the full rotation and scale of its ancestors, and pairs are compared with a separating-axis test, so rotated rectangles no longer report broad-phase false positives. An entity takes its 3D box from an enabled `Collider3D` or `Trigger3D` (box, sphere and capsule report their bounding box; `mesh` uses the mesh bounds), otherwise an enabled `MeshRenderer3D` (its generated mesh, or the authored primitive fields before the first frame builds one), otherwise an explicit `size_z` on the entity, which pairs with `size_x`/`size_y` as a centred volume. Everything else is measured as its 2D rectangle: two of them ignore depth, and one compared against a 3D box behaves like the flat quad it is, sitting in its accumulated `position_z` plane. Touching edges count as separated. Spritebox masks and component visibility are ignored. Duplicate references can overlap themselves according to the pair traversal and should be removed by callers. |
 | `transform.raycast(originX, originY, dirX, dirY, maxDistance?, options?)` | Origin; direction (need not be normalized); optional distance; optional ignore record. | Nearest `RaycastHit`, or `nil`. | Normalizes direction, intersects entity AABBs, and returns the closest allowed hit including distance, point, and normal aliases. A zero/non-finite direction returns nil. Distance defaults to infinity, clamps to `0..1,000,000`, and negative becomes zero. Both ignore fields accept one entity or an array and are combined. Root, explicit `raycastable = false`, non-positive global bounds, and ignored entities are skipped. |
 
 Normal aliases in `RaycastHit` carry identical numbers. A hit at the origin can
@@ -3491,10 +3637,14 @@ export type CoreModule = {
     LightOccluder2D: LightOccluder2D,
     EntityScaler: EntityScaler,
     Camera: Camera,
+    Tag: Tag,
+    Layer: Layer,
     Shape2D: Shape2D,
     ParticleSystem2D: ParticleSystem2D,
     AnimationController: AnimationController,
     SpatialSound2D: SpatialSound2D,
+    AudioSource3D: AudioSource3D,
+    AudioListener3D: AudioListener3D,
     TextBox: TextBox,
     TextLabel: TextBox,
     RudimentaryTextLabel: TextBox,
@@ -3537,6 +3687,17 @@ component. `shader` applies a custom shader where the renderer supports it.
 Drawable output is also skipped for non-positive bounds, nil/unloaded images,
 or fully transparent final colors.
 
+## `core.Tag` and `core.Layer`
+
+These components are dimension-independent metadata and are offered in both 2D
+and 3D editor scenes. `Tag.tag` defaults to `"Untagged"`; logical `Layer.layer`
+defaults to `0` and its optional display `name` defaults to `"Default"`.
+Disabling either component removes it from entity/ECS queries. Neither changes
+rendering, visibility, collision filters, or physics behavior. Use
+`RenderLayer3D` for camera filtering and collider `layer`/`mask` fields for
+physics filtering. The older `Tag3D`, `Layer3D`, and `*3D` query spellings are
+compatibility aliases only.
+
 ::: details Engine-managed component fields
 Core prototypes and instances contain lifecycle functions such as `awake` and
 `update`, plus `__neolove_core_component` and `__neolove_component` tags. Some
@@ -3556,17 +3717,50 @@ legacy 2D `rotation`, uniform `scale`, and draw-order `z` fields.
 ## Cameras, lights, and mesh renderers
 
 `core.Camera3D` supports perspective and orthographic projection, `fov`,
-`orthographic_size`, and near/far clipping. The first enabled camera is the
+`orthographic_size`, near/far clipping, and a 31-bit `render_mask`. The first enabled camera is the
 fallback; `camera:SetActive()` selects another camera explicitly. The editor
 draws a camera-body, lens, viewfinder, and frustum proxy for camera entities.
 
+`Visibility3D` supplies hierarchy-aware visual visibility. With
+`inherit_parent = true`, a hidden ancestor suppresses this entity; setting it
+false creates an explicit boundary. `RenderLayer3D.mask` is tested against the
+active camera mask and passes when any bit overlaps. Meshes, lights,
+environments, and particle drawing use the same policy in Scene View and the
+runtime. Scripts and physics keep running, and hidden particle systems keep
+simulating. The editor-only Render Layers and Entity Visibility diagnostics
+show the resolved decision without mutating authored properties.
+
 `core.Light3D` supports `point`, `spot`, and `directional` lights. Intensity,
 range, spot angle/softness, color, and Euler-authored direction are evaluated
-by the current diffuse 3D lighting path.
+by the direct Cook-Torrance PBR lighting path.
+
+On native Vulkan, the first enabled shadow-casting directional light is
+preferred as the frame's shadow source; if none exists, the first
+shadow-casting spot light is used. The renderer reuses a 2048×2048 depth image,
+renders eligible native meshes (including GPU-skinned and camera-offscreen
+casters), and applies bounded 3×3 PCF while evaluating that light. These
+authoring fields are live:
+
+```luau
+light.casts_shadows = true
+light.shadow_bias = 0.0005
+renderer.casts_shadows = true
+renderer.receives_shadows = true
+```
+
+Bias is a normalized light-depth offset and clamps to `0..0.1`. A frame without
+an active shadow source does not redraw the map after its one-time layout
+initialization. Point-light shadow cubemaps, multiple simultaneous shadow
+lights, directional cascades, alpha-tested caster silhouettes, configurable
+quality, and software/Web shadow parity are not yet implemented.
 
 `core.MeshRenderer3D` accepts a `MeshHandle`, `mesh_path`, base texture, tint,
-custom mesh shader, and `double_sided` rendering. An imported `mesh_path` takes
-precedence over its generic primitive controls:
+custom mesh shader, reusable `material`/`materials` overrides, and
+`double_sided` rendering. An imported `mesh_path` takes
+precedence over its generic primitive controls. glTF/GLB base-color images are
+resolved from external relative URIs, embedded data URIs, and GLB buffer views,
+then selected per material/submesh automatically. An explicit `texture` handle
+overrides those imported base images for the complete mesh:
 
 ```luau
 local model = ecs.newEntity("Model", ecs.root, 0, 0)
@@ -3617,7 +3811,10 @@ The sibling [`3d-shaders-aa`](../samples/3d-shaders-aa) sample is a runnable
 version with a procedural material, capability fallback, live uniforms, and
 keys `1`/`2`/`3` for the three AA modes.
 
-When `texture` is absent, the built-in `Texture` sampler receives opaque white.
+When `texture` and an imported base-color image are both absent, the built-in
+`Texture` sampler receives opaque white. Vulkan and the ordinary Web/software
+path select imported base images per submesh. The custom WebGL shader bridge
+currently uses only the explicit component texture.
 Mesh UVs are perspective-correct and the supplied `color` includes current CPU
 diffuse lighting, so a fragment shader can preserve it by multiplying its base
 sample by `color`. See [Portable fragment contract](#portable-fragment-contract)
@@ -3655,7 +3852,12 @@ from one-based Luau tables. Mesh handles are shared, revisioned assets:
 local mesh = assets.loadMesh("assets/terrain.glb")
 mesh:setPosition(1, -1, 0.5, 0, true)
 mesh:setMaterialColor(1, Color4(255, 180, 120))
-mesh:setMaterialTexture(1, "base_color", "assets/albedo.png")
+mesh:setMaterialPbr(1, 0.2, 0.65)
+mesh:setMaterialTexture(1, "base_color", assets.loadImage("assets/albedo.png"))
+mesh:setMaterialTexture(1, "normal", assets.loadImage("assets/normal.png"))
+mesh:setMaterialTexture(1, "metallic_roughness", assets.loadImage("assets/orm.png"))
+mesh:setMaterialEmissive(1, Color4(20, 5, 0))
+mesh:setMaterialAlpha(1, "mask", 0.5)
 renderer.mesh = mesh
 ```
 
@@ -3664,6 +3866,62 @@ renderer.mesh = mesh
 previous snapshot intact. Mesh colliders and every renderer using the identity
 observe successful revisions. Image handles are revisioned too, so editing the
 assigned texture in a script is visible without replacing it.
+
+For glTF/GLB assets, base-color, metallic/roughness, normal, and emissive image
+dependencies are decoded once per glTF image and retained by the mesh handle.
+OBJ `mtllib`/`usemtl` imports common MTL factors and maps; ASCII and binary FBX
+imports common factors, external texture/video links, and ByPolygon/AllSame
+material slots. Path-based import is required to resolve external files. The
+default Vulkan and software/ordinary Web paths evaluate these bindings with
+tangent-space normal mapping and direct-light metallic/roughness PBR shading.
+`setMaterialTexture` accepts a live `ImageHandle`, a source-metadata string, or
+`nil`; strings do not perform file I/O, so use `assets.loadImage(...)` for a
+rendered runtime map. Custom shader paths remain author-controlled, and custom
+WebGL currently receives only the explicit component texture.
+
+## Reusable 3D materials
+
+`Material3DHandle` separates appearance from geometry. Bind one handle to
+`renderer.material` for slot 1, or populate `renderer.materials` by one-based
+submesh material slot. A missing slot falls back to the material imported with
+the mesh. Successful setters commit an atomic revision that all bound
+renderers observe on the following frame:
+
+```luau
+local material = assets.newMaterial3D({
+    name = "Painted metal",
+    color = Color4(80, 130, 210),
+    metallic = 0.75,
+    roughness = 0.28,
+    normal_texture = assets.loadImage("assets/paint-normal.png"),
+    metallic_roughness_texture = assets.loadImage("assets/paint-orm.png"),
+})
+renderer.mesh = assets.primitiveMesh("sphere")
+renderer.material = material
+
+material:setColor(Color4(210, 70, 45))
+material:setPbr(0.65, 0.4)
+material:setTexture("emissive", assets.loadImage("assets/emission.png"))
+material:setEmissive(Color4(30, 8, 2))
+```
+
+`setAlpha`, `setDoubleSided`, `revision`, `identity`, and `get` complete the
+live API. `assets.saveMaterial3D(material, path)` writes version 1 JSON with a
+`.neomaterial` extension. `assets.loadMaterial3D(path)` caches the handle and
+loads texture sources relative to the material file; `loadMaterial`,
+`saveMaterial`, and `newMaterial` are concise aliases. A runtime-only image has
+no durable source, so export it and bind its path before saving. The scene
+editor's MeshRenderer3D inspector includes a Material asset picker and exports
+the selected handle assignment. In a 3D project, **Project → New 3D Material**
+creates the same versioned contract, and double-clicking a `.neomaterial` opens
+its dedicated PBR editor. The editor exposes base RGBA, metallic, roughness,
+emissive RGB, alpha mode/cutoff, double-sided state, and base/normal/ORM/
+emissive texture sources with UV-set indices. Slot labels make the runtime's
+sRGB (base/emissive) versus linear (normal/ORM) interpretation explicit. Its
+sphere preview is rendered by the real software PBR rasterizer after passing
+through the runtime material loader; the last valid preview remains visible if
+an in-progress edit becomes invalid. The same validation blocks a save and
+reports corrupt JSON, unsupported values, or the resolved missing texture path.
 
 ## Armatures and imported animation
 
@@ -3693,18 +3951,29 @@ renderer.animation_looping = true
 renderer:PlayAnimation()
 ```
 
-Skinning currently runs on the CPU and publishes a new immutable vertex
-snapshot. Multi-skin flattened assets, morph targets, glTF CUBICSPLINE,
-compressed/sparse accessors, and binary-FBX armature/animation data are not yet
-supported. Use ASCII FBX 7.x or glTF 2.0 when animation is required.
+Pose sampling publishes an immutable CPU-deformed snapshot for bounds and
+fallback renderers. The default Vulkan path additionally uploads bind-pose
+joint/weight attributes once and applies palettes of up to 256 joints in its
+vertex shader. Detached poses share the persistent bind/index buffers, so
+animation revisions update uniforms rather than re-uploading geometry. Custom
+mesh shaders, software/Web rendering, larger armatures, and skinned meshes whose
+vertices were edited after import use the CPU snapshot. Multi-skin flattened
+assets, morph targets, glTF CUBICSPLINE, compressed/sparse accessors, and
+binary-FBX armature/animation data are not yet supported. Use ASCII FBX 7.x or
+glTF 2.0 when animation is required.
 
 ## Environment and skybox control
 
 `core.Environment3D` (`core.Skybox3D` alias) renders before depth-tested
-geometry. Its modes are `solid`, `gradient`, and `equirectangular`. A panorama
-follows camera rotation but ignores camera translation. The component fields
-are `enabled`, `mode`, `color`, `top_color`, `bottom_color`, `texture`,
-`texture_path`, `rotation`, and `intensity`.
+geometry. Its modes are `solid`, `gradient`, `equirectangular`, and `cubemap`.
+A panorama or cubemap follows camera rotation but ignores camera translation.
+The component also owns runtime fog through `fog_enabled`, `fog_mode`,
+`fog_color`, `fog_start`, `fog_end`, and `fog_density`. Linear fog uses the
+authored start/end distances; `exponential` and `exponential_squared` use
+density. All distances are measured from the active camera in world units.
+Real-time 3D ambient occlusion is authored with `ao_enabled`, `ao_radius`,
+`ao_intensity`, and `ao_bias`. Radius and bias are world-unit values; intensity
+is clamped to 0–1.
 
 Scripts without an environment entity can use the identical global aliases
 `environment3d`, `environment3D`, and `skybox`:
@@ -3713,12 +3982,110 @@ Scripts without an environment entity can use the identical global aliases
 skybox.setGradient(Color4(30, 47, 78), Color4(8, 10, 16))
 skybox.setEquirectangular(assets.loadImage("assets/panorama.png"), 20)
 skybox.setIntensity(1.2)
+skybox.setFog(Color4(110, 125, 145), {
+    mode = "linear",
+    start_distance = 12,
+    end_distance = 90,
+})
+skybox.setAmbientOcclusion({
+    radius = 2.5,
+    intensity = 0.65,
+    bias = 0.025,
+})
 skybox.setEnabled(true)
+-- skybox.clearFog() disables fog without changing the sky.
+-- skybox.clearAmbientOcclusion() disables AO without changing the sky.
 -- skybox.clear() removes the script-owned environment.
 ```
 
-Only equirectangular panoramas are currently supported; six-face cubemaps are
-not. The software/web panorama representation is cached by image revision.
+A six-face cubemap uses explicit axis names and can be assigned to the global
+environment without flattening it into a panorama:
+
+```luau
+local studio = assets.loadCubemap({
+    positive_x = "assets/studio/px.png",
+    negative_x = "assets/studio/nx.png",
+    positive_y = "assets/studio/py.png",
+    negative_y = "assets/studio/ny.png",
+    positive_z = "assets/studio/pz.png",
+    negative_z = "assets/studio/nz.png",
+})
+skybox.setCubemap(studio, 15)
+```
+
+All six faces must be square and have identical dimensions. `newCubemap`
+accepts live `ImageHandle` faces; `loadCubemap` resolves six image paths.
+Cubemap face revisions propagate to the visible background and built-in PBR
+lighting without replacing the `CubemapHandle`.
+
+Fog is evaluated per pixel by the software/Web runtime and per fragment by the
+native Vulkan PBR path. Scene View uses the same sanitized distance function;
+particles and projected custom-mesh streams receive fogged vertex colors while
+the embedded Game View remains the exact runtime authority.
+
+Ambient occlusion uses conservative transformed world-space mesh bounds rather
+than a screen-space depth approximation. For each receiving mesh, the renderer
+chooses the nearest 32 eligible bounds, evaluates contact distance, surface
+hemisphere, apparent extent, radius, bias, and authored intensity, and applies
+the resulting visibility in linear light before emissive and fog. A renderer
+with `casts_shadows = false` is not an AO occluder; one with
+`receives_shadows = false` is not darkened by AO. Software and ordinary Web
+meshes evaluate it per pixel, Vulkan built-in PBR evaluates it per fragment,
+and projected custom meshes receive vertex-sampled AO. Scene View uses the same
+policy with triangle-averaged preview values. This provides backend-stable
+contact and crease shading, but it is not mesh-exact ray-traced AO or
+depth-buffer SSAO; unusually interleaved custom WebGL/2D command chunks also do
+not share occluders with separate software chunks.
+
+The same equirectangular panorama or six-face cubemap supplies built-in PBR
+environment lighting on Vulkan, software, and the ordinary Web mesh path. It
+contributes bounded diffuse and roughness-aware specular samples using the
+visible sky's image revisions, rotation, and intensity; the legacy synthetic
+headlight is disabled while IBL is active. Software/Web representations and
+native Vulkan cubemap uploads are revision-aware. Float-HDR texture uploads,
+irradiance convolution, prefiltered specular mip chains, and a BRDF integration
+LUT are not yet implemented.
+
+## `core.ReflectionProbe3D`
+
+`ReflectionProbe3D` supplies an authored local cubemap to built-in PBR meshes
+inside a finite influence volume. Assign either a live `cubemap` handle in a
+script or all six face properties (`positive_x`, `negative_x`, `positive_y`,
+`negative_y`, `positive_z`, and `negative_z`) through the Inspector. Supplying
+only some faces raises an actionable missing-face error; no faces leaves the
+probe inactive.
+
+```luau
+local probe = room:AddComponent(core.ReflectionProbe3D)
+probe.cubemap = studio
+probe.size_x, probe.size_y, probe.size_z = 12, 5, 9
+probe.blend_distance = 1.5
+probe.intensity = 1.1
+probe.rotation = 15
+probe.priority = 10
+```
+
+The entity's hierarchy-resolved transform moves, rotates, and scales the
+authored volume. Runtime selection tests the center of each receiving mesh's
+transformed bounds against the conservative world AABB. Higher `priority`
+wins overlapping volumes; ties prefer the greatest interior blend weight,
+then nearest probe center and a stable source id. `blend_distance` fades local
+lighting into the global `Environment3D` at volume edges. Visibility ancestry,
+`visible`, `enabled`, `RenderLayer3D`, and the active camera mask are applied
+before a probe is queued, so unloading or hiding it cannot leave stale light.
+
+Software, ordinary Web, and native Vulkan built-in PBR paths share this
+selection and blend policy. The Scene lighting panel can add/select a probe,
+its Inspector persists all six image paths and settings, and the editor-only
+**Reflection Probe Volumes** diagnostic shows the transformed influence box.
+Embedded Game View remains the exact runtime visual authority; Scene View
+currently visualizes the volume rather than duplicating the runtime IBL pass.
+
+Probes currently consume assigned cubemaps. Runtime scene capture/baking,
+irradiance/specular filtering, float-HDR faces, parallax-corrected box
+projection, per-pixel volume selection, and built-in probe bindings for custom
+shaders remain. A rotated probe's conservative AABB can influence corners
+outside the authored oriented box.
 
 ## `core.ParticleSystem3D`
 
@@ -3740,16 +4107,179 @@ sparks:Emit(256)
 `particle_count` is engine-derived. Simulation and per-emitter transparency
 sorting are CPU-side; particles are not globally sorted between emitters.
 
+## `core.Raycast3D`
+
+`Raycast3D` is an authorable local-space query component backed by the same
+native collider registry as `physics3d.raycast`. The Inspector exposes origin
+offset, direction, maximum distance, layer/mask, trigger inclusion, and
+self-exclusion. Each runtime update refreshes `hit`, `hit_entity_id`, hit
+position, distance, and normal; `cast()` performs the same query immediately.
+
+```luau
+local sensor = actor:AddComponent(core.Raycast3D)
+sensor.direction_y = -1
+sensor.max_distance = 2.5
+sensor.include_triggers = false
+sensor:setOnHit(function(hit)
+    print(hit.entity_id, hit.distance, hit.normal_y)
+end)
+
+local hit = sensor:cast()
+```
+
+The independently switchable Raycasts Scene View overlay draws the authored
+world-space query without changing the component or simulating runtime state.
+
+## `core.Collider3D`, `core.Trigger3D`, and physics materials
+
+Both components author box, sphere, capsule, or triangle-mesh geometry with
+the same world transform, mesh BVH, and reciprocal integer `layer`/`mask`
+filtering used by `physics3d.raycast`, `contacts`, and capsule sweeps.
+`Collider3D` can resolve exact primitive contacts. `Trigger3D` permanently
+sets `is_trigger` and `non_physics`, so scripts cannot accidentally turn a
+sensor into a resolving collider.
+
+```luau
+local rubber = assets.newPhysicsMaterial3D({
+    name = "Rubber",
+    friction = 0.8,
+    restitution = 0.55,
+})
+assets.savePhysicsMaterial3D(rubber, "assets/materials/rubber")
+
+local collider = actor:AddComponent(core.Collider3D)
+collider.physics_material = rubber
+
+local volume = checkpoint:AddComponent(core.Trigger3D)
+volume.size_x, volume.size_y, volume.size_z = 4, 3, 2
+volume:setOnEnter(function(hit) print("enter", hit.entity_id, hit.quality) end)
+volume:setOnStay(function(hit) print("stay", hit.entity_id) end)
+volume:setOnExit(function(hit) print("exit", hit.entity_id) end)
+```
+
+`PhysicsMaterial3DHandle` has shared identity plus `revision`, `get`,
+`setFriction`, `setRestitution`, and `set`. Edits validate atomically: name
+must not be empty and both factors must be finite within `0..1`. Bound
+colliders read the current handle on their normal next update. With no handle,
+the collider's inline `friction` and `restitution` remain the fallback.
+`loadPhysicsMaterial3D` caches versioned `.neophysicsmaterial` files;
+`newPhysicsMaterial`, `loadPhysicsMaterial`, `savePhysicsMaterial`, and
+`unloadPhysicsMaterial` are aliases of their `*3D` forms.
+
+Trigger overlap output is deterministic and deduplicated by other entity id.
+`overlap_count` and sorted `overlapping_entity_ids` update every frame. Enter
+fires for a new overlap, stay for every current overlap, and exit after
+separation. Enter/stay callbacks receive `quality = "exact" | "bounds"` and
+`exact`; exit omits quality because the pair is no longer touching. The Scene
+View draws dedicated triggers in orange and uses their real transformed shapes
+for collision-aware placement, without mutating the authored component.
+
+## `core.CharacterController3D`
+
+`CharacterController3D` is an upright kinematic capsule whose dimensions are
+authored in world units (`height` includes both hemispheres). It shares the
+native `Collider3D` registry and collision `layer`/`mask` contract. Calling
+`Move(x, y, z)` treats its arguments as one world-space displacement and
+returns the applied displacement, grounded state, support identity/normal, and
+ordered collision hits.
+
+Movement uses continuous capsule casts rather than end-position overlap. Box,
+sphere, and capsule obstacles use exact primitive contact; mesh obstacles use
+exact swept-sphere/triangle tests through the retained mesh BVH. After the
+first hit, a bounded iterative solver removes only motion entering the surface,
+preserving tangent motion for walls and walkable slopes. A step succeeds only
+when the upward cast has headroom, the complete horizontal remainder clears,
+and a downward cast finds a surface within `max_slope_degrees`. Ground snapping
+keeps small descents stable. `skin_width` prevents persistent zero-distance
+contacts.
+
+```luau
+local controller = player:AddComponent(core.CharacterController3D)
+controller.radius = 0.45
+controller.height = 1.8
+controller.step_height = 0.3
+controller.max_slope_degrees = 50
+controller.velocity_x = moveX * 5
+controller.velocity_z = moveZ * 5
+controller:setOnCollision(function(hit)
+    print(hit.entity_id, hit.normal_x, hit.normal_y, hit.normal_z)
+end)
+controller:setOnGrounded(function(ground)
+    print("landed on", ground.entity_id)
+end)
+
+local jump = controller:Move(0, 0.75, 0)
+```
+
+When `use_gravity` is enabled, the component update integrates `velocity_y`
+using `gravity`; horizontal velocity fields are also applied each frame.
+Grounded controllers follow the supporting collider's translation before their
+own velocity, supporting moving platforms. `onGrounded` fires on the airborne
+to grounded transition; `onCollision` reports each blocking hit. The callbacks
+do not change authored scene state. `physics3d.sweepCapsule` and its
+snake-case alias expose the same continuous query for custom movement. The
+Collider Shapes Scene View diagnostic renders the runtime-matching upright
+capsule. Arbitrary capsule orientation and CCD for dynamic rigid bodies remain
+outside this controller path.
+
+## `core.LODGroup3D`
+
+Attach `LODGroup3D` to an entity with `MeshRenderer3D` to select geometry using
+distance from the active runtime camera:
+
+```luau
+local lod = model:AddComponent(core.LODGroup3D)
+lod.lod0_mesh = "assets/tree-high.glb" -- empty inherits renderer.mesh_path
+lod.lod1_mesh = "assets/tree-medium.glb"
+lod.lod2_mesh = "assets/tree-low.glb"
+lod.lod1_distance = 20
+lod.lod2_distance = 50
+lod.cull_distance = 100
+lod.force_level = "automatic" -- lod0, lod1, lod2, or culled also accepted
+```
+
+The ranges are `[0, lod1)`, `[lod1, lod2)`, `[lod2, cull)`, then culled.
+Non-finite values use defaults; negative and reversed thresholds are normalized
+to a non-negative monotonic sequence. Empty mesh slots fall back toward LOD 0,
+and an empty LOD 0 inherits `MeshRenderer3D.mesh_path`. `force_level` is a live
+runtime override and bypasses distance selection, including forced culling.
+After `MeshRenderer3D.update`, `active_level` reports the resolved populated
+level (`-1` while culled) and `camera_distance` reports the measured distance.
+
+The Scene View uses the same selector, fallback rules, entity world transform,
+and camera distance as the runtime. Its editor-only **LOD State** diagnostic
+draws the sanitized range spheres and resolved level. Preview rendering and the
+diagnostic never serialize the runtime-observed fields or dirty the scene.
+Because LOD selection is camera-dependent, an enabled group bypasses the
+static-mesh preparation shortcut and is evaluated on every runtime frame.
+
 ## Backend and resolution behavior
 
 The software renderer lazily allocates depth and 3D-AA scratch surfaces only
 when needed and samples textures from immutable copy-on-write snapshots. Its
 3D edge pass runs before 2D overlays. Vulkan uses a depth-tested, configurable
-MSAA GPU raster path, although mesh projection/lighting and skinning remain
-CPU-side and projected triangles are streamed rather than retained as indexed
-GPU meshes. WebAssembly composites ordinary meshes through the antialiased
-software path and depth-tested custom-shader meshes through WebGL; high-quality
-WebGL shader AA uses bounded 2× supersampling when device limits permit it.
+MSAA GPU raster path. Default-shader meshes retain revision-keyed indexed
+device-local buffers, apply model/normal transforms and direct-light PBR on the
+GPU, automatically instance compatible opaque submissions, and GPU-skin
+supported armatures from per-draw palettes. Custom mesh shaders retain a
+CPU-projected fallback. Vulkan also renders one 2048² directional/spot shadow
+map before the main pass. The main pass writes and optionally MSAA-resolves to
+a persistent linear RGBA16F image. A second fullscreen GPU pass applies the
+last enabled exposure-tonemap configuration (None, Reinhard, or ACES plus
+gamma) and writes the swapchain. Clear colors, ordinary RGBA images/UI,
+equirectangular environments, and portable custom fragments are decoded into
+linear space before blending; default PBR output remains unclamped until this
+presentation pass. Default PBR meshes also bind an active equirectangular
+environment and evaluate bounded diffuse/specular IBL in linear space; the
+software and ordinary Web paths use the same orientation and lobe contract on
+their RGBA8 reference framebuffer. Native bloom uses two reusable half-resolution RGBA16F
+targets for threshold/downsample and bounded separable blur, then adds the
+bloom image before tone mapping. Disabled or zero-radius/intensity bloom
+performs no extra draws. Other ordered native effects still require GPU
+ping-pong passes. WebAssembly composites ordinary meshes through the
+antialiased software path and depth-tested custom-shader meshes through WebGL;
+high-quality WebGL shader AA uses bounded 2× supersampling when device limits
+permit it.
 
 Native editor/runtime framebuffers use logical pixels at high-DPI scale factors
 and expand once for presentation. Lighting quality tiers enforce bounded,
@@ -4050,6 +4580,34 @@ local hum = machine:AddComponent(core.SpatialSound2D)
 hum.sound = assets.loadSound("assets/hum.ogg")
 hum.looping, hum.volume = true, 0.35
 assert(hum:play())
+```
+
+## `core.AudioSource3D` and `core.AudioListener3D`
+
+`AudioSource3D` is the authorable 3D emitter. It exposes `sound`, `enabled`,
+`volume`, `looping`, `autoplay`, `min_distance`, `max_distance`, `rolloff`, and
+the `inverse`, `linear`, or `exponential` `distance_model`. `play`/`Play`
+returns `false` without an enabled source and valid sound; `stop`/`Stop` is safe
+while idle. Position and attenuation edits propagate every runtime frame, and
+removal or disabling stops the source's independent voice.
+
+`AudioListener3D` follows its entity's world position and XYZ Euler
+orientation. The first enabled listener becomes active; `SetActive`/`setActive`
+selects another explicitly, while `IsActive`/`isActive` reports the selection.
+`ear_distance` defaults to `0.2` world units. This explicit selection prevents
+multiple listeners from overwriting one another according to update order.
+
+```luau
+local listener = player:AddComponent(core.AudioListener3D)
+listener:SetActive()
+
+local source = machine:AddComponent(core.AudioSource3D)
+source.sound = assets.loadSound("assets/machine.ogg")
+source.looping = true
+source.autoplay = true
+source.min_distance = 2
+source.max_distance = 45
+source.distance_model = "exponential"
 ```
 
 <!-- page: text | Text Components -->

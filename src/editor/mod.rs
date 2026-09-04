@@ -16,9 +16,12 @@ mod app;
 mod hub;
 mod inspector;
 mod logger;
+mod parity3d;
 mod ui;
+pub(crate) mod visual_regression3d;
 
 use std::num::NonZeroU32;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -397,12 +400,15 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
 
         if let Event::NewEvents(_) = event {
             // A run just started: open/refresh the live logger window.
+            let embedded_game_view = editor.embedded_game_view_active();
             if let Some(session) = editor.take_logger_session() {
                 logger_ui = Some(LoggerWindow::new(session.state));
-                logger_visible = true;
-                logger_window.set_visible(true);
-                logger_window.focus_window();
-                logger_window.request_redraw();
+                logger_visible = !embedded_game_view;
+                logger_window.set_visible(logger_visible);
+                if logger_visible {
+                    logger_window.focus_window();
+                    logger_window.request_redraw();
+                }
             }
             if editor.poll_run() {
                 window.request_redraw();
@@ -460,6 +466,7 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                     WindowEvent::ModifiersChanged(state) => {
                         input.ctrl = state.ctrl() || state.logo();
                         input.shift = state.shift();
+                        input.alt = state.alt();
                     }
                     WindowEvent::CursorMoved { position, .. } => {
                         let display_scale = window.scale_factor().max(1.0);
@@ -549,6 +556,13 @@ pub fn run_editor(project_root: PathBuf) -> Result<(), String> {
                         ..
                     } => {
                         let pressed = state == ElementState::Pressed;
+                        if let Some(name) = crate::virtual_key_name(key) {
+                            if pressed {
+                                input.runtime_keys_down.insert(name.to_string());
+                            } else {
+                                input.runtime_keys_down.remove(name);
+                            }
+                        }
                         match key {
                             VirtualKeyCode::W => input.key_w = pressed,
                             VirtualKeyCode::A => input.key_a = pressed,
@@ -820,6 +834,7 @@ struct PendingInput {
     end: bool,
     ctrl: bool,
     shift: bool,
+    alt: bool,
     copy: bool,
     paste: bool,
     cut: bool,
@@ -850,6 +865,7 @@ struct PendingInput {
     key_d: bool,
     key_q: bool,
     key_e: bool,
+    runtime_keys_down: BTreeSet<String>,
     last_click: Instant,
     last_click_x: f32,
     last_click_y: f32,
@@ -885,6 +901,7 @@ impl Default for PendingInput {
             end: false,
             ctrl: false,
             shift: false,
+            alt: false,
             copy: false,
             paste: false,
             cut: false,
@@ -915,6 +932,7 @@ impl Default for PendingInput {
             key_d: false,
             key_q: false,
             key_e: false,
+            runtime_keys_down: BTreeSet::new(),
             last_click: Instant::now() - Duration::from_secs(10),
             last_click_x: 0.0,
             last_click_y: 0.0,
@@ -970,6 +988,7 @@ impl PendingInput {
             toggle_snap: self.toggle_snap,
             ctrl: self.ctrl,
             shift: self.shift,
+            alt: self.alt,
             focus_selection: self.focus_selection,
             rename: self.rename,
             reset_view: self.reset_view,
@@ -982,6 +1001,7 @@ impl PendingInput {
             key_d: self.key_d,
             key_q: self.key_q,
             key_e: self.key_e,
+            runtime_keys_down: self.runtime_keys_down.iter().cloned().collect(),
             display_scale: 1.0,
         };
         self.mouse_pressed = false;
@@ -1094,6 +1114,7 @@ fn handle_detached_widget_event(
         WindowEvent::ModifiersChanged(state) => {
             widget.input.ctrl = state.ctrl() || state.logo();
             widget.input.shift = state.shift();
+            widget.input.alt = state.alt();
         }
         WindowEvent::CursorMoved { position, .. } => {
             let display_scale = widget.window.scale_factor().max(1.0);

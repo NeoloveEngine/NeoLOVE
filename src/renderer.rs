@@ -197,6 +197,8 @@ pub(crate) struct RenderState {
     last_frame_occluders: Vec<crate::lighting::Occluder>,
     lights_3d: Vec<crate::render3d::Light3D>,
     last_frame_lights_3d: Vec<crate::render3d::Light3D>,
+    reflection_probes_3d: Vec<crate::render3d::ReflectionProbe3D>,
+    last_frame_reflection_probes_3d: Vec<crate::render3d::ReflectionProbe3D>,
     // Camera selection persists across frames, while the offset is resolved
     // afresh by the camera pre-pass. Scene commands stay in world space until
     // they are drained; editor/debug overlays are intentionally screen-space.
@@ -279,6 +281,10 @@ impl RenderState {
         self.commands.push(command);
     }
 
+    pub(crate) fn queue_all(&mut self, commands: impl IntoIterator<Item = DrawCommand>) {
+        self.commands.extend(commands);
+    }
+
     pub(crate) fn extend_overlay(&mut self, commands: Vec<DrawCommand>) {
         self.overlay_commands.extend(commands);
     }
@@ -326,6 +332,10 @@ impl RenderState {
 
     pub(crate) fn queue_light_3d(&mut self, light: crate::render3d::Light3D) {
         self.lights_3d.push(light);
+    }
+
+    pub(crate) fn queue_reflection_probe_3d(&mut self, probe: crate::render3d::ReflectionProbe3D) {
+        self.reflection_probes_3d.push(probe.sanitized());
     }
 
     /// Start resolving the camera for a new rendered frame. The last resolved
@@ -523,6 +533,18 @@ impl RenderState {
         let lights = std::mem::take(&mut self.lights_3d);
         self.last_frame_lights_3d = lights.clone();
         lights
+    }
+
+    pub(crate) fn take_reflection_probes_3d(&mut self) -> Vec<crate::render3d::ReflectionProbe3D> {
+        let probes = std::mem::take(&mut self.reflection_probes_3d);
+        self.last_frame_reflection_probes_3d = probes.clone();
+        probes
+    }
+
+    pub(crate) fn last_frame_reflection_probes_3d(
+        &self,
+    ) -> Vec<crate::render3d::ReflectionProbe3D> {
+        self.last_frame_reflection_probes_3d.clone()
     }
 
     pub(crate) fn last_frame_lights_3d(&self) -> Vec<crate::render3d::Light3D> {
@@ -1955,6 +1977,76 @@ pub(crate) struct SoftwareRenderer {
     environment_cache_pixels: Vec<u8>,
 }
 
+struct SoftwarePbrMaterial {
+    material: Arc<crate::mesh::MeshMaterial>,
+    base_color: Option<Arc<RgbaImage>>,
+    normal: Option<SoftwarePbrTexture>,
+    metallic_roughness: Option<SoftwarePbrTexture>,
+    emissive: Option<SoftwarePbrTexture>,
+}
+
+struct SoftwarePbrTexture {
+    image: Arc<RgbaImage>,
+    solid: Option<[f32; 4]>,
+}
+
+impl SoftwarePbrTexture {
+    fn new(image: Arc<RgbaImage>) -> Self {
+        let solid = if image.width().saturating_mul(image.height()) <= 16 {
+            let first = image.pixels().next().map(|pixel| pixel.0);
+            first
+                .filter(|first| image.pixels().all(|pixel| pixel.0 == *first))
+                .map(|pixel| pixel.map(|value| value as f32 / 255.0))
+        } else {
+            None
+        };
+        Self { image, solid }
+    }
+
+    fn sample(&self, uv: [f32; 2]) -> [f32; 4] {
+        self.solid
+            .unwrap_or_else(|| sample_software_texture(&self.image, uv))
+    }
+
+    fn is_flat_normal(&self) -> bool {
+        self.solid.is_some_and(|sample| {
+            (sample[0] - 128.0 / 255.0).abs() <= f32::EPSILON
+                && (sample[1] - 128.0 / 255.0).abs() <= f32::EPSILON
+                && (sample[2] - 1.0).abs() <= f32::EPSILON
+        })
+    }
+
+    fn is_neutral_orm(&self) -> bool {
+        self.solid
+            .is_some_and(|sample| sample[1] == 1.0 && sample[2] == 1.0)
+    }
+
+    fn is_white_emissive(&self) -> bool {
+        self.solid.is_some_and(|sample| sample[..3] == [1.0; 3])
+    }
+}
+
+fn software_image_pixels(image: Option<&ImageHandle>) -> Result<Option<Arc<RgbaImage>>, String> {
+    image
+        .map(|image| {
+            image
+                .snapshot()
+                .map(|snapshot| snapshot.into_parts().2)
+                .map_err(|error| error.to_string())
+        })
+        .transpose()
+}
+
+fn sample_software_texture(texture: &RgbaImage, uv: [f32; 2]) -> [f32; 4] {
+    if texture.width() == 0 || texture.height() == 0 {
+        return [1.0; 4];
+    }
+    let x = (uv[0].rem_euclid(1.0) * texture.width().saturating_sub(1) as f32).round() as u32;
+    let y =
+        ((1.0 - uv[1]).clamp(0.0, 1.0) * texture.height().saturating_sub(1) as f32).round() as u32;
+    texture.get_pixel(x, y).0.map(|value| value as f32 / 255.0)
+}
+
 impl SoftwareRenderer {
     pub(crate) fn new(width: u32, height: u32) -> Self {
         Self {
@@ -2023,13 +2115,23 @@ impl SoftwareRenderer {
         platform: &SharedPlatformState,
         render_state: &SharedRenderState,
     ) -> Result<(), String> {
-        let (commands, lighting, lights, occluders, lights_3d, environment, camera_3d) = {
+        let (
+            commands,
+            lighting,
+            lights,
+            occluders,
+            lights_3d,
+            reflection_probes_3d,
+            environment,
+            camera_3d,
+        ) = {
             let mut state = render_state
                 .lock()
                 .map_err(|_| "render state lock poisoned".to_string())?;
             let commands = state.drain_without_remembering();
             let (lighting, lights, occluders) = state.take_lighting();
             let lights_3d = state.take_lights_3d();
+            let reflection_probes_3d = state.take_reflection_probes_3d();
             let environment = state.environment_3d();
             let camera_3d = state.camera_3d();
             (
@@ -2038,6 +2140,7 @@ impl SoftwareRenderer {
                 lights,
                 occluders,
                 lights_3d,
+                reflection_probes_3d,
                 environment,
                 camera_3d,
             )
@@ -2046,6 +2149,7 @@ impl SoftwareRenderer {
             platform,
             &commands,
             &lights_3d,
+            &reflection_probes_3d,
             Some((&environment, camera_3d)),
         )?;
         self.apply_lighting_pass(&lighting, &lights, &occluders);
@@ -2096,7 +2200,7 @@ impl SoftwareRenderer {
         platform: &SharedPlatformState,
         commands: &[DrawCommand],
     ) -> Result<(), String> {
-        self.render_command_slice(platform, commands, &[], None)
+        self.render_command_slice(platform, commands, &[], &[], None)
     }
 
     fn render_command_slice(
@@ -2104,6 +2208,7 @@ impl SoftwareRenderer {
         platform: &SharedPlatformState,
         commands: &[DrawCommand],
         lights_3d: &[crate::render3d::Light3D],
+        reflection_probes_3d: &[crate::render3d::ReflectionProbe3D],
         environment: Option<(
             &crate::environment3d::Environment3D,
             crate::render3d::Camera3D,
@@ -2131,7 +2236,12 @@ impl SoftwareRenderer {
         } else {
             self.clear_to_color(clear);
         }
-        self.draw_unshaded_commands_with_lights(commands, lights_3d)
+        self.draw_unshaded_commands_with_lights(
+            commands,
+            lights_3d,
+            reflection_probes_3d,
+            environment.map(|(environment, _)| environment),
+        )
     }
 
     pub(crate) fn clear_to_color(&mut self, clear: Color) {
@@ -2153,13 +2263,19 @@ impl SoftwareRenderer {
         camera: crate::render3d::Camera3D,
         fallback: Color,
     ) {
-        let cacheable_panorama = environment.enabled
-            && environment.mode == crate::environment3d::EnvironmentMode3D::Equirectangular
-            && environment
-                .equirectangular
-                .as_ref()
-                .is_some_and(|image| image.revision().is_ok());
-        if !cacheable_panorama {
+        let cacheable_image_environment = environment.enabled
+            && match environment.mode {
+                crate::environment3d::EnvironmentMode3D::Equirectangular => environment
+                    .equirectangular
+                    .as_ref()
+                    .is_some_and(|image| image.revision().is_ok()),
+                crate::environment3d::EnvironmentMode3D::Cubemap => environment
+                    .cubemap
+                    .as_ref()
+                    .is_some_and(|cubemap| cubemap.snapshot().is_ok()),
+                _ => false,
+            };
+        if !cacheable_image_environment {
             crate::environment3d::render_software_background(
                 environment,
                 camera,
@@ -2205,21 +2321,39 @@ impl SoftwareRenderer {
         &mut self,
         commands: &[DrawCommand],
     ) -> Result<(), String> {
-        self.draw_unshaded_commands_with_lights(commands, &[])
+        self.draw_unshaded_commands_with_lights(commands, &[], &[], None)
     }
 
     pub(crate) fn draw_commands_with_3d_lights(
         &mut self,
         commands: &[DrawCommand],
         lights_3d: &[crate::render3d::Light3D],
+        environment: Option<&crate::environment3d::Environment3D>,
     ) -> Result<(), String> {
-        self.draw_unshaded_commands_with_lights(commands, lights_3d)
+        self.draw_unshaded_commands_with_lights(commands, lights_3d, &[], environment)
+    }
+
+    pub(crate) fn draw_commands_with_3d_scene(
+        &mut self,
+        commands: &[DrawCommand],
+        lights_3d: &[crate::render3d::Light3D],
+        reflection_probes_3d: &[crate::render3d::ReflectionProbe3D],
+        environment: Option<&crate::environment3d::Environment3D>,
+    ) -> Result<(), String> {
+        self.draw_unshaded_commands_with_lights(
+            commands,
+            lights_3d,
+            reflection_probes_3d,
+            environment,
+        )
     }
 
     fn draw_unshaded_commands_with_lights(
         &mut self,
         commands: &[DrawCommand],
         lights_3d: &[crate::render3d::Light3D],
+        reflection_probes_3d: &[crate::render3d::ReflectionProbe3D],
+        environment: Option<&crate::environment3d::Environment3D>,
     ) -> Result<(), String> {
         if commands.iter().any(command_uses_custom_shader) {
             return Err("draw_unshaded_commands received a shader command".to_string());
@@ -2238,14 +2372,102 @@ impl SoftwareRenderer {
             // floor after one 3D frame.
             self.three_d_aa_scratch = Vec::new();
         }
+        let pbr_environment = if let Some(environment) = environment.filter(|value| value.enabled) {
+            match environment.mode {
+                crate::environment3d::EnvironmentMode3D::Equirectangular => environment
+                    .equirectangular
+                    .as_ref()
+                    .map(|image| {
+                        image
+                            .snapshot()
+                            .map(|snapshot| {
+                                crate::render3d::PbrEnvironment::new(
+                                    snapshot.into_parts().2,
+                                    environment.intensity,
+                                    environment.rotation_degrees,
+                                )
+                            })
+                            .map_err(|error| error.to_string())
+                    })
+                    .transpose()?,
+                crate::environment3d::EnvironmentMode3D::Cubemap => environment
+                    .cubemap
+                    .as_ref()
+                    .map(|cubemap| {
+                        cubemap
+                            .snapshot()
+                            .map(|snapshot| {
+                                crate::render3d::PbrEnvironment::new_cubemap(
+                                    snapshot.faces,
+                                    environment.intensity,
+                                    environment.rotation_degrees,
+                                )
+                            })
+                            .map_err(|error| error.to_string())
+                    })
+                    .transpose()?,
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let prepared_probe_environments = reflection_probes_3d
+            .iter()
+            .map(|probe| {
+                probe
+                    .cubemap
+                    .snapshot()
+                    .map(|snapshot| {
+                        crate::render3d::PbrEnvironment::new_cubemap(
+                            snapshot.faces,
+                            probe.intensity,
+                            probe.rotation_degrees,
+                        )
+                    })
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let fog = environment
+            .filter(|value| value.enabled && value.fog.enabled)
+            .map(|value| value.fog.sanitized());
+        let ambient_occlusion = environment
+            .filter(|value| value.enabled && value.ambient_occlusion.enabled)
+            .map(|value| value.ambient_occlusion.sanitized());
+        let ambient_occluders = ambient_occlusion
+            .map(|_| crate::render3d::gather_ambient_occluders_3d(commands.iter()))
+            .unwrap_or_default();
         // Opaque 3D geometry owns the depth buffer and is rendered before the
         // existing 2D command stream. This makes canvas/UI components natural
         // overlays without changing their long-standing z/order behavior.
-        for command in commands {
+        for (source_index, command) in commands.iter().enumerate() {
             let DrawCommand::Mesh3D(mesh) = command else {
                 continue;
             };
-            self.draw_mesh_3d(mesh, lights_3d)?;
+            let selected_probe =
+                crate::render3d::mesh_world_bounds_3d(mesh)
+                    .ok()
+                    .and_then(|receiver| {
+                        crate::render3d::select_reflection_probe_3d(
+                            receiver.center,
+                            reflection_probes_3d,
+                        )
+                    });
+            let blended_environment = selected_probe.map(|selection| {
+                crate::render3d::PbrEnvironment::blended(
+                    prepared_probe_environments[selection.index].clone(),
+                    pbr_environment.clone(),
+                    selection.weight,
+                )
+            });
+            self.draw_mesh_3d(
+                mesh,
+                lights_3d,
+                blended_environment.as_ref().or(pbr_environment.as_ref()),
+                fog,
+                ambient_occlusion,
+                &ambient_occluders,
+                source_index,
+            )?;
         }
         // Transparent billboards are submitted after all opaque meshes. Each
         // emitter's projected triangles are sorted back-to-front while the
@@ -2254,7 +2476,7 @@ impl SoftwareRenderer {
             let DrawCommand::Particles3D(particles) = command else {
                 continue;
             };
-            self.draw_particles_3d(particles)?;
+            self.draw_particles_3d(particles, fog)?;
         }
         if has_3d {
             self.apply_3d_antialiasing();
@@ -2507,8 +2729,27 @@ impl SoftwareRenderer {
         &mut self,
         command: &crate::render3d::Mesh3DCommand,
         lights: &[crate::render3d::Light3D],
+        environment: Option<&crate::render3d::PbrEnvironment>,
+        fog: Option<crate::environment3d::Fog3D>,
+        ambient_occlusion: Option<crate::environment3d::AmbientOcclusion3D>,
+        ambient_occluders: &[crate::render3d::AmbientOccluder3D],
+        source_index: usize,
     ) -> Result<(), String> {
         let triangles = crate::render3d::project_mesh(command, lights)?;
+        let selected_occluders = if command.receives_shadows {
+            ambient_occlusion
+                .and_then(|_| crate::render3d::mesh_world_bounds_3d(command).ok())
+                .map(|receiver| {
+                    crate::render3d::select_ambient_occluders_3d(
+                        source_index,
+                        receiver,
+                        ambient_occluders,
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let texture = command
             .texture
             .as_ref()
@@ -2519,8 +2760,79 @@ impl SoftwareRenderer {
                     .map_err(|error| error.to_string())
             })
             .transpose()?;
+        let materials = command
+            .resolved_materials()?
+            .into_iter()
+            .map(|material| {
+                material
+                    .map(|material| {
+                        Ok(SoftwarePbrMaterial {
+                            base_color: software_image_pixels(
+                                material
+                                    .base_color_texture
+                                    .as_ref()
+                                    .and_then(|binding| binding.image.as_ref()),
+                            )?,
+                            normal: software_image_pixels(
+                                material
+                                    .normal_texture
+                                    .as_ref()
+                                    .and_then(|binding| binding.image.as_ref()),
+                            )?
+                            .map(SoftwarePbrTexture::new)
+                            .filter(|texture| !texture.is_flat_normal()),
+                            metallic_roughness: software_image_pixels(
+                                material
+                                    .metallic_roughness_texture
+                                    .as_ref()
+                                    .and_then(|binding| binding.image.as_ref()),
+                            )?
+                            .map(SoftwarePbrTexture::new)
+                            .filter(|texture| !texture.is_neutral_orm()),
+                            emissive: software_image_pixels(
+                                material
+                                    .emissive_texture
+                                    .as_ref()
+                                    .and_then(|binding| binding.image.as_ref()),
+                            )?
+                            .map(SoftwarePbrTexture::new)
+                            .filter(|texture| !texture.is_white_emissive()),
+                            material,
+                        })
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let tint = [
+            command.tint.r as f32 / 255.0,
+            command.tint.g as f32 / 255.0,
+            command.tint.b as f32 / 255.0,
+            command.tint.a as f32 / 255.0,
+        ];
         for triangle in triangles {
-            self.rasterize_projected_triangle(&triangle, texture.as_deref());
+            let material = triangle
+                .material
+                .and_then(|index| materials.get(index))
+                .and_then(Option::as_ref);
+            let base_texture = texture.as_deref().or_else(|| {
+                triangle
+                    .material
+                    .and_then(|index| materials.get(index))
+                    .and_then(Option::as_ref)
+                    .and_then(|material| material.base_color.as_deref())
+            });
+            self.rasterize_projected_triangle(
+                &triangle,
+                base_texture,
+                material,
+                tint,
+                command.camera_position,
+                lights,
+                environment,
+                fog,
+                ambient_occlusion,
+                &selected_occluders,
+            );
         }
         Ok(())
     }
@@ -2528,6 +2840,7 @@ impl SoftwareRenderer {
     fn draw_particles_3d(
         &mut self,
         command: &crate::particles3d::ParticleSystem3DCommand,
+        fog: Option<crate::environment3d::Fog3D>,
     ) -> Result<(), String> {
         let triangles = crate::render3d::project_particles(command)?;
         let texture = command
@@ -2541,7 +2854,18 @@ impl SoftwareRenderer {
             })
             .transpose()?;
         for triangle in triangles {
-            self.rasterize_projected_triangle(&triangle, texture.as_deref());
+            self.rasterize_projected_triangle(
+                &triangle,
+                texture.as_deref(),
+                None,
+                [1.0; 4],
+                command.camera_position,
+                &[],
+                None,
+                fog,
+                None,
+                &[],
+            );
         }
         Ok(())
     }
@@ -2550,6 +2874,14 @@ impl SoftwareRenderer {
         &mut self,
         triangle: &crate::render3d::ProjectedTriangle,
         texture: Option<&RgbaImage>,
+        pbr: Option<&SoftwarePbrMaterial>,
+        tint: [f32; 4],
+        camera_position: crate::render3d::Vec3,
+        lights: &[crate::render3d::Light3D],
+        environment: Option<&crate::render3d::PbrEnvironment>,
+        fog: Option<crate::environment3d::Fog3D>,
+        ambient_occlusion: Option<crate::environment3d::AmbientOcclusion3D>,
+        ambient_occluders: &[crate::render3d::AmbientOccluder3D],
     ) {
         let to_screen = |ndc: [f32; 3]| -> [f32; 3] {
             [
@@ -2625,6 +2957,10 @@ impl SoftwareRenderer {
                 };
                 let mut color = [0.0; 4];
                 let mut uv = [0.0; 2];
+                let mut world_position = [0.0; 3];
+                let mut world_normal = [0.0; 3];
+                let mut world_tangent = [0.0; 3];
+                let mut tangent_sign = 0.0;
                 for corner in 0..3 {
                     let weight = attribute_weights[corner];
                     for channel in 0..4 {
@@ -2633,21 +2969,92 @@ impl SoftwareRenderer {
                     for axis in 0..2 {
                         uv[axis] += triangle.vertices[corner].uv[axis] * weight;
                     }
-                }
-                if let Some(texture) = texture
-                    && texture.width() > 0
-                    && texture.height() > 0
-                {
-                    let texture_x = (uv[0].rem_euclid(1.0)
-                        * texture.width().saturating_sub(1) as f32)
-                        .round() as u32;
-                    let texture_y = ((1.0 - uv[1]).clamp(0.0, 1.0)
-                        * texture.height().saturating_sub(1) as f32)
-                        .round() as u32;
-                    let texel = texture.get_pixel(texture_x, texture_y).0;
-                    for channel in 0..4 {
-                        color[channel] *= texel[channel] as f32 / 255.0;
+                    for axis in 0..3 {
+                        world_position[axis] +=
+                            triangle.vertices[corner].world_position[axis] * weight;
+                        world_normal[axis] += triangle.vertices[corner].world_normal[axis] * weight;
+                        world_tangent[axis] +=
+                            triangle.vertices[corner].world_tangent[axis] * weight;
                     }
+                    tangent_sign += triangle.vertices[corner].tangent_sign * weight;
+                }
+                // Match Vulkan's gl_FrontFacing behavior for two-sided PBR
+                // materials so normal maps illuminate the back face from the
+                // physically opposite side.
+                if area < 0.0 {
+                    for axis in 0..3 {
+                        world_normal[axis] = -world_normal[axis];
+                        world_tangent[axis] = -world_tangent[axis];
+                    }
+                }
+                let ambient_visibility = ambient_occlusion.map_or(1.0, |settings| {
+                    crate::render3d::ambient_occlusion_visibility_3d(
+                        settings,
+                        crate::render3d::Vec3::new(
+                            world_position[0],
+                            world_position[1],
+                            world_position[2],
+                        ),
+                        crate::render3d::Vec3::new(
+                            world_normal[0],
+                            world_normal[1],
+                            world_normal[2],
+                        ),
+                        ambient_occluders,
+                    )
+                });
+                if let Some(pbr) = pbr {
+                    let base = texture
+                        .map(|texture| sample_software_texture(texture, uv))
+                        .unwrap_or([1.0; 4]);
+                    let normal = pbr.normal.as_ref().map(|texture| {
+                        let sample = texture.sample(uv);
+                        [sample[0], sample[1], sample[2]]
+                    });
+                    let orm = pbr.metallic_roughness.as_ref().map(|texture| {
+                        let sample = texture.sample(uv);
+                        [sample[1], sample[2]]
+                    });
+                    let emissive = pbr.emissive.as_ref().map(|texture| {
+                        let sample = texture.sample(uv);
+                        [sample[0], sample[1], sample[2]]
+                    });
+                    let Some(shaded) = crate::render3d::shade_pbr_pixel(
+                        &pbr.material,
+                        tint,
+                        base,
+                        normal,
+                        orm,
+                        emissive,
+                        world_position,
+                        world_normal,
+                        world_tangent,
+                        tangent_sign,
+                        camera_position,
+                        lights,
+                        environment,
+                        ambient_visibility,
+                    ) else {
+                        continue;
+                    };
+                    color = shaded;
+                } else if let Some(texture) = texture {
+                    let texel = sample_software_texture(texture, uv);
+                    for channel in 0..4 {
+                        color[channel] *= texel[channel];
+                    }
+                }
+                if pbr.is_none() && ambient_visibility < 1.0 {
+                    color =
+                        crate::render3d::apply_ambient_occlusion_srgb(color, ambient_visibility);
+                }
+                if let Some(fog) = fog {
+                    color = crate::render3d::apply_fog_srgb(
+                        color,
+                        world_position,
+                        camera_position,
+                        fog,
+                    );
                 }
                 let source = Color::rgba(
                     (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
@@ -3713,6 +4120,10 @@ mod tests {
             ndc: [0.0; 3],
             uv: [0.0; 2],
             color: [1.0; 4],
+            world_position: [0.0; 3],
+            world_normal: [0.0, 0.0, 1.0],
+            world_tangent: [1.0, 0.0, 0.0],
+            tangent_sign: 1.0,
         };
         let vertices = [vertex(1.0), vertex(2.0), vertex(4.0)];
         let weights = perspective_correct_weights(&vertices, [0.25, 0.25, 0.5])
@@ -3753,10 +4164,14 @@ mod tests {
                 mesh: mesh.clone(),
                 model: crate::render3d::Mat4::translation(crate::render3d::Vec3::new(0.0, 0.0, z)),
                 view_projection: camera.view_projection(1.0),
+                camera_position: camera.position,
                 tint,
                 texture: None,
+                materials: Vec::new(),
                 shader: None,
                 double_sided: true,
+                casts_shadows: true,
+                receives_shadows: true,
             })
         };
         let near = command(2.0, Color::rgba(255, 0, 0, 255));
@@ -3806,10 +4221,14 @@ mod tests {
             mesh,
             model: crate::render3d::Mat4::translation(crate::render3d::Vec3::new(0.0, 0.0, 2.0)),
             view_projection: camera.view_projection(1.0),
+            camera_position: camera.position,
             tint: Color::WHITE,
             texture: None,
+            materials: Vec::new(),
             shader: None,
             double_sided: true,
+            casts_shadows: true,
+            receives_shadows: true,
         });
         let platform = crate::platform::new_shared_platform_state();
         {
@@ -3928,10 +4347,14 @@ mod tests {
             mesh,
             model: crate::render3d::Mat4::translation(crate::render3d::Vec3::new(0.0, 0.0, 2.0)),
             view_projection: camera.view_projection(1.0),
+            camera_position: camera.position,
             tint: Color::WHITE,
             texture: Some(texture.clone()),
+            materials: Vec::new(),
             shader: None,
             double_sided: true,
+            casts_shadows: true,
+            receives_shadows: true,
         });
         let platform = crate::platform::new_shared_platform_state();
         lock_platform_state(&platform).set_clear_color(Color::rgba(0, 0, 0, 255));
@@ -3948,6 +4371,170 @@ mod tests {
         renderer
             .render_commands(&platform, &[command])
             .expect("render edited green texture");
+        assert!(renderer.pixels()[center + 1] > renderer.pixels()[center]);
+    }
+
+    #[test]
+    fn software_mesh_uses_imported_base_color_texture_per_submesh() {
+        use crate::mesh::{MeshData, MeshHandle, MeshMaterial, Submesh, TextureBinding, Vertex};
+
+        let red = ImageHandle::from_rgba_image(RgbaImage::from_pixel(1, 1, Rgba([255, 0, 0, 255])));
+        let green =
+            ImageHandle::from_rgba_image(RgbaImage::from_pixel(1, 1, Rgba([0, 255, 0, 255])));
+        let material = |name: &str, image: ImageHandle| {
+            let mut material = MeshMaterial::named(name);
+            material.base_color_texture = Some(TextureBinding {
+                source: format!("{name}.png"),
+                tex_coord: 0,
+                image: Some(image),
+            });
+            material
+        };
+        let mesh = MeshHandle::new(
+            MeshData::new(
+                "two materials",
+                vec![
+                    Vertex::from_position([-0.9, -0.7, 0.0]),
+                    Vertex::from_position([-0.1, -0.7, 0.0]),
+                    Vertex::from_position([-0.5, 0.7, 0.0]),
+                    Vertex::from_position([0.1, -0.7, 0.0]),
+                    Vertex::from_position([0.9, -0.7, 0.0]),
+                    Vertex::from_position([0.5, 0.7, 0.0]),
+                ],
+                vec![0, 1, 2, 3, 4, 5],
+                vec![
+                    Submesh {
+                        name: "left".into(),
+                        first_index: 0,
+                        index_count: 3,
+                        material: Some(0),
+                    },
+                    Submesh {
+                        name: "right".into(),
+                        first_index: 3,
+                        index_count: 3,
+                        material: Some(1),
+                    },
+                ],
+                vec![material("red", red), material("green", green)],
+                true,
+            )
+            .expect("mesh data"),
+        )
+        .expect("mesh handle");
+        let camera = crate::render3d::Camera3D::default();
+        let command = DrawCommand::Mesh3D(crate::render3d::Mesh3DCommand {
+            mesh,
+            model: crate::render3d::Mat4::translation(crate::render3d::Vec3::new(0.0, 0.0, 2.0)),
+            view_projection: camera.view_projection(1.0),
+            camera_position: camera.position,
+            tint: Color::WHITE,
+            texture: None,
+            materials: Vec::new(),
+            shader: None,
+            double_sided: true,
+            casts_shadows: true,
+            receives_shadows: true,
+        });
+        let platform = crate::platform::new_shared_platform_state();
+        lock_platform_state(&platform).set_clear_color(Color::rgba(0, 0, 0, 255));
+        let mut renderer = SoftwareRenderer::new(64, 64);
+        renderer
+            .render_commands(&platform, &[command])
+            .expect("render imported material textures");
+
+        let mut left_red = 0usize;
+        let mut right_green = 0usize;
+        for (index, pixel) in renderer.pixels().chunks_exact(4).enumerate() {
+            let x = index % 64;
+            if x < 32 && pixel[0] > pixel[1] {
+                left_red += 1;
+            }
+            if x >= 32 && pixel[1] > pixel[0] {
+                right_green += 1;
+            }
+        }
+        assert!(left_red > 20, "left material did not render its red image");
+        assert!(
+            right_green > 20,
+            "right material did not render its green image"
+        );
+    }
+
+    #[test]
+    fn software_mesh_observes_reusable_material_texture_edits() {
+        use crate::mesh::{
+            MaterialHandle, MeshData, MeshHandle, MeshMaterial, Submesh, TextureBinding, Vertex,
+        };
+
+        let red = ImageHandle::from_rgba_image(RgbaImage::from_pixel(1, 1, Rgba([255, 0, 0, 255])));
+        let green =
+            ImageHandle::from_rgba_image(RgbaImage::from_pixel(1, 1, Rgba([0, 255, 0, 255])));
+        let mut initial = MeshMaterial::named("live override");
+        initial.base_color_texture = Some(TextureBinding {
+            source: "red.png".into(),
+            tex_coord: 0,
+            image: Some(red),
+        });
+        let material = MaterialHandle::new(initial).expect("material handle");
+        let mesh = MeshHandle::new(
+            MeshData::new(
+                "material override triangle",
+                vec![
+                    Vertex::from_position([-0.8, -0.8, 0.0]),
+                    Vertex::from_position([0.8, -0.8, 0.0]),
+                    Vertex::from_position([0.0, 0.8, 0.0]),
+                ],
+                vec![0, 1, 2],
+                vec![Submesh {
+                    name: "triangle".into(),
+                    first_index: 0,
+                    index_count: 3,
+                    material: None,
+                }],
+                Vec::new(),
+                true,
+            )
+            .expect("mesh data"),
+        )
+        .expect("mesh handle");
+        let camera = crate::render3d::Camera3D::default();
+        let command = DrawCommand::Mesh3D(crate::render3d::Mesh3DCommand {
+            mesh,
+            model: crate::render3d::Mat4::translation(crate::render3d::Vec3::new(0.0, 0.0, 2.0)),
+            view_projection: camera.view_projection(1.0),
+            camera_position: camera.position,
+            tint: Color::WHITE,
+            texture: None,
+            materials: vec![Some(material.clone())],
+            shader: None,
+            double_sided: true,
+            casts_shadows: true,
+            receives_shadows: true,
+        });
+        let platform = crate::platform::new_shared_platform_state();
+        lock_platform_state(&platform).set_clear_color(Color::rgba(0, 0, 0, 255));
+        let mut renderer = SoftwareRenderer::new(64, 64);
+        let center = (32usize * 64 + 32) * 4;
+
+        renderer
+            .render_commands(&platform, std::slice::from_ref(&command))
+            .expect("render red material");
+        assert!(renderer.pixels()[center] > renderer.pixels()[center + 1]);
+
+        material
+            .mutate(move |material| {
+                material.base_color_texture = Some(TextureBinding {
+                    source: "green.png".into(),
+                    tex_coord: 0,
+                    image: Some(green),
+                });
+                Ok(())
+            })
+            .expect("edit reusable material");
+        renderer
+            .render_commands(&platform, &[command])
+            .expect("render edited green material");
         assert!(renderer.pixels()[center + 1] > renderer.pixels()[center]);
     }
 }

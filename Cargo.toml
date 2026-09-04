@@ -2,6 +2,7 @@
 name = "neolove"
 version = "0.1.0"
 edition = "2024"
+default-run = "neolove"
 
 [lib]
 name = "neolove"
@@ -11,6 +12,12 @@ path = "src/main_android.rs"
 [features]
 default = []
 vulkan = ["dep:naga", "dep:vulkano"]
+packaged-launcher = []
+
+[[bin]]
+name = "neolove-launcher"
+path = "src/packaged_launcher.rs"
+required-features = ["packaged-launcher"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 mlua = { version = "0.11.5", features = ["luau"] }

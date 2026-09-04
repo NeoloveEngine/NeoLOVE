@@ -8,7 +8,8 @@
 //! channels are retained and can be CPU-skinned through [`MeshHandle`], keeping
 //! the renderer contract backend-neutral. Morph targets, compressed accessors,
 //! and model-level scene instancing remain outside this module. ASCII FBX
-//! supports the common Model/Skin/Cluster/AnimationCurve subset; binary FBX
+//! supports the common Model/Skin/Cluster/AnimationCurve subset; ASCII and
+//! binary FBX retain common external material bindings, while binary FBX
 //! deformation is explicitly rejected rather than silently imported as static.
 
 use std::collections::HashMap;
@@ -16,6 +17,7 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use base64::Engine as _;
@@ -23,6 +25,12 @@ use flate2::read::ZlibDecoder;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 pub(crate) type MeshResult<T> = Result<T, MeshError>;
+
+static NEXT_MESH_GEOMETRY_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_mesh_geometry_identity() -> u64 {
+    NEXT_MESH_GEOMETRY_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// A model format accepted by [`import_from_bytes`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +88,10 @@ pub(crate) struct TextureBinding {
     /// A relative URI, a data label, or an importer-generated embedded label.
     pub source: String,
     pub tex_coord: u32,
+    /// Decoded image retained by imported mesh assets. Runtime-created
+    /// metadata may leave this empty until an explicit component texture is
+    /// assigned.
+    pub image: Option<crate::assets::ImageHandle>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -132,6 +144,96 @@ impl Default for MeshMaterial {
     }
 }
 
+fn validate_material(material: &MeshMaterial, context: &str) -> MeshResult<()> {
+    if !all_finite(&material.base_color)
+        || !material.metallic.is_finite()
+        || !material.roughness.is_finite()
+        || !all_finite(&material.emissive)
+        || !material.alpha_cutoff.is_finite()
+    {
+        return Err(MeshError::InvalidData(format!(
+            "{context} contains a non-finite value"
+        )));
+    }
+    if material
+        .base_color
+        .iter()
+        .any(|value| !(0.0..=1.0).contains(value))
+        || !(0.0..=1.0).contains(&material.metallic)
+        || !(0.0..=1.0).contains(&material.roughness)
+        || material.emissive.iter().any(|value| *value < 0.0)
+        || !(0.0..=1.0).contains(&material.alpha_cutoff)
+    {
+        return Err(MeshError::InvalidData(format!(
+            "{context} factors are outside their supported ranges"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MaterialSnapshot {
+    pub revision: u64,
+    pub material: Arc<MeshMaterial>,
+}
+
+#[derive(Debug)]
+struct VersionedMaterial {
+    revision: u64,
+    material: Arc<MeshMaterial>,
+}
+
+/// Reusable live PBR material identity. Render commands retain the handle, so
+/// one transactional edit becomes visible to every bound mesh next frame.
+#[derive(Clone, Debug)]
+pub(crate) struct MaterialHandle {
+    inner: Arc<RwLock<VersionedMaterial>>,
+}
+
+impl MaterialHandle {
+    pub(crate) fn new(material: MeshMaterial) -> MeshResult<Self> {
+        validate_material(&material, "material")?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(VersionedMaterial {
+                revision: 0,
+                material: Arc::new(material),
+            })),
+        })
+    }
+
+    pub(crate) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
+    pub(crate) fn revision(&self) -> MeshResult<u64> {
+        self.inner
+            .read()
+            .map(|asset| asset.revision)
+            .map_err(|_| MeshError::LockPoisoned)
+    }
+
+    pub(crate) fn snapshot(&self) -> MeshResult<MaterialSnapshot> {
+        let asset = self.inner.read().map_err(|_| MeshError::LockPoisoned)?;
+        Ok(MaterialSnapshot {
+            revision: asset.revision,
+            material: Arc::clone(&asset.material),
+        })
+    }
+
+    pub(crate) fn mutate(
+        &self,
+        edit: impl FnOnce(&mut MeshMaterial) -> MeshResult<()>,
+    ) -> MeshResult<u64> {
+        let mut asset = self.inner.write().map_err(|_| MeshError::LockPoisoned)?;
+        let mut candidate = asset.material.as_ref().clone();
+        edit(&mut candidate)?;
+        validate_material(&candidate, "material")?;
+        asset.material = Arc::new(candidate);
+        asset.revision = asset.revision.wrapping_add(1);
+        Ok(asset.revision)
+    }
+}
+
 /// A contiguous triangle range rendered with one material.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Submesh {
@@ -176,6 +278,10 @@ pub(crate) struct Armature {
     pub nodes: Vec<ArmatureNode>,
     pub joints: Vec<usize>,
     pub inverse_bind_matrices: Vec<[f32; 16]>,
+    /// Current global-joint × inverse-bind matrices. CPU fallbacks consume the
+    /// deformed vertices while native backends can skin bind vertices from
+    /// this compact palette without rebuilding geometry buffers.
+    pub pose_palette: Vec<[f32; 16]>,
     pub vertex_weights: Vec<SkinWeights>,
     pub bind_vertices: Vec<Vertex>,
 }
@@ -361,16 +467,7 @@ impl MeshData {
         }
 
         for (index, material) in self.materials.iter().enumerate() {
-            if !all_finite(&material.base_color)
-                || !material.metallic.is_finite()
-                || !material.roughness.is_finite()
-                || !all_finite(&material.emissive)
-                || !material.alpha_cutoff.is_finite()
-            {
-                return Err(MeshError::InvalidData(format!(
-                    "material {index} contains a non-finite value"
-                )));
-            }
+            validate_material(material, &format!("material {index}"))?;
         }
         self.validate_animation_data()?;
         Ok(())
@@ -395,6 +492,16 @@ impl MeshData {
         if armature.joints.len() != armature.inverse_bind_matrices.len() {
             return Err(MeshError::InvalidData(
                 "armature joint and inverse-bind counts differ".into(),
+            ));
+        }
+        if armature.pose_palette.len() != armature.joints.len()
+            || armature
+                .pose_palette
+                .iter()
+                .any(|matrix| !all_finite(matrix))
+        {
+            return Err(MeshError::InvalidData(
+                "armature pose palette must contain one finite matrix per joint".into(),
             ));
         }
         if armature.joints.len() > usize::from(u16::MAX) + 1 {
@@ -498,6 +605,11 @@ impl MeshData {
 #[derive(Clone, Debug)]
 pub(crate) struct MeshSnapshot {
     pub revision: u64,
+    /// Changes only when uploaded bind/static geometry may have changed. Pose
+    /// and material revisions can advance without forcing a GPU mesh upload.
+    pub geometry_revision: u64,
+    /// Stable across detached pose clones until one clone edits geometry.
+    pub geometry_identity: u64,
     /// Cheap immutable snapshot; cloning it does not clone vertex/index buffers.
     pub mesh: Arc<MeshData>,
 }
@@ -505,6 +617,8 @@ pub(crate) struct MeshSnapshot {
 #[derive(Debug)]
 struct VersionedMesh {
     revision: u64,
+    geometry_revision: u64,
+    geometry_identity: u64,
     mesh: Arc<MeshData>,
     playback: Option<AnimationPlayback>,
 }
@@ -530,6 +644,8 @@ impl MeshHandle {
         Ok(Self {
             inner: Arc::new(RwLock::new(VersionedMesh {
                 revision: 0,
+                geometry_revision: 0,
+                geometry_identity: next_mesh_geometry_identity(),
                 mesh: Arc::new(mesh),
                 playback: None,
             })),
@@ -550,6 +666,8 @@ impl MeshHandle {
         let asset = self.inner.read().map_err(|_| MeshError::LockPoisoned)?;
         Ok(MeshSnapshot {
             revision: asset.revision,
+            geometry_revision: asset.geometry_revision,
+            geometry_identity: asset.geometry_identity,
             mesh: Arc::clone(&asset.mesh),
         })
     }
@@ -565,7 +683,7 @@ impl MeshHandle {
         &self,
         edit: impl FnOnce(&mut MeshData) -> MeshResult<()>,
     ) -> MeshResult<u64> {
-        self.mutate_internal(false, edit)
+        self.mutate_internal(false, true, edit)
     }
 
     /// Apply a transaction and rebuild normals from the edited triangle data.
@@ -573,7 +691,16 @@ impl MeshHandle {
         &self,
         edit: impl FnOnce(&mut MeshData) -> MeshResult<()>,
     ) -> MeshResult<u64> {
-        self.mutate_internal(true, edit)
+        self.mutate_internal(true, true, edit)
+    }
+
+    /// Update non-geometry metadata without invalidating shared bind/index GPU
+    /// buffers used by detached animation poses.
+    pub(crate) fn mutate_metadata(
+        &self,
+        edit: impl FnOnce(&mut MeshData) -> MeshResult<()>,
+    ) -> MeshResult<u64> {
+        self.mutate_internal(false, false, edit)
     }
 
     pub(crate) fn set_vertex(
@@ -582,7 +709,7 @@ impl MeshHandle {
         vertex: Vertex,
         recompute_normals: bool,
     ) -> MeshResult<u64> {
-        self.mutate_internal(recompute_normals, |mesh| {
+        self.mutate_internal(recompute_normals, true, |mesh| {
             let destination = mesh
                 .vertices
                 .get_mut(index)
@@ -597,7 +724,7 @@ impl MeshHandle {
         vertices: Vec<Vertex>,
         indices: Vec<u32>,
     ) -> MeshResult<u64> {
-        self.mutate_internal(true, move |mesh| {
+        self.mutate_internal(true, true, move |mesh| {
             mesh.vertices = vertices;
             mesh.indices = indices;
             mesh.submeshes.clear();
@@ -608,14 +735,22 @@ impl MeshHandle {
     }
 
     pub(crate) fn recompute_normals(&self) -> MeshResult<u64> {
-        self.mutate_internal(true, |_| Ok(()))
+        self.mutate_internal(true, true, |_| Ok(()))
     }
 
     /// Create an independent mesh identity, useful when several entities play
     /// different poses from one cached source asset.
     pub(crate) fn detached_clone(&self) -> MeshResult<Self> {
-        let snapshot = self.snapshot()?;
-        Self::new(snapshot.mesh.as_ref().clone())
+        let asset = self.inner.read().map_err(|_| MeshError::LockPoisoned)?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(VersionedMesh {
+                revision: asset.revision,
+                geometry_revision: asset.geometry_revision,
+                geometry_identity: asset.geometry_identity,
+                mesh: asset.mesh.clone(),
+                playback: None,
+            })),
+        })
     }
 
     pub(crate) fn animation_names(&self) -> MeshResult<Vec<String>> {
@@ -643,7 +778,7 @@ impl MeshHandle {
                 "animation sample time must be finite".into(),
             ));
         }
-        self.mutate_internal(false, |mesh| {
+        self.mutate_internal(false, false, |mesh| {
             let clip = mesh
                 .animations
                 .iter()
@@ -706,6 +841,9 @@ impl MeshHandle {
             let mesh = Arc::make_mut(&mut asset.mesh);
             mesh.vertices = bind_vertices;
             mesh.bounds = calculate_bounds(&mesh.vertices)?;
+            if let Some(armature) = mesh.armature.as_mut() {
+                armature.pose_palette = vec![identity_matrix(); armature.joints.len()];
+            }
             asset.revision = asset.revision.wrapping_add(1);
         }
         Ok(())
@@ -751,6 +889,7 @@ impl MeshHandle {
     fn mutate_internal(
         &self,
         recompute_normals: bool,
+        geometry_changed: bool,
         edit: impl FnOnce(&mut MeshData) -> MeshResult<()>,
     ) -> MeshResult<u64> {
         let mut asset = self.inner.write().map_err(|_| MeshError::LockPoisoned)?;
@@ -759,6 +898,10 @@ impl MeshHandle {
         candidate.finish_mutation(recompute_normals)?;
         asset.mesh = Arc::new(candidate);
         asset.revision = asset.revision.wrapping_add(1);
+        if geometry_changed {
+            asset.geometry_revision = asset.geometry_revision.wrapping_add(1);
+            asset.geometry_identity = next_mesh_geometry_identity();
+        }
         Ok(asset.revision)
     }
 }
@@ -823,10 +966,10 @@ fn parse_mesh_bytes(
     base_dir: Option<&Path>,
 ) -> MeshResult<MeshData> {
     match format {
-        MeshFormat::Obj => parse_obj(bytes),
+        MeshFormat::Obj => parse_obj(bytes, base_dir),
         MeshFormat::Gltf => parse_gltf_json(bytes, base_dir, None),
         MeshFormat::Glb => parse_glb(bytes, base_dir),
-        MeshFormat::Fbx => parse_fbx(bytes),
+        MeshFormat::Fbx => parse_fbx(bytes, base_dir),
     }
 }
 
@@ -1060,6 +1203,10 @@ fn apply_animation_pose(mesh: &mut MeshData, clip: &AnimationClip, time: f32) ->
     let bounds = calculate_bounds(&vertices)?;
     mesh.vertices = vertices;
     mesh.bounds = bounds;
+    mesh.armature
+        .as_mut()
+        .expect("armature was validated before pose evaluation")
+        .pose_palette = palette;
     Ok(())
 }
 
@@ -1624,7 +1771,40 @@ struct ObjCorner {
     normal: Option<usize>,
 }
 
-fn parse_obj(bytes: &[u8]) -> MeshResult<MeshData> {
+#[derive(Debug)]
+struct ObjMtlDefinition {
+    material: MeshMaterial,
+    base_color_map: Option<String>,
+    alpha_map: Option<String>,
+    normal_map: Option<String>,
+    roughness_map: Option<String>,
+    metallic_map: Option<String>,
+    emissive_map: Option<String>,
+    metallic_explicit: bool,
+    emissive_explicit: bool,
+    texture_directory: PathBuf,
+}
+
+impl ObjMtlDefinition {
+    fn new(name: String) -> Self {
+        let mut material = MeshMaterial::named(name);
+        material.metallic = 0.0;
+        Self {
+            material,
+            base_color_map: None,
+            alpha_map: None,
+            normal_map: None,
+            roughness_map: None,
+            metallic_map: None,
+            emissive_map: None,
+            metallic_explicit: false,
+            emissive_explicit: false,
+            texture_directory: PathBuf::new(),
+        }
+    }
+}
+
+fn parse_obj(bytes: &[u8], base_dir: Option<&Path>) -> MeshResult<MeshData> {
     let source = std::str::from_utf8(bytes)
         .map_err(|error| MeshError::InvalidData(format!("OBJ is not UTF-8 text: {error}")))?;
     let mut positions = Vec::<[f32; 3]>::new();
@@ -1633,8 +1813,7 @@ fn parse_obj(bytes: &[u8]) -> MeshResult<MeshData> {
     let mut vertices = Vec::<Vertex>::new();
     let mut indices = Vec::<u32>::new();
     let mut corner_cache = HashMap::<ObjCorner, u32>::new();
-    let mut materials = Vec::<MeshMaterial>::new();
-    let mut material_indices = HashMap::<String, usize>::new();
+    let (mut materials, mut material_indices) = load_obj_materials(source, base_dir)?;
     let mut submeshes = Vec::<Submesh>::new();
     let mut current_group = "default".to_string();
     let mut current_material = None;
@@ -1791,6 +1970,453 @@ fn parse_obj(bytes: &[u8]) -> MeshResult<MeshData> {
         materials,
         missing_normals || normals.is_empty(),
     )
+}
+
+fn load_obj_materials(
+    source: &str,
+    base_dir: Option<&Path>,
+) -> MeshResult<(Vec<MeshMaterial>, HashMap<String, usize>)> {
+    let mut libraries = Vec::<String>::new();
+    for raw_line in source.lines() {
+        let line = raw_line.split('#').next().unwrap_or_default().trim();
+        let Some(rest) = line.strip_prefix("mtllib") else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let rest = rest.trim();
+        if rest.is_empty() {
+            continue;
+        }
+        let base_dir = base_dir.ok_or_else(|| {
+            MeshError::InvalidData(
+                "OBJ references an external material library; import from a path to resolve it"
+                    .into(),
+            )
+        })?;
+        if base_dir.join(rest).is_file() {
+            libraries.push(rest.to_string());
+        } else {
+            libraries.extend(rest.split_whitespace().map(str::to_string));
+        }
+    }
+    let mut definitions = Vec::<ObjMtlDefinition>::new();
+    for library in libraries {
+        if library.contains("://") || Path::new(&library).is_absolute() {
+            return Err(MeshError::InvalidData(format!(
+                "OBJ material library path must be relative: '{library}'"
+            )));
+        }
+        let base_dir = base_dir.expect("material libraries require an OBJ base directory");
+        let path = base_dir.join(&library);
+        let bytes = fs::read(&path).map_err(|error| {
+            MeshError::Io(format!(
+                "failed to read OBJ material library '{}': {error}",
+                path.display()
+            ))
+        })?;
+        definitions.extend(parse_mtl(&bytes, &path)?);
+    }
+
+    let mut materials = Vec::<MeshMaterial>::new();
+    let mut indices = HashMap::<String, usize>::new();
+    let mut image_cache = HashMap::new();
+    for definition in definitions {
+        let name = definition.material.name.clone();
+        let material = finish_obj_material(definition, &mut image_cache)?;
+        if let Some(index) = indices.get(&name).copied() {
+            materials[index] = material;
+        } else {
+            indices.insert(name, materials.len());
+            materials.push(material);
+        }
+    }
+    Ok((materials, indices))
+}
+
+fn parse_mtl(bytes: &[u8], path: &Path) -> MeshResult<Vec<ObjMtlDefinition>> {
+    let source = std::str::from_utf8(bytes).map_err(|error| {
+        MeshError::InvalidData(format!(
+            "MTL '{}' is not UTF-8 text: {error}",
+            path.display()
+        ))
+    })?;
+    let mut materials = Vec::new();
+    let mut current: Option<ObjMtlDefinition> = None;
+    for (line_index, raw_line) in source.lines().enumerate() {
+        let line_number = line_index + 1;
+        let line = raw_line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(directive) = fields.next() else {
+            continue;
+        };
+        if directive.eq_ignore_ascii_case("newmtl") {
+            if let Some(material) = current.take() {
+                materials.push(material);
+            }
+            let name = fields.collect::<Vec<_>>().join(" ");
+            if name.is_empty() {
+                return Err(MeshError::InvalidData(format!(
+                    "MTL '{}' line {line_number} has an empty newmtl name",
+                    path.display()
+                )));
+            }
+            current = Some(ObjMtlDefinition::new(name));
+            continue;
+        }
+        let Some(material) = current.as_mut() else {
+            continue;
+        };
+        let context = format!("MTL '{}' line {line_number}", path.display());
+        match directive.to_ascii_lowercase().as_str() {
+            "kd" => {
+                let rgb = parse_mtl_rgb(fields, &context, "Kd")?;
+                material.material.base_color[..3].copy_from_slice(&rgb);
+            }
+            "ke" => {
+                material.material.emissive = parse_mtl_rgb(fields, &context, "Ke")?;
+                material.emissive_explicit = true;
+            }
+            "d" => {
+                let values = fields.collect::<Vec<_>>();
+                let value = values.last().ok_or_else(|| {
+                    MeshError::InvalidData(format!("{context} is missing opacity"))
+                })?;
+                material.material.base_color[3] = parse_mtl_number(value, &context, "opacity")?;
+            }
+            "tr" => {
+                let value = fields.next().ok_or_else(|| {
+                    MeshError::InvalidData(format!("{context} is missing transparency"))
+                })?;
+                material.material.base_color[3] =
+                    1.0 - parse_mtl_number(value, &context, "transparency")?;
+            }
+            "ns" => {
+                let value = fields.next().ok_or_else(|| {
+                    MeshError::InvalidData(format!("{context} is missing shininess"))
+                })?;
+                let shininess = parse_mtl_number(value, &context, "shininess")?.max(0.0);
+                material.material.roughness = (2.0 / (shininess + 2.0)).sqrt().clamp(0.0, 1.0);
+            }
+            "pr" => {
+                let value = fields.next().ok_or_else(|| {
+                    MeshError::InvalidData(format!("{context} is missing roughness"))
+                })?;
+                material.material.roughness = parse_mtl_number(value, &context, "roughness")?;
+            }
+            "pm" => {
+                let value = fields.next().ok_or_else(|| {
+                    MeshError::InvalidData(format!("{context} is missing metallic"))
+                })?;
+                material.material.metallic = parse_mtl_number(value, &context, "metallic")?;
+                material.metallic_explicit = true;
+            }
+            "map_kd" => material.base_color_map = Some(parse_mtl_map(line, directive, &context)?),
+            "map_d" => material.alpha_map = Some(parse_mtl_map(line, directive, &context)?),
+            "map_bump" | "bump" | "norm" => {
+                material.normal_map = Some(parse_mtl_map(line, directive, &context)?)
+            }
+            "map_pr" => material.roughness_map = Some(parse_mtl_map(line, directive, &context)?),
+            "map_pm" => material.metallic_map = Some(parse_mtl_map(line, directive, &context)?),
+            "map_ke" => material.emissive_map = Some(parse_mtl_map(line, directive, &context)?),
+            _ => {}
+        }
+    }
+    if let Some(material) = current {
+        materials.push(material);
+    }
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    for material in &mut materials {
+        material.texture_directory = directory.to_path_buf();
+        for source in [
+            &mut material.base_color_map,
+            &mut material.alpha_map,
+            &mut material.normal_map,
+            &mut material.roughness_map,
+            &mut material.metallic_map,
+            &mut material.emissive_map,
+        ] {
+            if let Some(source) = source {
+                if source.contains("://") || Path::new(source).is_absolute() {
+                    return Err(MeshError::InvalidData(format!(
+                        "MTL '{}' texture path must be relative: '{source}'",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(materials)
+}
+
+fn parse_mtl_rgb<'a>(
+    mut fields: impl Iterator<Item = &'a str>,
+    context: &str,
+    label: &str,
+) -> MeshResult<[f32; 3]> {
+    let mut rgb = [0.0; 3];
+    for (index, channel) in rgb.iter_mut().enumerate() {
+        let value = fields.next().ok_or_else(|| {
+            MeshError::InvalidData(format!("{context} {label} is missing channel {index}"))
+        })?;
+        *channel = parse_mtl_number(value, context, label)?;
+    }
+    Ok(rgb)
+}
+
+fn parse_mtl_number(value: &str, context: &str, label: &str) -> MeshResult<f32> {
+    let value = value.parse::<f32>().map_err(|error| {
+        MeshError::InvalidData(format!("{context} has invalid {label}: {error}"))
+    })?;
+    if !value.is_finite() {
+        return Err(MeshError::InvalidData(format!(
+            "{context} has non-finite {label}"
+        )));
+    }
+    Ok(value)
+}
+
+fn parse_mtl_map(line: &str, directive: &str, context: &str) -> MeshResult<String> {
+    let rest = line[directive.len()..].trim();
+    let tokens = rest.split_whitespace().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < tokens.len() && tokens[index].starts_with('-') {
+        let option = tokens[index].to_ascii_lowercase();
+        index += 1;
+        if matches!(option.as_str(), "-o" | "-s" | "-t") {
+            let mut consumed = 0;
+            while consumed < 3 && index < tokens.len() && tokens[index].parse::<f32>().is_ok() {
+                index += 1;
+                consumed += 1;
+            }
+            continue;
+        }
+        let values = match option.as_str() {
+            "-mm" => 2,
+            "-blendu" | "-blendv" | "-cc" | "-clamp" | "-texres" | "-bm" | "-imfchan" | "-type" => {
+                1
+            }
+            _ => 0,
+        };
+        index = index.saturating_add(values).min(tokens.len());
+    }
+    let source = tokens[index..].join(" ");
+    if source.is_empty() {
+        return Err(MeshError::InvalidData(format!(
+            "{context} has no texture filename"
+        )));
+    }
+    Ok(source)
+}
+
+fn load_obj_image(
+    source: &str,
+    directory: &Path,
+    cache: &mut HashMap<PathBuf, crate::assets::ImageHandle>,
+) -> MeshResult<crate::assets::ImageHandle> {
+    let path = directory.join(source);
+    let key = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    if let Some(image) = cache.get(&key) {
+        return Ok(image.clone());
+    }
+    let bytes = fs::read(&path).map_err(|error| {
+        MeshError::Io(format!(
+            "failed to read MTL texture '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let pixels = image::load_from_memory(&bytes)
+        .map_err(|error| {
+            MeshError::InvalidData(format!(
+                "could not decode MTL texture '{}': {error}",
+                path.display()
+            ))
+        })?
+        .to_rgba8();
+    let image = crate::assets::ImageHandle::from_rgba_image(pixels);
+    cache.insert(key, image.clone());
+    Ok(image)
+}
+
+fn finish_obj_material(
+    mut definition: ObjMtlDefinition,
+    cache: &mut HashMap<PathBuf, crate::assets::ImageHandle>,
+) -> MeshResult<MeshMaterial> {
+    let base_image = definition
+        .base_color_map
+        .as_deref()
+        .map(|source| load_obj_image(source, &definition.texture_directory, cache))
+        .transpose()?;
+    let alpha_image = definition
+        .alpha_map
+        .as_deref()
+        .map(|source| load_obj_image(source, &definition.texture_directory, cache))
+        .transpose()?;
+    if base_image.is_some() || alpha_image.is_some() {
+        let source = definition
+            .base_color_map
+            .as_ref()
+            .or(definition.alpha_map.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let image = if let Some(alpha) = alpha_image {
+            let alpha = alpha
+                .with_image(Clone::clone)
+                .map_err(|error| MeshError::InvalidData(error.to_string()))?;
+            let mut base = if let Some(base) = base_image {
+                base.with_image(Clone::clone)
+                    .map_err(|error| MeshError::InvalidData(error.to_string()))?
+            } else {
+                image::RgbaImage::from_pixel(
+                    alpha.width(),
+                    alpha.height(),
+                    image::Rgba([255, 255, 255, 255]),
+                )
+            };
+            let alpha = if alpha.dimensions() == base.dimensions() {
+                alpha
+            } else {
+                image::imageops::resize(
+                    &alpha,
+                    base.width(),
+                    base.height(),
+                    image::imageops::FilterType::Triangle,
+                )
+            };
+            for (base, mask) in base.pixels_mut().zip(alpha.pixels()) {
+                let mask =
+                    ((u16::from(mask[0]) + u16::from(mask[1]) + u16::from(mask[2])) / 3) as u8;
+                base[3] = ((u16::from(base[3]) * u16::from(mask)) / 255) as u8;
+            }
+            crate::assets::ImageHandle::from_rgba_image(base)
+        } else {
+            base_image.expect("base or alpha image must exist")
+        };
+        if image
+            .with_image(Clone::clone)
+            .map_err(|error| MeshError::InvalidData(error.to_string()))?
+            .pixels()
+            .any(|pixel| pixel[3] < 255)
+            || definition.material.base_color[3] < 1.0
+        {
+            definition.material.alpha_mode = AlphaMode::Blend;
+        }
+        definition.material.base_color_texture = Some(TextureBinding {
+            source,
+            tex_coord: 0,
+            image: Some(image),
+        });
+    } else if definition.material.base_color[3] < 1.0 {
+        definition.material.alpha_mode = AlphaMode::Blend;
+    }
+
+    definition.material.normal_texture = definition
+        .normal_map
+        .as_deref()
+        .map(|source| {
+            Ok::<_, MeshError>(TextureBinding {
+                source: source.to_string(),
+                tex_coord: 0,
+                image: Some(load_obj_image(
+                    source,
+                    &definition.texture_directory,
+                    cache,
+                )?),
+            })
+        })
+        .transpose()?;
+    definition.material.emissive_texture = definition
+        .emissive_map
+        .as_deref()
+        .map(|source| {
+            Ok::<_, MeshError>(TextureBinding {
+                source: source.to_string(),
+                tex_coord: 0,
+                image: Some(load_obj_image(
+                    source,
+                    &definition.texture_directory,
+                    cache,
+                )?),
+            })
+        })
+        .transpose()?;
+    if definition.emissive_map.is_some() && !definition.emissive_explicit {
+        definition.material.emissive = [1.0; 3];
+    }
+
+    let roughness = definition
+        .roughness_map
+        .as_deref()
+        .map(|source| load_obj_image(source, &definition.texture_directory, cache))
+        .transpose()?;
+    let metallic = definition
+        .metallic_map
+        .as_deref()
+        .map(|source| load_obj_image(source, &definition.texture_directory, cache))
+        .transpose()?;
+    if roughness.is_some() || metallic.is_some() {
+        let reference = roughness.as_ref().or(metallic.as_ref()).unwrap();
+        let (width, height) = reference
+            .dimensions()
+            .map_err(|error| MeshError::InvalidData(error.to_string()))?;
+        let roughness = roughness
+            .map(|image| image.with_image(Clone::clone))
+            .transpose()
+            .map_err(|error| MeshError::InvalidData(error.to_string()))?;
+        let metallic = metallic
+            .map(|image| image.with_image(Clone::clone))
+            .transpose()
+            .map_err(|error| MeshError::InvalidData(error.to_string()))?;
+        let resize = |image: image::RgbaImage| {
+            if image.dimensions() == (width, height) {
+                image
+            } else {
+                image::imageops::resize(
+                    &image,
+                    width,
+                    height,
+                    image::imageops::FilterType::Triangle,
+                )
+            }
+        };
+        let roughness = roughness.map(resize);
+        let metallic = metallic.map(resize);
+        let mut packed = image::RgbaImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let luminance = |pixel: &image::Rgba<u8>| {
+                    ((u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2])) / 3) as u8
+                };
+                let roughness = roughness
+                    .as_ref()
+                    .map(|image| luminance(image.get_pixel(x, y)))
+                    .unwrap_or(255);
+                let metallic = metallic
+                    .as_ref()
+                    .map(|image| luminance(image.get_pixel(x, y)))
+                    .unwrap_or(255);
+                packed.put_pixel(x, y, image::Rgba([255, roughness, metallic, 255]));
+            }
+        }
+        if definition.metallic_map.is_some() && !definition.metallic_explicit {
+            definition.material.metallic = 1.0;
+        }
+        definition.material.metallic_roughness_texture = Some(TextureBinding {
+            source: definition
+                .roughness_map
+                .as_ref()
+                .or(definition.metallic_map.as_ref())
+                .cloned()
+                .unwrap_or_default(),
+            tex_coord: 0,
+            image: Some(crate::assets::ImageHandle::from_rgba_image(packed)),
+        });
+    }
+    Ok(definition.material)
 }
 
 fn parse_obj_float(value: Option<&str>, line: usize, label: &str) -> MeshResult<f32> {
@@ -2476,7 +3102,7 @@ fn parse_gltf_json(
     }
 
     let buffers = load_gltf_buffers(root, base_dir, embedded_bin)?;
-    let materials = parse_gltf_materials(root)?;
+    let materials = parse_gltf_materials(root, &buffers, base_dir)?;
     let meshes = root
         .get("meshes")
         .and_then(JsonValue::as_array)
@@ -2823,10 +3449,12 @@ fn parse_gltf_json(
         needs_normals,
     )?;
     if let Some(import) = armature_import {
+        let pose_palette = vec![identity_matrix(); import.joints.len()];
         mesh.armature = Some(Armature {
             nodes: import.nodes,
             joints: import.joints,
             inverse_bind_matrices: import.inverse_bind_matrices,
+            pose_palette,
             vertex_weights,
             bind_vertices: mesh.vertices.clone(),
         });
@@ -2986,13 +3614,29 @@ fn decode_hex(value: u8) -> Option<u8> {
     }
 }
 
-fn parse_gltf_materials(root: &JsonMap<String, JsonValue>) -> MeshResult<Vec<MeshMaterial>> {
+#[derive(Clone)]
+struct ImportedGltfImage {
+    source: String,
+    image: crate::assets::ImageHandle,
+}
+
+fn parse_gltf_materials(
+    root: &JsonMap<String, JsonValue>,
+    buffers: &[Vec<u8>],
+    base_dir: Option<&Path>,
+) -> MeshResult<Vec<MeshMaterial>> {
     let Some(definitions) = root.get("materials") else {
         return Ok(Vec::new());
     };
     let definitions = definitions
         .as_array()
         .ok_or_else(|| MeshError::InvalidData("glTF materials must be an array".into()))?;
+    let image_count = root
+        .get("images")
+        .and_then(JsonValue::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let mut decoded_images = vec![None; image_count];
     let mut materials = Vec::with_capacity(definitions.len());
     for (index, definition) in definitions.iter().enumerate() {
         let context = format!("glTF material {index}");
@@ -3031,21 +3675,33 @@ fn parse_gltf_materials(root: &JsonMap<String, JsonValue>) -> MeshResult<Vec<Mes
         )?;
         material.base_color_texture = parse_texture_binding(
             root,
+            buffers,
+            base_dir,
+            &mut decoded_images,
             pbr.and_then(|value| value.get("baseColorTexture")),
             &format!("{context} baseColorTexture"),
         )?;
         material.metallic_roughness_texture = parse_texture_binding(
             root,
+            buffers,
+            base_dir,
+            &mut decoded_images,
             pbr.and_then(|value| value.get("metallicRoughnessTexture")),
             &format!("{context} metallicRoughnessTexture"),
         )?;
         material.normal_texture = parse_texture_binding(
             root,
+            buffers,
+            base_dir,
+            &mut decoded_images,
             definition.get("normalTexture"),
             &format!("{context} normalTexture"),
         )?;
         material.emissive_texture = parse_texture_binding(
             root,
+            buffers,
+            base_dir,
+            &mut decoded_images,
             definition.get("emissiveTexture"),
             &format!("{context} emissiveTexture"),
         )?;
@@ -3084,6 +3740,9 @@ fn parse_gltf_materials(root: &JsonMap<String, JsonValue>) -> MeshResult<Vec<Mes
 
 fn parse_texture_binding(
     root: &JsonMap<String, JsonValue>,
+    buffers: &[Vec<u8>],
+    base_dir: Option<&Path>,
+    decoded_images: &mut [Option<ImportedGltfImage>],
     value: Option<&JsonValue>,
     context: &str,
 ) -> MeshResult<Option<TextureBinding>> {
@@ -3105,7 +3764,7 @@ fn parse_texture_binding(
             ))
         })?;
     let image_index = required_usize(texture, "source", context)?;
-    let image = root
+    let image_definition = root
         .get("images")
         .and_then(JsonValue::as_array)
         .and_then(|images| images.get(image_index))
@@ -3113,36 +3772,144 @@ fn parse_texture_binding(
         .ok_or_else(|| {
             MeshError::InvalidData(format!("{context} references missing image {image_index}"))
         })?;
-    let source = if let Some(uri) = image.get("uri").and_then(JsonValue::as_str) {
+    let imported = if let Some(imported) = decoded_images
+        .get(image_index)
+        .and_then(Option::as_ref)
+        .cloned()
+    {
+        imported
+    } else {
+        let imported = decode_gltf_image(
+            root,
+            buffers,
+            base_dir,
+            image_definition,
+            image_index,
+            context,
+        )?;
+        let destination = decoded_images.get_mut(image_index).ok_or_else(|| {
+            MeshError::InvalidData(format!("{context} references missing image {image_index}"))
+        })?;
+        *destination = Some(imported.clone());
+        imported
+    };
+    let tex_coord = optional_usize(info, "texCoord", context)?.unwrap_or(0);
+    Ok(Some(TextureBinding {
+        source: imported.source,
+        tex_coord: usize_to_u32(tex_coord, "glTF texture coordinate set")?,
+        image: Some(imported.image),
+    }))
+}
+
+fn decode_gltf_image(
+    root: &JsonMap<String, JsonValue>,
+    buffers: &[Vec<u8>],
+    base_dir: Option<&Path>,
+    definition: &JsonMap<String, JsonValue>,
+    image_index: usize,
+    context: &str,
+) -> MeshResult<ImportedGltfImage> {
+    let (source, bytes) = if let Some(uri) = definition.get("uri") {
+        let uri = uri.as_str().ok_or_else(|| {
+            MeshError::InvalidData(format!("{context} image URI is not a string"))
+        })?;
         if uri.starts_with("data:") {
-            format!("embedded-image:{image_index}")
+            (
+                format!("embedded-image:{image_index}"),
+                decode_data_uri(uri, &format!("glTF image {image_index}"))?,
+            )
         } else {
-            uri.to_string()
+            let base_dir = base_dir.ok_or_else(|| {
+                MeshError::InvalidData(format!(
+                    "{context} uses external image URI '{uri}'; import from a path to resolve it"
+                ))
+            })?;
+            let decoded = percent_decode(uri.as_bytes(), &format!("glTF image {image_index}"))?;
+            let decoded = String::from_utf8(decoded).map_err(|error| {
+                MeshError::InvalidData(format!("{context} image URI is not UTF-8: {error}"))
+            })?;
+            if decoded.contains("://") {
+                return Err(MeshError::UnsupportedFormat(format!(
+                    "{context} uses a network image URI"
+                )));
+            }
+            let relative = PathBuf::from(&decoded);
+            if relative.is_absolute() {
+                return Err(MeshError::InvalidData(format!(
+                    "{context} image URI must be relative to the model"
+                )));
+            }
+            let resolved = base_dir.join(relative);
+            let bytes = fs::read(&resolved).map_err(|error| {
+                MeshError::Io(format!(
+                    "failed to read external glTF image '{}': {error}",
+                    resolved.display()
+                ))
+            })?;
+            (uri.to_string(), bytes)
         }
-    } else if let Some(view) = image.get("bufferView").and_then(JsonValue::as_u64) {
+    } else if let Some(view) = definition.get("bufferView") {
+        let view = view.as_u64().ok_or_else(|| {
+            MeshError::InvalidData(format!("{context} image bufferView is not an integer"))
+        })?;
         let view = usize::try_from(view).map_err(|_| {
             MeshError::InvalidData(format!("{context} image bufferView is too large"))
         })?;
-        let view_exists = root
+        let view_definition = root
             .get("bufferViews")
             .and_then(JsonValue::as_array)
-            .is_some_and(|views| view < views.len());
-        if !view_exists {
-            return Err(MeshError::InvalidData(format!(
-                "{context} image references missing bufferView {view}"
-            )));
-        }
-        format!("embedded-buffer-view:{view}")
+            .and_then(|views| views.get(view))
+            .and_then(JsonValue::as_object)
+            .ok_or_else(|| {
+                MeshError::InvalidData(format!(
+                    "{context} image references missing bufferView {view}"
+                ))
+            })?;
+        let buffer_index = required_usize(
+            view_definition,
+            "buffer",
+            &format!("glTF image {image_index} bufferView"),
+        )?;
+        let buffer = buffers.get(buffer_index).ok_or_else(|| {
+            MeshError::InvalidData(format!(
+                "{context} image bufferView references missing buffer {buffer_index}"
+            ))
+        })?;
+        let offset = optional_usize(
+            view_definition,
+            "byteOffset",
+            &format!("glTF image {image_index} bufferView"),
+        )?
+        .unwrap_or(0);
+        let length = required_usize(
+            view_definition,
+            "byteLength",
+            &format!("glTF image {image_index} bufferView"),
+        )?;
+        let end = offset.checked_add(length).ok_or_else(|| {
+            MeshError::InvalidData(format!("{context} image bufferView range overflows"))
+        })?;
+        let bytes = buffer.get(offset..end).ok_or_else(|| {
+            MeshError::InvalidData(format!("{context} image bufferView exceeds its buffer"))
+        })?;
+        (format!("embedded-buffer-view:{view}"), bytes.to_vec())
     } else {
         return Err(MeshError::InvalidData(format!(
             "{context} image has neither URI nor bufferView"
         )));
     };
-    let tex_coord = optional_usize(info, "texCoord", context)?.unwrap_or(0);
-    Ok(Some(TextureBinding {
+
+    let pixels = image::load_from_memory(&bytes)
+        .map_err(|error| {
+            MeshError::InvalidData(format!(
+                "{context} could not decode image '{source}': {error}"
+            ))
+        })?
+        .to_rgba8();
+    Ok(ImportedGltfImage {
         source,
-        tex_coord: usize_to_u32(tex_coord, "glTF texture coordinate set")?,
-    }))
+        image: crate::assets::ImageHandle::from_rgba_image(pixels),
+    })
 }
 
 fn json_float_array<const N: usize>(
@@ -3573,19 +4340,60 @@ const BINARY_FBX_MAGIC: &[u8; 23] = b"Kaydara FBX Binary  \0\x1a\0";
 const MAX_BINARY_FBX_DEPTH: usize = 128;
 const MAX_BINARY_FBX_ARRAY_BYTES: usize = 256 * 1024 * 1024;
 
-fn parse_fbx(bytes: &[u8]) -> MeshResult<MeshData> {
+fn parse_fbx(bytes: &[u8], base_dir: Option<&Path>) -> MeshResult<MeshData> {
     if bytes.starts_with(BINARY_FBX_MAGIC) || bytes.starts_with(b"Kaydara FBX Binary") {
-        parse_binary_fbx(bytes)
+        parse_binary_fbx(bytes, base_dir)
     } else {
-        parse_ascii_fbx(bytes)
+        parse_ascii_fbx(bytes, base_dir)
     }
 }
 
 #[derive(Debug)]
 struct BinaryFbxGeometry {
+    id: i64,
     name: String,
     positions: Option<Vec<f64>>,
     polygon_indices: Option<Vec<i64>>,
+    material_indices: Option<Vec<i64>>,
+    materials_all_same: bool,
+}
+
+struct BinaryFbxGeometryRange {
+    id: i64,
+    name: String,
+    first_index: u32,
+    index_count: u32,
+    polygon_sizes: Vec<usize>,
+    material_indices: Vec<i64>,
+    materials_all_same: bool,
+}
+
+#[derive(Debug)]
+struct BinaryFbxMaterial {
+    id: i64,
+    material: MeshMaterial,
+}
+
+#[derive(Debug)]
+struct BinaryFbxTexture {
+    id: i64,
+    source: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct BinaryFbxConnection {
+    child: i64,
+    parent: i64,
+    property: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BinaryFbxContext {
+    Geometry(usize),
+    Material(usize),
+    Texture(usize),
+    Video(usize),
+    OtherObject,
 }
 
 #[derive(Debug)]
@@ -3631,7 +4439,118 @@ impl BinaryFbxNumericArray {
 #[derive(Debug)]
 enum BinaryFbxProperty {
     Text(String),
+    Integer(i64),
+    Float(f64),
     NumericArray(BinaryFbxNumericArray),
+}
+
+fn binary_fbx_text(properties: &[BinaryFbxProperty], index: usize) -> Option<&str> {
+    properties
+        .iter()
+        .filter_map(|property| match property {
+            BinaryFbxProperty::Text(value) => Some(value.as_str()),
+            _ => None,
+        })
+        .nth(index)
+}
+
+fn binary_fbx_first_integer(properties: &[BinaryFbxProperty]) -> Option<i64> {
+    properties.iter().find_map(|property| match property {
+        BinaryFbxProperty::Integer(value) => Some(*value),
+        _ => None,
+    })
+}
+
+fn binary_fbx_integers(properties: &[BinaryFbxProperty]) -> Vec<i64> {
+    properties
+        .iter()
+        .filter_map(|property| match property {
+            BinaryFbxProperty::Integer(value) => Some(*value),
+            _ => None,
+        })
+        .collect()
+}
+
+fn binary_fbx_numbers(properties: &[BinaryFbxProperty]) -> Vec<f32> {
+    properties
+        .iter()
+        .filter_map(|property| match property {
+            BinaryFbxProperty::Integer(value) => Some(*value as f32),
+            BinaryFbxProperty::Float(value) => Some(*value as f32),
+            _ => None,
+        })
+        .collect()
+}
+
+fn binary_fbx_object_name(value: &str, label: &str) -> String {
+    value
+        .split_once("\0\u{1}")
+        .map(|(name, _)| name)
+        .unwrap_or_else(|| value.strip_prefix(&format!("{label}::")).unwrap_or(value))
+        .to_string()
+}
+
+fn apply_binary_fbx_material_property(
+    material: &mut MeshMaterial,
+    properties: &[BinaryFbxProperty],
+) -> MeshResult<()> {
+    let Some(label) = binary_fbx_text(properties, 0) else {
+        return Ok(());
+    };
+    let values = binary_fbx_numbers(properties);
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(MeshError::InvalidData(format!(
+            "binary FBX material property {label} is non-finite"
+        )));
+    }
+    let scalar = values.last().copied();
+    match label {
+        "DiffuseColor" if values.len() >= 3 => {
+            material.base_color[..3].copy_from_slice(&values[values.len() - 3..]);
+        }
+        "EmissiveColor" if values.len() >= 3 => {
+            material
+                .emissive
+                .copy_from_slice(&values[values.len() - 3..]);
+        }
+        "EmissiveFactor" => {
+            if let Some(value) = scalar {
+                material.emissive = material.emissive.map(|channel| channel * value);
+            }
+        }
+        "Metalness" | "Metallic" | "Maya|metalness" => {
+            if let Some(value) = scalar {
+                material.metallic = value;
+            }
+        }
+        "Roughness" | "Maya|roughness" => {
+            if let Some(value) = scalar {
+                material.roughness = value;
+            }
+        }
+        "Shininess" | "ShininessExponent" => {
+            if let Some(value) = scalar {
+                material.roughness = (2.0 / (value.max(0.0) + 2.0)).sqrt().clamp(0.0, 1.0);
+            }
+        }
+        "Opacity" => {
+            if let Some(value) = scalar {
+                material.base_color[3] = value;
+            }
+        }
+        "TransparencyFactor" => {
+            if let Some(value) = scalar {
+                material.base_color[3] = 1.0 - value;
+            }
+        }
+        "DoubleSided" => {
+            if let Some(value) = scalar {
+                material.double_sided = value != 0.0;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3648,6 +4567,10 @@ struct BinaryFbxParser<'a> {
     version: u32,
     wide_records: bool,
     geometries: Vec<BinaryFbxGeometry>,
+    materials: Vec<BinaryFbxMaterial>,
+    textures: Vec<BinaryFbxTexture>,
+    videos: Vec<BinaryFbxTexture>,
+    connections: Vec<BinaryFbxConnection>,
     has_deformation: bool,
 }
 
@@ -3669,6 +4592,10 @@ impl<'a> BinaryFbxParser<'a> {
             version,
             wide_records: version >= 7500,
             geometries: Vec::new(),
+            materials: Vec::new(),
+            textures: Vec::new(),
+            videos: Vec::new(),
+            connections: Vec::new(),
             has_deformation: false,
         })
     }
@@ -3783,7 +4710,7 @@ impl<'a> BinaryFbxParser<'a> {
         offset: usize,
         parent_end: usize,
         depth: usize,
-        inherited_geometry: Option<usize>,
+        inherited_context: Option<BinaryFbxContext>,
     ) -> MeshResult<usize> {
         if depth >= MAX_BINARY_FBX_DEPTH {
             return Err(MeshError::InvalidData(format!(
@@ -3801,40 +4728,78 @@ impl<'a> BinaryFbxParser<'a> {
         ) {
             self.has_deformation = true;
         }
-        let capture_text = header.name == "Geometry";
-        let capture_numeric = matches!(header.name.as_str(), "Vertices" | "PolygonVertexIndex");
-        let properties = self.parse_properties(&header, capture_text, capture_numeric)?;
+        let capture_numeric = matches!(
+            header.name.as_str(),
+            "Vertices" | "PolygonVertexIndex" | "Materials"
+        );
+        let properties = self.parse_properties(&header, capture_numeric)?;
 
-        let mut geometry_index = inherited_geometry;
+        let mut context = inherited_context;
         if header.name == "Geometry" {
-            geometry_index = None;
+            context = Some(BinaryFbxContext::OtherObject);
             let strings = properties
                 .iter()
                 .filter_map(|property| match property {
                     BinaryFbxProperty::Text(value) => Some(value.as_str()),
-                    BinaryFbxProperty::NumericArray(_) => None,
+                    _ => None,
                 })
                 .collect::<Vec<_>>();
             if strings.get(1).is_some_and(|kind| *kind == "Mesh") {
                 let name = strings
                     .first()
-                    .map(|name| name.strip_prefix("Geometry::").unwrap_or(name).to_string())
+                    .map(|name| binary_fbx_object_name(name, "Geometry"))
                     .unwrap_or_else(|| format!("Geometry {}", self.geometries.len()));
-                geometry_index = Some(self.geometries.len());
+                let id = binary_fbx_first_integer(&properties).unwrap_or(0);
+                context = Some(BinaryFbxContext::Geometry(self.geometries.len()));
                 self.geometries.push(BinaryFbxGeometry {
+                    id,
                     name,
                     positions: None,
                     polygon_indices: None,
+                    material_indices: None,
+                    materials_all_same: false,
                 });
             }
-        } else if let Some(index) = geometry_index
-            && (header.name == "Vertices" || header.name == "PolygonVertexIndex")
+        } else if header.name == "Material" {
+            let id = binary_fbx_first_integer(&properties).unwrap_or(0);
+            let name = binary_fbx_text(&properties, 0)
+                .map(|name| binary_fbx_object_name(name, "Material"))
+                .unwrap_or_else(|| format!("Material {}", self.materials.len()));
+            let mut material = MeshMaterial::named(name);
+            material.metallic = 0.0;
+            context = Some(BinaryFbxContext::Material(self.materials.len()));
+            self.materials.push(BinaryFbxMaterial { id, material });
+        } else if header.name == "Texture" || header.name == "Video" {
+            let id = binary_fbx_first_integer(&properties).unwrap_or(0);
+            let entry = BinaryFbxTexture { id, source: None };
+            if header.name == "Texture" {
+                context = Some(BinaryFbxContext::Texture(self.textures.len()));
+                self.textures.push(entry);
+            } else {
+                context = Some(BinaryFbxContext::Video(self.videos.len()));
+                self.videos.push(entry);
+            }
+        } else if matches!(
+            header.name.as_str(),
+            "Model"
+                | "Deformer"
+                | "AnimationStack"
+                | "AnimationLayer"
+                | "AnimationCurveNode"
+                | "AnimationCurve"
+        ) {
+            context = Some(BinaryFbxContext::OtherObject);
+        } else if let Some(BinaryFbxContext::Geometry(index)) = context
+            && matches!(
+                header.name.as_str(),
+                "Vertices" | "PolygonVertexIndex" | "Materials"
+            )
         {
             let array = properties
                 .into_iter()
                 .find_map(|property| match property {
                     BinaryFbxProperty::NumericArray(array) => Some(array),
-                    BinaryFbxProperty::Text(_) => None,
+                    _ => None,
                 })
                 .ok_or_else(|| {
                     MeshError::InvalidData(format!(
@@ -3853,7 +4818,7 @@ impl<'a> BinaryFbxParser<'a> {
                     )));
                 }
                 geometry.positions = Some(array.into_positions());
-            } else {
+            } else if header.name == "PolygonVertexIndex" {
                 if geometry.polygon_indices.is_some() {
                     return Err(MeshError::InvalidData(format!(
                         "binary FBX geometry '{}' has duplicate PolygonVertexIndex nodes",
@@ -3862,6 +4827,48 @@ impl<'a> BinaryFbxParser<'a> {
                 }
                 geometry.polygon_indices =
                     Some(array.into_polygon_indices("FBX PolygonVertexIndex array")?);
+            } else {
+                if geometry.material_indices.is_some() {
+                    return Err(MeshError::InvalidData(format!(
+                        "binary FBX geometry '{}' has duplicate Materials nodes",
+                        geometry.name
+                    )));
+                }
+                geometry.material_indices =
+                    Some(array.into_polygon_indices("FBX Materials array")?);
+            }
+        } else if header.name == "MappingInformationType"
+            && let Some(BinaryFbxContext::Geometry(index)) = context
+            && binary_fbx_text(&properties, 0) == Some("AllSame")
+        {
+            self.geometries[index].materials_all_same = true;
+        } else if header.name == "P"
+            && let Some(BinaryFbxContext::Material(index)) = context
+        {
+            apply_binary_fbx_material_property(&mut self.materials[index].material, &properties)?;
+        } else if matches!(
+            header.name.as_str(),
+            "RelativeFilename" | "RelativeFileName" | "FileName" | "Filename"
+        ) && let Some(source) = binary_fbx_text(&properties, 0)
+            && !source.is_empty()
+        {
+            match context {
+                Some(BinaryFbxContext::Texture(index)) => {
+                    self.textures[index].source = Some(source.to_string())
+                }
+                Some(BinaryFbxContext::Video(index)) => {
+                    self.videos[index].source = Some(source.to_string())
+                }
+                _ => {}
+            }
+        } else if header.name == "C" {
+            let integers = binary_fbx_integers(&properties);
+            if integers.len() >= 2 {
+                self.connections.push(BinaryFbxConnection {
+                    child: integers[0],
+                    parent: integers[1],
+                    property: binary_fbx_text(&properties, 1).map(str::to_string),
+                });
             }
         }
 
@@ -3879,7 +4886,7 @@ impl<'a> BinaryFbxParser<'a> {
                 }
                 break;
             }
-            child_cursor = self.parse_node(child_cursor, header.end, depth + 1, geometry_index)?;
+            child_cursor = self.parse_node(child_cursor, header.end, depth + 1, context)?;
         }
         if child_cursor != header.end {
             return Err(MeshError::InvalidData(format!(
@@ -3893,7 +4900,6 @@ impl<'a> BinaryFbxParser<'a> {
     fn parse_properties(
         &self,
         header: &BinaryFbxNodeHeader,
-        capture_text: bool,
         capture_numeric: bool,
     ) -> MeshResult<Vec<BinaryFbxProperty>> {
         let mut cursor = header.properties_start;
@@ -3914,9 +4920,46 @@ impl<'a> BinaryFbxParser<'a> {
                 _ => None,
             };
             if let Some(size) = fixed_size {
+                let value_start = cursor;
                 cursor = cursor.checked_add(size).ok_or_else(|| {
                     MeshError::InvalidData("binary FBX scalar property range overflows".into())
                 })?;
+                let property = match type_code {
+                    b'Y' => BinaryFbxProperty::Integer(i64::from(read_i16_le(
+                        self.bytes,
+                        value_start,
+                        "binary FBX short property",
+                    )?)),
+                    b'C' => BinaryFbxProperty::Integer(i64::from(
+                        *self.bytes.get(value_start).ok_or_else(|| {
+                            MeshError::InvalidData(
+                                "binary FBX boolean property is truncated".into(),
+                            )
+                        })?,
+                    )),
+                    b'I' => BinaryFbxProperty::Integer(i64::from(read_i32_le(
+                        self.bytes,
+                        value_start,
+                        "binary FBX integer property",
+                    )?)),
+                    b'L' => BinaryFbxProperty::Integer(read_i64_le(
+                        self.bytes,
+                        value_start,
+                        "binary FBX long property",
+                    )?),
+                    b'F' => BinaryFbxProperty::Float(f64::from(read_f32_le(
+                        self.bytes,
+                        value_start,
+                        "binary FBX float property",
+                    )?)),
+                    b'D' => BinaryFbxProperty::Float(read_f64_le(
+                        self.bytes,
+                        value_start,
+                        "binary FBX double property",
+                    )?),
+                    _ => unreachable!("fixed FBX property type was matched above"),
+                };
+                captured.push(property);
             } else if matches!(type_code, b'S' | b'R') {
                 let length = usize::try_from(read_u32_le(
                     self.bytes,
@@ -3941,7 +4984,7 @@ impl<'a> BinaryFbxParser<'a> {
                 let value = self.bytes.get(cursor..end).ok_or_else(|| {
                     MeshError::InvalidData("binary FBX ends inside a string/raw property".into())
                 })?;
-                if capture_text && type_code == b'S' {
+                if type_code == b'S' {
                     captured.push(BinaryFbxProperty::Text(
                         std::str::from_utf8(value)
                             .map_err(|error| {
@@ -4132,7 +5175,7 @@ fn decode_binary_fbx_array(
     }
 }
 
-fn parse_binary_fbx(bytes: &[u8]) -> MeshResult<MeshData> {
+fn parse_binary_fbx(bytes: &[u8], base_dir: Option<&Path>) -> MeshResult<MeshData> {
     let mut parser = BinaryFbxParser::new(bytes)?;
     parser.parse_document()?;
     if parser.has_deformation {
@@ -4151,6 +5194,7 @@ fn parse_binary_fbx(bytes: &[u8]) -> MeshResult<MeshData> {
     let mut indices = Vec::new();
     let mut submeshes = Vec::new();
     let first_name = parser.geometries[0].name.clone();
+    let mut geometry_ranges = Vec::with_capacity(parser.geometries.len());
     for geometry in parser.geometries {
         let positions = geometry.positions.ok_or_else(|| {
             MeshError::InvalidData(format!(
@@ -4164,19 +5208,217 @@ fn parse_binary_fbx(bytes: &[u8]) -> MeshResult<MeshData> {
                 geometry.name
             ))
         })?;
+        let first_index = usize_to_u32(indices.len(), "binary FBX geometry index offset")?;
+        let mut polygon_sizes = Vec::new();
+        let mut polygon_size = 0usize;
+        for index in &polygon_indices {
+            polygon_size += 1;
+            if *index < 0 {
+                polygon_sizes.push(polygon_size);
+                polygon_size = 0;
+            }
+        }
         append_fbx_geometry(
             &mut vertices,
             &mut indices,
             &mut submeshes,
-            geometry.name,
+            geometry.name.clone(),
             &positions,
             &polygon_indices,
         )?;
+        let end_index = usize_to_u32(indices.len(), "binary FBX geometry index end")?;
+        geometry_ranges.push(BinaryFbxGeometryRange {
+            id: geometry.id,
+            name: geometry.name,
+            first_index,
+            index_count: end_index - first_index,
+            polygon_sizes,
+            material_indices: geometry.material_indices.unwrap_or_default(),
+            materials_all_same: geometry.materials_all_same,
+        });
     }
-    MeshData::new(first_name, vertices, indices, submeshes, Vec::new(), true)
+    let mesh = MeshData::new(first_name, vertices, indices, submeshes, Vec::new(), true)?;
+    attach_binary_fbx_materials(
+        mesh,
+        geometry_ranges,
+        parser.materials,
+        parser.textures,
+        parser.videos,
+        parser.connections,
+        base_dir,
+    )
 }
 
-fn parse_ascii_fbx(bytes: &[u8]) -> MeshResult<MeshData> {
+fn attach_binary_fbx_materials(
+    mut mesh: MeshData,
+    geometry_ranges: Vec<BinaryFbxGeometryRange>,
+    material_objects: Vec<BinaryFbxMaterial>,
+    textures: Vec<BinaryFbxTexture>,
+    videos: Vec<BinaryFbxTexture>,
+    connections: Vec<BinaryFbxConnection>,
+    base_dir: Option<&Path>,
+) -> MeshResult<MeshData> {
+    if material_objects.is_empty() {
+        return Ok(mesh);
+    }
+    let material_by_id = material_objects
+        .iter()
+        .enumerate()
+        .map(|(index, material)| (material.id, index))
+        .collect::<HashMap<_, _>>();
+    let videos = videos
+        .into_iter()
+        .filter_map(|video| video.source.map(|source| (video.id, source)))
+        .collect::<HashMap<_, _>>();
+    let mut texture_sources = HashMap::<i64, String>::new();
+    for texture in textures {
+        if let Some(source) = texture.source {
+            texture_sources.insert(texture.id, source);
+        } else if let Some(source) = connections
+            .iter()
+            .find(|connection| connection.parent == texture.id)
+            .and_then(|connection| videos.get(&connection.child))
+        {
+            texture_sources.insert(texture.id, source.clone());
+        }
+    }
+
+    let mut materials = material_objects
+        .into_iter()
+        .map(|object| object.material)
+        .collect::<Vec<_>>();
+    let mut image_cache = HashMap::new();
+    let mut roughness_maps = HashMap::new();
+    let mut metallic_maps = HashMap::new();
+    for connection in &connections {
+        let Some(&material_index) = material_by_id.get(&connection.parent) else {
+            continue;
+        };
+        let Some(source) = texture_sources.get(&connection.child) else {
+            continue;
+        };
+        let image = load_fbx_image(source, base_dir, &mut image_cache)?;
+        let slot = connection
+            .property
+            .as_deref()
+            .unwrap_or("DiffuseColor")
+            .to_ascii_lowercase();
+        let binding = || TextureBinding {
+            source: source.clone(),
+            tex_coord: 0,
+            image: Some(image.clone()),
+        };
+        if slot.contains("normal") || slot.contains("bump") {
+            materials[material_index].normal_texture = Some(binding());
+        } else if slot.contains("emiss") {
+            materials[material_index].emissive_texture = Some(binding());
+            if materials[material_index].emissive == [0.0; 3] {
+                materials[material_index].emissive = [1.0; 3];
+            }
+        } else if slot.contains("rough") {
+            roughness_maps.insert(material_index, image);
+        } else if slot.contains("metal") {
+            metallic_maps.insert(material_index, image);
+            if materials[material_index].metallic == 0.0 {
+                materials[material_index].metallic = 1.0;
+            }
+        } else if slot.contains("diffuse") || slot.contains("basecolor") || slot.contains("color") {
+            materials[material_index].base_color_texture = Some(binding());
+        }
+    }
+    for (index, material) in materials.iter_mut().enumerate() {
+        if material.base_color[3] < 1.0 {
+            material.alpha_mode = AlphaMode::Blend;
+        }
+        let roughness = roughness_maps.remove(&index);
+        let metallic = metallic_maps.remove(&index);
+        if roughness.is_some() || metallic.is_some() {
+            material.metallic_roughness_texture = Some(TextureBinding {
+                source: format!("packed-binary-fbx-orm:{}", material.name),
+                tex_coord: 0,
+                image: Some(pack_fbx_orm(roughness, metallic)?),
+            });
+        }
+    }
+
+    let mut rebuilt = Vec::<Submesh>::new();
+    for (range_index, range) in geometry_ranges.iter().enumerate() {
+        let original = mesh.submeshes.get(range_index).ok_or_else(|| {
+            MeshError::InvalidData("binary FBX material geometry range is missing".into())
+        })?;
+        let model = connections
+            .iter()
+            .find(|connection| connection.child == range.id)
+            .map(|connection| connection.parent);
+        let attached = connections
+            .iter()
+            .filter(|connection| {
+                material_by_id.contains_key(&connection.child)
+                    && (connection.parent == range.id || Some(connection.parent) == model)
+            })
+            .filter_map(|connection| material_by_id.get(&connection.child).copied())
+            .collect::<Vec<_>>();
+        if attached.is_empty() {
+            rebuilt.push(original.clone());
+            continue;
+        }
+        let mut offset = range.first_index;
+        for (polygon, corners) in range.polygon_sizes.iter().copied().enumerate() {
+            let count = usize_to_u32(
+                corners.saturating_sub(2) * 3,
+                "binary FBX polygon material index count",
+            )?;
+            let local = if range.materials_all_same {
+                range.material_indices.first().copied().unwrap_or(0)
+            } else {
+                range.material_indices.get(polygon).copied().unwrap_or(0)
+            };
+            let local = usize::try_from(local).map_err(|_| {
+                MeshError::InvalidData(format!(
+                    "binary FBX geometry '{}' has negative material slot {local}",
+                    range.name
+                ))
+            })?;
+            let material = attached.get(local).copied().ok_or_else(|| {
+                MeshError::InvalidData(format!(
+                    "binary FBX geometry '{}' polygon {polygon} references missing material slot {local}",
+                    range.name
+                ))
+            })?;
+            if let Some(last) = rebuilt.last_mut()
+                && last.material == Some(material)
+                && last.first_index + last.index_count == offset
+                && last.name.starts_with(&range.name)
+            {
+                last.index_count = last.index_count.checked_add(count).ok_or_else(|| {
+                    MeshError::InvalidData("binary FBX material submesh range overflows".into())
+                })?;
+            } else {
+                rebuilt.push(Submesh {
+                    name: format!("{} / {}", range.name, materials[material].name),
+                    first_index: offset,
+                    index_count: count,
+                    material: Some(material),
+                });
+            }
+            offset = offset.checked_add(count).ok_or_else(|| {
+                MeshError::InvalidData("binary FBX material submesh offset overflows".into())
+            })?;
+        }
+        if offset != range.first_index + range.index_count {
+            return Err(MeshError::InvalidData(format!(
+                "binary FBX geometry '{}' polygon/material ranges disagree",
+                range.name
+            )));
+        }
+    }
+    mesh.materials = materials;
+    mesh.submeshes = rebuilt;
+    mesh.finish_mutation(false)?;
+    Ok(mesh)
+}
+
+fn parse_ascii_fbx(bytes: &[u8], base_dir: Option<&Path>) -> MeshResult<MeshData> {
     let source = std::str::from_utf8(bytes)
         .map_err(|error| MeshError::InvalidData(format!("FBX is not UTF-8 text: {error}")))?;
     if !source.is_ascii() {
@@ -4272,6 +5514,7 @@ fn parse_ascii_fbx(bytes: &[u8]) -> MeshResult<MeshData> {
         Vec::new(),
         true,
     )?;
+    let mesh = attach_ascii_fbx_materials(source, mesh, &geometry_ranges, base_dir)?;
     attach_ascii_fbx_armature(source, mesh, &geometry_ranges)
 }
 
@@ -4344,6 +5587,14 @@ fn fbx_ascii_objects<'a>(source: &'a str, label: &str) -> MeshResult<Vec<AsciiFb
     let mut search = 0usize;
     while let Some(relative) = source[search..].find(&marker_text) {
         let marker = search + relative;
+        let line_start = source[..marker]
+            .rfind(['\n', '\r'])
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        if !source[line_start..marker].trim().is_empty() {
+            search = marker + marker_text.len();
+            continue;
+        }
         let Some(relative_open) = source[marker..].find('{') else {
             return Err(MeshError::InvalidData(format!(
                 "FBX {label} block has no opening brace"
@@ -4427,6 +5678,398 @@ fn fbx_property_vec3(block: &str, label: &str, default: [f32; 3]) -> MeshResult<
         }
     }
     Ok(output)
+}
+
+fn fbx_property_scalar(block: &str, labels: &[&str]) -> MeshResult<Option<f32>> {
+    for label in labels {
+        let marker = format!("P: \"{label}\"");
+        let Some(line) = block.lines().find(|line| line.contains(&marker)) else {
+            continue;
+        };
+        let value = scan_fbx_numbers(line)
+            .last()
+            .ok_or_else(|| MeshError::InvalidData(format!("FBX property {label} has no value")))?
+            .parse::<f32>()
+            .map_err(|error| {
+                MeshError::InvalidData(format!("FBX property {label} is invalid: {error}"))
+            })?;
+        if !value.is_finite() {
+            return Err(MeshError::InvalidData(format!(
+                "FBX property {label} is non-finite"
+            )));
+        }
+        return Ok(Some(value));
+    }
+    Ok(None)
+}
+
+fn fbx_texture_filename(block: &str) -> Option<String> {
+    for label in [
+        "RelativeFilename",
+        "RelativeFileName",
+        "FileName",
+        "Filename",
+    ] {
+        if let Some(line) = block
+            .lines()
+            .find(|line| line.trim_start().starts_with(label))
+            && let Some(value) = fbx_quoted_strings(line).last()
+            && !value.is_empty()
+        {
+            return Some(value.clone());
+        }
+    }
+    None
+}
+
+fn load_fbx_image(
+    source: &str,
+    base_dir: Option<&Path>,
+    cache: &mut HashMap<PathBuf, crate::assets::ImageHandle>,
+) -> MeshResult<crate::assets::ImageHandle> {
+    let base_dir = base_dir.ok_or_else(|| {
+        MeshError::InvalidData(
+            "ASCII FBX references external textures; import from a path to resolve them".into(),
+        )
+    })?;
+    let normalized = source.replace('\\', "/");
+    let source_path = Path::new(&normalized);
+    let windows_absolute = normalized.as_bytes().get(1) == Some(&b':');
+    let mut resolved = if source_path.is_absolute() {
+        source_path.to_path_buf()
+    } else if windows_absolute {
+        base_dir.join(source_path.file_name().unwrap_or_default())
+    } else {
+        base_dir.join(source_path)
+    };
+    if !resolved.is_file()
+        && let Some(file_name) = source_path.file_name()
+    {
+        for fallback in [
+            base_dir.join(file_name),
+            base_dir.join("textures").join(file_name),
+        ] {
+            if fallback.is_file() {
+                resolved = fallback;
+                break;
+            }
+        }
+    }
+    let key = fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+    if let Some(image) = cache.get(&key) {
+        return Ok(image.clone());
+    }
+    let bytes = fs::read(&resolved).map_err(|error| {
+        MeshError::Io(format!(
+            "failed to read FBX texture '{}' (resolved to '{}'): {error}",
+            source,
+            resolved.display()
+        ))
+    })?;
+    let pixels = image::load_from_memory(&bytes)
+        .map_err(|error| {
+            MeshError::InvalidData(format!(
+                "could not decode FBX texture '{}' (resolved to '{}'): {error}",
+                source,
+                resolved.display()
+            ))
+        })?
+        .to_rgba8();
+    let image = crate::assets::ImageHandle::from_rgba_image(pixels);
+    cache.insert(key, image.clone());
+    Ok(image)
+}
+
+fn pack_fbx_orm(
+    roughness: Option<crate::assets::ImageHandle>,
+    metallic: Option<crate::assets::ImageHandle>,
+) -> MeshResult<crate::assets::ImageHandle> {
+    let reference = roughness.as_ref().or(metallic.as_ref()).ok_or_else(|| {
+        MeshError::InvalidData("FBX ORM packing requires a roughness or metallic map".into())
+    })?;
+    let (width, height) = reference
+        .dimensions()
+        .map_err(|error| MeshError::InvalidData(error.to_string()))?;
+    let copy = |image: crate::assets::ImageHandle| {
+        image
+            .with_image(Clone::clone)
+            .map_err(|error| MeshError::InvalidData(error.to_string()))
+            .map(|image| {
+                if image.dimensions() == (width, height) {
+                    image
+                } else {
+                    image::imageops::resize(
+                        &image,
+                        width,
+                        height,
+                        image::imageops::FilterType::Triangle,
+                    )
+                }
+            })
+    };
+    let roughness = roughness.map(copy).transpose()?;
+    let metallic = metallic.map(copy).transpose()?;
+    let mut packed = image::RgbaImage::new(width, height);
+    let luminance = |pixel: &image::Rgba<u8>| {
+        ((u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2])) / 3) as u8
+    };
+    for y in 0..height {
+        for x in 0..width {
+            packed.put_pixel(
+                x,
+                y,
+                image::Rgba([
+                    255,
+                    roughness
+                        .as_ref()
+                        .map(|image| luminance(image.get_pixel(x, y)))
+                        .unwrap_or(255),
+                    metallic
+                        .as_ref()
+                        .map(|image| luminance(image.get_pixel(x, y)))
+                        .unwrap_or(255),
+                    255,
+                ]),
+            );
+        }
+    }
+    Ok(crate::assets::ImageHandle::from_rgba_image(packed))
+}
+
+fn attach_ascii_fbx_materials(
+    source: &str,
+    mut mesh: MeshData,
+    geometry_ranges: &[AsciiFbxGeometryRange],
+    base_dir: Option<&Path>,
+) -> MeshResult<MeshData> {
+    let material_objects = fbx_ascii_objects(source, "Material")?;
+    if material_objects.is_empty() {
+        return Ok(mesh);
+    }
+    let texture_objects = fbx_ascii_objects(source, "Texture")?;
+    let video_objects = fbx_ascii_objects(source, "Video")?;
+    let geometry_objects = fbx_ascii_objects(source, "Geometry")?;
+    let connections = fbx_ascii_connections(source)?;
+    let mut materials = Vec::with_capacity(material_objects.len());
+    let mut material_by_id = HashMap::new();
+    for object in &material_objects {
+        let mut material = MeshMaterial::named(object.name.clone());
+        material.metallic = 0.0;
+        material.base_color[..3].copy_from_slice(&fbx_property_vec3(
+            object.block,
+            "DiffuseColor",
+            [1.0; 3],
+        )?);
+        material.emissive = fbx_property_vec3(object.block, "EmissiveColor", [0.0; 3])?;
+        if let Some(factor) = fbx_property_scalar(object.block, &["EmissiveFactor"])? {
+            material.emissive = material.emissive.map(|value| value * factor);
+        }
+        if let Some(value) =
+            fbx_property_scalar(object.block, &["Metalness", "Metallic", "Maya|metalness"])?
+        {
+            material.metallic = value;
+        }
+        if let Some(value) = fbx_property_scalar(object.block, &["Roughness", "Maya|roughness"])? {
+            material.roughness = value;
+        } else if let Some(shininess) =
+            fbx_property_scalar(object.block, &["Shininess", "ShininessExponent"])?
+        {
+            material.roughness = (2.0 / (shininess.max(0.0) + 2.0)).sqrt().clamp(0.0, 1.0);
+        }
+        if let Some(opacity) = fbx_property_scalar(object.block, &["Opacity"])? {
+            material.base_color[3] = opacity;
+        } else if let Some(transparency) =
+            fbx_property_scalar(object.block, &["TransparencyFactor"])?
+        {
+            material.base_color[3] = 1.0 - transparency;
+        }
+        if material.base_color[3] < 1.0 {
+            material.alpha_mode = AlphaMode::Blend;
+        }
+        if let Some(value) = fbx_property_scalar(object.block, &["DoubleSided"])? {
+            material.double_sided = value != 0.0;
+        }
+        material_by_id.insert(object.id, materials.len());
+        materials.push(material);
+    }
+
+    let videos = video_objects
+        .iter()
+        .filter_map(|video| fbx_texture_filename(video.block).map(|path| (video.id, path)))
+        .collect::<HashMap<_, _>>();
+    let mut texture_sources = HashMap::<i64, String>::new();
+    for texture in &texture_objects {
+        if let Some(path) = fbx_texture_filename(texture.block) {
+            texture_sources.insert(texture.id, path);
+            continue;
+        }
+        if let Some(path) = connections
+            .iter()
+            .find(|connection| {
+                connection.parent == texture.id && videos.contains_key(&connection.child)
+            })
+            .and_then(|connection| videos.get(&connection.child))
+        {
+            texture_sources.insert(texture.id, path.clone());
+        }
+    }
+    let mut image_cache = HashMap::new();
+    let mut roughness_maps = HashMap::<usize, crate::assets::ImageHandle>::new();
+    let mut metallic_maps = HashMap::<usize, crate::assets::ImageHandle>::new();
+    for connection in &connections {
+        let Some(&material_index) = material_by_id.get(&connection.parent) else {
+            continue;
+        };
+        let Some(source) = texture_sources.get(&connection.child) else {
+            continue;
+        };
+        let image = load_fbx_image(source, base_dir, &mut image_cache)?;
+        let slot = connection
+            .property
+            .as_deref()
+            .unwrap_or("DiffuseColor")
+            .to_ascii_lowercase();
+        let binding = || TextureBinding {
+            source: source.clone(),
+            tex_coord: 0,
+            image: Some(image.clone()),
+        };
+        if slot.contains("normal") || slot.contains("bump") {
+            materials[material_index].normal_texture = Some(binding());
+        } else if slot.contains("emiss") {
+            materials[material_index].emissive_texture = Some(binding());
+            if materials[material_index].emissive == [0.0; 3] {
+                materials[material_index].emissive = [1.0; 3];
+            }
+        } else if slot.contains("rough") {
+            roughness_maps.insert(material_index, image);
+        } else if slot.contains("metal") {
+            metallic_maps.insert(material_index, image);
+            if materials[material_index].metallic == 0.0 {
+                materials[material_index].metallic = 1.0;
+            }
+        } else if slot.contains("diffuse") || slot.contains("basecolor") || slot.contains("color") {
+            materials[material_index].base_color_texture = Some(binding());
+        }
+    }
+    for index in 0..materials.len() {
+        let roughness = roughness_maps.remove(&index);
+        let metallic = metallic_maps.remove(&index);
+        if roughness.is_some() || metallic.is_some() {
+            let source = material_objects[index].name.clone();
+            materials[index].metallic_roughness_texture = Some(TextureBinding {
+                source: format!("packed-fbx-orm:{source}"),
+                tex_coord: 0,
+                image: Some(pack_fbx_orm(roughness, metallic)?),
+            });
+        }
+    }
+
+    let geometry_by_id = geometry_objects
+        .iter()
+        .map(|geometry| (geometry.id, geometry))
+        .collect::<HashMap<_, _>>();
+    let mut rebuilt_submeshes = Vec::new();
+    for (range_index, range) in geometry_ranges.iter().enumerate() {
+        let original = mesh.submeshes.get(range_index).ok_or_else(|| {
+            MeshError::InvalidData("ASCII FBX material geometry range is missing".into())
+        })?;
+        let model = connections
+            .iter()
+            .find(|connection| connection.child == range.id)
+            .map(|connection| connection.parent);
+        let attached = connections
+            .iter()
+            .filter(|connection| {
+                material_by_id.contains_key(&connection.child)
+                    && (connection.parent == range.id || Some(connection.parent) == model)
+            })
+            .filter_map(|connection| material_by_id.get(&connection.child).copied())
+            .collect::<Vec<_>>();
+        if attached.is_empty() {
+            rebuilt_submeshes.push(original.clone());
+            continue;
+        }
+        let geometry = geometry_by_id.get(&range.id).ok_or_else(|| {
+            MeshError::InvalidData("ASCII FBX material geometry object is missing".into())
+        })?;
+        let mapping_all_same = geometry
+            .block
+            .lines()
+            .any(|line| line.contains("MappingInformationType") && line.contains("AllSame"));
+        let local_materials = fbx_array_tokens(geometry.block, "Materials")?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| {
+                value.parse::<usize>().map_err(|error| {
+                    MeshError::InvalidData(format!(
+                        "FBX geometry '{}' material index is invalid: {error}",
+                        geometry.name
+                    ))
+                })
+            })
+            .collect::<MeshResult<Vec<_>>>()?;
+        let polygons =
+            fbx_array_tokens(geometry.block, "PolygonVertexIndex")?.ok_or_else(|| {
+                MeshError::InvalidData(format!(
+                    "FBX geometry '{}' has no polygon indexes for materials",
+                    geometry.name
+                ))
+            })?;
+        let mut polygon_sizes = Vec::new();
+        let mut size = 0usize;
+        for value in polygons {
+            size += 1;
+            if value.starts_with('-') {
+                polygon_sizes.push(size);
+                size = 0;
+            }
+        }
+        let mut offset = original.first_index;
+        for (polygon, corners) in polygon_sizes.into_iter().enumerate() {
+            let count = usize_to_u32((corners - 2) * 3, "FBX polygon material index count")?;
+            let local = if mapping_all_same {
+                local_materials.first().copied().unwrap_or(0)
+            } else {
+                local_materials.get(polygon).copied().unwrap_or(0)
+            };
+            let material = attached.get(local).copied().ok_or_else(|| {
+                MeshError::InvalidData(format!(
+                    "FBX geometry '{}' polygon {polygon} references missing material slot {local}",
+                    geometry.name
+                ))
+            })?;
+            if let Some(last) = rebuilt_submeshes.last_mut()
+                && last.material == Some(material)
+                && last.first_index + last.index_count == offset
+                && last.name.starts_with(&geometry.name)
+            {
+                last.index_count = last.index_count.checked_add(count).ok_or_else(|| {
+                    MeshError::InvalidData("FBX material submesh range overflows".into())
+                })?;
+            } else {
+                rebuilt_submeshes.push(Submesh {
+                    name: format!("{} / {}", geometry.name, materials[material].name),
+                    first_index: offset,
+                    index_count: count,
+                    material: Some(material),
+                });
+            }
+            offset = offset.checked_add(count).ok_or_else(|| {
+                MeshError::InvalidData("FBX material submesh offset overflows".into())
+            })?;
+        }
+        if offset != original.first_index + original.index_count {
+            return Err(MeshError::InvalidData(format!(
+                "FBX geometry '{}' polygon/material ranges disagree",
+                geometry.name
+            )));
+        }
+    }
+    mesh.materials = materials;
+    mesh.submeshes = rebuilt_submeshes;
+    mesh.finish_mutation(false)?;
+    Ok(mesh)
 }
 
 fn quaternion_from_euler_degrees(euler: [f32; 3]) -> [f32; 4] {
@@ -4714,6 +6357,7 @@ fn attach_ascii_fbx_armature(
         parse_ascii_fbx_animations(source, &models, &model_indices, &connections, &rest_euler)?;
     mesh.armature = Some(Armature {
         nodes,
+        pose_palette: vec![identity_matrix(); joints.len()],
         joints,
         inverse_bind_matrices,
         vertex_weights,
@@ -5124,10 +6768,20 @@ mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::ZlibEncoder;
+    use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+    use std::io::Cursor;
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn png_bytes(pixel: [u8; 4]) -> MeshResult<Vec<u8>> {
+        let mut png = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(RgbaImage::from_pixel(1, 1, Rgba(pixel)))
+            .write_to(&mut png, ImageFormat::Png)
+            .map_err(|error| MeshError::Io(error.to_string()))?;
+        Ok(png.into_inner())
+    }
 
     #[test]
     fn built_in_primitives_are_cached_valid_triangle_meshes() -> MeshResult<()> {
@@ -5267,11 +6921,27 @@ mod tests {
         );
         assert_eq!(handle.animation_names()?, vec!["Slide"]);
         assert_eq!(handle.animation_duration("Slide")?, Some(1.0));
+        assert_eq!(imported.geometry_revision, 0);
         handle.sample_animation("Slide", 0.5, false)?;
         let posed = handle.snapshot()?;
+        assert_eq!(posed.geometry_revision, imported.geometry_revision);
+        assert!(posed.revision > imported.revision);
         assert!((posed.mesh.vertices[0].position[0] - 1.0).abs() < 0.0001);
         assert!((posed.mesh.vertices[1].position[0] - 2.0).abs() < 0.0001);
+        let palette = &posed
+            .mesh
+            .armature
+            .as_ref()
+            .expect("skinned import")
+            .pose_palette;
+        assert_eq!(palette.len(), 1);
+        assert!((palette[0][12] - 1.0).abs() < 0.0001);
         let independent = handle.detached_clone()?;
+        assert_eq!(
+            independent.snapshot()?.geometry_identity,
+            posed.geometry_identity,
+            "detached poses should share immutable bind/index geometry"
+        );
         independent.sample_animation("Slide", 0.0, false)?;
         assert_ne!(handle.identity(), independent.identity());
         assert!((handle.snapshot()?.mesh.vertices[0].position[0] - 1.0).abs() < 0.0001);
@@ -5282,7 +6952,23 @@ mod tests {
         independent.set_animation_paused(true)?;
         assert!(!independent.advance_animation(0.25)?);
         independent.stop_animation()?;
-        assert!(independent.snapshot()?.mesh.vertices[0].position[0].abs() < 0.0001);
+        let stopped = independent.snapshot()?;
+        assert!(stopped.mesh.vertices[0].position[0].abs() < 0.0001);
+        assert_eq!(
+            stopped
+                .mesh
+                .armature
+                .as_ref()
+                .expect("skinned import")
+                .pose_palette,
+            vec![identity_matrix()]
+        );
+        let mut edited_vertex = stopped.mesh.vertices[0];
+        edited_vertex.position[2] = 0.25;
+        independent.set_vertex(0, edited_vertex, false)?;
+        let edited = independent.snapshot()?;
+        assert_ne!(edited.geometry_identity, posed.geometry_identity);
+        assert!(edited.geometry_revision > posed.geometry_revision);
         Ok(())
     }
 
@@ -5389,6 +7075,7 @@ mod tests {
             material.base_color_texture = Some(TextureBinding {
                 source: "textures/live.png".into(),
                 tex_coord: 0,
+                image: None,
             });
             Ok(())
         })?;
@@ -5424,6 +7111,39 @@ mod tests {
     }
 
     #[test]
+    fn reusable_material_handles_share_live_atomic_revisions() -> MeshResult<()> {
+        let mut material = MeshMaterial::named("Reusable");
+        material.metallic = 0.2;
+        material.roughness = 0.8;
+        let handle = MaterialHandle::new(material)?;
+        let shared = handle.clone();
+        assert_eq!(handle.identity(), shared.identity());
+        assert_eq!(handle.revision()?, 0);
+
+        assert_eq!(
+            handle.mutate(|material| {
+                material.metallic = 0.75;
+                material.roughness = 0.25;
+                Ok(())
+            })?,
+            1
+        );
+        let snapshot = shared.snapshot()?;
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(snapshot.material.metallic, 0.75);
+        assert_eq!(snapshot.material.roughness, 0.25);
+
+        let failed = shared.mutate(|material| {
+            material.roughness = f32::NAN;
+            Ok(())
+        });
+        assert!(matches!(failed, Err(MeshError::InvalidData(_))));
+        assert_eq!(handle.revision()?, 1);
+        assert_eq!(handle.snapshot()?.material.roughness, 0.25);
+        Ok(())
+    }
+
+    #[test]
     fn obj_imports_negative_indices_triangulates_and_tracks_materials() -> MeshResult<()> {
         let fixture = br#"
             o Quad
@@ -5447,6 +7167,101 @@ mod tests {
 
         let invalid = import_from_bytes(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 0 2 3\n", MeshFormat::Obj);
         assert!(matches!(invalid, Err(MeshError::InvalidData(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn obj_mtl_imports_pbr_factors_maps_and_opacity_relative_to_library() -> MeshResult<()> {
+        let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "neolove-mesh-obj-mtl-{}-{unique}",
+            std::process::id()
+        ));
+        let material_dir = root.join("materials");
+        let texture_dir = material_dir.join("textures");
+        fs::create_dir_all(&texture_dir)?;
+        for (name, pixel) in [
+            ("base color.png", [100, 50, 20, 200]),
+            ("opacity.png", [128, 128, 128, 255]),
+            ("normal.png", [128, 128, 255, 255]),
+            ("rough.png", [60, 60, 60, 255]),
+            ("metal.png", [180, 180, 180, 255]),
+            ("emission.png", [255, 100, 10, 255]),
+        ] {
+            fs::write(texture_dir.join(name), png_bytes(pixel)?)?;
+        }
+        fs::write(
+            material_dir.join("library with space.mtl"),
+            br#"
+                newmtl Painted Metal
+                Kd 0.5 0.25 0.75
+                d 0.8
+                Pr 0.4
+                Pm 0.7
+                Ke 0.1 0.2 0.3
+                map_Kd -s 1 1 1 textures/base color.png
+                map_d textures/opacity.png
+                bump -bm 0.8 textures/normal.png
+                map_Pr textures/rough.png
+                map_Pm textures/metal.png
+                map_Ke textures/emission.png
+            "#,
+        )?;
+        let model_path = root.join("model.obj");
+        fs::write(
+            &model_path,
+            br#"
+                mtllib materials/library with space.mtl
+                v 0 0 0
+                v 1 0 0
+                v 0 1 0
+                vt 0 0
+                vt 1 0
+                vt 0 1
+                usemtl Painted Metal
+                f 1/1 2/2 3/3
+            "#,
+        )?;
+
+        let snapshot = import_from_path(&model_path)?.snapshot()?;
+        assert_eq!(snapshot.mesh.materials.len(), 1);
+        assert_eq!(snapshot.mesh.submeshes[0].material, Some(0));
+        let material = &snapshot.mesh.materials[0];
+        assert_eq!(material.name, "Painted Metal");
+        assert_eq!(material.base_color, [0.5, 0.25, 0.75, 0.8]);
+        assert_eq!(material.emissive, [0.1, 0.2, 0.3]);
+        assert!((material.metallic - 0.7).abs() < 0.0001);
+        assert!((material.roughness - 0.4).abs() < 0.0001);
+        assert_eq!(material.alpha_mode, AlphaMode::Blend);
+        let base = material
+            .base_color_texture
+            .as_ref()
+            .and_then(|binding| binding.image.as_ref())
+            .expect("base/opacity texture");
+        assert_eq!(
+            base.with_image(|image| image.get_pixel(0, 0).0)
+                .map_err(|error| MeshError::Io(error.to_string()))?,
+            [100, 50, 20, 100]
+        );
+        let orm = material
+            .metallic_roughness_texture
+            .as_ref()
+            .and_then(|binding| binding.image.as_ref())
+            .expect("packed roughness/metallic texture");
+        assert_eq!(
+            orm.with_image(|image| image.get_pixel(0, 0).0)
+                .map_err(|error| MeshError::Io(error.to_string()))?,
+            [255, 60, 180, 255]
+        );
+        assert!(material.normal_texture.is_some());
+        assert!(material.emissive_texture.is_some());
+
+        let in_memory = import_from_bytes(
+            b"mtllib missing.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n",
+            MeshFormat::Obj,
+        );
+        assert!(matches!(in_memory, Err(MeshError::InvalidData(_))));
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 
@@ -5528,6 +7343,47 @@ mod tests {
     }
 
     #[test]
+    fn glb_decodes_and_binds_buffer_view_material_image() -> MeshResult<()> {
+        let mut buffer = triangle_buffer();
+        let image_offset = buffer.len();
+        let png = png_bytes([90, 80, 70, 255])?;
+        buffer.extend_from_slice(&png);
+        let mut document = triangle_gltf(serde_json::json!({ "byteLength": buffer.len() }), 3, 36);
+        document["bufferViews"]
+            .as_array_mut()
+            .expect("bufferViews array")
+            .push(serde_json::json!({
+                "buffer": 0,
+                "byteOffset": image_offset,
+                "byteLength": png.len()
+            }));
+        document["images"] = serde_json::json!([{
+            "bufferView": 2,
+            "mimeType": "image/png"
+        }]);
+        document["textures"] = serde_json::json!([{ "source": 0 }]);
+        document["materials"] = serde_json::json!([{
+            "pbrMetallicRoughness": { "baseColorTexture": { "index": 0 } }
+        }]);
+        document["meshes"][0]["primitives"][0]["material"] = serde_json::json!(0);
+
+        let glb = build_glb(&document, &buffer)?;
+        let snapshot = import_from_bytes(&glb, MeshFormat::Glb)?.snapshot()?;
+        let image = snapshot.mesh.materials[0]
+            .base_color_texture
+            .as_ref()
+            .and_then(|binding| binding.image.as_ref())
+            .expect("GLB material image was not bound");
+        assert_eq!(
+            image
+                .with_image(|pixels| pixels.get_pixel(0, 0).0)
+                .map_err(|error| MeshError::Io(error.to_string()))?,
+            [90, 80, 70, 255]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn gltf_resolves_external_buffers_relative_to_model_path() -> MeshResult<()> {
         let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
@@ -5536,7 +7392,7 @@ mod tests {
         fs::create_dir_all(&buffer_dir)?;
         let buffer = triangle_buffer();
         fs::write(buffer_dir.join("triangle.bin"), &buffer)?;
-        let document = triangle_gltf(
+        let mut document = triangle_gltf(
             serde_json::json!({
                 "byteLength": buffer.len(),
                 "uri": "buffers/triangle.bin"
@@ -5544,6 +7400,23 @@ mod tests {
             3,
             36,
         );
+        let texture_dir = root.join("textures");
+        fs::create_dir_all(&texture_dir)?;
+        fs::write(
+            texture_dir.join("base color.png"),
+            png_bytes([12, 34, 56, 255])?,
+        )?;
+        document["images"] = serde_json::json!([{ "uri": "textures/base%20color.png" }]);
+        document["textures"] = serde_json::json!([{ "source": 0 }]);
+        document["materials"] = serde_json::json!([{
+            "pbrMetallicRoughness": {
+                "baseColorTexture": { "index": 0 },
+                "metallicRoughnessTexture": { "index": 0 }
+            },
+            "normalTexture": { "index": 0 },
+            "emissiveTexture": { "index": 0 }
+        }]);
+        document["meshes"][0]["primitives"][0]["material"] = serde_json::json!(0);
         let model_path = root.join("triangle.gltf");
         fs::write(&model_path, serde_json::to_vec(&document)?)?;
         let imported = import_from_path(&model_path);
@@ -5551,6 +7424,40 @@ mod tests {
         let snapshot = imported?.snapshot()?;
         assert_eq!(snapshot.mesh.name, "triangle");
         assert_eq!(snapshot.mesh.indices, vec![0, 1, 2]);
+        let material = &snapshot.mesh.materials[0];
+        let base = material
+            .base_color_texture
+            .as_ref()
+            .and_then(|binding| binding.image.as_ref())
+            .expect("external base-color image was not bound");
+        let normal = material
+            .normal_texture
+            .as_ref()
+            .and_then(|binding| binding.image.as_ref())
+            .expect("external normal image was not bound");
+        let metallic_roughness = material
+            .metallic_roughness_texture
+            .as_ref()
+            .and_then(|binding| binding.image.as_ref())
+            .expect("external metallic/roughness image was not bound");
+        let emissive = material
+            .emissive_texture
+            .as_ref()
+            .and_then(|binding| binding.image.as_ref())
+            .expect("external emissive image was not bound");
+        assert_eq!(base, normal, "one glTF image should decode only once");
+        assert_eq!(base, metallic_roughness);
+        assert_eq!(base, emissive);
+        assert_eq!(
+            base.dimensions()
+                .map_err(|error| MeshError::Io(error.to_string()))?,
+            (1, 1)
+        );
+        assert_eq!(
+            base.with_image(|image| image.get_pixel(0, 0).0)
+                .map_err(|error| MeshError::Io(error.to_string()))?,
+            [12, 34, 56, 255]
+        );
         Ok(())
     }
 
@@ -5599,6 +7506,112 @@ mod tests {
     }
 
     #[test]
+    fn ascii_fbx_imports_material_textures_and_polygon_submeshes() -> MeshResult<()> {
+        let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "neolove-mesh-ascii-fbx-materials-{}-{unique}",
+            std::process::id()
+        ));
+        let textures = root.join("textures");
+        fs::create_dir_all(&textures)?;
+        for (name, pixel) in [
+            ("red.png", [220, 30, 20, 255]),
+            ("green.png", [20, 220, 40, 255]),
+            ("normal.png", [128, 128, 255, 255]),
+            ("rough.png", [80, 80, 80, 255]),
+            ("metal.png", [200, 200, 200, 255]),
+        ] {
+            fs::write(textures.join(name), png_bytes(pixel)?)?;
+        }
+        let model_path = root.join("materials.fbx");
+        fs::write(
+            &model_path,
+            br#"
+                ; FBX 7.4.0 project file
+                Objects: {
+                    Geometry: 1, "Geometry::Pair", "Mesh" {
+                        Vertices: *18 { a: -1,0,0, 0,0,0, -0.5,1,0, 0,0,0, 1,0,0, 0.5,1,0 }
+                        PolygonVertexIndex: *6 { a: 0,1,-3, 3,4,-6 }
+                        LayerElementMaterial: 0 {
+                            MappingInformationType: "ByPolygon"
+                            ReferenceInformationType: "IndexToDirect"
+                            Materials: *2 { a: 0,1 }
+                        }
+                    }
+                    Model: 10, "Model::Pair", "Mesh" { }
+                    Material: 20, "Material::Red metal", "" {
+                        Properties70: {
+                            P: "DiffuseColor", "Color", "", "A",0.8,0.2,0.1
+                            P: "Metalness", "Number", "", "A",0.65
+                            P: "Roughness", "Number", "", "A",0.3
+                            P: "Opacity", "Number", "", "A",0.75
+                        }
+                    }
+                    Material: 21, "Material::Green", "" {
+                        Properties70: {
+                            P: "DiffuseColor", "Color", "", "A",0.1,0.9,0.2
+                        }
+                    }
+                    Texture: 30, "Texture::Red", "TextureVideoClip" {
+                        RelativeFilename: "textures/red.png"
+                    }
+                    Texture: 31, "Texture::Green", "TextureVideoClip" {
+                        RelativeFilename: "textures/green.png"
+                    }
+                    Texture: 32, "Texture::Normal", "TextureVideoClip" {
+                        RelativeFilename: "textures/normal.png"
+                    }
+                    Texture: 33, "Texture::Rough", "TextureVideoClip" {
+                        RelativeFilename: "textures/rough.png"
+                    }
+                    Texture: 34, "Texture::Metal", "TextureVideoClip" {
+                        RelativeFilename: "textures/metal.png"
+                    }
+                }
+                Connections: {
+                    C: "OO",1,10
+                    C: "OO",20,10
+                    C: "OO",21,10
+                    C: "OP",30,20,"DiffuseColor"
+                    C: "OP",31,21,"DiffuseColor"
+                    C: "OP",32,20,"NormalMap"
+                    C: "OP",33,20,"Roughness"
+                    C: "OP",34,20,"Metalness"
+                }
+            "#,
+        )?;
+
+        let snapshot = import_from_path(&model_path)?.snapshot()?;
+        assert_eq!(snapshot.mesh.materials.len(), 2);
+        assert_eq!(snapshot.mesh.submeshes.len(), 2);
+        assert_eq!(snapshot.mesh.submeshes[0].material, Some(0));
+        assert_eq!(snapshot.mesh.submeshes[0].index_count, 3);
+        assert_eq!(snapshot.mesh.submeshes[1].material, Some(1));
+        assert_eq!(snapshot.mesh.submeshes[1].first_index, 3);
+        let red = &snapshot.mesh.materials[0];
+        assert_eq!(red.name, "Red metal");
+        assert_eq!(red.alpha_mode, AlphaMode::Blend);
+        assert!((red.base_color[3] - 0.75).abs() < 0.0001);
+        assert!((red.metallic - 0.65).abs() < 0.0001);
+        assert!((red.roughness - 0.3).abs() < 0.0001);
+        assert!(red.base_color_texture.is_some());
+        assert!(red.normal_texture.is_some());
+        let orm = red
+            .metallic_roughness_texture
+            .as_ref()
+            .and_then(|binding| binding.image.as_ref())
+            .expect("packed FBX ORM image");
+        assert_eq!(
+            orm.with_image(|image| image.get_pixel(0, 0).0)
+                .map_err(|error| MeshError::Io(error.to_string()))?,
+            [255, 80, 200, 255]
+        );
+        assert!(snapshot.mesh.materials[1].base_color_texture.is_some());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn binary_fbx_7400_imports_raw_arrays_and_triangulates() -> MeshResult<()> {
         let bytes = binary_fbx_quad(7400, false)?;
         let snapshot = import_from_bytes(&bytes, MeshFormat::Fbx)?.snapshot()?;
@@ -5618,6 +7631,56 @@ mod tests {
         assert_eq!(snapshot.mesh.name, "BinaryQuad");
         assert_eq!(snapshot.mesh.indices, vec![0, 1, 2, 0, 2, 3]);
         assert_eq!(snapshot.mesh.vertices[2].position, [1.0, 1.0, 0.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn binary_fbx_imports_material_factors_textures_and_polygon_slots() -> MeshResult<()> {
+        let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "neolove-mesh-binary-fbx-materials-{}-{unique}",
+            std::process::id()
+        ));
+        let textures = root.join("textures");
+        fs::create_dir_all(&textures)?;
+        for (name, pixel) in [
+            ("red.png", [220, 30, 20, 255]),
+            ("green.png", [20, 220, 40, 255]),
+            ("normal.png", [128, 128, 255, 255]),
+            ("rough.png", [80, 80, 80, 255]),
+            ("metal.png", [200, 200, 200, 255]),
+        ] {
+            fs::write(textures.join(name), png_bytes(pixel)?)?;
+        }
+        let path = root.join("materials.fbx");
+        fs::write(&path, binary_fbx_material_pair(7500)?)?;
+
+        let snapshot = import_from_path(&path)?.snapshot()?;
+        assert_eq!(snapshot.mesh.materials.len(), 2);
+        assert_eq!(snapshot.mesh.submeshes.len(), 2);
+        assert_eq!(snapshot.mesh.submeshes[0].material, Some(0));
+        assert_eq!(snapshot.mesh.submeshes[1].material, Some(1));
+        let red = &snapshot.mesh.materials[0];
+        assert_eq!(red.name, "Red metal");
+        assert_eq!(red.alpha_mode, AlphaMode::Blend);
+        assert!((red.base_color[0] - 0.8).abs() < 0.0001);
+        assert!((red.base_color[3] - 0.75).abs() < 0.0001);
+        assert!((red.metallic - 0.65).abs() < 0.0001);
+        assert!((red.roughness - 0.3).abs() < 0.0001);
+        assert!(red.base_color_texture.is_some());
+        assert!(red.normal_texture.is_some());
+        let orm = red
+            .metallic_roughness_texture
+            .as_ref()
+            .and_then(|binding| binding.image.as_ref())
+            .expect("packed binary FBX ORM image");
+        assert_eq!(
+            orm.with_image(|image| image.get_pixel(0, 0).0)
+                .map_err(|error| MeshError::Io(error.to_string()))?,
+            [255, 80, 200, 255]
+        );
+        assert!(snapshot.mesh.materials[1].base_color_texture.is_some());
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 
@@ -5692,6 +7755,172 @@ mod tests {
         Ok(output)
     }
 
+    fn binary_fbx_material_pair(version: u32) -> MeshResult<Vec<u8>> {
+        let mut position_bytes = Vec::new();
+        for value in [
+            -1.0f64, 0.0, 0.0, 0.0, 0.0, 0.0, -0.5, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5,
+            1.0, 0.0,
+        ] {
+            position_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut polygon_bytes = Vec::new();
+        for value in [0i32, 1, -3, 3, 4, -6] {
+            polygon_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut material_bytes = Vec::new();
+        for value in [0i32, 1] {
+            material_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let geometry = TestFbxNode {
+            name: "Geometry",
+            properties: vec![
+                test_fbx_i64(1),
+                test_fbx_string("Pair\0\u{1}Geometry")?,
+                test_fbx_string("Mesh")?,
+            ],
+            children: vec![
+                TestFbxNode {
+                    name: "Vertices",
+                    properties: vec![test_fbx_array(b'd', 18, position_bytes, true)?],
+                    children: Vec::new(),
+                },
+                TestFbxNode {
+                    name: "PolygonVertexIndex",
+                    properties: vec![test_fbx_array(b'i', 6, polygon_bytes, true)?],
+                    children: Vec::new(),
+                },
+                TestFbxNode {
+                    name: "LayerElementMaterial",
+                    properties: vec![test_fbx_i64(0)],
+                    children: vec![
+                        TestFbxNode {
+                            name: "MappingInformationType",
+                            properties: vec![test_fbx_string("ByPolygon")?],
+                            children: Vec::new(),
+                        },
+                        TestFbxNode {
+                            name: "Materials",
+                            properties: vec![test_fbx_array(b'i', 2, material_bytes, false)?],
+                            children: Vec::new(),
+                        },
+                    ],
+                },
+            ],
+        };
+        let property = |name: &'static str, values: &[f64]| -> MeshResult<TestFbxNode<'static>> {
+            let mut properties = vec![
+                test_fbx_string(name)?,
+                test_fbx_string(if values.len() == 3 { "Color" } else { "Number" })?,
+                test_fbx_string("")?,
+                test_fbx_string("A")?,
+            ];
+            properties.extend(values.iter().copied().map(test_fbx_f64));
+            Ok(TestFbxNode {
+                name: "P",
+                properties,
+                children: Vec::new(),
+            })
+        };
+        let material = |id, name: &'static str, children| -> MeshResult<TestFbxNode<'static>> {
+            Ok(TestFbxNode {
+                name: "Material",
+                properties: vec![
+                    test_fbx_i64(id),
+                    test_fbx_string(&format!("{name}\0\u{1}Material"))?,
+                    test_fbx_string("")?,
+                ],
+                children: vec![TestFbxNode {
+                    name: "Properties70",
+                    properties: Vec::new(),
+                    children,
+                }],
+            })
+        };
+        let texture = |id, name, source: &'static str| -> MeshResult<TestFbxNode<'static>> {
+            Ok(TestFbxNode {
+                name: "Texture",
+                properties: vec![
+                    test_fbx_i64(id),
+                    test_fbx_string(name)?,
+                    test_fbx_string("")?,
+                ],
+                children: vec![TestFbxNode {
+                    name: "RelativeFilename",
+                    properties: vec![test_fbx_string(source)?],
+                    children: Vec::new(),
+                }],
+            })
+        };
+        let connection = |kind, child, parent, slot| -> MeshResult<TestFbxNode<'static>> {
+            let mut properties = vec![
+                test_fbx_string(kind)?,
+                test_fbx_i64(child),
+                test_fbx_i64(parent),
+            ];
+            if let Some(slot) = slot {
+                properties.push(test_fbx_string(slot)?);
+            }
+            Ok(TestFbxNode {
+                name: "C",
+                properties,
+                children: Vec::new(),
+            })
+        };
+        let objects = TestFbxNode {
+            name: "Objects",
+            properties: Vec::new(),
+            children: vec![
+                geometry,
+                TestFbxNode {
+                    name: "Model",
+                    properties: vec![test_fbx_i64(10), test_fbx_string("Pair")?],
+                    children: Vec::new(),
+                },
+                material(
+                    20,
+                    "Red metal",
+                    vec![
+                        property("DiffuseColor", &[0.8, 0.2, 0.1])?,
+                        property("Metalness", &[0.65])?,
+                        property("Roughness", &[0.3])?,
+                        property("Opacity", &[0.75])?,
+                    ],
+                )?,
+                material(
+                    21,
+                    "Green",
+                    vec![property("DiffuseColor", &[0.1, 0.9, 0.2])?],
+                )?,
+                texture(30, "Red", "textures/red.png")?,
+                texture(31, "Green", "textures/green.png")?,
+                texture(32, "Normal", "textures/normal.png")?,
+                texture(33, "Rough", "textures/rough.png")?,
+                texture(34, "Metal", "textures/metal.png")?,
+            ],
+        };
+        let connections = TestFbxNode {
+            name: "Connections",
+            properties: Vec::new(),
+            children: vec![
+                connection("OO", 1, 10, None)?,
+                connection("OO", 20, 10, None)?,
+                connection("OO", 21, 10, None)?,
+                connection("OP", 30, 20, Some("DiffuseColor"))?,
+                connection("OP", 31, 21, Some("DiffuseColor"))?,
+                connection("OP", 32, 20, Some("NormalMap"))?,
+                connection("OP", 33, 20, Some("Roughness"))?,
+                connection("OP", 34, 20, Some("Metalness"))?,
+            ],
+        };
+        let mut output = Vec::new();
+        output.extend_from_slice(BINARY_FBX_MAGIC);
+        output.extend_from_slice(&version.to_le_bytes());
+        write_test_fbx_node(&mut output, version, &objects)?;
+        write_test_fbx_node(&mut output, version, &connections)?;
+        output.resize(output.len() + if version >= 7500 { 25 } else { 13 }, 0);
+        Ok(output)
+    }
+
     struct TestFbxNode<'a> {
         name: &'a str,
         properties: Vec<Vec<u8>>,
@@ -5700,6 +7929,12 @@ mod tests {
 
     fn test_fbx_i64(value: i64) -> Vec<u8> {
         let mut property = vec![b'L'];
+        property.extend_from_slice(&value.to_le_bytes());
+        property
+    }
+
+    fn test_fbx_f64(value: f64) -> Vec<u8> {
+        let mut property = vec![b'D'];
         property.extend_from_slice(&value.to_le_bytes());
         property
     }

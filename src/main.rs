@@ -1,4 +1,7 @@
-#![cfg_attr(neolove_packaged, allow(dead_code, unused_mut, unused_variables))]
+#![cfg_attr(
+    neolove_packaged,
+    allow(dead_code, unused_imports, unused_mut, unused_variables)
+)]
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 include!("main_desktop.rs");

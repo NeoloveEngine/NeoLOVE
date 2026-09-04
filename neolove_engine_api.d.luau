@@ -89,6 +89,15 @@ export type Entity = {
 	Duplicate: (self: Entity, parent: Entity?) -> Entity,
 	findFirstChild: (self: Entity, name: string) -> Entity?,
 	FindFirstChild: (self: Entity, name: string) -> Entity?,
+	hasTag: (self: Entity, tag: string) -> boolean,
+	HasTag: (self: Entity, tag: string) -> boolean,
+	isInLayer: (self: Entity, layer: number) -> boolean,
+	IsInLayer: (self: Entity, layer: number) -> boolean,
+	-- Compatibility aliases; Tag and Layer are shared by 2D and 3D.
+	hasTag3D: (self: Entity, tag: string) -> boolean,
+	HasTag3D: (self: Entity, tag: string) -> boolean,
+	isInLayer3D: (self: Entity, layer: number) -> boolean,
+	IsInLayer3D: (self: Entity, layer: number) -> boolean,
 	getWorldPosition: (self: Entity) -> (number, number),
 	GetWorldPosition: (self: Entity) -> (number, number),
 	getWorldRotation: (self: Entity) -> number,
@@ -161,6 +170,21 @@ export type ImageHandle = {
 	isUnloaded: (self: ImageHandle) -> boolean,
 }
 
+export type CubemapFaces<T> = {
+	positive_x: T,
+	negative_x: T,
+	positive_y: T,
+	negative_y: T,
+	positive_z: T,
+	negative_z: T,
+}
+
+export type CubemapHandle = {
+	size: (self: CubemapHandle) -> number,
+	face: (self: CubemapHandle, name: string) -> ImageHandle,
+	getFace: (self: CubemapHandle, name: string) -> ImageHandle,
+}
+
 -- Vertex and index arguments use Lua's one-based indexing. A vertex accepts
 -- flat x/y/z, u/v fields or nested position/normal/uv/tangent tables.
 export type MeshVertexInput = {
@@ -208,9 +232,18 @@ export type MeshMaterial = {
 	metallic: number,
 	roughness: number,
 	double_sided: boolean,
+	alpha_mode: "opaque" | "mask" | "blend",
+	alpha_cutoff: number,
 	base_color_texture: string?,
 	normal_texture: string?,
+	metallic_roughness_texture: string?,
+	emissive_texture: string?,
+	base_color_image: ImageHandle?,
+	normal_image: ImageHandle?,
+	metallic_roughness_image: ImageHandle?,
+	emissive_image: ImageHandle?,
 	base_color: Color4Value,
+	emissive: Color4Value,
 }
 
 export type MeshMaterialTextureSlot =
@@ -224,6 +257,58 @@ export type MeshMaterialTextureSlot =
 	| "orm"
 	| "emissive"
 	| "emission"
+
+export type Material3DOptions = {
+	name: string?,
+	color: Color4Value?,
+	emissive: Color4Value?,
+	metallic: number?,
+	roughness: number?,
+	double_sided: boolean?,
+	alpha_mode: ("opaque" | "mask" | "blend")?,
+	alpha_cutoff: number?,
+	base_color_texture: (string | ImageHandle)?,
+	normal_texture: (string | ImageHandle)?,
+	metallic_roughness_texture: (string | ImageHandle)?,
+	emissive_texture: (string | ImageHandle)?,
+}
+
+-- Material handles have shared identity. Successful edits commit atomically,
+-- increment revision(), and are visible to every bound renderer next frame.
+export type Material3DHandle = {
+	revision: (self: Material3DHandle) -> number,
+	identity: (self: Material3DHandle) -> number,
+	get: (self: Material3DHandle) -> MeshMaterial,
+	setColor: (self: Material3DHandle, color: Color4Value) -> number,
+	setPbr: (self: Material3DHandle, metallic: number, roughness: number) -> number,
+	setEmissive: (self: Material3DHandle, color: Color4Value) -> number,
+	setTexture: (self: Material3DHandle, slot: MeshMaterialTextureSlot, source: (string | ImageHandle)?, texCoord: number?) -> number,
+	setAlpha: (self: Material3DHandle, mode: "opaque" | "mask" | "blend", cutoff: number?) -> number,
+	setDoubleSided: (self: Material3DHandle, enabled: boolean) -> number,
+}
+
+export type PhysicsMaterial3DOptions = {
+	name: string?,
+	friction: number?,
+	restitution: number?,
+}
+
+export type PhysicsMaterial3DValue = {
+	name: string,
+	friction: number,
+	restitution: number,
+}
+
+-- Shared surface response used by every bound Collider3D. Values must remain
+-- finite and within 0..1; successful edits are visible on the next update.
+export type PhysicsMaterial3DHandle = {
+	revision: (self: PhysicsMaterial3DHandle) -> number,
+	identity: (self: PhysicsMaterial3DHandle) -> number,
+	get: (self: PhysicsMaterial3DHandle) -> PhysicsMaterial3DValue,
+	setFriction: (self: PhysicsMaterial3DHandle, friction: number) -> number,
+	setRestitution: (self: PhysicsMaterial3DHandle, restitution: number) -> number,
+	set: (self: PhysicsMaterial3DHandle, friction: number, restitution: number) -> number,
+}
 
 export type PrimitiveMeshKind = "cube" | "sphere" | "plane" | "cylinder" | "capsule" | "cone"
 
@@ -262,8 +347,12 @@ export type MeshHandle = {
 	recomputeNormals: (self: MeshHandle) -> number,
 	materialCount: (self: MeshHandle) -> number,
 	getMaterial: (self: MeshHandle, index: number) -> MeshMaterial,
-	setMaterialTexture: (self: MeshHandle, index: number, slot: MeshMaterialTextureSlot, source: string?, texCoord: number?) -> number,
+	setMaterialTexture: (self: MeshHandle, index: number, slot: MeshMaterialTextureSlot, source: (string | ImageHandle)?, texCoord: number?) -> number,
 	setMaterialColor: (self: MeshHandle, index: number, color: Color4Value) -> number,
+	setMaterialPbr: (self: MeshHandle, index: number, metallic: number, roughness: number) -> number,
+	setMaterialEmissive: (self: MeshHandle, index: number, color: Color4Value) -> number,
+	setMaterialAlpha: (self: MeshHandle, index: number, mode: "opaque" | "mask" | "blend", cutoff: number?) -> number,
+	setMaterialDoubleSided: (self: MeshHandle, index: number, enabled: boolean) -> number,
 	-- Cached imported/primitive handles share geometry and pose. Clone before
 	-- independently animating several instances of the same asset.
 	cloneDetached: (self: MeshHandle) -> MeshHandle,
@@ -346,11 +435,28 @@ export type InputModule = {
 export type AssetsModule = {
 	loadImage: (pathOrBase64Png: string) -> ImageHandle,
 	loadImageBase64: (base64Png: string) -> ImageHandle,
-	-- Imports .obj, .gltf, .glb, or ASCII/binary .fbx geometry. glTF/GLB and
-	-- supported ASCII FBX files may also contain one armature and animation clips.
+	loadCubemap: (faces: CubemapFaces<string>) -> CubemapHandle,
+	loadCubeMap: (faces: CubemapFaces<string>) -> CubemapHandle,
+	newCubemap: (faces: CubemapFaces<ImageHandle>) -> CubemapHandle,
+	newCubeMap: (faces: CubemapFaces<ImageHandle>) -> CubemapHandle,
+	-- Imports .obj, .gltf, .glb, or ASCII/binary .fbx geometry. glTF/GLB image
+	-- dependencies and supported glTF/ASCII-FBX armatures are retained by the mesh.
 	loadMesh: (path: string) -> MeshHandle,
 	primitiveMesh: (kind: PrimitiveMeshKind | string, options: PrimitiveMeshOptions?) -> MeshHandle,
 	newMesh: (vertices: { MeshVertexInput }, indices: { number }?) -> MeshHandle,
+	newMaterial3D: (options: Material3DOptions?) -> Material3DHandle,
+	newMaterial: (options: Material3DOptions?) -> Material3DHandle,
+	newPhysicsMaterial3D: (options: PhysicsMaterial3DOptions?) -> PhysicsMaterial3DHandle,
+	newPhysicsMaterial: (options: PhysicsMaterial3DOptions?) -> PhysicsMaterial3DHandle,
+	-- .neomaterial texture sources resolve relative to the material file.
+	loadMaterial3D: (path: string) -> Material3DHandle,
+	loadMaterial: (path: string) -> Material3DHandle,
+	loadPhysicsMaterial3D: (path: string) -> PhysicsMaterial3DHandle,
+	loadPhysicsMaterial: (path: string) -> PhysicsMaterial3DHandle,
+	saveMaterial3D: (material: Material3DHandle, path: string) -> (),
+	saveMaterial: (material: Material3DHandle, path: string) -> (),
+	savePhysicsMaterial3D: (material: PhysicsMaterial3DHandle, path: string) -> (),
+	savePhysicsMaterial: (material: PhysicsMaterial3DHandle, path: string) -> (),
 	snapPhoto: (x: number, y: number, x2: number, y2: number) -> ImageHandle,
 	newImage: (width: number, height: number, color: Color4Value?) -> ImageHandle,
 	loadSound: (path: string) -> SoundHandle,
@@ -359,7 +465,26 @@ export type AssetsModule = {
 	unloadSound: (value: string | SoundHandle) -> boolean,
 	-- Evicts a path from the cache; existing handles remain valid.
 	unloadMesh: (path: string) -> boolean,
+	unloadMaterial3D: (path: string) -> boolean,
+	unloadPhysicsMaterial3D: (path: string) -> boolean,
+	unloadPhysicsMaterial: (path: string) -> boolean,
 	gc: () -> (number, number),
+}
+
+export type SpatialAudio3DDistanceModel = "inverse" | "linear" | "exponential"
+
+export type SpatialAudio3DOptions = {
+	voice_id: number?,
+	voiceId: number?,
+	looping: boolean?,
+	volume: number?,
+	min_distance: number?,
+	minDistance: number?,
+	max_distance: number?,
+	maxDistance: number?,
+	rolloff: number?,
+	distance_model: SpatialAudio3DDistanceModel?,
+	distanceModel: SpatialAudio3DDistanceModel?,
 }
 
 export type AudioModule = {
@@ -370,6 +495,10 @@ export type AudioModule = {
 	playSpatial: (sound: SoundHandle, x: number, y: number, looped: boolean?, volume: number?) -> (),
 	setPosition: (sound: SoundHandle, x: number, y: number) -> boolean,
 	setListenerPosition: (x: number, y: number) -> (),
+	playSpatial3D: (sound: SoundHandle, x: number, y: number, z: number, options: SpatialAudio3DOptions?) -> number,
+	updateSpatial3D: (voiceId: number, x: number, y: number, z: number, options: SpatialAudio3DOptions?) -> boolean,
+	stopSpatial3D: (voiceId: number) -> (),
+	setListener3D: (x: number, y: number, z: number, forwardX: number, forwardY: number, forwardZ: number, upX: number, upY: number, upZ: number, earDistance: number?) -> (),
 }
 
 export type MediaPermissionStatus = "prompt" | "granted" | "denied" | "unavailable"
@@ -741,6 +870,10 @@ export type TransformModule = {
 	look_at: (from_x: number, from_y: number, to_x: number, to_y: number) -> number,
 	GetEntitiesInFront: (world_x: number, world_y: number, minimum_z: number?) -> { Entity },
 	getEntitiesInFront: (world_x: number, world_y: number, minimum_z: number?) -> { Entity },
+	-- Intersects world-space oriented boxes: anchors, pivots, rotation and
+	-- scale all count, in 2D and 3D alike. A 3D volume comes from an enabled
+	-- Collider3D, else a MeshRenderer3D, else an explicit size_z on the
+	-- entity; anything else is measured as its 2D rectangle.
 	doTheyOverlap: (entities: { Entity }) -> boolean,
 	raycast: (
 		origin_x: number,
@@ -758,6 +891,15 @@ export type EcsModule = {
 	deleteEntity: (entity: Entity) -> (),
 	duplicateEntity: (targetEntity: Entity, parent: Entity) -> Entity,
 	findFirstChild: (parent: Entity, name: string) -> Entity?,
+	findByTag: (tag: string) -> { Entity },
+	FindByTag: (tag: string) -> { Entity },
+	findByLayer: (layer: number) -> { Entity },
+	FindByLayer: (layer: number) -> { Entity },
+	-- Compatibility aliases; prefer the dimension-independent names above.
+	findByTag3D: (tag: string) -> { Entity },
+	FindByTag3D: (tag: string) -> { Entity },
+	findByLayer3D: (layer: number) -> { Entity },
+	FindByLayer3D: (layer: number) -> { Entity },
 	root: Entity,
 	addComponent: (entity: Entity, component: Component) -> ComponentInstance,
 	removeComponent: (entity: Entity, target: number | ComponentInstance) -> boolean,
@@ -966,16 +1108,20 @@ export type Camera3D = ComponentInstance & {
 	orthographic_size: number,
 	near_clip: number,
 	far_clip: number,
+	-- 31-bit camera mask; a RenderLayer3D is visible when any bit overlaps.
+	render_mask: number,
 	SetActive: (self: Camera3D) -> boolean,
 	setActive: (self: Camera3D) -> boolean,
 	IsActive: (self: Camera3D) -> boolean,
 	isActive: (self: Camera3D) -> boolean,
 }
 
-export type Environment3DMode = "solid" | "gradient" | "equirectangular"
+export type Environment3DMode = "solid" | "gradient" | "equirectangular" | "cubemap"
+export type Fog3DMode = "linear" | "exponential" | "exponential_squared"
 
 -- A scene environment renders before 3D geometry and ignores camera
--- translation. `texture`/`texture_path` expect an equirectangular panorama.
+-- translation. `texture`/`texture_path` expect an equirectangular panorama;
+-- cubemap mode accepts `cubemap` or all six signed-axis image fields.
 export type Environment3D = ComponentInstance & {
 	__neolove_component: "Environment3D",
 	NEOLOVE_RENDERING: boolean,
@@ -986,11 +1132,117 @@ export type Environment3D = ComponentInstance & {
 	bottom_color: Color4Value,
 	texture: ImageHandle?,
 	texture_path: string,
+	cubemap: CubemapHandle?,
+	positive_x: ImageHandle?,
+	negative_x: ImageHandle?,
+	positive_y: ImageHandle?,
+	negative_y: ImageHandle?,
+	positive_z: ImageHandle?,
+	negative_z: ImageHandle?,
 	rotation: number,
 	intensity: number,
+	fog_enabled: boolean,
+	fog_mode: Fog3DMode,
+	fog_color: Color4Value,
+	fog_start: number,
+	fog_end: number,
+	fog_density: number,
+	ao_enabled: boolean,
+	ao_radius: number,
+	ao_intensity: number,
+	ao_bias: number,
 }
 
 export type Skybox3D = Environment3D
+
+-- Local cubemap image-based lighting inside a finite world-space influence
+-- volume. Overlaps resolve by priority and blend smoothly into the global
+-- Environment3D near the probe boundary.
+export type ReflectionProbe3D = ComponentInstance & {
+	__neolove_component: "ReflectionProbe3D",
+	NEOLOVE_RENDERING: boolean,
+	enabled: boolean,
+	visible: boolean,
+	cubemap: CubemapHandle?,
+	positive_x: ImageHandle?,
+	negative_x: ImageHandle?,
+	positive_y: ImageHandle?,
+	negative_y: ImageHandle?,
+	positive_z: ImageHandle?,
+	negative_z: ImageHandle?,
+	size_x: number,
+	size_y: number,
+	size_z: number,
+	blend_distance: number,
+	intensity: number,
+	rotation: number,
+	priority: number,
+}
+
+-- A hierarchy-aware visual switch. It affects 3D rendering only: scripts and
+-- physics keep running. Disabling inherit_parent makes an explicit boundary.
+export type Visibility3D = ComponentInstance & {
+	__neolove_component: "Visibility3D",
+	enabled: boolean,
+	visible: boolean,
+	inherit_parent: boolean,
+	effective_visible: boolean,
+	isVisible: (self: Visibility3D) -> boolean,
+	IsVisible: (self: Visibility3D) -> boolean,
+}
+
+-- Render membership mask tested against Camera3D.render_mask.
+export type RenderLayer3D = ComponentInstance & {
+	__neolove_component: "RenderLayer3D",
+	enabled: boolean,
+	mask: number,
+	matchesMask: (self: RenderLayer3D, cameraOrMask: Camera3D | number) -> boolean,
+	MatchesMask: (self: RenderLayer3D, cameraOrMask: Camera3D | number) -> boolean,
+}
+
+-- Dimension-independent gameplay/organization metadata. Tag does not alter
+-- visibility or rendering and can be attached in 2D and 3D scenes.
+export type Tag = ComponentInstance & {
+	__neolove_component: "Tag",
+	enabled: boolean,
+	tag: string,
+	matches: (self: Tag, tag: string) -> boolean,
+	Matches: (self: Tag, tag: string) -> boolean,
+}
+
+-- A gameplay/organization layer. This does not alter rendering; use
+-- RenderLayer3D for camera filtering. It is valid in 2D and 3D scenes.
+export type Layer = ComponentInstance & {
+	__neolove_component: "Layer",
+	enabled: boolean,
+	layer: number,
+	name: string,
+	matches: (self: Layer, layer: number) -> boolean,
+	Matches: (self: Layer, layer: number) -> boolean,
+}
+
+-- Source-compatible aliases from the short-lived 3D-only naming.
+export type Tag3D = Tag
+export type Layer3D = Layer
+
+export type LODForce3D = "automatic" | "lod0" | "lod1" | "lod2" | "culled"
+
+-- Camera-distance mesh selection consumed by MeshRenderer3D. Empty lower LOD
+-- slots fall back toward LOD 0; an empty LOD 0 inherits mesh_path.
+export type LODGroup3D = ComponentInstance & {
+	__neolove_component: "LODGroup3D",
+	enabled: boolean,
+	lod0_mesh: string,
+	lod1_mesh: string,
+	lod2_mesh: string,
+	lod1_distance: number,
+	lod2_distance: number,
+	cull_distance: number,
+	force_level: LODForce3D,
+	-- Runtime-observed state. -1 means culled.
+	active_level: number,
+	camera_distance: number,
+}
 
 export type MeshRenderer3D = ComponentInstance & {
 	__neolove_component: "MeshRenderer3D",
@@ -1008,14 +1260,18 @@ export type MeshRenderer3D = ComponentInstance & {
 	primitive_rings: number,
 	-- Assign an ImageHandle here to texture the mesh immediately.
 	texture: ImageHandle?,
-	-- Reserved authoring metadata; normal mapping is not rendered yet.
+	-- A singular override for material slot 1, or per-submesh-slot overrides.
+	-- Nil entries fall back to the material embedded in the mesh.
+	material: Material3DHandle?,
+	materials: { Material3DHandle? },
+	-- Legacy authoring metadata. Use material:setTexture("normal", image).
 	normal_texture: ImageHandle?,
 	color: Color4Value,
-	-- Reserved authoring metadata; current 3D shading is diffuse/emissive.
+	-- Legacy authoring metadata. Use Material3D PBR factors for native shading.
 	metallic: number,
 	roughness: number,
 	visible: boolean,
-	-- Reserved authoring metadata; 3D shadow maps are not rendered yet.
+	-- Live on native Vulkan shadow maps; retained by other backends for parity.
 	casts_shadows: boolean,
 	receives_shadows: boolean,
 	double_sided: boolean,
@@ -1045,7 +1301,7 @@ export type Light3D = ComponentInstance & {
 	range: number,
 	spot_angle: number,
 	spot_softness: number,
-	-- Reserved authoring metadata; 3D shadow maps are not rendered yet.
+	-- Live for the selected native Vulkan directional/spot shadow source.
 	casts_shadows: boolean,
 	shadow_bias: number,
 	visible: boolean,
@@ -1104,8 +1360,9 @@ export type ParticleSystem3D = ComponentInstance & {
 }
 
 -- Lightweight velocity/gravity integration with automatic positional and
--- velocity response for exact primitive contacts. Bounds-only contacts (mesh,
--- capsule-box, or non-uniform round shapes) are reported but never resolved.
+-- velocity response for exact primitive contacts. Translational CCD also
+-- resolves exact round-shape mesh hits and conservative bounds hits where an
+-- exact box/mesh or non-uniform-round sweep is unavailable.
 export type Rigidbody3D = ComponentInstance & {
 	__neolove_component: "Rigidbody3D",
 	enabled: boolean,
@@ -1127,10 +1384,19 @@ export type Rigidbody3D = ComponentInstance & {
 	freeze_rotation_x: boolean,
 	freeze_rotation_y: boolean,
 	freeze_rotation_z: boolean,
-	-- Reserved metadata; continuous collision detection is not implemented yet.
+	-- Sweep every attached response-enabled Collider3D before discrete contacts.
 	continuous_collision: boolean,
 	auto_resolve: boolean,
 	contact_slop: number,
+	ccd_hit: boolean,
+	ccd_hit_count: number,
+	ccd_entity_id: number?,
+	ccd_distance: number,
+	ccd_time_fraction: number,
+	ccd_normal_x: number,
+	ccd_normal_y: number,
+	ccd_normal_z: number,
+	ccd_quality: Physics3DContactQuality?,
 	onContact: Physics3DContactCallback?,
 	onTrigger: Physics3DContactCallback?,
 	setOnContact: (self: Rigidbody3D, callback: Physics3DContactCallback?) -> (),
@@ -1156,11 +1422,119 @@ export type Collider3D = ComponentInstance & {
 	offset_x: number,
 	offset_y: number,
 	offset_z: number,
+	physics_material: PhysicsMaterial3DHandle?,
 	restitution: number,
 	friction: number,
 	non_physics: boolean,
 	layer: number,
 	mask: number,
+}
+
+export type Trigger3DOverlap = {
+	entity_id: number,
+	is_trigger: boolean,
+	-- Exit events omit contact quality because the shapes no longer overlap.
+	quality: Physics3DContactQuality?,
+	exact: boolean?,
+}
+
+export type Trigger3DCallback = (overlap: Trigger3DOverlap) -> ()
+
+-- Dedicated non-resolving volume. Geometry and collision filtering use the
+-- same native registry and narrow phase as Collider3D.
+export type Trigger3D = ComponentInstance & {
+	__neolove_component: "Trigger3D",
+	enabled: boolean,
+	is_trigger: boolean,
+	non_physics: boolean,
+	shape: Collider3DShape,
+	mesh: MeshHandle?,
+	mesh_path: string,
+	convex: boolean,
+	size_x: number,
+	size_y: number,
+	size_z: number,
+	radius: number,
+	height: number,
+	offset_x: number,
+	offset_y: number,
+	offset_z: number,
+	layer: number,
+	mask: number,
+	overlap_count: number,
+	overlapping_entity_ids: { number },
+	onEnter: Trigger3DCallback?,
+	onStay: Trigger3DCallback?,
+	onExit: Trigger3DCallback?,
+	setOnEnter: (self: Trigger3D, callback: Trigger3DCallback?) -> (),
+	setOnStay: (self: Trigger3D, callback: Trigger3DCallback?) -> (),
+	setOnExit: (self: Trigger3D, callback: Trigger3DCallback?) -> (),
+}
+
+export type CharacterController3D = ComponentInstance & {
+	__neolove_component: "CharacterController3D",
+	enabled: boolean,
+	radius: number,
+	-- Complete capsule height including both hemispheres.
+	height: number,
+	center_x: number,
+	center_y: number,
+	center_z: number,
+	skin_width: number,
+	max_slope_degrees: number,
+	step_height: number,
+	ground_snap_distance: number,
+	max_iterations: number,
+	layer: number,
+	mask: number,
+	include_triggers: boolean,
+	use_gravity: boolean,
+	gravity: number,
+	velocity_x: number,
+	velocity_y: number,
+	velocity_z: number,
+	grounded: boolean,
+	ground_entity_id: number?,
+	ground_normal_x: number,
+	ground_normal_y: number,
+	ground_normal_z: number,
+	collision_count: number,
+	onCollision: ((hit: Physics3DSweepHit) -> ())?,
+	onGrounded: ((ground: Physics3DGroundHit) -> ())?,
+	move: (self: CharacterController3D, x: number, y: number, z: number) -> CharacterController3DMoveResult,
+	Move: (self: CharacterController3D, x: number, y: number, z: number) -> CharacterController3DMoveResult,
+	setOnCollision: (self: CharacterController3D, callback: ((hit: Physics3DSweepHit) -> ())?) -> (),
+	setOnGrounded: (self: CharacterController3D, callback: ((ground: Physics3DGroundHit) -> ())?) -> (),
+}
+
+-- Authored local-space ray query evaluated through the same native collider
+-- registry as physics3d.raycast. Runtime hit fields are refreshed every cast.
+export type Raycast3D = ComponentInstance & {
+	__neolove_component: "Raycast3D",
+	enabled: boolean,
+	offset_x: number,
+	offset_y: number,
+	offset_z: number,
+	direction_x: number,
+	direction_y: number,
+	direction_z: number,
+	max_distance: number,
+	layer: number,
+	mask: number,
+	include_triggers: boolean,
+	exclude_self: boolean,
+	hit: boolean,
+	hit_entity_id: number?,
+	hit_distance: number,
+	hit_x: number,
+	hit_y: number,
+	hit_z: number,
+	normal_x: number,
+	normal_y: number,
+	normal_z: number,
+	onHit: ((hit: Physics3DRaycastHit) -> ())?,
+	cast: (self: Raycast3D) -> Physics3DRaycastHit?,
+	setOnHit: (self: Raycast3D, callback: ((hit: Physics3DRaycastHit) -> ())?) -> (),
 }
 
 export type Shape2DShape = "box" | "circle" | "triangle" | "right_triangle" | "righttriangle" | "rightangledtriangle"
@@ -1275,6 +1649,33 @@ export type SpatialSound2D = ComponentInstance & {
 	Play: (self: SpatialSound2D) -> boolean,
 	stop: (self: SpatialSound2D) -> (),
 	Stop: (self: SpatialSound2D) -> (),
+}
+
+export type AudioSource3D = ComponentInstance & {
+	__neolove_component: "AudioSource3D",
+	enabled: boolean,
+	sound: SoundHandle?,
+	volume: number,
+	looping: boolean,
+	autoplay: boolean,
+	distance_model: SpatialAudio3DDistanceModel,
+	min_distance: number,
+	max_distance: number,
+	rolloff: number,
+	play: (self: AudioSource3D) -> boolean,
+	Play: (self: AudioSource3D) -> boolean,
+	stop: (self: AudioSource3D) -> (),
+	Stop: (self: AudioSource3D) -> (),
+}
+
+export type AudioListener3D = ComponentInstance & {
+	__neolove_component: "AudioListener3D",
+	enabled: boolean,
+	ear_distance: number,
+	SetActive: (self: AudioListener3D) -> boolean,
+	setActive: (self: AudioListener3D) -> boolean,
+	IsActive: (self: AudioListener3D) -> boolean,
+	isActive: (self: AudioListener3D) -> boolean,
 }
 
 export type TextScaleMode = "none" | "fit" | "fit_width" | "fit_height"
@@ -1867,6 +2268,7 @@ export type Physics3DRaycastOptions = {
 	layer: number?,
 	mask: number?,
 	include_triggers: boolean?,
+	exclude_entity_id: number?,
 }
 
 export type Physics3DRaycastHit = {
@@ -1883,6 +2285,37 @@ export type Physics3DRaycastHit = {
 	-- Present for mesh colliders; indices are one-based for Luau.
 	triangle_index: number?,
 	barycentric: { number }?,
+}
+
+export type Physics3DSweepHit = {
+	entity_id: number,
+	distance: number,
+	x: number,
+	y: number,
+	z: number,
+	normal_x: number,
+	normal_y: number,
+	normal_z: number,
+	is_trigger: boolean,
+}
+
+export type Physics3DGroundHit = {
+	entity_id: number?,
+	normal_x: number,
+	normal_y: number,
+	normal_z: number,
+}
+
+export type CharacterController3DMoveResult = {
+	moved_x: number,
+	moved_y: number,
+	moved_z: number,
+	grounded: boolean,
+	ground_entity_id: number?,
+	ground_normal_x: number,
+	ground_normal_y: number,
+	ground_normal_z: number,
+	collisions: { Physics3DSweepHit },
 }
 
 export type Physics3DBroadphasePair = {
@@ -1929,6 +2362,9 @@ export type Physics3DBodyContact = {
 	quality: Physics3DContactQuality,
 	exact: boolean,
 	can_resolve: boolean,
+	continuous: boolean,
+	distance: number?,
+	time_fraction: number?,
 }
 
 export type Physics3DContactCallback = (contact: Physics3DBodyContact) -> ()
@@ -1950,6 +2386,12 @@ export type Physics3DResolveResult = {
 	correction_x: number,
 	correction_y: number,
 	correction_z: number,
+	ccd_hit: boolean,
+	ccd_hit_count: number,
+	ccd_time_fraction: number,
+	ccd_adjustment_x: number,
+	ccd_adjustment_y: number,
+	ccd_adjustment_z: number,
 }
 
 export type Physics3DModule = {
@@ -1963,11 +2405,35 @@ export type Physics3DModule = {
 		max_distance: number?,
 		options: Physics3DRaycastOptions?
 	) -> Physics3DRaycastHit?,
+	-- Continuous upright-capsule cast. `height` is the total capsule height and
+	-- dx/dy/dz are a displacement, not a normalized direction.
+	sweepCapsule: (
+		center_x: number,
+		center_y: number,
+		center_z: number,
+		radius: number,
+		height: number,
+		dx: number,
+		dy: number,
+		dz: number,
+		options: Physics3DRaycastOptions?
+	) -> Physics3DSweepHit?,
+	sweep_capsule: (
+		center_x: number,
+		center_y: number,
+		center_z: number,
+		radius: number,
+		height: number,
+		dx: number,
+		dy: number,
+		dz: number,
+		options: Physics3DRaycastOptions?
+	) -> Physics3DSweepHit?,
 	-- Runs deterministic broadphase + primitive narrowphase. `bounds` contacts
 	-- are conservative candidates, not exact mesh/ellipsoid manifolds.
 	contacts: (options: Physics3DContactOptions?) -> { Physics3DContact },
-	-- Resolves only exact, non-trigger primitive contacts for one body. Called
-	-- automatically by Rigidbody3D when `auto_resolve` is true.
+	-- Runs optional translational CCD, then resolves discrete exact primitive
+	-- contacts. Called automatically when Rigidbody3D.auto_resolve is true.
 	resolveBody: (
 		entity: Entity,
 		body: Rigidbody3D,
@@ -2076,8 +2542,24 @@ export type Environment3DModule = {
 	setSolid: (color: Color4Value) -> (),
 	setGradient: (top: Color4Value, bottom: Color4Value) -> (),
 	setEquirectangular: (image: ImageHandle, rotationDegrees: number?) -> (),
+	setCubemap: (cubemap: CubemapHandle, rotationDegrees: number?) -> (),
 	setEnabled: (enabled: boolean) -> (),
 	setIntensity: (intensity: number) -> (),
+	setFog: (color: Color4Value, options: {
+		mode: Fog3DMode?,
+		start_distance: number?,
+		end_distance: number?,
+		start: number?,
+		["end"]: number?,
+		density: number?,
+	}?) -> (),
+	clearFog: () -> (),
+	setAmbientOcclusion: (options: {
+		radius: number?,
+		intensity: number?,
+		bias: number?,
+	}?) -> (),
+	clearAmbientOcclusion: () -> (),
 	clear: () -> (),
 }
 
@@ -2090,15 +2572,28 @@ export type CoreModule = {
 	Camera3D: Camera3D,
 	Environment3D: Environment3D,
 	Skybox3D: Skybox3D,
+	ReflectionProbe3D: ReflectionProbe3D,
+	Visibility3D: Visibility3D,
+	RenderLayer3D: RenderLayer3D,
+	Tag: Tag,
+	Layer: Layer,
+	Tag3D: Tag3D,
+	Layer3D: Layer3D,
+	LODGroup3D: LODGroup3D,
 	MeshRenderer3D: MeshRenderer3D,
 	Light3D: Light3D,
 	ParticleSystem3D: ParticleSystem3D,
 	Rigidbody3D: Rigidbody3D,
 	Collider3D: Collider3D,
+	Trigger3D: Trigger3D,
+	CharacterController3D: CharacterController3D,
+	Raycast3D: Raycast3D,
 	Shape2D: Shape2D,
 	ParticleSystem2D: ParticleSystem2D,
 	AnimationController: AnimationController,
 	SpatialSound2D: SpatialSound2D,
+	AudioSource3D: AudioSource3D,
+	AudioListener3D: AudioListener3D,
 	TextBox: TextBox,
 	TextLabel: TextLabel,
 	RudimentaryTextLabel: RudimentaryTextLabel,

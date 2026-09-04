@@ -31,6 +31,7 @@ EM_JS(void, neolove_js_bootstrap, (), {
     audio: {
       context: null,
       active: new Map(),
+      active3d: new Map(),
       lastError: "",
       resumeHooksInstalled: false
     },
@@ -49,6 +50,11 @@ EM_JS(void, neolove_js_bootstrap, (), {
     images: new Map(),
     imageUseCounter: 0
   });
+
+  // Keep hot-reloaded pages created by an older bridge revision compatible.
+  if (!state.audio.active3d) {
+    state.audio.active3d = new Map();
+  }
 
   const canvas = document.getElementById("canvas");
   if (!canvas) {
@@ -201,6 +207,25 @@ EM_JS(void, neolove_js_bootstrap, (), {
       }
     } catch (_error) {
     }
+  };
+
+  module.neoloveStopAudio3DInstance = (voiceId) => {
+    const existing = state.audio.active3d.get(voiceId);
+    if (!existing) {
+      return;
+    }
+    existing.stopped = true;
+    state.audio.active3d.delete(voiceId);
+    try {
+      if (existing.source) {
+        existing.source.onended = null;
+        existing.source.stop();
+      }
+    } catch (_error) {
+    }
+    try { if (existing.source) existing.source.disconnect(); } catch (_error) {}
+    try { if (existing.gain) existing.gain.disconnect(); } catch (_error) {}
+    try { if (existing.panner) existing.panner.disconnect(); } catch (_error) {}
   };
 
   if (!state.audio.resumeHooksInstalled) {
@@ -1589,6 +1614,183 @@ EM_JS(int, neolove_js_audio_set_listener_position, (float x, float y), {
   }
 });
 
+EM_JS(int, neolove_js_audio_play_spatial_3d, (
+  int voice_id,
+  const uint8_t* bytes,
+  int bytes_len,
+  int looped,
+  float volume,
+  float x,
+  float y,
+  float z,
+  float min_distance,
+  float max_distance,
+  float rolloff,
+  int distance_model
+), {
+  const state = Module.neoloveState;
+  if (!state) return 0;
+  try {
+    Module.neoloveClearAudioError();
+    const context = Module.neoloveEnsureAudioContext();
+    Module.neoloveStopAudio3DInstance(voice_id);
+    if (bytes_len <= 0) throw new Error("sound has no encoded bytes");
+
+    const encodedBytes = new Uint8Array(bytes_len);
+    encodedBytes.set(HEAPU8.subarray(bytes, bytes + bytes_len));
+    const entry = {
+      source: null,
+      gain: null,
+      panner: null,
+      x, y, z,
+      volume: Math.min(1, Math.max(0, volume)),
+      minDistance: Math.max(0.001, min_distance),
+      maxDistance: Math.max(Math.max(0.001, min_distance), max_distance),
+      rolloff: Math.max(0, rolloff),
+      distanceModel: distance_model,
+      stopped: false
+    };
+    const cleanup = () => {
+      if (state.audio.active3d.get(voice_id) !== entry) return;
+      state.audio.active3d.delete(voice_id);
+      try { if (entry.source) entry.source.disconnect(); } catch (_error) {}
+      try { if (entry.gain) entry.gain.disconnect(); } catch (_error) {}
+      try { if (entry.panner) entry.panner.disconnect(); } catch (_error) {}
+    };
+    state.audio.active3d.set(voice_id, entry);
+    const resumed = context.state === "running" ? Promise.resolve() : context.resume();
+    const decoded = context.decodeAudioData(encodedBytes.buffer.slice(0));
+    Promise.all([resumed, decoded]).then((results) => {
+      if (entry.stopped) {
+        cleanup();
+        return;
+      }
+      const gain = context.createGain();
+      gain.gain.value = entry.volume;
+      const panner = context.createPanner();
+      panner.panningModel = "HRTF";
+      panner.distanceModel = entry.distanceModel === 0
+        ? "linear"
+        : (entry.distanceModel === 2 ? "exponential" : "inverse");
+      panner.refDistance = entry.minDistance;
+      panner.maxDistance = entry.maxDistance;
+      panner.rolloffFactor = entry.rolloff;
+      panner.positionX.value = entry.x;
+      panner.positionY.value = entry.y;
+      panner.positionZ.value = entry.z;
+      gain.connect(panner);
+      panner.connect(context.destination);
+
+      const source = context.createBufferSource();
+      source.buffer = results[1];
+      source.loop = !!looped;
+      source.connect(gain);
+      source.onended = cleanup;
+      entry.gain = gain;
+      entry.panner = panner;
+      entry.source = source;
+      source.start(0);
+    }).catch((error) => {
+      cleanup();
+      Module.neoloveSetAudioError(error);
+    });
+    return 1;
+  } catch (error) {
+    Module.neoloveSetAudioError(error);
+    return 0;
+  }
+});
+
+EM_JS(int, neolove_js_audio_update_spatial_3d, (
+  int voice_id,
+  float x,
+  float y,
+  float z,
+  float volume,
+  float min_distance,
+  float max_distance,
+  float rolloff,
+  int distance_model
+), {
+  const state = Module.neoloveState;
+  if (!state) return 0;
+  try {
+    const entry = state.audio.active3d.get(voice_id);
+    if (!entry) return 0;
+    entry.x = x;
+    entry.y = y;
+    entry.z = z;
+    entry.volume = Math.min(1, Math.max(0, volume));
+    entry.minDistance = Math.max(0.001, min_distance);
+    entry.maxDistance = Math.max(entry.minDistance, max_distance);
+    entry.rolloff = Math.max(0, rolloff);
+    entry.distanceModel = distance_model;
+    if (entry.gain) entry.gain.gain.value = entry.volume;
+    if (entry.panner) {
+      entry.panner.positionX.value = x;
+      entry.panner.positionY.value = y;
+      entry.panner.positionZ.value = z;
+      entry.panner.distanceModel = distance_model === 0
+        ? "linear"
+        : (distance_model === 2 ? "exponential" : "inverse");
+      entry.panner.refDistance = entry.minDistance;
+      entry.panner.maxDistance = entry.maxDistance;
+      entry.panner.rolloffFactor = entry.rolloff;
+    }
+    return 1;
+  } catch (error) {
+    Module.neoloveSetAudioError(error);
+    return 0;
+  }
+});
+
+EM_JS(int, neolove_js_audio_stop_spatial_3d, (int voice_id), {
+  try {
+    Module.neoloveClearAudioError();
+    Module.neoloveStopAudio3DInstance(voice_id);
+    return 1;
+  } catch (error) {
+    Module.neoloveSetAudioError(error);
+    return 0;
+  }
+});
+
+EM_JS(int, neolove_js_audio_set_listener_3d, (
+  float x,
+  float y,
+  float z,
+  float forward_x,
+  float forward_y,
+  float forward_z,
+  float up_x,
+  float up_y,
+  float up_z
+), {
+  try {
+    const listener = Module.neoloveEnsureAudioContext().listener;
+    if (listener.positionX) {
+      listener.positionX.value = x;
+      listener.positionY.value = y;
+      listener.positionZ.value = z;
+      listener.forwardX.value = forward_x;
+      listener.forwardY.value = forward_y;
+      listener.forwardZ.value = forward_z;
+      listener.upX.value = up_x;
+      listener.upY.value = up_y;
+      listener.upZ.value = up_z;
+    } else {
+      if (listener.setPosition) listener.setPosition(x, y, z);
+      if (listener.setOrientation) {
+        listener.setOrientation(forward_x, forward_y, forward_z, up_x, up_y, up_z);
+      }
+    }
+    return 1;
+  } catch (error) {
+    Module.neoloveSetAudioError(error);
+    return 0;
+  }
+});
+
 EM_JS(int, neolove_js_audio_stop, (int sound_id), {
   const state = Module.neoloveState;
   if (!state) {
@@ -2423,6 +2625,82 @@ int neolove_web_audio_set_position(int sound_id, float x, float y) {
 
 int neolove_web_audio_set_listener_position(float x, float y) {
   return neolove_js_audio_set_listener_position(x, y);
+}
+
+int neolove_web_audio_play_spatial_3d(
+    int voice_id,
+    const uint8_t* bytes,
+    int bytes_len,
+    int looped,
+    float volume,
+    float x,
+    float y,
+    float z,
+    float min_distance,
+    float max_distance,
+    float rolloff,
+    int distance_model) {
+  return neolove_js_audio_play_spatial_3d(
+      voice_id,
+      bytes,
+      bytes_len,
+      looped,
+      volume,
+      x,
+      y,
+      z,
+      min_distance,
+      max_distance,
+      rolloff,
+      distance_model);
+}
+
+int neolove_web_audio_update_spatial_3d(
+    int voice_id,
+    float x,
+    float y,
+    float z,
+    float volume,
+    float min_distance,
+    float max_distance,
+    float rolloff,
+    int distance_model) {
+  return neolove_js_audio_update_spatial_3d(
+      voice_id,
+      x,
+      y,
+      z,
+      volume,
+      min_distance,
+      max_distance,
+      rolloff,
+      distance_model);
+}
+
+int neolove_web_audio_stop_spatial_3d(int voice_id) {
+  return neolove_js_audio_stop_spatial_3d(voice_id);
+}
+
+int neolove_web_audio_set_listener_3d(
+    float x,
+    float y,
+    float z,
+    float forward_x,
+    float forward_y,
+    float forward_z,
+    float up_x,
+    float up_y,
+    float up_z) {
+  return neolove_js_audio_set_listener_3d(
+      x,
+      y,
+      z,
+      forward_x,
+      forward_y,
+      forward_z,
+      up_x,
+      up_y,
+      up_z);
 }
 
 int neolove_web_take_audio_error(char* buffer, int capacity) {

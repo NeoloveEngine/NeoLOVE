@@ -50,7 +50,11 @@ use std::process::ExitCode;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
+#[cfg(not(neolove_packaged))]
+use base64::Engine as _;
 use image::imageops::FilterType;
+#[cfg(not(neolove_packaged))]
+use image::ImageEncoder as _;
 use mlua::Compiler;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -73,6 +77,7 @@ use crate::renderer::SoftwareRenderer;
 const EMBED_TRAILER_MAGIC: &[u8; 16] = b"NEOLOVE_EMBED_V1";
 const PAYLOAD_MAGIC: &[u8; 8] = b"NLPKGv1\0";
 const COMPRESSED_PAYLOAD_MAGIC: &[u8; 8] = b"NLPKGv2\0";
+const WRAPPER_MAGIC: &[u8; 16] = b"NEOLOVE_WRAPPED1";
 const TEMPLATE_LUAURC: &str = include_str!("project_template/.luaurc");
 const TEMPLATE_VSCODE_SETTINGS: &str = include_str!("project_template/vscode_settings.json");
 const TEMPLATE_NEOLOVE_ENGINE_API: &str =
@@ -88,6 +93,11 @@ enum DesktopPresenter {
         surface: softbuffer::Surface,
         renderer: SoftwareRenderer,
         vulkan_error: Option<String>,
+    },
+    /// The real software runtime renderer without an OS presentation surface.
+    /// Editor Game View uses this variant inside its isolated child process.
+    EmbeddedSoftware {
+        renderer: SoftwareRenderer,
     },
 }
 
@@ -207,6 +217,48 @@ fn blit_software_pixels(
 }
 
 impl DesktopPresenter {
+    fn new_embedded(
+        _event_loop: &EventLoop<()>,
+        _window: &std::sync::Arc<winit::window::Window>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
+        let requested = env::var("NEOLOVE_EDITOR_EMBEDDED_BACKEND")
+            .unwrap_or_else(|_| "auto".to_string())
+            .to_ascii_lowercase();
+        #[cfg(feature = "vulkan")]
+        if requested != "software" {
+            match catch_desktop_panic("failed while initializing embedded Vulkan", || {
+                VulkanPresenter::new(_event_loop, _window.clone())
+            })? {
+                Ok((mut presenter, _surface)) => {
+                    presenter.set_frame_capture_enabled(true);
+                    return Ok(Self::Vulkan(presenter));
+                }
+                Err(error) if requested == "vulkan" => {
+                    return Err(format!(
+                        "embedded Vulkan was explicitly requested but initialization failed: {error}"
+                    ));
+                }
+                Err(error) => eprintln!(
+                    "render warning: embedded Vulkan capture unavailable, using software: {error}"
+                ),
+            }
+        }
+
+        #[cfg(not(feature = "vulkan"))]
+        if requested == "vulkan" {
+            return Err(
+                "embedded Vulkan was explicitly requested, but this build has no Vulkan feature"
+                    .to_string(),
+            );
+        }
+
+        Ok(Self::EmbeddedSoftware {
+            renderer: SoftwareRenderer::new(width, height),
+        })
+    }
+
     fn new(
         event_loop: &EventLoop<()>,
         window: &std::sync::Arc<winit::window::Window>,
@@ -255,6 +307,29 @@ impl DesktopPresenter {
         #[cfg(feature = "vulkan")]
         if let Self::Vulkan(presenter) = self {
             presenter.request_swapchain_recreate();
+        }
+    }
+
+    fn backend_name(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "vulkan")]
+            Self::Vulkan(presenter) if presenter.captured_pixels().is_some() => "vulkan-embedded",
+            #[cfg(feature = "vulkan")]
+            Self::Vulkan(_) => "vulkan",
+            Self::Software { .. } => "software",
+            Self::EmbeddedSoftware { .. } => "software-embedded",
+        }
+    }
+
+    fn embedded_pixels(&self) -> Option<(u32, u32, &[u8])> {
+        match self {
+            #[cfg(feature = "vulkan")]
+            Self::Vulkan(presenter) => presenter.captured_pixels(),
+            Self::EmbeddedSoftware { renderer } => {
+                let (width, height) = renderer.dimensions();
+                Some((width, height, renderer.pixels()))
+            }
+            _ => None,
         }
     }
 
@@ -326,6 +401,15 @@ impl DesktopPresenter {
                     .present()
                     .map_err(|error| format!("failed to present software surface: {error}"))?;
                 Ok(())
+            }
+            Self::EmbeddedSoftware { renderer } => {
+                let size = window.inner_size();
+                let (logical_width, logical_height) =
+                    logical_dimensions(size.width, size.height, window.scale_factor());
+                renderer.resize(logical_width, logical_height);
+                renderer
+                    .render(platform_state, render_state)
+                    .map_err(|error| format!("embedded software renderer failed: {error}"))
             }
         }
     }
@@ -846,10 +930,22 @@ fn window_options_for_project(project_root: &Path) -> (String, Option<Icon>, f32
 }
 
 fn should_skip_in_build(path: &Path) -> bool {
-    path.components().any(|component| {
+    if path.components().any(|component| {
         let name = component.as_os_str();
-        name == OsStr::new(".git") || name == OsStr::new("target") || name == OsStr::new("dist")
-    })
+        name == OsStr::new(".git")
+            || name == OsStr::new(".vscode")
+            || name == OsStr::new(".idea")
+            || name == OsStr::new(".neolove")
+            || name == OsStr::new("target")
+            || name == OsStr::new("dist")
+    }) {
+        return true;
+    }
+
+    let file_name = path.file_name().unwrap_or_default();
+    file_name == OsStr::new(".gitignore")
+        || file_name == OsStr::new(".luaurc")
+        || is_lua_declaration_file(path)
 }
 
 fn is_lua_declaration_file(path: &Path) -> bool {
@@ -1236,12 +1332,16 @@ impl DesktopPackageTarget {
         }
     }
 
-    fn target_dir_name(self) -> &'static str {
-        match self.target_triple() {
-            Some("x86_64-pc-windows-gnu") => "neolove-packaged-runtime-windows-x86_64",
-            Some("x86_64-unknown-linux-gnu") => "neolove-packaged-runtime-linux-x86_64",
-            _ => "neolove-packaged-runtime",
-        }
+    fn target_dir_name(self, project_kind: ProjectKind) -> String {
+        let platform = match self.target_triple() {
+            Some("x86_64-pc-windows-gnu") => "windows-x86_64",
+            Some("x86_64-unknown-linux-gnu") => "linux-x86_64",
+            _ => "host",
+        };
+        format!(
+            "neolove-packaged-runtime-{platform}-{}",
+            project_kind.as_str()
+        )
     }
 
     fn is_windows(self) -> bool {
@@ -1412,9 +1512,14 @@ fn ensure_rust_target_installed(target_triple: &str) -> Result<(), String> {
     run_checked_command(&mut rustup, "installing desktop Rust target")
 }
 
-fn build_packaged_runtime(target: DesktopPackageTarget) -> Result<PathBuf, String> {
+fn build_packaged_runtime(
+    target: DesktopPackageTarget,
+    project_kind: ProjectKind,
+) -> Result<(PathBuf, PathBuf), String> {
     let engine_root = engine_source_root()?;
-    let cargo_target_dir = engine_root.join("target").join(target.target_dir_name());
+    let cargo_target_dir = engine_root
+        .join("target")
+        .join(target.target_dir_name(project_kind));
     let rust_target = target.target_triple();
     if let Some(target_triple) = rust_target {
         ensure_rust_target_installed(target_triple)?;
@@ -1434,11 +1539,15 @@ fn build_packaged_runtime(target: DesktopPackageTarget) -> Result<PathBuf, Strin
     }
     cargo
         .env("NEOLOVE_PACKAGED_RUNTIME", "1")
+        .env("NEOLOVE_PACKAGED_PROJECT_KIND", project_kind.as_str())
         .env("CARGO_TARGET_DIR", &cargo_target_dir)
         .arg("build")
         .arg("--release")
         .arg("--bin")
-        .arg(env!("CARGO_PKG_NAME"));
+        .arg(env!("CARGO_PKG_NAME"))
+        .arg("--bin")
+        .arg("neolove-launcher")
+        .args(["--features", "packaged-launcher"]);
     if let Some(target_triple) = rust_target {
         cargo.arg("--target").arg(target_triple);
     }
@@ -1467,16 +1576,33 @@ fn build_packaged_runtime(target: DesktopPackageTarget) -> Result<PathBuf, Strin
             artifact.display()
         ));
     }
-    Ok(artifact)
+    let launcher = if rust_target.is_some() {
+        cargo_target_dir
+            .join(rust_target.expect("checked above"))
+            .join("release")
+            .join(executable_file_name("neolove-launcher", target))
+    } else {
+        cargo_target_dir
+            .join("release")
+            .join(executable_file_name("neolove-launcher", target))
+    };
+    if !launcher.is_file() {
+        return Err(format!(
+            "packaged launcher build succeeded but output was not found: {}",
+            launcher.display()
+        ));
+    }
+    Ok((artifact, launcher))
 }
 
 fn build_executable(project_root: &Path, target: DesktopPackageTarget) -> Result<PathBuf, String> {
+    let project_kind = parse_project_settings(project_root).kind;
     let output_stem = project_output_stem(project_root);
     let output_name = executable_file_name(&output_stem, target);
 
     let payload = build_payload(project_root)?;
 
-    let packaged_runtime = build_packaged_runtime(target)?;
+    let (packaged_runtime, packaged_launcher) = build_packaged_runtime(target, project_kind)?;
     #[allow(unused_mut)]
     let mut engine_bytes = fs::read(&packaged_runtime).map_err(|e| {
         format!(
@@ -1502,8 +1628,30 @@ fn build_executable(project_root: &Path, target: DesktopPackageTarget) -> Result
     })?;
     let output_path = output_dir.join(output_name);
 
+    let mut encoder = flate2::write::DeflateEncoder::new(
+        Vec::new(),
+        flate2::Compression::best(),
+    );
+    encoder
+        .write_all(&engine_bytes)
+        .map_err(|error| format!("failed to compress packaged runtime: {error}"))?;
+    let compressed_runtime = encoder
+        .finish()
+        .map_err(|error| format!("failed to finalize packaged runtime: {error}"))?;
+
+    let mut launcher_bytes = fs::read(&packaged_launcher).map_err(|error| {
+        format!(
+            "failed to read packaged launcher {}: {error}",
+            packaged_launcher.display()
+        )
+    })?;
+    if target.is_windows() {
+        patch_subsystem_to_gui(&mut launcher_bytes)
+            .map_err(|error| format!("failed to prepare game launcher: {error}"))?;
+    }
+
     let total_steps = 3usize;
-    progress_bar(1, total_steps, "Copying engine executable");
+    progress_bar(1, total_steps, "Writing compressed game launcher");
 
     let mut out_file = File::create(&output_path).map_err(|e| {
         format!(
@@ -1512,19 +1660,20 @@ fn build_executable(project_root: &Path, target: DesktopPackageTarget) -> Result
         )
     })?;
     out_file
-        .write_all(&engine_bytes)
-        .map_err(|e| format!("failed to write engine bytes: {e}"))?;
+        .write_all(&launcher_bytes)
+        .map_err(|e| format!("failed to write launcher bytes: {e}"))?;
 
-    progress_bar(2, total_steps, "Embedding game payload");
+    progress_bar(2, total_steps, "Embedding compressed runtime and game");
+    out_file
+        .write_all(&compressed_runtime)
+        .and_then(|_| out_file.write_all(&(compressed_runtime.len() as u64).to_le_bytes()))
+        .and_then(|_| out_file.write_all(WRAPPER_MAGIC))
+        .map_err(|e| format!("failed to write compressed runtime: {e}"))?;
     out_file
         .write_all(&payload)
-        .map_err(|e| format!("failed to write payload: {e}"))?;
-    out_file
-        .write_all(&(payload.len() as u64).to_le_bytes())
-        .map_err(|e| format!("failed to write payload length: {e}"))?;
-    out_file
-        .write_all(EMBED_TRAILER_MAGIC)
-        .map_err(|e| format!("failed to write payload trailer magic: {e}"))?;
+        .and_then(|_| out_file.write_all(&(payload.len() as u64).to_le_bytes()))
+        .and_then(|_| out_file.write_all(EMBED_TRAILER_MAGIC))
+        .map_err(|e| format!("failed to write game payload: {e}"))?;
     out_file
         .flush()
         .map_err(|e| format!("failed to flush output file: {e}"))?;
@@ -3718,6 +3867,161 @@ fn catch_desktop_panic<T>(context: &str, f: impl FnOnce() -> T) -> Result<T, Str
         .map_err(|payload| describe_desktop_panic(context, payload.as_ref()))
 }
 
+#[cfg(not(neolove_packaged))]
+fn encode_editor_runtime_frame(
+    serial: u64,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    backend: &str,
+    fps: f32,
+    update_ms: f32,
+    render_ms: f32,
+    draw_calls: u32,
+    triangles: u64,
+) -> Result<editor_ipc::RuntimeFrame, String> {
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(pixels, width, height, image::ColorType::Rgba8)
+        .map_err(|error| format!("encode embedded runtime frame: {error}"))?;
+    Ok(editor_ipc::RuntimeFrame {
+        serial,
+        width,
+        height,
+        png_base64: base64::engine::general_purpose::STANDARD.encode(png),
+        backend: backend.to_string(),
+        fps,
+        update_ms,
+        render_ms,
+        draw_calls,
+        triangles,
+    })
+}
+
+#[cfg(not(neolove_packaged))]
+fn runtime_frame_draw_stats(
+    render_state: &crate::renderer::SharedRenderState,
+) -> (u32, u64) {
+    let commands = crate::renderer::last_frame_commands(render_state)
+        .ok()
+        .flatten();
+    let Some(commands) = commands else {
+        return (0, 0);
+    };
+    let draw_calls = u32::try_from(commands.len()).unwrap_or(u32::MAX);
+    let triangles = commands
+        .iter()
+        .filter_map(|command| match command {
+            crate::renderer::DrawCommand::Mesh3D(command) => command
+                .mesh
+                .with_read(|mesh, _| mesh.indices.len() as u64 / 3)
+                .ok(),
+            crate::renderer::DrawCommand::Triangle { .. } => Some(1),
+            crate::renderer::DrawCommand::Rect { .. }
+            | crate::renderer::DrawCommand::Image { .. } => Some(2),
+            _ => None,
+        })
+        .sum();
+    (draw_calls, triangles)
+}
+
+#[cfg(not(neolove_packaged))]
+fn runtime_error_log(message: String) -> crate::window::RuntimeLogLine {
+    let marker = |name: &str| {
+        let start = message.find(&format!("{name}="))? + name.len() + 1;
+        let digits = message[start..]
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect::<String>();
+        (!digits.is_empty()).then(|| digits.parse::<usize>().ok()).flatten()
+    };
+    let component = message
+        .find("component=")
+        .map(|start| start + "component=".len())
+        .and_then(|start| {
+            let value = message[start..]
+                .chars()
+                .take_while(|character| {
+                    !character.is_whitespace() && !matches!(character, ']' | ':' | ',')
+                })
+                .collect::<String>();
+            (!value.is_empty()).then_some(value)
+        })
+        .or_else(|| {
+            let start = message.find("component '")? + "component '".len();
+            let end = message[start..].find('\'')? + start;
+            Some(message[start..end].to_string())
+        });
+    let (script, line) = message
+        .split_whitespace()
+        .filter_map(|token| {
+            let token = token.trim_matches(|character: char| {
+                matches!(character, '[' | ']' | '(' | ')' | '\'' | '"' | ',')
+            });
+            let source = token.strip_prefix('@')?.trim_end_matches(':');
+            let (path, line) = source.rsplit_once(':')?;
+            let line = line
+                .trim_matches(|character: char| !character.is_ascii_digit())
+                .parse::<u32>()
+                .ok()?;
+            Some((path.to_string(), line))
+        })
+        .next()
+        .map(|(script, line)| (Some(script), Some(line)))
+        .unwrap_or_default();
+    let entity_id = marker("entity_id");
+    let component_index = marker("component_index");
+    crate::window::RuntimeLogLine {
+        level: "error".into(),
+        message,
+        entity_id,
+        component_index,
+        component,
+        script,
+        line,
+        ..crate::window::RuntimeLogLine::default()
+    }
+}
+
+#[cfg(not(neolove_packaged))]
+fn apply_editor_runtime_input(
+    platform_state: &SharedPlatformState,
+    snapshot: editor_ipc::RuntimeInputSnapshot,
+) {
+    use std::collections::BTreeSet;
+
+    let mut platform = lock_platform_state(platform_state);
+    let next_keys = snapshot.keys.into_iter().collect::<BTreeSet<_>>();
+    let previous_keys = platform.input().keys_down.clone();
+    for key in next_keys.difference(&previous_keys) {
+        platform.input_mut().keys_pressed.insert(key.clone());
+        platform.input_mut().last_key_pressed = Some(key.clone());
+    }
+    for key in previous_keys.difference(&next_keys) {
+        platform.input_mut().keys_released.insert(key.clone());
+    }
+    platform.input_mut().keys_down = next_keys;
+
+    let next_buttons = snapshot
+        .mouse_buttons
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let previous_buttons = platform.input().mouse_down.clone();
+    for button in next_buttons.difference(&previous_buttons) {
+        platform.input_mut().mouse_pressed.insert(button.clone());
+    }
+    for button in previous_buttons.difference(&next_buttons) {
+        platform.input_mut().mouse_released.insert(button.clone());
+    }
+    platform.input_mut().mouse_down = next_buttons;
+    platform.set_mouse_position(snapshot.mouse_x, snapshot.mouse_y);
+    platform.input_mut().wheel_x += snapshot.wheel_x;
+    platform.input_mut().wheel_y += snapshot.wheel_y;
+    if !snapshot.text.is_empty() {
+        platform.input_mut().char_pressed = Some(snapshot.text);
+    }
+}
+
 fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Result<(), String> {
     env::set_current_dir(&project_root).map_err(|error| {
         format!(
@@ -3725,8 +4029,24 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
             project_root.display()
         )
     })?;
-    let (title, icon, window_width, window_height, fullscreen, resizable) =
+    let (title, icon, mut window_width, mut window_height, fullscreen, resizable) =
         window_options_for_project(&project_root);
+    #[cfg(not(neolove_packaged))]
+    let editor_embedded = env::var("NEOLOVE_EDITOR_EMBEDDED").as_deref() == Ok("1");
+    #[cfg(neolove_packaged)]
+    let editor_embedded = false;
+    if editor_embedded {
+        window_width = env::var("NEOLOVE_EDITOR_EMBEDDED_WIDTH")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value >= 64.0)
+            .unwrap_or(960.0);
+        window_height = env::var("NEOLOVE_EDITOR_EMBEDDED_HEIGHT")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value >= 64.0)
+            .unwrap_or(540.0);
+    }
     let mobile_profile = mobile_emulation::MobileEmulation::from_env();
     let (window_width, window_height, fullscreen, resizable) = if mobile_profile.enabled {
         let (mobile_width, mobile_height) = mobile_profile.oriented_size();
@@ -3756,17 +4076,41 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.start())) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            return Err(format!(
+            let message = format!(
                 "failed to start runtime:\n{}",
                 lua_error::describe_lua_error(&error)
-            ));
+            );
+            #[cfg(not(neolove_packaged))]
+            if let Some(ipc) = ipc_client.as_ref() {
+                ipc.send(&editor_ipc::IpcMessage::Log(runtime_error_log(
+                    message.clone(),
+                )));
+            }
+            return Err(message);
         }
         Err(payload) => {
-            return Err(format!(
+            let message = format!(
                 "runtime panicked during startup\nPanic: {}",
                 lua_error::describe_panic(payload.as_ref())
-            ));
+            );
+            #[cfg(not(neolove_packaged))]
+            if let Some(ipc) = ipc_client.as_ref() {
+                ipc.send(&editor_ipc::IpcMessage::Log(runtime_error_log(
+                    message.clone(),
+                )));
+            }
+            return Err(message);
         }
+    }
+
+    // Capture the exact post-load, pre-update state once. Live snapshots below
+    // continue to reflect scripts and simulation, while this immutable sample
+    // lets the editor distinguish serialization parity from intentional play.
+    #[cfg(not(neolove_packaged))]
+    if let Some(ipc) = ipc_client.as_ref() {
+        ipc.send(&editor_ipc::IpcMessage::InitialScene {
+            entities: runtime.snapshot_entities(),
+        });
     }
 
     let event_loop =
@@ -3783,8 +4127,9 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
     let mut builder = WindowBuilder::new()
         .with_title(title)
         .with_inner_size(LogicalSize::new(window_width as f64, window_height as f64))
-        .with_resizable(resizable);
-    if fullscreen {
+        .with_resizable(resizable && !editor_embedded)
+        .with_visible(!editor_embedded);
+    if fullscreen && !editor_embedded {
         builder = builder.with_fullscreen(Some(Fullscreen::Borderless(None)));
     }
     if let Some(icon) = icon {
@@ -3801,12 +4146,31 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
 
     let platform_state = runtime.platform_state();
     let render_state = runtime.render_state();
-    let mut presenter = DesktopPresenter::new(&event_loop, &window)?;
+    let mut presenter = if editor_embedded {
+        DesktopPresenter::new_embedded(
+            &event_loop,
+            &window,
+            logical_width,
+            logical_height,
+        )?
+    } else {
+        DesktopPresenter::new(&event_loop, &window)?
+    };
 
     let mut last_update = Instant::now();
     let mut next_update_deadline = None;
     let mut last_snapshot = Instant::now();
+    #[cfg(not(neolove_packaged))]
+    let mut last_frame_stream = Instant::now() - Duration::from_secs(1);
+    #[cfg(not(neolove_packaged))]
+    let mut frame_serial = 0_u64;
+    #[cfg(not(neolove_packaged))]
+    let mut last_update_ms = 0.0_f32;
+    #[cfg(not(neolove_packaged))]
+    let mut runtime_fps = 60.0_f32;
     let mut cursor_grab_warning_logged = false;
+    #[cfg(not(neolove_packaged))]
+    let mut editor_paused = false;
     event_loop.run(move |event, _target, control_flow| {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let now = Instant::now();
@@ -3941,6 +4305,56 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
                     _ => {}
                 },
                 Event::MainEventsCleared => {
+                    #[cfg(not(neolove_packaged))]
+                    let mut editor_step_once = false;
+                    #[cfg(not(neolove_packaged))]
+                    if let Some(ipc) = ipc_client.as_ref() {
+                        for command in ipc.drain_commands() {
+                            match command {
+                                editor_ipc::IpcCommand::Pause => editor_paused = true,
+                                editor_ipc::IpcCommand::Resume => editor_paused = false,
+                                editor_ipc::IpcCommand::Step => {
+                                    editor_paused = true;
+                                    editor_step_once = true;
+                                }
+                                editor_ipc::IpcCommand::Stop => {
+                                    *control_flow = ControlFlow::Exit;
+                                    return;
+                                }
+                                editor_ipc::IpcCommand::Input { snapshot } => {
+                                    apply_editor_runtime_input(&platform_state, snapshot);
+                                }
+                                editor_ipc::IpcCommand::Resize { width, height } => {
+                                    let width = width.clamp(64, 4096);
+                                    let height = height.clamp(64, 4096);
+                                    window.set_inner_size(LogicalSize::new(
+                                        width as f64,
+                                        height as f64,
+                                    ));
+                                    runtime.set_platform_window_state(
+                                        width as f32,
+                                        height as f32,
+                                    );
+                                    presenter.request_resize();
+                                }
+                            }
+                        }
+                    }
+
+                    #[cfg(not(neolove_packaged))]
+                    if editor_paused && !editor_step_once {
+                        last_update = Instant::now();
+                        let _ = with_platform_state(
+                            &platform_state,
+                            "finalizing paused frame input state",
+                            |platform| platform.begin_frame(),
+                        );
+                        next_update_deadline =
+                            Some(last_update + Duration::from_millis(16));
+                        window.request_redraw();
+                        return;
+                    }
+
                     if let Some(deadline) = next_update_deadline
                         && Instant::now() < deadline
                     {
@@ -3949,26 +4363,50 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
                     }
                     next_update_deadline = None;
                     let update_start = Instant::now();
-                    let dt = update_start.duration_since(last_update).as_secs_f32();
+                    let mut dt = update_start.duration_since(last_update).as_secs_f32();
+                    #[cfg(not(neolove_packaged))]
+                    if editor_step_once {
+                        dt = 1.0 / 60.0;
+                    }
                     last_update = update_start;
-
+                    #[cfg(not(neolove_packaged))]
+                    if (0.001..=0.25).contains(&dt) {
+                        runtime_fps = runtime_fps * 0.85 + dt.recip() * 0.15;
+                    }
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         runtime.update(dt)
                     })) {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
+                            #[cfg(not(neolove_packaged))]
+                            if let Some(ipc) = ipc_client.as_ref() {
+                                ipc.send(&editor_ipc::IpcMessage::Log(runtime_error_log(
+                                    error.clone(),
+                                )));
+                            }
                             exit_runtime_failure(control_flow, "Fatal Runtime Error:", &error);
                         }
                         Err(payload) => {
+                            let panic_message = format!(
+                                "Runtime panicked during frame update\nPanic: {}",
+                                lua_error::describe_panic(payload.as_ref())
+                            );
+                            #[cfg(not(neolove_packaged))]
+                            if let Some(ipc) = ipc_client.as_ref() {
+                                ipc.send(&editor_ipc::IpcMessage::Log(runtime_error_log(
+                                    panic_message.clone(),
+                                )));
+                            }
                             exit_runtime_failure(
                                 control_flow,
                                 "Rust Panic:",
-                                &format!(
-                                    "Runtime panicked during frame update\nPanic: {}",
-                                    lua_error::describe_panic(payload.as_ref())
-                                ),
+                                &panic_message,
                             );
                         }
+                    }
+                    #[cfg(not(neolove_packaged))]
+                    {
+                        last_update_ms = update_start.elapsed().as_secs_f32() * 1000.0;
                     }
 
                     // Stream output and a throttled live snapshot to the editor.
@@ -4022,12 +4460,45 @@ fn run_project_window(project_root: PathBuf, data_root: Option<PathBuf>) -> Resu
                     window.request_redraw();
                 }
                 Event::RedrawRequested(_) => {
+                    let render_start = Instant::now();
                     if let Err(error) = presenter.render(&window, &platform_state, &render_state) {
+                        #[cfg(not(neolove_packaged))]
+                        if let Some(ipc) = ipc_client.as_ref() {
+                            ipc.send(&editor_ipc::IpcMessage::Log(runtime_error_log(format!(
+                                "desktop presenter failed: {error}"
+                            ))));
+                        }
                         exit_runtime_failure(
                             control_flow,
                             "Fatal Render Error:",
                             &format!("desktop presenter failed: {error}"),
                         );
+                    }
+                    #[cfg(not(neolove_packaged))]
+                    if editor_embedded
+                        && last_frame_stream.elapsed() >= Duration::from_millis(66)
+                        && let Some(ipc) = ipc_client.as_ref()
+                        && let Some((width, height, pixels)) = presenter.embedded_pixels()
+                    {
+                        frame_serial = frame_serial.wrapping_add(1);
+                        let render_ms = render_start.elapsed().as_secs_f32() * 1000.0;
+                        let (draw_calls, triangles) = runtime_frame_draw_stats(&render_state);
+                        match encode_editor_runtime_frame(
+                            frame_serial,
+                            width,
+                            height,
+                            pixels,
+                            presenter.backend_name(),
+                            runtime_fps,
+                            last_update_ms,
+                            render_ms,
+                            draw_calls,
+                            triangles,
+                        ) {
+                            Ok(frame) => ipc.send(&editor_ipc::IpcMessage::Frame(frame)),
+                            Err(error) => eprintln!("runtime frame stream warning: {error}"),
+                        }
+                        last_frame_stream = Instant::now();
                     }
                     next_update_deadline =
                         frame_deadline(last_update, Instant::now(), runtime.max_fps());
@@ -4212,6 +4683,9 @@ fn print_usage() {
     println!(
         "  neolove run [project-dir] [--mobile] [--portrait|--landscape] [--wifi|--cellular|--offline]"
     );
+    println!(
+        "  neolove validate-3d [project-dir] --baseline <png> [--backend auto|software|vulkan] [--width N --height N] [--write-baseline]"
+    );
     println!("  neolove editor [project-dir]");
     println!("  neolove build [project-dir] [--windows|--linux|--webasm|--android|--apk|--ios]");
     println!("  neolove api [project-dir]");
@@ -4274,6 +4748,13 @@ fn graphical_desktop_available() -> bool {
 }
 
 fn embedded_data_root(executable: &Path) -> Result<PathBuf, String> {
+    // Compressed desktop builds run their cached native runtime from the temp
+    // directory. Keep user saves beside the distributed launcher, exactly as
+    // they were for the former uncompressed single-file executable.
+    let launcher_path = env::var_os("NEOLOVE_LAUNCHER_PATH")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let executable = launcher_path.as_deref().unwrap_or(executable);
     let parent = executable
         .parent()
         .ok_or_else(|| "embedded executable has no parent directory".to_string())?;
@@ -4348,13 +4829,396 @@ fn parse_run_options<'a>(
     Ok((project_arg, mobile))
 }
 
+#[cfg(not(neolove_packaged))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Validate3dOptions<'a> {
+    project_arg: Option<&'a str>,
+    baseline: PathBuf,
+    backend: &'a str,
+    width: u32,
+    height: u32,
+    write_baseline: bool,
+    report: Option<PathBuf>,
+    diff: Option<PathBuf>,
+    timeout: Duration,
+}
+
+#[cfg(not(neolove_packaged))]
+fn parse_validate_3d_options(args: &[String]) -> Result<Validate3dOptions<'_>, String> {
+    let mut project_arg = None;
+    let mut baseline = None;
+    let mut backend = "auto";
+    let mut width = 960_u32;
+    let mut height = 540_u32;
+    let mut write_baseline = false;
+    let mut report = None;
+    let mut diff = None;
+    let mut timeout = Duration::from_secs(30);
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        let mut next_value = |name: &str| -> Result<&str, String> {
+            index += 1;
+            args.get(index)
+                .map(String::as_str)
+                .ok_or_else(|| format!("validate-3d failed: {name} requires a value"))
+        };
+        match argument {
+            "--baseline" => baseline = Some(PathBuf::from(next_value("--baseline")?)),
+            "--backend" => backend = next_value("--backend")?,
+            "--width" => {
+                width = next_value("--width")?.parse().map_err(|_| {
+                    "validate-3d failed: --width expects an integer".to_string()
+                })?;
+            }
+            "--height" => {
+                height = next_value("--height")?.parse().map_err(|_| {
+                    "validate-3d failed: --height expects an integer".to_string()
+                })?;
+            }
+            "--write-baseline" | "--set-baseline" => write_baseline = true,
+            "--report" => report = Some(PathBuf::from(next_value("--report")?)),
+            "--diff" => diff = Some(PathBuf::from(next_value("--diff")?)),
+            "--timeout-ms" => {
+                let milliseconds = next_value("--timeout-ms")?.parse::<u64>().map_err(|_| {
+                    "validate-3d failed: --timeout-ms expects an integer".to_string()
+                })?;
+                timeout = Duration::from_millis(milliseconds);
+            }
+            _ if argument.starts_with("--baseline=") => {
+                baseline = Some(PathBuf::from(argument.trim_start_matches("--baseline=")));
+            }
+            _ if argument.starts_with("--backend=") => {
+                backend = argument.trim_start_matches("--backend=");
+            }
+            _ if argument.starts_with("--width=") => {
+                width = argument
+                    .trim_start_matches("--width=")
+                    .parse()
+                    .map_err(|_| {
+                        "validate-3d failed: --width expects an integer".to_string()
+                    })?;
+            }
+            _ if argument.starts_with("--height=") => {
+                height = argument
+                    .trim_start_matches("--height=")
+                    .parse()
+                    .map_err(|_| {
+                        "validate-3d failed: --height expects an integer".to_string()
+                    })?;
+            }
+            _ if argument.starts_with("--report=") => {
+                report = Some(PathBuf::from(argument.trim_start_matches("--report=")));
+            }
+            _ if argument.starts_with("--diff=") => {
+                diff = Some(PathBuf::from(argument.trim_start_matches("--diff=")));
+            }
+            _ if argument.starts_with("--timeout-ms=") => {
+                let milliseconds = argument
+                    .trim_start_matches("--timeout-ms=")
+                    .parse::<u64>()
+                    .map_err(|_| {
+                        "validate-3d failed: --timeout-ms expects an integer".to_string()
+                    })?;
+                timeout = Duration::from_millis(milliseconds);
+            }
+            _ if argument.starts_with('-') => {
+                return Err(format!(
+                    "validate-3d failed: unrecognized option: {argument}"
+                ));
+            }
+            _ if project_arg.is_none() => project_arg = Some(argument),
+            _ => {
+                return Err(
+                    "validate-3d failed: expected at most one project directory".to_string(),
+                );
+            }
+        }
+        index += 1;
+    }
+    if !matches!(backend, "auto" | "software" | "vulkan") {
+        return Err(
+            "validate-3d failed: --backend expects auto, software, or vulkan".to_string(),
+        );
+    }
+    if !(64..=8192).contains(&width) || !(64..=8192).contains(&height) {
+        return Err(
+            "validate-3d failed: width and height must each be between 64 and 8192".to_string(),
+        );
+    }
+    if timeout < Duration::from_millis(100) || timeout > Duration::from_secs(300) {
+        return Err(
+            "validate-3d failed: --timeout-ms must be between 100 and 300000".to_string(),
+        );
+    }
+    let baseline = baseline.ok_or_else(|| {
+        "validate-3d failed: --baseline PATH is required (add --write-baseline to create it)"
+            .to_string()
+    })?;
+    Ok(Validate3dOptions {
+        project_arg,
+        baseline,
+        backend,
+        width,
+        height,
+        write_baseline,
+        report,
+        diff,
+        timeout,
+    })
+}
+
+#[cfg(not(neolove_packaged))]
+fn visual_baseline_metadata_path(baseline: &Path) -> PathBuf {
+    let stem = baseline
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or("baseline");
+    baseline.with_file_name(format!("{stem}-baseline.json"))
+}
+
+#[cfg(not(neolove_packaged))]
+fn visual_validation_artifact_path(baseline: &Path, suffix: &str) -> PathBuf {
+    let stem = baseline
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or("baseline");
+    baseline.with_file_name(format!("{stem}-{suffix}"))
+}
+
+#[cfg(not(neolove_packaged))]
+fn stop_validation_child(
+    command_tx: &std::sync::mpsc::Sender<editor_ipc::IpcCommand>,
+    child: &mut std::process::Child,
+) -> Result<std::process::ExitStatus, String> {
+    let _ = command_tx.send(editor_ipc::IpcCommand::Stop);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("query validation runtime: {error}"))?
+        {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            child
+                .kill()
+                .map_err(|error| format!("terminate validation runtime: {error}"))?;
+            return child
+                .wait()
+                .map_err(|error| format!("wait for terminated validation runtime: {error}"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(neolove_packaged))]
+fn capture_validation_frame(
+    executable: &Path,
+    project_root: &Path,
+    options: &Validate3dOptions<'_>,
+) -> Result<editor_ipc::RuntimeFrame, String> {
+    let session = editor_ipc::LoggerSession::start()
+        .map_err(|error| format!("start validation IPC listener: {error}"))?;
+    let command_tx = session.command_sender();
+    let mut child = std::process::Command::new(executable)
+        .arg("run")
+        .arg(project_root)
+        .env("NEOLOVE_EDITOR_IPC", &session.addr)
+        .env("NEOLOVE_EDITOR_EMBEDDED", "1")
+        .env("NEOLOVE_EDITOR_EMBEDDED_BACKEND", options.backend)
+        .env("NEOLOVE_EDITOR_EMBEDDED_WIDTH", options.width.to_string())
+        .env("NEOLOVE_EDITOR_EMBEDDED_HEIGHT", options.height.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("launch validation runtime: {error}"))?;
+    let deadline = Instant::now() + options.timeout;
+    let frame = loop {
+        if let Ok(state) = session.state.lock() {
+            if let Some(frame) = state.latest_frame.clone() {
+                break frame;
+            }
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("query validation runtime: {error}"))?
+        {
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            return Err(format!(
+                "validation runtime exited before producing a frame ({status}){}",
+                if stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", stderr.trim())
+                }
+            ));
+        }
+        if Instant::now() >= deadline {
+            let _ = stop_validation_child(&command_tx, &mut child);
+            return Err(format!(
+                "validation runtime did not produce a frame within {} ms",
+                options.timeout.as_millis()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let logs = session
+        .state
+        .lock()
+        .map(|state| state.logs.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let status = stop_validation_child(&command_tx, &mut child)?;
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    if !status.success() {
+        return Err(format!(
+            "validation runtime exited with {status}{}",
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            }
+        ));
+    }
+    if let Some(error) = logs.iter().find(|line| line.level == "error") {
+        return Err(format!("validation runtime error: {}", error.message));
+    }
+    for warning in logs.iter().filter(|line| line.level == "warning") {
+        eprintln!("validation runtime warning: {}", warning.message);
+    }
+    Ok(frame)
+}
+
+#[cfg(not(neolove_packaged))]
+fn write_parent(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("path has no parent: {}", path.display()))?;
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("create directory {}: {error}", parent.display()))
+}
+
+#[cfg(not(neolove_packaged))]
+fn validate_3d_project(
+    executable: &Path,
+    project_root: &Path,
+    options: &Validate3dOptions<'_>,
+) -> Result<(), String> {
+    let frame = capture_validation_frame(executable, project_root, options)?;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(&frame.png_base64)
+        .map_err(|error| format!("decode validation frame: {error}"))?;
+    let current = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+        .map_err(|error| format!("decode validation PNG: {error}"))?
+        .into_rgba8();
+    let baseline_path = if options.baseline.is_absolute() {
+        options.baseline.clone()
+    } else {
+        env::current_dir()
+            .map_err(|error| format!("resolve baseline path: {error}"))?
+            .join(&options.baseline)
+    };
+    let metadata_path = visual_baseline_metadata_path(&baseline_path);
+    if options.write_baseline {
+        write_parent(&baseline_path)?;
+        current
+            .save_with_format(&baseline_path, image::ImageFormat::Png)
+            .map_err(|error| format!("save baseline {}: {error}", baseline_path.display()))?;
+        let metadata = editor::visual_regression3d::VisualBaselineMetadata::new(
+            frame.backend.clone(),
+            current.width(),
+            current.height(),
+        );
+        let json = serde_json::to_string_pretty(&metadata)
+            .map_err(|error| format!("serialize baseline metadata: {error}"))?;
+        fs::write(&metadata_path, json).map_err(|error| {
+            format!(
+                "save baseline metadata {}: {error}",
+                metadata_path.display()
+            )
+        })?;
+        println!(
+            "Wrote 3D visual baseline {} ({} · {}x{})",
+            baseline_path.display(),
+            frame.backend,
+            current.width(),
+            current.height()
+        );
+        return Ok(());
+    }
+    let baseline = image::open(&baseline_path)
+        .map_err(|error| format!("open baseline {}: {error}", baseline_path.display()))?
+        .into_rgba8();
+    let metadata = fs::read_to_string(&metadata_path)
+        .ok()
+        .and_then(|json| {
+            serde_json::from_str::<editor::visual_regression3d::VisualBaselineMetadata>(&json).ok()
+        })
+        .filter(|metadata| metadata.matches(baseline.width(), baseline.height()));
+    let baseline_backend = metadata
+        .as_ref()
+        .map(|metadata| metadata.backend.as_str())
+        .unwrap_or("");
+    if baseline_backend.is_empty() {
+        eprintln!(
+            "validation warning: no valid backend metadata at {}; using the strict same-backend profile",
+            metadata_path.display()
+        );
+    }
+    let (tolerance, profile) = editor::visual_regression3d::comparison_tolerance(
+        baseline_backend,
+        &frame.backend,
+    );
+    let (mut report, diff_image) =
+        editor::visual_regression3d::compare(&baseline, &current, tolerance);
+    report.comparison_profile = profile.to_string();
+    report.baseline_backend = baseline_backend.to_string();
+    report.current_backend = frame.backend.clone();
+    let report_path = options.report.clone().unwrap_or_else(|| {
+        visual_validation_artifact_path(&baseline_path, "latest-report.json")
+    });
+    let diff_path = options
+        .diff
+        .clone()
+        .unwrap_or_else(|| visual_validation_artifact_path(&baseline_path, "latest-diff.png"));
+    write_parent(&report_path)?;
+    let report_json = serde_json::to_string_pretty(&report)
+        .map_err(|error| format!("serialize validation report: {error}"))?;
+    fs::write(&report_path, &report_json)
+        .map_err(|error| format!("write report {}: {error}", report_path.display()))?;
+    println!("{report_json}");
+    println!("Report: {}", report_path.display());
+    if !report.passed {
+        write_parent(&diff_path)?;
+        diff_image
+            .save_with_format(&diff_path, image::ImageFormat::Png)
+            .map_err(|error| format!("write diff {}: {error}", diff_path.display()))?;
+        println!("Diff: {}", diff_path.display());
+        return Err(format!("3D visual regression failed: {}", report.summary()));
+    }
+    Ok(())
+}
+
 fn run_cli() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
 
     let current_exe = env::current_exe()
         .map_err(|error| format!("failed to resolve executable path: {error}"))?;
 
-    let embedded_payload = read_embedded_payload(&current_exe)
+    let payload_executable = env::var_os("NEOLOVE_LAUNCHER_PATH")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| current_exe.clone());
+    let embedded_payload = read_embedded_payload(&payload_executable)
         .map_err(|error| format!("failed to read embedded payload: {error}"))?;
 
     if let Some(payload) = embedded_payload {
@@ -4467,6 +5331,13 @@ fn run_cli() -> Result<(), String> {
                     .map_err(|error| format!("run failed: {error}"))?;
                 run_project_window(project_root, None)
                     .map_err(|error| format!("run failed: {error}"))?;
+            }
+            "validate-3d" => {
+                let options = parse_validate_3d_options(&args[2..])?;
+                let project_root = resolve_target_project_root(options.project_arg)?;
+                validate_project_root(&project_root)
+                    .map_err(|error| format!("validate-3d failed: {error}"))?;
+                validate_3d_project(&current_exe, &project_root, &options)?;
             }
             "editor" => {
                 if args.len() > 3 {
@@ -4700,6 +5571,42 @@ mod build_compression_tests {
     }
 
     #[test]
+    fn desktop_payload_excludes_editor_only_project_files() {
+        for path in [
+            ".git/config",
+            ".vscode/settings.json",
+            ".idea/workspace.xml",
+            ".neolove/recovery/scene.json",
+            "target/debug/game",
+            "dist/game",
+            ".gitignore",
+            ".luaurc",
+            "types/neolove_engine_api.d.luau",
+        ] {
+            assert!(should_skip_in_build(Path::new(path)), "{path}");
+        }
+        for path in [
+            "main.luau",
+            "neolove.toml",
+            "scenes/level.neoscene",
+            "assets/sprite.png",
+        ] {
+            assert!(!should_skip_in_build(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn packaged_runtime_caches_are_separate_by_project_kind() {
+        let target = DesktopPackageTarget::Host;
+        assert_ne!(
+            target.target_dir_name(ProjectKind::TwoD),
+            target.target_dir_name(ProjectKind::ThreeD)
+        );
+        assert!(target.target_dir_name(ProjectKind::TwoD).ends_with("-2d"));
+        assert!(target.target_dir_name(ProjectKind::ThreeD).ends_with("-3d"));
+    }
+
+    #[test]
     fn new_command_project_kind_options_are_backward_compatible() {
         let args = ["my-game".to_string()];
         assert_eq!(
@@ -4734,6 +5641,45 @@ mod build_compression_tests {
         let args = ["--unknown".to_string(), "my-game".to_string()];
         assert!(parse_new_options(&args).is_err());
         assert!(parse_new_options(&[]).is_err());
+    }
+
+    #[test]
+    fn validate_3d_cli_options_are_bounded_and_ci_friendly() {
+        let args = [
+            "sample".to_string(),
+            "--baseline".to_string(),
+            "artifacts/reference.png".to_string(),
+            "--backend=vulkan".to_string(),
+            "--width".to_string(),
+            "320".to_string(),
+            "--height=180".to_string(),
+            "--timeout-ms=12000".to_string(),
+            "--report=artifacts/report.json".to_string(),
+            "--diff".to_string(),
+            "artifacts/diff.png".to_string(),
+        ];
+        let parsed = parse_validate_3d_options(&args).expect("validation options");
+        assert_eq!(parsed.project_arg, Some("sample"));
+        assert_eq!(parsed.baseline, PathBuf::from("artifacts/reference.png"));
+        assert_eq!(parsed.backend, "vulkan");
+        assert_eq!((parsed.width, parsed.height), (320, 180));
+        assert_eq!(parsed.timeout, Duration::from_secs(12));
+        assert_eq!(parsed.report, Some(PathBuf::from("artifacts/report.json")));
+        assert_eq!(parsed.diff, Some(PathBuf::from("artifacts/diff.png")));
+        assert_eq!(
+            visual_baseline_metadata_path(Path::new("artifacts/reference.png")),
+            PathBuf::from("artifacts/reference-baseline.json")
+        );
+
+        assert!(parse_validate_3d_options(&["--backend=metal".into()]).is_err());
+        assert!(
+            parse_validate_3d_options(&[
+                "--baseline=base.png".into(),
+                "--width=32".into()
+            ])
+            .is_err()
+        );
+        assert!(parse_validate_3d_options(&[]).is_err());
     }
 
     #[test]
@@ -4789,5 +5735,61 @@ mod build_compression_tests {
             data
         );
         let _ = std::fs::remove_dir_all(output);
+    }
+
+    #[test]
+    fn embedded_input_snapshots_preserve_runtime_pressed_held_and_released_edges() {
+        let platform = crate::platform::new_shared_platform_state();
+        apply_editor_runtime_input(
+            &platform,
+            editor_ipc::RuntimeInputSnapshot {
+                mouse_x: 120.0,
+                mouse_y: 45.0,
+                mouse_buttons: vec!["left".into()],
+                keys: vec!["w".into(), "leftshift".into()],
+                wheel_x: -1.0,
+                wheel_y: 2.0,
+                text: "é".into(),
+            },
+        );
+        {
+            let state = crate::platform::lock_platform_state(&platform);
+            assert_eq!((state.mouse().x, state.mouse().y), (120.0, 45.0));
+            assert!(state.input().keys_down.contains("w"));
+            assert!(state.input().keys_pressed.contains("w"));
+            assert!(state.input().mouse_down.contains("left"));
+            assert!(state.input().mouse_pressed.contains("left"));
+            assert_eq!((state.input().wheel_x, state.input().wheel_y), (-1.0, 2.0));
+            assert_eq!(state.input().char_pressed.as_deref(), Some("é"));
+        }
+        crate::platform::lock_platform_state(&platform).begin_frame();
+        apply_editor_runtime_input(
+            &platform,
+            editor_ipc::RuntimeInputSnapshot {
+                mouse_x: 125.0,
+                mouse_y: 40.0,
+                ..Default::default()
+            },
+        );
+        let state = crate::platform::lock_platform_state(&platform);
+        assert!(state.input().keys_down.is_empty());
+        assert!(state.input().keys_released.contains("w"));
+        assert!(state.input().mouse_down.is_empty());
+        assert!(state.input().mouse_released.contains("left"));
+        assert_eq!((state.mouse().delta_x, state.mouse().delta_y), (5.0, -5.0));
+    }
+
+    #[test]
+    fn runtime_error_logs_extract_entity_component_and_script_links() {
+        let diagnostic = runtime_error_log(
+            "rendering failed [entity_id=27 component_index=3 component=MeshRenderer3D]: @scripts/spinner.luau:42: bad material"
+                .to_string(),
+        );
+        assert_eq!(diagnostic.level, "error");
+        assert_eq!(diagnostic.entity_id, Some(27));
+        assert_eq!(diagnostic.component_index, Some(3));
+        assert_eq!(diagnostic.component.as_deref(), Some("MeshRenderer3D"));
+        assert_eq!(diagnostic.script.as_deref(), Some("scripts/spinner.luau"));
+        assert_eq!(diagnostic.line, Some(42));
     }
 }

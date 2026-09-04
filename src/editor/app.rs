@@ -8,15 +8,20 @@
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::BufReader;
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rodio::Source;
 use serde::{Deserialize, Serialize};
+use base64::Engine as _;
 
+use crate::assets::{
+    AssetManager, Material3DFile, MaterialTextureFile, PhysicsMaterial3DFile,
+};
+use crate::mesh::{PrimitiveOptions, primitive_mesh};
 use crate::platform::Color;
 use crate::post_process::{
     BloomConfig, BrightnessContrastSaturationConfig, ChromaticAberrationConfig,
@@ -26,7 +31,7 @@ use crate::post_process::{
 };
 use crate::render3d::{
     Camera3D as RenderCamera3D, Light3D as RenderLight3D, LightKind3D, Mat4, Mesh3DCommand,
-    Projection3D, Vec3, project_mesh,
+    ProjectedTriangle, Projection3D, Vec3, project_mesh,
 };
 use crate::renderer::{
     self, FontHandle, Rect as RenderRect, TextAlignX, TextAlignY, TextAntialiasing,
@@ -41,7 +46,11 @@ use crate::scene::{
 use crate::update::AvailableUpdate;
 
 use super::inspector::{parse_inspector_variables, script_registers_component_picker};
+use super::parity3d::{ParityMismatch, ParityReport};
 use super::ui::{Painter, Rect, Rgba, Theme, Ui, icon};
+use super::visual_regression3d::{
+    VisualBaselineMetadata, VisualDiffReport, comparison_tolerance,
+};
 
 const TOOLBAR_H: f32 = 40.0;
 const STATUS_H: f32 = 24.0;
@@ -57,6 +66,11 @@ const PREVIEW_ROOT_WIDTH: f32 = 1280.0;
 const PREVIEW_ROOT_HEIGHT: f32 = 720.0;
 const WAVEFORM_PREVIEW_BUCKETS: usize = 192;
 const VIEWPORT_MESH_CACHE_LIMIT: usize = 64;
+/// Dirty 3D documents are snapshotted outside the authored scene file. Keeping
+/// the cadence fixed and editor-owned makes recovery dependable without
+/// changing any 2D project setting or serialization.
+const RECOVERY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
+const RECOVERY_SNAPSHOT_VERSION: u32 = 1;
 /// Enough samples for smooth projected rotation rings without making editor
 /// chrome expensive in scenes that redraw continuously.
 const ROTATION_RING_SAMPLES: usize = 32;
@@ -301,10 +315,456 @@ pub enum ViewTool {
     Transform,
 }
 
+/// Orientation used by the 3D move gizmo. This is editor-only state: it
+/// changes how authored transforms are manipulated, never how they are loaded
+/// or evaluated by the runtime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransformOrientation3D {
+    #[default]
+    Local,
+    World,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrthographicView3D {
+    Top,
+    Front,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewportDiagnostic3D {
+    Wireframe,
+    Normals,
+    Tangents,
+    UvSeams,
+    MeshBounds,
+    Pivots,
+    SceneAxes,
+    Colliders,
+    RigidBodies,
+    Triggers,
+    Raycasts,
+    CameraFrustums,
+    LightRanges,
+    SpotCones,
+    ShadowFrustums,
+    ReflectionProbes,
+    ParticleBounds,
+    LodState,
+    RenderLayers,
+    EntityVisibility,
+    Statistics,
+}
+
+impl ViewportDiagnostic3D {
+    const ALL: [Self; 21] = [
+        Self::Wireframe,
+        Self::Normals,
+        Self::Tangents,
+        Self::UvSeams,
+        Self::MeshBounds,
+        Self::Pivots,
+        Self::SceneAxes,
+        Self::Colliders,
+        Self::RigidBodies,
+        Self::Triggers,
+        Self::Raycasts,
+        Self::CameraFrustums,
+        Self::LightRanges,
+        Self::SpotCones,
+        Self::ShadowFrustums,
+        Self::ReflectionProbes,
+        Self::ParticleBounds,
+        Self::LodState,
+        Self::RenderLayers,
+        Self::EntityVisibility,
+        Self::Statistics,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Wireframe => "Wireframe Overlay",
+            Self::Normals => "Surface Normals",
+            Self::Tangents => "Surface Tangents",
+            Self::UvSeams => "UV Seams",
+            Self::MeshBounds => "Mesh Bounds",
+            Self::Pivots => "Entity Pivots",
+            Self::SceneAxes => "World Origin / Axes",
+            Self::Colliders => "Collider Shapes",
+            Self::RigidBodies => "Rigid Bodies",
+            Self::Triggers => "Triggers",
+            Self::Raycasts => "Raycasts",
+            Self::CameraFrustums => "Camera Frustums",
+            Self::LightRanges => "Light Ranges",
+            Self::SpotCones => "Spot Cones",
+            Self::ShadowFrustums => "Shadow Frustums",
+            Self::ReflectionProbes => "Reflection Probe Volumes",
+            Self::ParticleBounds => "Particle Bounds",
+            Self::LodState => "LOD State",
+            Self::RenderLayers => "Render Layers",
+            Self::EntityVisibility => "Entity Visibility",
+            Self::Statistics => "Viewport Statistics",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CameraBookmark3D {
+    pub position: [f32; 3],
+    pub euler: [f32; 3],
+    pub orthographic: bool,
+    pub fov: f32,
+    pub orthographic_size: f32,
+}
+
+impl Default for CameraBookmark3D {
+    fn default() -> Self {
+        Self {
+            position: [4.5, 3.5, 8.0],
+            euler: [-18.0, 28.0, 0.0],
+            orthographic: false,
+            fov: 60.0,
+            orthographic_size: 10.0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DocumentKind {
     Scene,
     Prefab,
+}
+
+impl DocumentKind {
+    fn recovery_label(self) -> &'static str {
+        match self {
+            Self::Scene => "scene",
+            Self::Prefab => "prefab",
+        }
+    }
+}
+
+/// Crash-recovery data deliberately stores the scene's public JSON rather
+/// than serializing `Scene` directly. Loading through `Scene::from_json`
+/// restores skipped runtime fields such as the next entity id and applies the
+/// same component normalization as a normal scene load.
+#[derive(Debug, Serialize, Deserialize)]
+struct RecoverySnapshot {
+    version: u32,
+    source: String,
+    document_kind: String,
+    created_unix_nanos: u64,
+    source_modified_unix_nanos: Option<u64>,
+    source_content_hash: Option<u64>,
+    scene_json: String,
+}
+
+fn recovery_source_key(project_root: &Path, source_path: &Path) -> String {
+    source_path
+        .strip_prefix(project_root)
+        .unwrap_or(source_path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn stable_bytes_hash(bytes: &[u8]) -> u64 {
+    // Stable FNV-1a: unlike DefaultHasher this remains stable across editor
+    // versions, so an upgrade can still locate a previous crash snapshot.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn recovery_source_hash(source: &str) -> u64 {
+    stable_bytes_hash(source.as_bytes())
+}
+
+fn recovery_snapshot_path(project_root: &Path, source_path: &Path) -> PathBuf {
+    let source = recovery_source_key(project_root, source_path);
+    project_root
+        .join(".neolove")
+        .join("recovery")
+        .join(format!("{:016x}.neorecovery", recovery_source_hash(&source)))
+}
+
+fn recovery_backup_path(path: &Path) -> PathBuf {
+    path.with_extension("neorecovery.bak")
+}
+
+fn modified_unix_nanos(path: &Path) -> Result<Option<u64>, String> {
+    let modified = match std::fs::metadata(path) {
+        Ok(metadata) => metadata
+            .modified()
+            .map_err(|error| format!("failed to read {} timestamp: {error}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to inspect {}: {error}", path.display())),
+    };
+    let nanos = modified
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("invalid {} timestamp: {error}", path.display()))?
+        .as_nanos();
+    Ok(Some(nanos.min(u128::from(u64::MAX)) as u64))
+}
+
+fn file_content_hash(path: &Path) -> Result<Option<u64>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(stable_bytes_hash(&bytes))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("failed to fingerprint {}: {error}", path.display())),
+    }
+}
+
+fn now_unix_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
+}
+
+fn write_recovery_snapshot(
+    project_root: &Path,
+    source_path: &Path,
+    kind: DocumentKind,
+    scene: &Scene,
+) -> Result<PathBuf, String> {
+    if scene.kind != SceneKind::ThreeD {
+        return Err("recovery snapshots are only available for 3D documents".to_string());
+    }
+
+    let source = recovery_source_key(project_root, source_path);
+    let target = recovery_snapshot_path(project_root, source_path);
+    let backup = recovery_backup_path(&target);
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("{} has no recovery directory", target.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+
+    // A hash collision must never replace another document's recovery data.
+    // Corrupt data with the same hash is allowed to be superseded because it
+    // cannot be recovered in any case.
+    for existing in [&target, &backup] {
+        let Ok(bytes) = std::fs::read(existing) else {
+            continue;
+        };
+        if let Ok(snapshot) = serde_json::from_slice::<RecoverySnapshot>(&bytes)
+            && snapshot.source != source
+        {
+            return Err(format!(
+                "recovery hash collision between '{}' and '{}'",
+                source, snapshot.source
+            ));
+        }
+    }
+
+    let snapshot = RecoverySnapshot {
+        version: RECOVERY_SNAPSHOT_VERSION,
+        source,
+        document_kind: kind.recovery_label().to_string(),
+        created_unix_nanos: now_unix_nanos(),
+        source_modified_unix_nanos: modified_unix_nanos(source_path)?,
+        source_content_hash: file_content_hash(source_path)?,
+        scene_json: scene.to_json()?,
+    };
+    let bytes = serde_json::to_vec_pretty(&snapshot)
+        .map_err(|error| format!("failed to serialize recovery snapshot: {error}"))?;
+
+    let mut temp = None;
+    let mut temp_file = None;
+    for attempt in 0..8_u8 {
+        let candidate = parent.join(format!(
+            ".{:016x}.{}.{}.tmp",
+            recovery_source_hash(&snapshot.source),
+            std::process::id(),
+            snapshot.created_unix_nanos.wrapping_add(u64::from(attempt))
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temp = Some(candidate);
+                temp_file = Some(file);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!("failed to create {}: {error}", candidate.display()));
+            }
+        }
+    }
+    let temp = temp.ok_or_else(|| "failed to allocate a recovery temp file".to_string())?;
+    let mut temp_file = temp_file.expect("a recovery temp path always has an open file");
+    if let Err(error) = temp_file
+        .write_all(&bytes)
+        .and_then(|_| temp_file.flush())
+        .and_then(|_| temp_file.sync_all())
+    {
+        drop(temp_file);
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("failed to write {}: {error}", temp.display()));
+    }
+    drop(temp_file);
+
+    if target.exists() {
+        match std::fs::remove_file(&backup) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let _ = std::fs::remove_file(&temp);
+                return Err(format!("failed to rotate {}: {error}", backup.display()));
+            }
+        }
+        if let Err(error) = std::fs::rename(&target, &backup) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!("failed to rotate {}: {error}", target.display()));
+        }
+    }
+
+    if let Err(error) = std::fs::rename(&temp, &target) {
+        if !target.exists() && backup.exists() {
+            let _ = std::fs::rename(&backup, &target);
+        }
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("failed to install {}: {error}", target.display()));
+    }
+    // Syncing directories is supported on Unix and harmlessly best-effort on
+    // platforms that reject directory handles. The backup remains valid until
+    // the new directory entry has been flushed.
+    let _ = File::open(parent).and_then(|directory| directory.sync_all());
+    match std::fs::remove_file(&backup) {
+        Ok(()) => {
+            let _ = File::open(parent).and_then(|directory| directory.sync_all());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!(
+            "warning: failed to remove old recovery backup {}: {error}",
+            backup.display()
+        ),
+    }
+    Ok(target)
+}
+
+fn load_recovery_snapshot(
+    project_root: &Path,
+    source_path: &Path,
+    kind: DocumentKind,
+    require_current_source: bool,
+) -> Result<Option<Scene>, String> {
+    let source = recovery_source_key(project_root, source_path);
+    let target = recovery_snapshot_path(project_root, source_path);
+    let backup = recovery_backup_path(&target);
+    let current_content_hash = file_content_hash(source_path)?;
+    let mut errors = Vec::new();
+
+    for candidate in [&target, &backup] {
+        let bytes = match std::fs::read(candidate) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                errors.push(format!("failed to read {}: {error}", candidate.display()));
+                continue;
+            }
+        };
+        let snapshot = match serde_json::from_slice::<RecoverySnapshot>(&bytes) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                errors.push(format!("failed to parse {}: {error}", candidate.display()));
+                continue;
+            }
+        };
+        if snapshot.version != RECOVERY_SNAPSHOT_VERSION {
+            errors.push(format!(
+                "{} uses unsupported recovery version {}",
+                candidate.display(),
+                snapshot.version
+            ));
+            continue;
+        }
+        if snapshot.source != source || snapshot.document_kind != kind.recovery_label() {
+            errors.push(format!(
+                "{} belongs to a different document",
+                candidate.display()
+            ));
+            continue;
+        }
+        if require_current_source && snapshot.source_content_hash != current_content_hash {
+            // The authored file was saved or externally replaced after this
+            // snapshot. Silently ignore stale recovery rather than offering
+            // to overwrite newer work.
+            continue;
+        }
+        let scene = match Scene::from_json(&snapshot.scene_json) {
+            Ok(scene) => scene,
+            Err(error) => {
+                errors.push(format!("{} contains an invalid scene: {error}", candidate.display()));
+                continue;
+            }
+        };
+        if scene.kind != SceneKind::ThreeD {
+            errors.push(format!(
+                "{} is not a 3D document recovery snapshot",
+                candidate.display()
+            ));
+            continue;
+        }
+        return Ok(Some(scene));
+    }
+
+    if errors.is_empty() {
+        Ok(None)
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn remove_recovery_snapshot(project_root: &Path, source_path: &Path) -> Result<(), String> {
+    let target = recovery_snapshot_path(project_root, source_path);
+    let backup = recovery_backup_path(&target);
+    let mut errors = Vec::new();
+    for path in [&target, &backup] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => errors.push(format!("failed to remove {}: {error}", path.display())),
+        }
+    }
+
+    // Clean interrupted temp writes for this exact stable hash as well.
+    if let Some(parent) = target.parent()
+        && let Ok(entries) = std::fs::read_dir(parent)
+    {
+        let prefix = format!(
+            ".{:016x}.",
+            recovery_source_hash(&recovery_source_key(project_root, source_path))
+        );
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix)
+                && name.ends_with(".tmp")
+                && let Err(error) = std::fs::remove_file(entry.path())
+            {
+                errors.push(format!(
+                    "failed to remove {}: {error}",
+                    entry.path().display()
+                ));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -327,6 +787,11 @@ pub struct Layout {
     pub right_split: f32,
     pub snap: bool,
     pub grid: f32,
+    /// 3D snapping is expressed in world units and intentionally remains
+    /// independent from the legacy 2D pixel grid.
+    pub grid_3d: f32,
+    /// Angular increment used by the 3D rotation gizmo while snapping is on.
+    pub rotation_snap_3d: f32,
     pub show_grid: bool,
     pub bin_h: f32,
     /// Use the HSV square/hue-strip color picker instead of plain RGBA sliders.
@@ -343,6 +808,38 @@ pub struct Layout {
     pub undock_project: bool,
     /// Active Scene view transform tool.
     pub view_tool: ViewTool,
+    /// Local/world orientation for 3D placement handles.
+    pub transform_orientation_3d: TransformOrientation3D,
+    /// Snap 3D placement pivots to transformed mesh surfaces under the cursor.
+    pub surface_snap_3d: bool,
+    /// Refine surface snapping to the nearest visible mesh vertex.
+    pub vertex_snap_3d: bool,
+    /// Rotate placed objects so their local +Y axis follows the hit normal.
+    pub align_surface_normal_3d: bool,
+    pub viewport_orthographic_3d: bool,
+    pub viewport_orthographic_size_3d: f32,
+    pub camera_bookmarks_3d: Vec<Option<CameraBookmark3D>>,
+    pub show_wireframe_3d: bool,
+    pub show_normals_3d: bool,
+    pub show_tangents_3d: bool,
+    pub show_uv_seams_3d: bool,
+    pub show_mesh_bounds_3d: bool,
+    pub show_pivots_3d: bool,
+    pub show_scene_axes_3d: bool,
+    pub show_colliders_3d: bool,
+    pub show_rigid_bodies_3d: bool,
+    pub show_triggers_3d: bool,
+    pub show_raycasts_3d: bool,
+    pub show_camera_frustums_3d: bool,
+    pub show_light_ranges_3d: bool,
+    pub show_spot_cones_3d: bool,
+    pub show_shadow_frustums_3d: bool,
+    pub show_reflection_probes_3d: bool,
+    pub show_particle_bounds_3d: bool,
+    pub show_lod_state_3d: bool,
+    pub show_render_layers_3d: bool,
+    pub show_entity_visibility_3d: bool,
+    pub show_statistics_3d: bool,
 }
 
 impl Default for Layout {
@@ -356,6 +853,8 @@ impl Default for Layout {
             right_split: 0.5,
             snap: true,
             grid: 32.0,
+            grid_3d: 1.0,
+            rotation_snap_3d: 15.0,
             show_grid: true,
             bin_h: 170.0,
             hsv_picker: true,
@@ -366,6 +865,34 @@ impl Default for Layout {
             undock_inspector: false,
             undock_project: false,
             view_tool: ViewTool::Move,
+            transform_orientation_3d: TransformOrientation3D::Local,
+            surface_snap_3d: false,
+            vertex_snap_3d: false,
+            align_surface_normal_3d: false,
+            viewport_orthographic_3d: false,
+            viewport_orthographic_size_3d: 10.0,
+            camera_bookmarks_3d: vec![None; 4],
+            show_wireframe_3d: false,
+            show_normals_3d: false,
+            show_tangents_3d: false,
+            show_uv_seams_3d: false,
+            show_mesh_bounds_3d: false,
+            show_pivots_3d: true,
+            show_scene_axes_3d: false,
+            show_colliders_3d: true,
+            show_rigid_bodies_3d: false,
+            show_triggers_3d: false,
+            show_raycasts_3d: false,
+            show_camera_frustums_3d: true,
+            show_light_ranges_3d: true,
+            show_spot_cones_3d: false,
+            show_shadow_frustums_3d: false,
+            show_reflection_probes_3d: true,
+            show_particle_bounds_3d: false,
+            show_lod_state_3d: false,
+            show_render_layers_3d: false,
+            show_entity_visibility_3d: false,
+            show_statistics_3d: false,
         }
     }
 }
@@ -427,8 +954,13 @@ pub struct EditorSettings {
     pub viewport_camera_speed: f32,
     /// Perspective field of view, in vertical degrees, for 3D scene views.
     pub viewport_camera_fov: f32,
-    /// Reverse vertical RMB mouse-look without changing horizontal yaw.
+    /// Reverse horizontal orbit/RMB mouse-look without changing pitch.
+    pub viewport_invert_mouse_x: bool,
+    /// Reverse vertical orbit/RMB mouse-look without changing yaw.
     pub viewport_invert_mouse_look: bool,
+    /// Allow WASD/QE fly translation while the 3D viewport is hovered instead
+    /// of requiring the right mouse button to be held.
+    pub viewport_fly_without_mouse_hold: bool,
     pub mobile_emulator: bool,
     pub mobile_orientation: String,
     pub mobile_wifi: bool,
@@ -450,7 +982,9 @@ impl Default for EditorSettings {
             viewport_camera_sensitivity: 1.0,
             viewport_camera_speed: 10.0,
             viewport_camera_fov: 60.0,
+            viewport_invert_mouse_x: false,
             viewport_invert_mouse_look: false,
+            viewport_fly_without_mouse_hold: true,
             mobile_emulator: false,
             mobile_orientation: "portrait".to_string(),
             mobile_wifi: true,
@@ -531,6 +1065,11 @@ enum Action {
     LoadScene,
     ExportScene,
     RunScene,
+    RunSceneFromSelectedCamera,
+    PauseResumeRun,
+    StepRun,
+    RestartRun,
+    StopRun,
     AddComponent(u64, String),
     /// Add a user-authored behaviour script component by project-relative path.
     AddScriptComponent(u64, String),
@@ -551,10 +1090,14 @@ enum Action {
     NewScript,
     NewShader,
     NewAnimation,
+    NewMaterial,
+    NewPhysicsMaterial,
     RevealInExplorer,
     OpenProjectInVscode,
     OpenPath(PathBuf),
     OpenAnimation(PathBuf),
+    OpenMaterial(PathBuf),
+    OpenPhysicsMaterial(PathBuf),
     OpenScene(PathBuf),
     EnterFolder(PathBuf),
     OpenSelectionTools(f32, f32),
@@ -636,6 +1179,14 @@ enum Action {
     Zoom100,
     ToggleMaximize,
     ToggleProject,
+    ToggleSurfaceSnap3D,
+    ToggleVertexSnap3D,
+    ToggleAlignSurfaceNormal3D,
+    ToggleProjection3D,
+    SetOrthographicView3D(OrthographicView3D),
+    StoreCameraBookmark3D(usize),
+    RecallCameraBookmark3D(usize),
+    ToggleViewportDiagnostic3D(ViewportDiagnostic3D),
 }
 
 #[derive(Clone, Debug)]
@@ -781,6 +1332,10 @@ struct Viewport3DTransformStart {
     position: Vec3,
     rotation: Vec3,
     scale: Vec3,
+    /// One authored-local position delta for each active world-space gizmo
+    /// basis direction. Capturing this at press time keeps multi-selection
+    /// stable when objects have differently transformed parents.
+    move_basis: [Vec3; 3],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -788,8 +1343,10 @@ enum Viewport3DDragMode {
     /// Free movement on the entity parent's local XY plane. The two projected
     /// derivatives map screen deltas back to authored local coordinates.
     MovePlane {
-        screen_x_axis: (f32, f32),
-        screen_y_axis: (f32, f32),
+        first_axis: usize,
+        second_axis: usize,
+        screen_first_axis: (f32, f32),
+        screen_second_axis: (f32, f32),
     },
     /// Movement along one authored position axis. `screen_axis` is the
     /// projected displacement caused by adding exactly one local unit.
@@ -836,6 +1393,39 @@ struct Viewport3DGizmoAxis {
     end: (f32, f32),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Viewport3DPlane {
+    Xy,
+    Xz,
+    Yz,
+}
+
+impl Viewport3DPlane {
+    const ALL: [Self; 3] = [Self::Xy, Self::Xz, Self::Yz];
+
+    fn axes(self) -> (Viewport3DAxis, Viewport3DAxis) {
+        match self {
+            Self::Xy => (Viewport3DAxis::X, Viewport3DAxis::Y),
+            Self::Xz => (Viewport3DAxis::X, Viewport3DAxis::Z),
+            Self::Yz => (Viewport3DAxis::Y, Viewport3DAxis::Z),
+        }
+    }
+
+    fn color(self) -> Rgba {
+        match self {
+            Self::Xy => [236, 206, 54, 120],
+            Self::Xz => [208, 76, 210, 120],
+            Self::Yz => [48, 196, 205, 120],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Viewport3DGizmoPlane {
+    plane: Viewport3DPlane,
+    points: [(f32, f32); 4],
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Viewport3DRotationRing {
     axis: Viewport3DAxis,
@@ -846,6 +1436,7 @@ struct Viewport3DRotationRing {
 struct Viewport3DGizmo {
     origin: (f32, f32),
     axes: [Option<Viewport3DGizmoAxis>; 3],
+    planes: [Option<Viewport3DGizmoPlane>; 3],
     rotation_rings: [Viewport3DRotationRing; 3],
 }
 
@@ -853,6 +1444,7 @@ struct Viewport3DGizmo {
 enum Viewport3DGizmoHit {
     MoveFree,
     MoveAxis(Viewport3DAxis),
+    MovePlane(Viewport3DPlane),
     ScaleAxis(Viewport3DAxis),
     ScaleUniform,
     RotateAxis(Viewport3DAxis),
@@ -875,11 +1467,35 @@ struct Viewport3DLook {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct Viewport3DOrbit {
+    mouse_x: f32,
+    mouse_y: f32,
+    pitch: f32,
+    yaw: f32,
+    target: Vec3,
+    distance: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct Viewport3DHit {
     id: u64,
     points: [(f32, f32); 3],
     bounds: Rect,
     depth: f32,
+    world_points: [Vec3; 3],
+    world_normals: [Vec3; 3],
+    world_tangents: [Vec3; 3],
+    uvs: [[f32; 2]; 3],
+    clip_w: [f32; 3],
+    pickable: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Viewport3DSurfaceHit {
+    id: u64,
+    position: Vec3,
+    normal: Vec3,
+    vertex: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -891,7 +1507,17 @@ struct Viewport3DProxyHit {
     depth: f32,
 }
 
-type Viewport3DDrawTriangle = (f32, u64, [(f32, f32); 3], Rgba);
+#[derive(Clone, Copy, Debug)]
+struct Viewport3DDrawTriangle {
+    id: u64,
+    points: [(f32, f32); 3],
+    depths: [f32; 3],
+    color: Rgba,
+    world_points: [Vec3; 3],
+    world_normals: [Vec3; 3],
+    active: bool,
+    receives_shadows: bool,
+}
 
 /// Active rotation drag via the gizmo knob. The pivot is the entity's world
 /// center captured at drag start, so rotating spins the entity in place.
@@ -925,11 +1551,14 @@ enum InspectorReferenceDrag {
 enum Pending {
     LoadScene,
     Quit,
+    RecoverDocument(PathBuf),
     RenameScene,
     CreateFolder,
     CreateScript,
     CreateShader,
     CreateAnimation,
+    CreateMaterial,
+    CreatePhysicsMaterial,
     RenameEntity(u64),
     CloseDocument(usize),
     UpdateEngine,
@@ -941,6 +1570,8 @@ enum AssetKind {
     Font,
     Sound,
     Mesh,
+    Material,
+    PhysicsMaterial,
     Shader,
     Animation,
 }
@@ -952,6 +1583,8 @@ impl AssetKind {
             Self::Font => "Choose Font",
             Self::Sound => "Choose Sound",
             Self::Mesh => "Choose 3D Mesh",
+            Self::Material => "Choose 3D Material",
+            Self::PhysicsMaterial => "Choose Physics Material",
             Self::Shader => "Choose Fragment Shader",
             Self::Animation => "Choose Animation",
         }
@@ -963,6 +1596,8 @@ impl AssetKind {
             Self::Font => icon::FONT_DOWNLOAD,
             Self::Sound => icon::AUDIOTRACK,
             Self::Mesh => icon::VIEW_IN_AR,
+            Self::Material => icon::DATA_OBJECT,
+            Self::PhysicsMaterial => icon::DATA_OBJECT,
             Self::Shader => icon::DATA_OBJECT,
             Self::Animation => icon::PLAY,
         }
@@ -986,6 +1621,10 @@ impl AssetKind {
                 matches_ignore_ascii_case(extension, &["wav", "mp3", "ogg", "oga", "flac"])
             }
             Self::Mesh => matches_ignore_ascii_case(extension, &["obj", "fbx", "gltf", "glb"]),
+            Self::Material => matches_ignore_ascii_case(extension, &["neomaterial"]),
+            Self::PhysicsMaterial => {
+                matches_ignore_ascii_case(extension, &["neophysicsmaterial"])
+            }
             Self::Shader => matches_ignore_ascii_case(extension, &["glsl", "frag", "fs", "shader"]),
             Self::Animation => {
                 matches_ignore_ascii_case(extension, &["neoanim", "animation", "anim"])
@@ -1258,6 +1897,17 @@ enum Popup {
         message: String,
         copied: bool,
     },
+    /// Structured comparison of the authored 3D document with the real
+    /// runtime's immutable post-load, pre-update scene snapshot.
+    ParityReport {
+        report: ParityReport,
+        scroll: f32,
+    },
+    VisualRegression {
+        report: VisualDiffReport,
+        baseline: PathBuf,
+        diff: Option<PathBuf>,
+    },
     BuildTarget,
     ProjectWindow {
         start_scene: String,
@@ -1287,13 +1937,29 @@ enum Popup {
         viewport_camera_sensitivity: f32,
         viewport_camera_speed: f32,
         viewport_camera_fov: f32,
+        viewport_invert_mouse_x: bool,
         viewport_invert_mouse_look: bool,
+        viewport_fly_without_mouse_hold: bool,
     },
     AnimationEditor {
         path: PathBuf,
         clip: AnimationClipAsset,
         selected_track: usize,
         selected_key: usize,
+    },
+    MaterialEditor {
+        path: PathBuf,
+        material: Material3DFile,
+        preview: Option<Rc<image::RgbaImage>>,
+        preview_key: String,
+        preview_error: Option<String>,
+        dirty: bool,
+    },
+    PhysicsMaterialEditor {
+        path: PathBuf,
+        material: PhysicsMaterial3DFile,
+        error: Option<String>,
+        dirty: bool,
     },
 }
 
@@ -1336,8 +2002,10 @@ pub struct EditorApp {
     /// Runtime Camera3D components remain scene data and never steal editor
     /// navigation state.
     viewport_camera_3d: RenderCamera3D,
+    viewport_3d_orbit_target: Option<Vec3>,
+    viewport_3d_orbit: Option<Viewport3DOrbit>,
     viewport_3d_look: Option<Viewport3DLook>,
-    viewport_3d_pan_anchor: Option<(f32, f32, Vec3)>,
+    viewport_3d_pan_anchor: Option<(f32, f32, Vec3, Option<Vec3>)>,
     viewport_3d_drag: Option<Viewport3DDrag>,
     viewport_3d_last_frame: Instant,
     /// Reused CPU preview/picking storage. Complex scenes otherwise allocate
@@ -1345,6 +2013,7 @@ pub struct EditorApp {
     viewport_3d_triangles: Vec<Viewport3DDrawTriangle>,
     viewport_3d_triangle_hits: Vec<Viewport3DHit>,
     viewport_3d_proxy_hits: Vec<Viewport3DProxyHit>,
+    viewport_3d_depth: Vec<f32>,
     /// Anchor captured when a middle-mouse pan begins: (mouse x, mouse y, cam x,
     /// cam y). Panning relative to a fixed anchor avoids the camera jumping by
     /// accumulated hover movement.
@@ -1408,6 +2077,26 @@ pub struct EditorApp {
     script_schema_cache: ScriptSchemaCache,
     /// Receiver for the outcome of a launched `Run` (None when finished).
     run_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
+    run_command_tx: Option<std::sync::mpsc::Sender<crate::editor_ipc::IpcCommand>>,
+    run_paused: bool,
+    restart_run_after_exit: bool,
+    /// Shared live runtime state retained by the main editor while the same
+    /// session also feeds the optional detached logger window.
+    runtime_state: Option<std::sync::Arc<std::sync::Mutex<crate::editor_ipc::LoggerState>>>,
+    game_view_active: bool,
+    game_view_focused: bool,
+    game_frame: Option<Rc<image::RgbaImage>>,
+    game_frame_serial: u64,
+    game_frame_backend: String,
+    game_frame_fps: f32,
+    game_frame_update_ms: f32,
+    game_frame_render_ms: f32,
+    game_frame_draw_calls: u32,
+    game_frame_triangles: u64,
+    game_view_size: (u32, u32),
+    /// Project-local isolated preview directory for the current unsaved 3D
+    /// scene. It is never part of the authored document or build output.
+    run_stage_dir: Option<PathBuf>,
     /// Receiver for the outcome of a launched `Build` (None when finished).
     build_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// A freshly created logger IPC session waiting to be picked up by the
@@ -1419,6 +2108,7 @@ pub struct EditorApp {
     pending_update: Option<AvailableUpdate>,
     status: String,
     scene_dirty: bool,
+    last_recovery_snapshot: Instant,
     should_quit: bool,
     dirty: bool,
     focus: Option<String>,
@@ -1458,7 +2148,7 @@ impl EditorApp {
             kind: DocumentKind::Scene,
             dirty: false,
         }];
-        Self {
+        let mut app = Self {
             bin_dir: project_root.clone(),
             project_root,
             scene_path,
@@ -1488,6 +2178,8 @@ impl EditorApp {
             cam_y: 0.0,
             cam_zoom: 1.0,
             viewport_camera_3d: default_editor_camera_3d(60.0),
+            viewport_3d_orbit_target: None,
+            viewport_3d_orbit: None,
             viewport_3d_look: None,
             viewport_3d_pan_anchor: None,
             viewport_3d_drag: None,
@@ -1495,6 +2187,7 @@ impl EditorApp {
             viewport_3d_triangles: Vec::new(),
             viewport_3d_triangle_hits: Vec::new(),
             viewport_3d_proxy_hits: Vec::new(),
+            viewport_3d_depth: Vec::new(),
             pan_anchor: None,
             last_viewport: Rect::new(0.0, 0.0, 0.0, 0.0),
             hierarchy_filter: String::new(),
@@ -1526,12 +2219,29 @@ impl EditorApp {
             preview_light_cache: RefCell::new(None),
             script_schema_cache: HashMap::new(),
             run_rx: None,
+            run_command_tx: None,
+            run_paused: false,
+            restart_run_after_exit: false,
+            runtime_state: None,
+            game_view_active: false,
+            game_view_focused: false,
+            game_frame: None,
+            game_frame_serial: 0,
+            game_frame_backend: String::new(),
+            game_frame_fps: 0.0,
+            game_frame_update_ms: 0.0,
+            game_frame_render_ms: 0.0,
+            game_frame_draw_calls: 0,
+            game_frame_triangles: 0,
+            game_view_size: (960, 540),
+            run_stage_dir: None,
             build_rx: None,
             pending_logger_session: None,
             update_rx: None,
             pending_update: None,
             status: "Ready".to_string(),
             scene_dirty: false,
+            last_recovery_snapshot: Instant::now(),
             should_quit: false,
             dirty: false,
             focus: None,
@@ -1540,7 +2250,10 @@ impl EditorApp {
             edit_selection_anchor: None,
             pointer_capture: None,
             font_reload_request: None,
-        }
+        };
+        let initial_scene_path = app.scene_path.clone();
+        app.offer_recovery_for_document(initial_scene_path, DocumentKind::Scene);
+        app
     }
 
     pub fn title(&self) -> String {
@@ -1620,6 +2333,15 @@ impl EditorApp {
         if self.popup.is_some() {
             ui.input.mouse_pressed = false;
             ui.input.right_pressed = false;
+        }
+
+        // A maximized viewport must always have an immediate keyboard escape,
+        // including while embedded Game View input owns the other shortcuts.
+        if self.popup.is_none() && self.maximize_view && ui.input.escape {
+            self.maximize_view = false;
+            self.release_game_input();
+            self.status = "Restored editor panels".to_string();
+            ui.input.escape = false;
         }
         ui.painter.clear(self.config.theme.panel);
         match widget {
@@ -1813,6 +2535,152 @@ impl EditorApp {
         }
     }
 
+    fn offer_recovery_for_document(&mut self, path: PathBuf, kind: DocumentKind) {
+        let is_three_d = self
+            .documents
+            .iter()
+            .find(|document| document.path == path && document.kind == kind)
+            .is_some_and(|document| document.scene.kind == SceneKind::ThreeD);
+        if !is_three_d {
+            return;
+        }
+        match load_recovery_snapshot(&self.project_root, &path, kind, true) {
+            Ok(Some(_)) => {
+                let source = recovery_source_key(&self.project_root, &path);
+                self.status = format!("Unsaved 3D recovery available for {source}");
+                self.open_confirm(
+                    &format!(
+                        "NeoLOVE found unsaved 3D changes for '{source}'. Recover them?"
+                    ),
+                    Pending::RecoverDocument(path),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("warning: ignored invalid 3D recovery data: {error}");
+                self.status = format!("Could not read 3D recovery data: {error}");
+            }
+        }
+    }
+
+    fn maybe_write_recovery_snapshots(&mut self) {
+        if self.should_quit {
+            return;
+        }
+        let now = Instant::now();
+        if now.duration_since(self.last_recovery_snapshot) < RECOVERY_SNAPSHOT_INTERVAL {
+            return;
+        }
+        self.sync_active_document();
+        let documents = self
+            .documents
+            .iter()
+            .filter(|document| document.dirty && document.scene.kind == SceneKind::ThreeD)
+            .map(|document| {
+                (
+                    document.path.clone(),
+                    document.kind,
+                    document.scene.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if documents.is_empty() {
+            // Keep the timer overdue while the editor is clean. The first edit
+            // after a long idle period then gets protected on the next frame.
+            return;
+        }
+        self.last_recovery_snapshot = now;
+
+        let mut errors = Vec::new();
+        for (path, kind, scene) in documents {
+            if let Err(error) =
+                write_recovery_snapshot(&self.project_root, &path, kind, &scene)
+            {
+                errors.push(format!("{}: {error}", path.display()));
+            }
+        }
+        if !errors.is_empty() {
+            self.status = format!("3D recovery snapshot failed: {}", errors.join("; "));
+        }
+    }
+
+    fn recover_document(&mut self, path: PathBuf) {
+        let Some(index) = self
+            .documents
+            .iter()
+            .position(|document| document.path == path)
+        else {
+            self.status = format!("Recovery target is no longer open: {}", path.display());
+            return;
+        };
+        let kind = self.documents[index].kind;
+        let recovered = match load_recovery_snapshot(&self.project_root, &path, kind, true) {
+            Ok(Some(scene)) => scene,
+            Ok(None) => {
+                self.status = "Recovery data is no longer current".to_string();
+                return;
+            }
+            Err(error) => {
+                self.status = format!("Recovery failed: {error}");
+                return;
+            }
+        };
+
+        if index != self.active_document {
+            self.switch_document(index);
+        }
+        let authored = self.scene.to_json().unwrap_or_default();
+        let recovered_json = recovered.to_json().unwrap_or_default();
+        self.scene = recovered.clone();
+        self.scene_dirty = true;
+        if let Some(document) = self.documents.get_mut(index) {
+            document.scene = recovered;
+            document.dirty = true;
+        }
+        self.undo_stack.clear();
+        if authored != recovered_json {
+            self.undo_stack.push(authored);
+        }
+        self.redo_stack.clear();
+        self.undo_baseline = recovered_json;
+        self.clear_scene_view_state();
+        self.last_recovery_snapshot = Instant::now();
+        self.status = format!(
+            "Recovered unsaved 3D changes for {}",
+            recovery_source_key(&self.project_root, &path)
+        );
+    }
+
+    fn discard_recovery_for_document(&mut self, path: &Path) {
+        match remove_recovery_snapshot(&self.project_root, path) {
+            Ok(()) => {
+                self.status = format!(
+                    "Discarded 3D recovery for {}",
+                    recovery_source_key(&self.project_root, path)
+                );
+            }
+            Err(error) => self.status = format!("Could not discard 3D recovery: {error}"),
+        }
+    }
+
+    fn discard_all_dirty_recovery_snapshots(&mut self) {
+        self.sync_active_document();
+        let paths = self
+            .documents
+            .iter()
+            .filter(|document| document.dirty && document.scene.kind == SceneKind::ThreeD)
+            .map(|document| document.path.clone())
+            .collect::<Vec<_>>();
+        for path in paths {
+            if let Err(error) = remove_recovery_snapshot(&self.project_root, &path) {
+                eprintln!(
+                    "warning: failed to discard 3D recovery for {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+
     fn add_post_process_pass(&mut self) {
         self.scene
             .post_process
@@ -1901,6 +2769,15 @@ impl EditorApp {
         }
         self.sync_active_document();
         let closed_name = self.documents[index].scene.name.clone();
+        if self.documents[index].scene.kind == SceneKind::ThreeD
+            && let Err(error) =
+                remove_recovery_snapshot(&self.project_root, &self.documents[index].path)
+        {
+            eprintln!(
+                "warning: failed to remove recovery for {}: {error}",
+                self.documents[index].path.display()
+            );
+        }
         let closing_active = index == self.active_document;
         self.documents.remove(index);
 
@@ -1946,6 +2823,8 @@ impl EditorApp {
         self.redo_stack.clear();
         self.undo_baseline = self.scene.to_json().unwrap_or_default();
         self.clear_scene_view_state();
+        let recovery_path = self.scene_path.clone();
+        self.offer_recovery_for_document(recovery_path, kind);
     }
 
     fn prune_selection(&mut self) {
@@ -2094,6 +2973,33 @@ impl EditorApp {
         }
     }
 
+    fn selection_center_3d(&self) -> Option<Vec3> {
+        let ids = self.selection_ids_ordered();
+        if ids.is_empty() {
+            return None;
+        }
+        let mut target = Vec3::ZERO;
+        let mut count: f32 = 0.0;
+        for id in ids {
+            if let Some(model) = self.entity_world_model_3d(id) {
+                target = add_vec3(target, model.transform_point(Vec3::ZERO));
+                count += 1.0;
+            }
+        }
+        (count > 0.0).then(|| scale_vec3(target, count.recip()))
+    }
+
+    fn navigation_target_3d(&self) -> Vec3 {
+        self.selection_center_3d()
+            .or(self.viewport_3d_orbit_target)
+            .unwrap_or_else(|| {
+                add_vec3(
+                    self.viewport_camera_3d.position,
+                    scale_vec3(camera_forward(self.viewport_camera_3d.euler), 6.0),
+                )
+            })
+    }
+
     /// Center the viewport on the selected entity at a comfortable zoom.
     fn frame_selected(&mut self) {
         let area = self.last_viewport;
@@ -2105,21 +3011,8 @@ impl EditorApp {
             return;
         }
         if self.scene.kind == SceneKind::ThreeD {
-            let mut target = Vec3::ZERO;
-            let mut count = 0.0;
-            for id in ids {
-                if let Some(model) = self.entity_world_model_3d(id) {
-                    let position = model.transform_point(Vec3::ZERO);
-                    target.x += position.x;
-                    target.y += position.y;
-                    target.z += position.z;
-                    count += 1.0;
-                }
-            }
-            if count > 0.0 {
-                target.x /= count;
-                target.y /= count;
-                target.z /= count;
+            if let Some(target) = self.selection_center_3d() {
+                let count = ids.len() as f32;
                 let forward = camera_forward(self.viewport_camera_3d.euler);
                 let distance = 6.0_f32.max(count.sqrt() * 2.0);
                 self.viewport_camera_3d.position = Vec3::new(
@@ -2127,6 +3020,11 @@ impl EditorApp {
                     target.y - forward.y * distance,
                     target.z - forward.z * distance,
                 );
+                self.viewport_3d_orbit_target = Some(target);
+                if self.config.layout.viewport_orthographic_3d {
+                    self.config.layout.viewport_orthographic_size_3d =
+                        (count.sqrt() * 1.5).max(2.0);
+                }
                 self.status = "Framed 3D selection".to_string();
             }
             return;
@@ -2173,6 +3071,10 @@ impl EditorApp {
         if self.scene.kind == SceneKind::ThreeD {
             self.viewport_camera_3d =
                 default_editor_camera_3d(self.config.settings.viewport_camera_fov);
+            self.config.layout.viewport_orthographic_3d = false;
+            self.config.layout.viewport_orthographic_size_3d = 10.0;
+            self.viewport_3d_orbit_target = None;
+            self.viewport_3d_orbit = None;
             self.viewport_3d_look = None;
             self.viewport_3d_pan_anchor = None;
             return;
@@ -2180,6 +3082,205 @@ impl EditorApp {
         self.cam_x = 0.0;
         self.cam_y = 0.0;
         self.cam_zoom = 1.0;
+    }
+
+    fn toggle_projection_3d(&mut self) {
+        if self.scene.kind != SceneKind::ThreeD {
+            return;
+        }
+        self.config.layout.viewport_orthographic_3d =
+            !self.config.layout.viewport_orthographic_3d;
+        self.dirty = true;
+        self.status = if self.config.layout.viewport_orthographic_3d {
+            "3D Scene View: orthographic".to_string()
+        } else {
+            "3D Scene View: perspective".to_string()
+        };
+    }
+
+    fn set_orthographic_view_3d(&mut self, view: OrthographicView3D) {
+        if self.scene.kind != SceneKind::ThreeD {
+            return;
+        }
+        let target = self.navigation_target_3d();
+        let distance = length_vec3(sub_vec3(self.viewport_camera_3d.position, target)).max(6.0);
+        self.viewport_camera_3d.euler = match view {
+            OrthographicView3D::Top => Vec3::new(-90.0, 0.0, 0.0),
+            OrthographicView3D::Front => Vec3::ZERO,
+            OrthographicView3D::Right => Vec3::new(0.0, 90.0, 0.0),
+        };
+        let forward = camera_forward(self.viewport_camera_3d.euler);
+        self.viewport_camera_3d.position = sub_vec3(target, scale_vec3(forward, distance));
+        self.viewport_3d_orbit_target = Some(target);
+        self.config.layout.viewport_orthographic_3d = true;
+        self.config.layout.viewport_orthographic_size_3d = self
+            .config
+            .layout
+            .viewport_orthographic_size_3d
+            .clamp(0.01, 100_000.0);
+        self.dirty = true;
+        self.status = format!(
+            "3D orthographic {} view",
+            match view {
+                OrthographicView3D::Top => "top",
+                OrthographicView3D::Front => "front",
+                OrthographicView3D::Right => "right",
+            }
+        );
+    }
+
+    fn ensure_camera_bookmark_slots_3d(&mut self) {
+        self.config.layout.camera_bookmarks_3d.truncate(4);
+        while self.config.layout.camera_bookmarks_3d.len() < 4 {
+            self.config.layout.camera_bookmarks_3d.push(None);
+        }
+    }
+
+    fn store_camera_bookmark_3d(&mut self, slot: usize) {
+        if self.scene.kind != SceneKind::ThreeD || slot >= 4 {
+            return;
+        }
+        self.ensure_camera_bookmark_slots_3d();
+        self.config.layout.camera_bookmarks_3d[slot] = Some(CameraBookmark3D {
+            position: [
+                self.viewport_camera_3d.position.x,
+                self.viewport_camera_3d.position.y,
+                self.viewport_camera_3d.position.z,
+            ],
+            euler: [
+                self.viewport_camera_3d.euler.x,
+                self.viewport_camera_3d.euler.y,
+                self.viewport_camera_3d.euler.z,
+            ],
+            orthographic: self.config.layout.viewport_orthographic_3d,
+            fov: self.config.settings.viewport_camera_fov,
+            orthographic_size: self.config.layout.viewport_orthographic_size_3d,
+        });
+        self.dirty = true;
+        self.status = format!("Stored 3D camera bookmark {}", slot + 1);
+    }
+
+    fn recall_camera_bookmark_3d(&mut self, slot: usize) {
+        if self.scene.kind != SceneKind::ThreeD || slot >= 4 {
+            return;
+        }
+        self.ensure_camera_bookmark_slots_3d();
+        let Some(bookmark) = self.config.layout.camera_bookmarks_3d[slot].clone() else {
+            self.status = format!("3D camera bookmark {} is empty", slot + 1);
+            return;
+        };
+        let finite = bookmark
+            .position
+            .into_iter()
+            .chain(bookmark.euler)
+            .all(f32::is_finite);
+        if !finite {
+            self.status = format!("3D camera bookmark {} is invalid", slot + 1);
+            return;
+        }
+        self.viewport_camera_3d.position = Vec3::new(
+            bookmark.position[0],
+            bookmark.position[1],
+            bookmark.position[2],
+        );
+        self.viewport_camera_3d.euler = Vec3::new(
+            bookmark.euler[0],
+            bookmark.euler[1],
+            bookmark.euler[2],
+        );
+        self.config.layout.viewport_orthographic_3d = bookmark.orthographic;
+        self.config.layout.viewport_orthographic_size_3d =
+            bookmark.orthographic_size.clamp(0.01, 100_000.0);
+        self.config.settings.viewport_camera_fov = bookmark.fov.clamp(20.0, 140.0);
+        self.viewport_3d_orbit_target = None;
+        self.dirty = true;
+        self.status = format!("Recalled 3D camera bookmark {}", slot + 1);
+    }
+
+    fn viewport_diagnostic_enabled_3d(&self, diagnostic: ViewportDiagnostic3D) -> bool {
+        match diagnostic {
+            ViewportDiagnostic3D::Wireframe => self.config.layout.show_wireframe_3d,
+            ViewportDiagnostic3D::Normals => self.config.layout.show_normals_3d,
+            ViewportDiagnostic3D::Tangents => self.config.layout.show_tangents_3d,
+            ViewportDiagnostic3D::UvSeams => self.config.layout.show_uv_seams_3d,
+            ViewportDiagnostic3D::MeshBounds => self.config.layout.show_mesh_bounds_3d,
+            ViewportDiagnostic3D::Pivots => self.config.layout.show_pivots_3d,
+            ViewportDiagnostic3D::SceneAxes => self.config.layout.show_scene_axes_3d,
+            ViewportDiagnostic3D::Colliders => self.config.layout.show_colliders_3d,
+            ViewportDiagnostic3D::RigidBodies => self.config.layout.show_rigid_bodies_3d,
+            ViewportDiagnostic3D::Triggers => self.config.layout.show_triggers_3d,
+            ViewportDiagnostic3D::Raycasts => self.config.layout.show_raycasts_3d,
+            ViewportDiagnostic3D::CameraFrustums => {
+                self.config.layout.show_camera_frustums_3d
+            }
+            ViewportDiagnostic3D::LightRanges => self.config.layout.show_light_ranges_3d,
+            ViewportDiagnostic3D::SpotCones => self.config.layout.show_spot_cones_3d,
+            ViewportDiagnostic3D::ShadowFrustums => self.config.layout.show_shadow_frustums_3d,
+            ViewportDiagnostic3D::ReflectionProbes => {
+                self.config.layout.show_reflection_probes_3d
+            }
+            ViewportDiagnostic3D::ParticleBounds => self.config.layout.show_particle_bounds_3d,
+            ViewportDiagnostic3D::LodState => self.config.layout.show_lod_state_3d,
+            ViewportDiagnostic3D::RenderLayers => self.config.layout.show_render_layers_3d,
+            ViewportDiagnostic3D::EntityVisibility => {
+                self.config.layout.show_entity_visibility_3d
+            }
+            ViewportDiagnostic3D::Statistics => self.config.layout.show_statistics_3d,
+        }
+    }
+
+    fn toggle_viewport_diagnostic_3d(&mut self, diagnostic: ViewportDiagnostic3D) {
+        if self.scene.kind != SceneKind::ThreeD {
+            return;
+        }
+        let enabled = !self.viewport_diagnostic_enabled_3d(diagnostic);
+        match diagnostic {
+            ViewportDiagnostic3D::Wireframe => self.config.layout.show_wireframe_3d = enabled,
+            ViewportDiagnostic3D::Normals => self.config.layout.show_normals_3d = enabled,
+            ViewportDiagnostic3D::Tangents => self.config.layout.show_tangents_3d = enabled,
+            ViewportDiagnostic3D::UvSeams => self.config.layout.show_uv_seams_3d = enabled,
+            ViewportDiagnostic3D::MeshBounds => self.config.layout.show_mesh_bounds_3d = enabled,
+            ViewportDiagnostic3D::Pivots => self.config.layout.show_pivots_3d = enabled,
+            ViewportDiagnostic3D::SceneAxes => self.config.layout.show_scene_axes_3d = enabled,
+            ViewportDiagnostic3D::Colliders => self.config.layout.show_colliders_3d = enabled,
+            ViewportDiagnostic3D::RigidBodies => {
+                self.config.layout.show_rigid_bodies_3d = enabled;
+            }
+            ViewportDiagnostic3D::Triggers => self.config.layout.show_triggers_3d = enabled,
+            ViewportDiagnostic3D::Raycasts => self.config.layout.show_raycasts_3d = enabled,
+            ViewportDiagnostic3D::CameraFrustums => {
+                self.config.layout.show_camera_frustums_3d = enabled;
+            }
+            ViewportDiagnostic3D::LightRanges => {
+                self.config.layout.show_light_ranges_3d = enabled;
+            }
+            ViewportDiagnostic3D::SpotCones => {
+                self.config.layout.show_spot_cones_3d = enabled;
+            }
+            ViewportDiagnostic3D::ShadowFrustums => {
+                self.config.layout.show_shadow_frustums_3d = enabled;
+            }
+            ViewportDiagnostic3D::ReflectionProbes => {
+                self.config.layout.show_reflection_probes_3d = enabled;
+            }
+            ViewportDiagnostic3D::ParticleBounds => {
+                self.config.layout.show_particle_bounds_3d = enabled;
+            }
+            ViewportDiagnostic3D::LodState => self.config.layout.show_lod_state_3d = enabled,
+            ViewportDiagnostic3D::RenderLayers => {
+                self.config.layout.show_render_layers_3d = enabled;
+            }
+            ViewportDiagnostic3D::EntityVisibility => {
+                self.config.layout.show_entity_visibility_3d = enabled;
+            }
+            ViewportDiagnostic3D::Statistics => self.config.layout.show_statistics_3d = enabled,
+        }
+        self.dirty = true;
+        self.status = format!(
+            "{} {}",
+            diagnostic.label(),
+            if enabled { "enabled" } else { "disabled" }
+        );
     }
 
     fn select_all(&mut self) {
@@ -2230,6 +3331,15 @@ impl EditorApp {
     }
 
     fn duplicate_selection(&mut self) {
+        let offset = if self.scene.kind == SceneKind::ThreeD {
+            Vec3::new(1.0, 0.0, 1.0)
+        } else {
+            Vec3::new(16.0, 16.0, 0.0)
+        };
+        self.duplicate_selection_with_offset(offset);
+    }
+
+    fn duplicate_selection_with_offset(&mut self, offset: Vec3) {
         let selected = self.selection_ids_ordered();
         if selected.is_empty() {
             return;
@@ -2256,8 +3366,9 @@ impl EditorApp {
             let original_parent = self.scene.entity(root).and_then(|entity| entity.parent);
             let mut proto = self.scene.subtree(root);
             if let Some(first) = proto.first_mut() {
-                first.x += 16.0;
-                first.y += 16.0;
+                first.x += offset.x;
+                first.y += offset.y;
+                first.position_z += offset.z;
                 first.name = format!("{} Copy", first.name);
             }
             if let Some(new_root) = self.scene.instantiate(proto) {
@@ -2269,7 +3380,11 @@ impl EditorApp {
         }
         self.select_many(new_roots, false);
         self.mark_dirty();
-        self.status = "Duplicated selection".to_string();
+        self.status = if offset == Vec3::ZERO {
+            "Duplicated selection; drag to place".to_string()
+        } else {
+            "Duplicated selection".to_string()
+        };
     }
 
     fn group_selected(&mut self) {
@@ -2745,6 +3860,13 @@ impl EditorApp {
         if area.w <= 0.0 {
             return;
         }
+        if self.scene.kind == SceneKind::ThreeD {
+            self.config.layout.viewport_orthographic_size_3d = 10.0;
+            self.viewport_camera_3d.orthographic_size = 10.0;
+            self.dirty = true;
+            self.status = "3D orthographic scale reset".to_string();
+            return;
+        }
         let cx = (area.w * 0.5 - self.cam_x) / self.cam_zoom;
         let cy = (area.h * 0.5 - self.cam_y) / self.cam_zoom;
         self.cam_zoom = 1.0;
@@ -2756,6 +3878,7 @@ impl EditorApp {
     // ---- Frame -------------------------------------------------------------
 
     pub fn frame(&mut self, ui: &mut Ui) {
+        self.sync_game_frame();
         self.world_transform_cache.borrow_mut().clear();
         self.world_model_3d_cache.borrow_mut().clear();
         self.prune_selection();
@@ -2776,8 +3899,20 @@ impl EditorApp {
             ui.input.right_pressed = false;
         }
 
+        // A maximized viewport must always have an immediate keyboard escape,
+        // including while embedded Game View input owns the other shortcuts.
+        if self.popup.is_none() && self.maximize_view && ui.input.escape {
+            self.maximize_view = false;
+            self.release_game_input();
+            self.status = "Restored editor panels".to_string();
+            ui.input.escape = false;
+        }
+
         // Global shortcuts (only when no text field is focused).
-        if !ui.has_focus() && self.popup.is_none() {
+        if !ui.has_focus()
+            && self.popup.is_none()
+            && !(self.game_view_active && self.game_view_focused)
+        {
             if ui.input.undo {
                 self.undo();
             }
@@ -3006,6 +4141,7 @@ impl EditorApp {
         self.handle_popup(ui, w, h, popup_interactive);
 
         self.commit_undo_if_settled(ui);
+        self.maybe_write_recovery_snapshots();
         if self.config.settings.show_tooltips {
             ui.draw_tooltip();
         }
@@ -3072,13 +4208,64 @@ impl EditorApp {
         ui.tooltip(save, "Save scene (Ctrl+S)");
         x += 35.0;
 
-        let run_width = ui.painter.text_width("Run", 14.0) + 31.0;
-        let run = Rect::new(x, y, run_width, bh);
-        if ui.icon_button(run, icon::PLAY, "Run") {
-            self.run_scene();
+        if self.run_pending() {
+            for (glyph, tip, action) in [
+                (
+                    if self.run_paused {
+                        icon::PLAY
+                    } else {
+                        icon::PAUSE
+                    },
+                    if self.run_paused {
+                        "Resume the real runtime"
+                    } else {
+                        "Pause the real runtime"
+                    },
+                    Action::PauseResumeRun,
+                ),
+                (icon::SKIP_NEXT, "Advance one fixed runtime frame", Action::StepRun),
+                (icon::REPLAY, "Restart the real runtime", Action::RestartRun),
+                (icon::STOP, "Stop the real runtime", Action::StopRun),
+            ] {
+                let control = Rect::new(x, y, 30.0, bh);
+                if ui.icon_toggle(control, glyph, false, self.config.theme.text) {
+                    self.perform(action);
+                }
+                ui.tooltip(control, tip);
+                x += 35.0;
+            }
+        } else {
+            let run_width = ui.painter.text_width("Run", 14.0) + 31.0;
+            let run = Rect::new(x, y, run_width, bh);
+            if ui.icon_button(run, icon::PLAY, "Run") {
+                self.run_scene();
+            }
+            ui.tooltip(
+                run,
+                if self.scene.kind == SceneKind::ThreeD {
+                    "Run the current unsaved scene in the embedded real runtime"
+                } else {
+                    "Run the current project through the real runtime"
+                },
+            );
+            x += run_width + 5.0;
+            if self.scene.kind == SceneKind::ThreeD
+                && self.selected.is_some_and(|id| {
+                    self.scene.entity(id).is_some_and(|entity| {
+                        entity.components.iter().any(
+                            |component| matches!(component, Component::Core { name, .. } if name == "Camera3D"),
+                        )
+                    })
+                })
+            {
+                let camera_run = Rect::new(x, y, 30.0, bh);
+                if ui.icon_toggle(camera_run, icon::VIDEOCAM, false, self.config.theme.text) {
+                    self.perform(Action::RunSceneFromSelectedCamera);
+                }
+                ui.tooltip(camera_run, "Play from the selected Camera3D");
+                x += 35.0;
+            }
         }
-        ui.tooltip(run, "Run the current project");
-        x += run_width + 5.0;
 
         let add_entity = Rect::new(x, y, 30.0, bh);
         if ui.icon_toggle(add_entity, icon::ADD_CIRCLE, false, self.config.theme.text) {
@@ -3111,6 +4298,28 @@ impl EditorApp {
             x += 32.0;
         }
         x += 8.0;
+
+        if self.scene.kind == SceneKind::ThreeD {
+            let orientation = self.config.layout.transform_orientation_3d;
+            let label = match orientation {
+                TransformOrientation3D::Local => "Local",
+                TransformOrientation3D::World => "World",
+            };
+            let orientation_rect = Rect::new(x, y, 52.0, bh);
+            if ui.button(orientation_rect, label) {
+                self.config.layout.transform_orientation_3d = match orientation {
+                    TransformOrientation3D::Local => TransformOrientation3D::World,
+                    TransformOrientation3D::World => TransformOrientation3D::Local,
+                };
+                self.dirty = true;
+            }
+            ui.tooltip(
+                orientation_rect,
+                "3D move orientation: Local follows the selected object; World uses global axes",
+            );
+            x += 57.0;
+        }
+
         // Snap + grid toggles.
         let snap = self.config.layout.snap;
         let snap_glyph = if snap { icon::GRID_ON } else { icon::GRID_OFF };
@@ -3132,16 +4341,57 @@ impl EditorApp {
 
         if w >= 900.0 {
             let grid_field = Rect::new(x, y, 46.0, bh);
-            let grid_str = format_num(self.config.layout.grid);
+            let grid_value = if self.scene.kind == SceneKind::ThreeD {
+                self.config.layout.grid_3d
+            } else {
+                self.config.layout.grid
+            };
+            let grid_str = format_num(grid_value);
             let r = ui.text_field("grid_size", grid_field, &grid_str);
             if r.changed {
                 if let Ok(v) = r.text.trim().parse::<f32>() {
-                    self.config.layout.grid = v.clamp(1.0, 512.0);
+                    if self.scene.kind == SceneKind::ThreeD {
+                        self.config.layout.grid_3d = v.clamp(0.0001, 100_000.0);
+                    } else {
+                        self.config.layout.grid = v.clamp(1.0, 512.0);
+                    }
                     self.dirty = true;
                 }
             }
-            ui.tooltip(grid_field, "Grid size");
+            ui.tooltip(
+                grid_field,
+                if self.scene.kind == SceneKind::ThreeD {
+                    "3D snap increment in world units"
+                } else {
+                    "2D grid size in pixels"
+                },
+            );
             x += 50.0;
+        }
+
+        if self.scene.kind == SceneKind::ThreeD && w >= 1_050.0 {
+            ui.painter.text(
+                x,
+                y + 5.0,
+                "Rot",
+                11.0,
+                self.config.theme.text_dim,
+            );
+            x += 23.0;
+            let rotation_field = Rect::new(x, y, 43.0, bh);
+            let response = ui.text_field(
+                "rotation_snap_3d",
+                rotation_field,
+                &format_num(self.config.layout.rotation_snap_3d),
+            );
+            if response.changed
+                && let Ok(value) = response.text.trim().parse::<f32>()
+            {
+                self.config.layout.rotation_snap_3d = value.abs().clamp(0.01, 360.0);
+                self.dirty = true;
+            }
+            ui.tooltip(rotation_field, "3D rotation snap increment in degrees");
+            x += 48.0;
         }
 
         if w >= 820.0 {
@@ -3694,6 +4944,618 @@ impl EditorApp {
 
     // ---- Viewport ----------------------------------------------------------
 
+    fn sync_game_frame(&mut self) {
+        let latest = self.runtime_state.as_ref().and_then(|state| {
+            state
+                .lock()
+                .ok()
+                .and_then(|state| state.latest_frame.clone())
+        });
+        let Some(frame) = latest.filter(|frame| frame.serial != self.game_frame_serial) else {
+            return;
+        };
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(frame.png_base64.as_bytes())
+            .map_err(|error| format!("decode runtime frame transport: {error}"))
+            .and_then(|bytes| {
+                image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+                    .map(|image| image.into_rgba8())
+                    .map_err(|error| format!("decode runtime frame PNG: {error}"))
+            });
+        self.game_frame_serial = frame.serial;
+        self.game_frame_backend = frame.backend;
+        self.game_frame_fps = frame.fps;
+        self.game_frame_update_ms = frame.update_ms;
+        self.game_frame_render_ms = frame.render_ms;
+        self.game_frame_draw_calls = frame.draw_calls;
+        self.game_frame_triangles = frame.triangles;
+        match decoded {
+            Ok(image) if image.dimensions() == (frame.width, frame.height) => {
+                self.game_frame = Some(Rc::new(image));
+            }
+            Ok(image) => {
+                self.status = format!(
+                    "Game View frame size mismatch: transport {}x{}, PNG {}x{}",
+                    frame.width,
+                    frame.height,
+                    image.width(),
+                    image.height()
+                );
+            }
+            Err(error) => self.status = format!("Game View frame failed: {error}"),
+        }
+    }
+
+    fn release_game_input(&mut self) {
+        if self.run_pending() {
+            let _ = self.send_run_command(crate::editor_ipc::IpcCommand::Input {
+                snapshot: crate::editor_ipc::RuntimeInputSnapshot::default(),
+            });
+        }
+        self.game_view_focused = false;
+    }
+
+    fn authored_id_for_runtime(&self, runtime_id: usize) -> Option<u64> {
+        self.runtime_state
+            .as_ref()
+            .and_then(|state| state.lock().ok())
+            .and_then(|state| {
+                state
+                    .entities
+                    .iter()
+                    .find(|entity| entity.id == runtime_id)
+                    .and_then(|entity| entity.source_id)
+            })
+    }
+
+    fn activate_runtime_diagnostic(&mut self, line: &crate::window::RuntimeLogLine) {
+        if let Some(id) = line.entity_id.and_then(|runtime_id| {
+            self.authored_id_for_runtime(runtime_id)
+                .or_else(|| u64::try_from(runtime_id).ok())
+        })
+            && self.scene.entity(id).is_some()
+        {
+            self.select_only(id);
+        }
+        if let Some(script) = line.script.as_deref() {
+            let source = Path::new(script);
+            let source = if source.is_absolute() {
+                source.to_path_buf()
+            } else {
+                self.project_root.join(source)
+            };
+            let target = format!("{}:{}", source.display(), line.line.unwrap_or(1));
+            for command in ["code", "code-insiders", "codium"] {
+                if std::process::Command::new(command)
+                    .arg("--reuse-window")
+                    .arg("--goto")
+                    .arg(&target)
+                    .spawn()
+                    .is_ok()
+                {
+                    self.status = format!("Opened runtime diagnostic at {target}");
+                    return;
+                }
+            }
+        }
+        self.status = format!(
+            "Runtime diagnostic{}{}{}: {}",
+            line.entity_id
+                .map(|id| format!(" · entity #{id}"))
+                .unwrap_or_default(),
+            line.component
+                .as_ref()
+                .map(|component| format!(" · {component}"))
+                .unwrap_or_default(),
+            line.property
+                .as_ref()
+                .map(|property| format!(".{property}"))
+                .unwrap_or_default(),
+            line.message.lines().next().unwrap_or("runtime message")
+        );
+    }
+
+    fn run_runtime_parity_validation(&mut self) {
+        let initial = self
+            .runtime_state
+            .as_ref()
+            .and_then(|state| state.lock().ok())
+            .and_then(|state| state.initial_entities.clone());
+        let Some(initial) = initial else {
+            self.status = if self.run_pending() {
+                "Parity validator is waiting for the runtime's initial scene snapshot…".to_string()
+            } else {
+                "Start the 3D Game View before running parity validation".to_string()
+            };
+            return;
+        };
+        let report = super::parity3d::validate(&self.scene, &initial);
+        self.status = if report.is_match() {
+            format!(
+                "Runtime-state parity passed for {} authored entities",
+                report.authored_entities
+            )
+        } else {
+            format!(
+                "Runtime-state parity found {} structured mismatch{}",
+                report.mismatches.len(),
+                if report.mismatches.len() == 1 { "" } else { "es" }
+            )
+        };
+        self.popup = Some(Popup::ParityReport {
+            report,
+            scroll: 0.0,
+        });
+    }
+
+    fn activate_parity_mismatch(&mut self, mismatch: &ParityMismatch) {
+        if let Some(entity_id) = mismatch
+            .entity_id
+            .filter(|entity_id| self.scene.entity(*entity_id).is_some())
+        {
+            self.select_only(entity_id);
+            self.config.layout.show_inspector = true;
+            if let Some(index) = mismatch.component_index {
+                self.collapsed.remove(&format!("comp_{entity_id}_{index}"));
+            }
+            self.inspector_scroll = 0.0;
+        }
+        self.status = format!(
+            "{} parity · {} · expected {}, runtime {}",
+            mismatch.category.label(),
+            mismatch.context(),
+            mismatch.expected,
+            mismatch.actual
+        );
+    }
+
+    fn visual_regression_stem(&self, width: u32, height: u32) -> String {
+        let mut stem = self
+            .scene
+            .name
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                    character.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        while stem.contains("--") {
+            stem = stem.replace("--", "-");
+        }
+        let stem = stem.trim_matches('-');
+        format!(
+            "{}-{width}x{height}",
+            if stem.is_empty() { "scene" } else { stem }
+        )
+    }
+
+    fn visual_baseline_path(&self, width: u32, height: u32) -> PathBuf {
+        self.project_root
+            .join(".neolove")
+            .join("visual-baselines")
+            .join(format!(
+                "{}.png",
+                self.visual_regression_stem(width, height)
+            ))
+    }
+
+    fn visual_baseline_metadata_path(&self, width: u32, height: u32) -> PathBuf {
+        self.project_root
+            .join(".neolove")
+            .join("visual-baselines")
+            .join(format!(
+                "{}-baseline.json",
+                self.visual_regression_stem(width, height)
+            ))
+    }
+
+    fn set_game_visual_baseline(&mut self) {
+        let Some(frame) = self.game_frame.as_ref().map(|frame| frame.as_ref().clone()) else {
+            self.status = "Visual baseline needs a rendered Game View frame".to_string();
+            return;
+        };
+        let path = self.visual_baseline_path(frame.width(), frame.height());
+        let metadata_path =
+            self.visual_baseline_metadata_path(frame.width(), frame.height());
+        let metadata = VisualBaselineMetadata::new(
+            self.game_frame_backend.clone(),
+            frame.width(),
+            frame.height(),
+        );
+        let result = path
+            .parent()
+            .ok_or_else(|| "visual baseline has no parent directory".to_string())
+            .and_then(|parent| {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("create visual baseline directory: {error}"))
+            })
+            .and_then(|()| {
+                frame
+                    .save_with_format(&path, image::ImageFormat::Png)
+                    .map_err(|error| format!("save visual baseline {}: {error}", path.display()))
+            })
+            .and_then(|()| {
+                serde_json::to_string_pretty(&metadata)
+                    .map_err(|error| format!("serialize visual baseline metadata: {error}"))
+            })
+            .and_then(|json| {
+                std::fs::write(&metadata_path, json).map_err(|error| {
+                    format!(
+                        "save visual baseline metadata {}: {error}",
+                        metadata_path.display()
+                    )
+                })
+            });
+        self.status = match result {
+            Ok(()) => format!(
+                "Saved canonical 3D Game View baseline {} ({} backend)",
+                path.display(),
+                self.game_frame_backend
+            ),
+            Err(error) => format!("Visual baseline failed: {error}"),
+        };
+    }
+
+    fn compare_game_visual_baseline(&mut self) {
+        let Some(frame) = self.game_frame.as_ref().map(|frame| frame.as_ref().clone()) else {
+            self.status = "Visual comparison needs a rendered Game View frame".to_string();
+            return;
+        };
+        let baseline_path = self.visual_baseline_path(frame.width(), frame.height());
+        let baseline = match image::open(&baseline_path) {
+            Ok(image) => image.into_rgba8(),
+            Err(error) => {
+                self.status = format!(
+                    "No readable visual baseline at {}: {error}. Use Set Base first.",
+                    baseline_path.display()
+                );
+                return;
+            }
+        };
+        let metadata_path =
+            self.visual_baseline_metadata_path(frame.width(), frame.height());
+        let baseline_metadata = std::fs::read_to_string(&metadata_path)
+            .ok()
+            .and_then(|json| serde_json::from_str::<VisualBaselineMetadata>(&json).ok())
+            .filter(|metadata| metadata.matches(baseline.width(), baseline.height()));
+        let baseline_backend = baseline_metadata
+            .as_ref()
+            .map(|metadata| metadata.backend.as_str())
+            .unwrap_or("");
+        let (tolerance, comparison_profile) =
+            comparison_tolerance(baseline_backend, &self.game_frame_backend);
+        let (mut report, diff_image) =
+            super::visual_regression3d::compare(&baseline, &frame, tolerance);
+        report.comparison_profile = comparison_profile.to_string();
+        report.baseline_backend = baseline_backend.to_string();
+        report.current_backend = self.game_frame_backend.clone();
+        let artifact_dir = self.project_root.join(".neolove").join("visual-regression");
+        let stem = self.visual_regression_stem(frame.width(), frame.height());
+        let report_path = artifact_dir.join(format!("{stem}-latest-report.json"));
+        let diff_path = artifact_dir.join(format!("{stem}-latest-diff.png"));
+        let mut written_diff = None;
+        if std::fs::create_dir_all(&artifact_dir).is_ok() {
+            if let Ok(json) = serde_json::to_string_pretty(&report) {
+                let _ = std::fs::write(&report_path, json);
+            }
+            if !report.passed
+                && diff_image
+                    .save_with_format(&diff_path, image::ImageFormat::Png)
+                    .is_ok()
+            {
+                written_diff = Some(diff_path);
+            }
+        }
+        self.status = format!(
+            "3D visual regression {} on {} ({}): {}",
+            if report.passed { "passed" } else { "failed" },
+            self.game_frame_backend,
+            report.comparison_profile,
+            report.summary()
+        );
+        self.popup = Some(Popup::VisualRegression {
+            report,
+            baseline: baseline_path,
+            diff: written_diff,
+        });
+    }
+
+    fn game_view(&mut self, ui: &mut Ui, area: Rect) {
+        self.last_viewport = area;
+        let previous_clip = ui.painter.push_clip(area);
+        ui.set_input_clip(area);
+        ui.painter.fill_rect(area, [12, 14, 17, 255]);
+
+        let (runtime_entities, runtime_logs, runtime_connected) = self
+            .runtime_state
+            .as_ref()
+            .and_then(|state| state.lock().ok())
+            .map(|state| {
+                (
+                    state.entities.clone(),
+                    state.logs.iter().cloned().collect::<Vec<_>>(),
+                    state.connected,
+                )
+            })
+            .unwrap_or_default();
+        let diagnostics_w = if area.w >= 720.0 { 218.0 } else { 0.0 };
+        let render_area = Rect::new(area.x, area.y, area.w - diagnostics_w, area.h);
+
+        let target_size = (
+            render_area.w.round().clamp(64.0, 4096.0) as u32,
+            render_area.h.round().clamp(64.0, 4096.0) as u32,
+        );
+        if self.run_pending() && target_size != self.game_view_size {
+            self.game_view_size = target_size;
+            let _ = self.send_run_command(crate::editor_ipc::IpcCommand::Resize {
+                width: target_size.0,
+                height: target_size.1,
+            });
+        }
+
+        let mut image_rect = render_area.shrink(8.0);
+        if let Some(image) = &self.game_frame {
+            let source_aspect = image.width() as f32 / image.height().max(1) as f32;
+            let destination_aspect = image_rect.w / image_rect.h.max(1.0);
+            if destination_aspect > source_aspect {
+                let width = image_rect.h * source_aspect;
+                image_rect.x += (image_rect.w - width) * 0.5;
+                image_rect.w = width;
+            } else {
+                let height = image_rect.w / source_aspect.max(0.001);
+                image_rect.y += (image_rect.h - height) * 0.5;
+                image_rect.h = height;
+            }
+            ui.painter
+                .draw_image(image, image_rect, None, [255, 255, 255, 255]);
+        } else {
+            ui.painter.text_wrapped(
+                Rect::new(
+                    render_area.x + 24.0,
+                    render_area.y + 36.0,
+                    render_area.w - 48.0,
+                    80.0,
+                ),
+                if self.run_pending() {
+                    "Starting the isolated runtime and waiting for its first rendered frame…"
+                } else {
+                    "The runtime is stopped. Press Run to start this Game View."
+                },
+                14.0,
+                19.0,
+                self.config.theme.text_dim,
+            );
+        }
+
+        let inside_image = image_rect.contains(ui.input.mouse_x, ui.input.mouse_y);
+        if ui.input.mouse_pressed {
+            if self.game_view_focused && !inside_image {
+                self.release_game_input();
+            } else {
+                self.game_view_focused = inside_image;
+            }
+        }
+        if self.run_pending() && self.game_view_focused {
+            let mouse_x = ((ui.input.mouse_x - image_rect.x) / image_rect.w.max(1.0)
+                * self.game_view_size.0 as f32)
+                .clamp(0.0, self.game_view_size.0.saturating_sub(1) as f32);
+            let mouse_y = ((ui.input.mouse_y - image_rect.y) / image_rect.h.max(1.0)
+                * self.game_view_size.1 as f32)
+                .clamp(0.0, self.game_view_size.1.saturating_sub(1) as f32);
+            let mut mouse_buttons = Vec::new();
+            for (down, name) in [
+                (ui.input.mouse_down, "left"),
+                (ui.input.right_down, "right"),
+                (ui.input.middle_down, "middle"),
+            ] {
+                if down {
+                    mouse_buttons.push(name.to_string());
+                }
+            }
+            let _ = self.send_run_command(crate::editor_ipc::IpcCommand::Input {
+                snapshot: crate::editor_ipc::RuntimeInputSnapshot {
+                    mouse_x,
+                    mouse_y,
+                    mouse_buttons,
+                    keys: ui.input.runtime_keys_down.clone(),
+                    wheel_x: 0.0,
+                    wheel_y: if inside_image { ui.input.scroll } else { 0.0 },
+                    text: ui.input.typed.clone(),
+                },
+            });
+            ui.wants_redraw = true;
+        }
+
+        let telemetry = format!(
+            "{}   {:.1} fps   update {:.2} ms   render {:.2} ms   draws {}   tris {}   frame {}{}",
+            if self.game_frame_backend.is_empty() {
+                "runtime"
+            } else {
+                &self.game_frame_backend
+            },
+            self.game_frame_fps,
+            self.game_frame_update_ms,
+            self.game_frame_render_ms,
+            self.game_frame_draw_calls,
+            self.game_frame_triangles,
+            self.game_frame_serial,
+            if self.game_view_focused {
+                "   input focused"
+            } else {
+                "   click to focus input"
+            }
+        );
+        let hud = Rect::new(
+            render_area.x + 14.0,
+            render_area.bottom() - 29.0,
+            (ui.painter.text_width(&telemetry, 12.0) + 16.0).min(render_area.w - 28.0),
+            20.0,
+        );
+        ui.painter.fill_round_rect(hud, 3.0, [0, 0, 0, 178]);
+        ui.painter.text_clipped(
+            hud.x + 8.0,
+            hud.y + 3.0,
+            &telemetry,
+            12.0,
+            self.config.theme.text,
+            hud.w - 12.0,
+        );
+        if diagnostics_w > 0.0 {
+            let diagnostics = Rect::new(render_area.right(), area.y, diagnostics_w, area.h);
+            ui.painter
+                .fill_rect(diagnostics, self.config.theme.panel_alt);
+            ui.painter
+                .stroke_rect(diagnostics, self.config.theme.border);
+            ui.painter.text(
+                diagnostics.x + 10.0,
+                diagnostics.y + 9.0,
+                "Live runtime",
+                13.0,
+                self.config.theme.accent,
+            );
+            let validate = Rect::new(
+                diagnostics.right() - 74.0,
+                diagnostics.y + 5.0,
+                66.0,
+                20.0,
+            );
+            if ui.button(validate, "Validate") {
+                self.run_runtime_parity_validation();
+            }
+            ui.painter.text_clipped(
+                diagnostics.x + 10.0,
+                diagnostics.y + 27.0,
+                &format!(
+                    "{}  ·  {} entities  ·  {} logs",
+                    if runtime_connected {
+                        "Connected"
+                    } else {
+                        "Waiting"
+                    },
+                    runtime_entities.len(),
+                    runtime_logs.len()
+                ),
+                11.0,
+                self.config.theme.text_dim,
+                diagnostics.w - 20.0,
+            );
+            ui.painter.fill_rect(
+                Rect::new(
+                    diagnostics.x + 8.0,
+                    diagnostics.y + 48.0,
+                    diagnostics.w - 16.0,
+                    1.0,
+                ),
+                self.config.theme.border,
+            );
+            let set_baseline = Rect::new(
+                diagnostics.x + 8.0,
+                diagnostics.y + 53.0,
+                (diagnostics.w - 22.0) * 0.5,
+                21.0,
+            );
+            let compare_visual = Rect::new(
+                set_baseline.right() + 6.0,
+                set_baseline.y,
+                set_baseline.w,
+                set_baseline.h,
+            );
+            if ui.button(set_baseline, "Set Base") {
+                self.set_game_visual_baseline();
+            }
+            if ui.button(compare_visual, "Compare") {
+                self.compare_game_visual_baseline();
+            }
+            ui.painter.fill_rect(
+                Rect::new(
+                    diagnostics.x + 8.0,
+                    diagnostics.y + 79.0,
+                    diagnostics.w - 16.0,
+                    1.0,
+                ),
+                self.config.theme.border,
+            );
+            let log_h = 112.0_f32.min((diagnostics.h * 0.34).max(72.0));
+            let entities_bottom = diagnostics.bottom() - log_h - 8.0;
+            let mut row_y = diagnostics.y + 85.0;
+            let entity_rows = ((entities_bottom - row_y) / 20.0).max(0.0) as usize;
+            for entity in runtime_entities.iter().take(entity_rows) {
+                let row = Rect::new(
+                    diagnostics.x + 6.0,
+                    row_y,
+                    diagnostics.w - 12.0,
+                    19.0,
+                );
+                let authored_id = entity.source_id;
+                let selected = authored_id.is_some_and(|id| self.is_selected(id));
+                if ui.list_row(
+                    row,
+                    &format!("{}  #{}", entity.name, entity.id),
+                    selected,
+                    6.0,
+                ) && let Some(id) = authored_id.filter(|id| self.scene.entity(*id).is_some())
+                {
+                    self.select_only(id);
+                    self.status = format!(
+                        "Linked runtime entity #{} ({}) to the authored Inspector",
+                        entity.id, entity.name
+                    );
+                }
+                row_y += 20.0;
+            }
+            let log_rect = Rect::new(
+                diagnostics.x + 6.0,
+                diagnostics.bottom() - log_h,
+                diagnostics.w - 12.0,
+                log_h - 6.0,
+            );
+            ui.painter.fill_rect(log_rect, [10, 12, 15, 255]);
+            ui.painter.stroke_rect(log_rect, self.config.theme.border);
+            ui.painter.text(
+                log_rect.x + 7.0,
+                log_rect.y + 6.0,
+                "Console",
+                12.0,
+                self.config.theme.text_dim,
+            );
+            let mut log_y = log_rect.y + 22.0;
+            for line in runtime_logs.iter().rev().take(4).rev() {
+                let color = match line.level.as_str() {
+                    "error" => [238, 112, 106, 255],
+                    "warn" | "warning" => [229, 192, 92, 255],
+                    _ => self.config.theme.text_dim,
+                };
+                let row = Rect::new(log_rect.x + 3.0, log_y - 2.0, log_rect.w - 6.0, 16.0);
+                if row.contains(ui.input.mouse_x, ui.input.mouse_y) {
+                    ui.painter.fill_rect(row, self.config.theme.panel_alt);
+                    if ui.input.mouse_pressed {
+                        self.activate_runtime_diagnostic(line);
+                    }
+                }
+                let context = match (&line.entity_id, &line.component) {
+                    (Some(entity), Some(component)) => format!("#{entity} {component} · "),
+                    (Some(entity), None) => format!("#{entity} · "),
+                    (None, Some(component)) => format!("{component} · "),
+                    (None, None) => String::new(),
+                };
+                ui.painter.text_clipped(
+                    row.x + 4.0,
+                    log_y,
+                    &format!("{context}{}", line.message.replace('\n', "  ")),
+                    10.0,
+                    color,
+                    row.w - 8.0,
+                );
+                log_y += 17.0;
+            }
+        }
+        ui.reset_input_clip();
+        ui.painter.set_clip_raw(previous_clip);
+    }
+
     fn viewport(&mut self, ui: &mut Ui, area: Rect) {
         if area.w <= 0.0 {
             return;
@@ -3701,7 +5563,48 @@ impl EditorApp {
         // Keep the mature 2D viewport below byte-for-byte in behavior. 3D
         // scenes have independent navigation, projection, picking, and gizmos.
         if self.scene.kind == SceneKind::ThreeD {
-            self.viewport_3d(ui, area);
+            let game_available = self.run_pending() || self.game_frame.is_some();
+            if game_available {
+                let tabs = Rect::new(area.x, area.y, area.w, 28.0);
+                ui.painter.fill_rect(tabs, self.config.theme.header);
+                ui.painter.stroke_rect(tabs, self.config.theme.border);
+                let scene_tab = Rect::new(tabs.x + 7.0, tabs.y + 3.0, 78.0, 22.0);
+                let game_tab = Rect::new(scene_tab.right() + 4.0, tabs.y + 3.0, 86.0, 22.0);
+                if ui.button_colored(
+                    scene_tab,
+                    "Scene View",
+                    if self.game_view_active {
+                        self.config.theme.button
+                    } else {
+                        self.config.theme.panel
+                    },
+                    self.config.theme.text,
+                ) {
+                    self.game_view_active = false;
+                    self.release_game_input();
+                }
+                if ui.button_colored(
+                    game_tab,
+                    "Game View",
+                    if self.game_view_active {
+                        self.config.theme.panel
+                    } else {
+                        self.config.theme.button
+                    },
+                    self.config.theme.text,
+                ) {
+                    self.game_view_active = true;
+                }
+                let content = Rect::new(area.x, tabs.bottom(), area.w, area.h - tabs.h);
+                if self.game_view_active {
+                    self.game_view(ui, content);
+                } else {
+                    self.viewport_3d(ui, content);
+                }
+            } else {
+                self.viewport_3d(ui, area);
+            }
+            self.maximized_view_restore_button(ui, area);
             return;
         }
         self.last_viewport = area;
@@ -3906,9 +5809,29 @@ impl EditorApp {
 
         ui.reset_input_clip();
         ui.painter.set_clip_raw(prev);
+        self.maximized_view_restore_button(ui, area);
+    }
+
+    fn maximized_view_restore_button(&mut self, ui: &mut Ui, area: Rect) {
+        if !self.maximize_view || area.w < 170.0 || area.h < 36.0 {
+            return;
+        }
+        let restore = Rect::new(area.right() - 158.0, area.y + 4.0, 150.0, 24.0);
+        if ui.button_colored(
+            restore,
+            "Restore editor  Esc",
+            self.config.theme.button,
+            self.config.theme.text,
+        ) {
+            self.maximize_view = false;
+            self.release_game_input();
+            self.status = "Restored editor panels".to_string();
+        }
+        ui.tooltip(restore, "Exit the maximized view and restore all editor panels");
     }
 
     fn viewport_3d(&mut self, ui: &mut Ui, area: Rect) {
+        let viewport_cpu_start = Instant::now();
         self.last_viewport = area;
         let previous_clip = ui.painter.push_clip(area);
         ui.set_input_clip(area);
@@ -3922,7 +5845,16 @@ impl EditorApp {
             .min(0.05);
         self.viewport_3d_last_frame = now;
         self.viewport_camera_3d.fov = self.config.settings.viewport_camera_fov.clamp(20.0, 140.0);
-        self.viewport_camera_3d.projection = Projection3D::Perspective;
+        self.viewport_camera_3d.projection = if self.config.layout.viewport_orthographic_3d {
+            Projection3D::Orthographic
+        } else {
+            Projection3D::Perspective
+        };
+        self.viewport_camera_3d.orthographic_size = self
+            .config
+            .layout
+            .viewport_orthographic_size_3d
+            .clamp(0.01, 100_000.0);
 
         let sensitivity = self
             .config
@@ -3934,6 +5866,50 @@ impl EditorApp {
             .settings
             .viewport_camera_speed
             .clamp(0.1, 1_000.0);
+
+        // Alt+LMB orbits around the active selection. With no selection it
+        // uses the last framed target, then a point in front of the camera.
+        if inside && ui.input.alt && ui.input.mouse_pressed && self.viewport_3d_orbit.is_none() {
+            let target = self.navigation_target_3d();
+            let distance = length_vec3(sub_vec3(self.viewport_camera_3d.position, target))
+                .clamp(0.01, 1_000_000.0);
+            self.viewport_3d_orbit = Some(Viewport3DOrbit {
+                mouse_x: ui.input.mouse_x,
+                mouse_y: ui.input.mouse_y,
+                pitch: self.viewport_camera_3d.euler.x,
+                yaw: self.viewport_camera_3d.euler.y,
+                target,
+                distance,
+            });
+        }
+        if ui.input.mouse_down
+            && ui.input.alt
+            && let Some(anchor) = self.viewport_3d_orbit
+        {
+            let dx = (ui.input.mouse_x - anchor.mouse_x) / display_scale;
+            let dy = (ui.input.mouse_y - anchor.mouse_y) / display_scale;
+            let pitch_direction = if self.config.settings.viewport_invert_mouse_look {
+                -1.0
+            } else {
+                1.0
+            };
+            let yaw_direction = if self.config.settings.viewport_invert_mouse_x {
+                -1.0
+            } else {
+                1.0
+            };
+            self.viewport_camera_3d.euler.x =
+                (anchor.pitch + dy * sensitivity * 0.2 * pitch_direction).clamp(-89.0, 89.0);
+            self.viewport_camera_3d.euler.y =
+                anchor.yaw + dx * sensitivity * 0.2 * yaw_direction;
+            let forward = camera_forward(self.viewport_camera_3d.euler);
+            self.viewport_camera_3d.position =
+                sub_vec3(anchor.target, scale_vec3(forward, anchor.distance));
+            self.viewport_3d_orbit_target = Some(anchor.target);
+            ui.wants_redraw = true;
+        } else if !ui.input.mouse_down {
+            self.viewport_3d_orbit = None;
+        }
 
         // Preserve a click candidate even when winit coalesces RMB press and
         // release before the next redraw.
@@ -3964,9 +5940,15 @@ impl EditorApp {
             } else {
                 1.0
             };
+            let yaw_direction = if self.config.settings.viewport_invert_mouse_x {
+                -1.0
+            } else {
+                1.0
+            };
             self.viewport_camera_3d.euler.x =
                 (anchor.pitch + look_dy * sensitivity * 0.2 * pitch_direction).clamp(-89.0, 89.0);
-            self.viewport_camera_3d.euler.y = anchor.yaw + look_dx * sensitivity * 0.2;
+            self.viewport_camera_3d.euler.y =
+                anchor.yaw + look_dx * sensitivity * 0.2 * yaw_direction;
 
             let fly_key = ui.input.key_w
                 || ui.input.key_a
@@ -3980,51 +5962,71 @@ impl EditorApp {
                     || ui.input.right_dragged;
             }
 
-            if !ui.input.ctrl {
-                let mut movement = Vec3::ZERO;
-                let forward = camera_forward(self.viewport_camera_3d.euler);
-                let right = camera_right(self.viewport_camera_3d.euler);
-                if ui.input.key_w {
-                    movement = add_vec3(movement, forward);
-                }
-                if ui.input.key_s {
-                    movement = sub_vec3(movement, forward);
-                }
-                if ui.input.key_d {
-                    movement = add_vec3(movement, right);
-                }
-                if ui.input.key_a {
-                    movement = sub_vec3(movement, right);
-                }
-                if ui.input.key_e {
-                    movement.y += 1.0;
-                }
-                if ui.input.key_q {
-                    movement.y -= 1.0;
-                }
-                movement = normalized_vec3(movement);
-                let boost = if ui.input.shift { 3.0 } else { 1.0 };
-                self.viewport_camera_3d.position = add_vec3(
-                    self.viewport_camera_3d.position,
-                    scale_vec3(movement, move_speed * boost * delta_seconds),
-                );
-            }
             ui.wants_redraw = true;
         } else if !ui.input.right_released {
             self.viewport_3d_look = None;
         }
 
+        // Translation can be configured as ordinary viewport-hover fly keys;
+        // RMB remains available for users who prefer the traditional coupled
+        // look-and-move gesture. Text fields and other focused controls retain
+        // ownership of W/A/S/D/Q/E.
+        let fly_keys_active = !ui.has_focus()
+            && !ui.input.ctrl
+            && (ui.input.right_down
+                || (inside && self.config.settings.viewport_fly_without_mouse_hold));
+        if fly_keys_active {
+            let mut movement = Vec3::ZERO;
+            let forward = camera_forward(self.viewport_camera_3d.euler);
+            let right = camera_right(self.viewport_camera_3d.euler);
+            if ui.input.key_w {
+                movement = add_vec3(movement, forward);
+            }
+            if ui.input.key_s {
+                movement = sub_vec3(movement, forward);
+            }
+            if ui.input.key_d {
+                movement = add_vec3(movement, right);
+            }
+            if ui.input.key_a {
+                movement = sub_vec3(movement, right);
+            }
+            if ui.input.key_e {
+                movement.y += 1.0;
+            }
+            if ui.input.key_q {
+                movement.y -= 1.0;
+            }
+            if length_vec3(movement) > f32::EPSILON {
+                let boost = if ui.input.shift { 3.0 } else { 1.0 };
+                self.viewport_camera_3d.position = add_vec3(
+                    self.viewport_camera_3d.position,
+                    scale_vec3(
+                        normalized_vec3(movement),
+                        move_speed * boost * delta_seconds,
+                    ),
+                );
+                if let Some(look) = self.viewport_3d_look.as_mut() {
+                    look.navigated = true;
+                }
+                ui.wants_redraw = true;
+            }
+        }
+
         // MMB pans in the camera plane. This mirrors the established 2D MMB
         // gesture while keeping the two camera states completely independent.
-        if !ui.input.right_down
+        if self.viewport_3d_orbit.is_none()
+            && !ui.input.right_down
             && ui.input.middle_down
             && (inside || self.viewport_3d_pan_anchor.is_some())
         {
-            let (start_x, start_y, start_position) = *self.viewport_3d_pan_anchor.get_or_insert((
-                ui.input.mouse_x,
-                ui.input.mouse_y,
-                self.viewport_camera_3d.position,
-            ));
+            let (start_x, start_y, start_position, start_target) =
+                *self.viewport_3d_pan_anchor.get_or_insert((
+                    ui.input.mouse_x,
+                    ui.input.mouse_y,
+                    self.viewport_camera_3d.position,
+                    self.viewport_3d_orbit_target,
+                ));
             let dx = ui.input.mouse_x - start_x;
             let dy = ui.input.mouse_y - start_y;
             let right = camera_right(self.viewport_camera_3d.euler);
@@ -4037,6 +6039,15 @@ impl EditorApp {
                     scale_vec3(up, dy * units_per_pixel),
                 ),
             );
+            if let Some(target) = start_target {
+                self.viewport_3d_orbit_target = Some(add_vec3(
+                    target,
+                    add_vec3(
+                        scale_vec3(right, -dx * units_per_pixel),
+                        scale_vec3(up, dy * units_per_pixel),
+                    ),
+                ));
+            }
             ui.wants_redraw = true;
         } else {
             self.viewport_3d_pan_anchor = None;
@@ -4044,11 +6055,23 @@ impl EditorApp {
 
         // Wheel dolly is useful without entering fly-look mode.
         if inside && ui.input.scroll != 0.0 && !ui.input.right_down {
-            let forward = camera_forward(self.viewport_camera_3d.euler);
-            self.viewport_camera_3d.position = add_vec3(
-                self.viewport_camera_3d.position,
-                scale_vec3(forward, ui.input.scroll * move_speed * 0.08),
-            );
+            if self.config.layout.viewport_orthographic_3d {
+                self.config.layout.viewport_orthographic_size_3d = (self
+                    .config
+                    .layout
+                    .viewport_orthographic_size_3d
+                    * (-ui.input.scroll * 0.12).exp())
+                .clamp(0.01, 100_000.0);
+                self.viewport_camera_3d.orthographic_size =
+                    self.config.layout.viewport_orthographic_size_3d;
+                self.dirty = true;
+            } else {
+                let forward = camera_forward(self.viewport_camera_3d.euler);
+                self.viewport_camera_3d.position = add_vec3(
+                    self.viewport_camera_3d.position,
+                    scale_vec3(forward, ui.input.scroll * move_speed * 0.08),
+                );
+            }
             ui.wants_redraw = true;
         }
 
@@ -4068,9 +6091,15 @@ impl EditorApp {
         }
 
         let lights = self.gather_viewport_lights_3d();
+        let viewport_fog = self.viewport_fog_3d();
+        let viewport_ambient_occlusion = self.viewport_ambient_occlusion_3d();
+        let mut viewport_ambient_occluders = Vec::new();
+        let mut viewport_ambient_receivers = HashMap::new();
         let mut triangles = std::mem::take(&mut self.viewport_3d_triangles);
         let mut triangle_hits = std::mem::take(&mut self.viewport_3d_triangle_hits);
         let mut proxy_hits = std::mem::take(&mut self.viewport_3d_proxy_hits);
+        let mut mesh_bounds = Vec::new();
+        let mut mesh_draws = 0usize;
         triangles.clear();
         triangle_hits.clear();
         proxy_hits.clear();
@@ -4087,6 +6116,11 @@ impl EditorApp {
                 continue;
             };
             let world_origin = model.transform_point(Vec3::ZERO);
+            let render_policy = viewport_render_policy_3d(
+                &self.scene,
+                entity,
+                self.viewport_camera_3d.render_mask,
+            );
             if let Some(point) = project_world_point(view_projection, world_origin, area) {
                 if !self.locked_ids.contains(&entity.id) {
                     proxy_hits.push(Viewport3DProxyHit {
@@ -4104,12 +6138,125 @@ impl EditorApp {
                 let Component::Core { name, props } = component else {
                     continue;
                 };
+                if matches!(name.as_str(), "Collider3D" | "Trigger3D")
+                    && prop_bool(props, &["enabled"]).unwrap_or(true)
+                {
+                    let shape = prop_string_like(props, &["shape"])
+                        .unwrap_or_else(|| "box".to_string())
+                        .to_ascii_lowercase();
+                    let offset = Vec3::new(
+                        prop_number(props, &["offset_x", "offsetX"]).unwrap_or(0.0),
+                        prop_number(props, &["offset_y", "offsetY"]).unwrap_or(0.0),
+                        prop_number(props, &["offset_z", "offsetZ"]).unwrap_or(0.0),
+                    );
+                    if shape == "box"
+                        && triangle_hits.len().saturating_add(12) <= triangle_budget
+                    {
+                        let half = Vec3::new(
+                            prop_number(props, &["size_x", "sizeX"])
+                                .unwrap_or(1.0)
+                                .abs()
+                                * 0.5,
+                            prop_number(props, &["size_y", "sizeY"])
+                                .unwrap_or(1.0)
+                                .abs()
+                                * 0.5,
+                            prop_number(props, &["size_z", "sizeZ"])
+                                .unwrap_or(1.0)
+                                .abs()
+                                * 0.5,
+                        );
+                        append_box_collider_surface_hits_3d(
+                            &mut triangle_hits,
+                            entity.id,
+                            model,
+                            view_projection,
+                            area,
+                            offset,
+                            half,
+                        );
+                    } else if triangle_hits.len() < triangle_budget {
+                        let options = crate::mesh::PrimitiveOptions {
+                            size: [1.0, 1.0, 1.0],
+                            radius: prop_number(props, &["radius"])
+                                .unwrap_or(0.5)
+                                .abs()
+                                .max(0.0001),
+                            height: prop_number(props, &["height"])
+                                .unwrap_or(1.0)
+                                .abs()
+                                .max(0.0001),
+                            segments: 24,
+                            rings: 12,
+                        };
+                        let collider_mesh = match shape.as_str() {
+                            "sphere" | "capsule" => {
+                                crate::mesh::primitive_mesh(&shape, options).ok()
+                            }
+                            "mesh" => prop_string_like(props, &["mesh_path", "meshPath"])
+                                .filter(|path| !path.trim().is_empty())
+                                .and_then(|path| self.load_viewport_mesh(&path)),
+                            _ => None,
+                        };
+                        if let Some(mesh) = collider_mesh {
+                            let collider_model = model.mul(Mat4::translation(offset));
+                            let command = Mesh3DCommand {
+                                mesh,
+                                model: collider_model,
+                                view_projection,
+                                camera_position: self.viewport_camera_3d.position,
+                                tint: Color::rgba(255, 255, 255, 255),
+                                texture: None,
+                                materials: Vec::new(),
+                                shader: None,
+                                double_sided: true,
+                                casts_shadows: false,
+                                receives_shadows: false,
+                            };
+                            if let Ok(projected) = project_mesh(&command, &[]) {
+                                let remaining = triangle_budget.saturating_sub(triangle_hits.len());
+                                append_projected_collider_surface_hits_3d(
+                                    &mut triangle_hits,
+                                    entity.id,
+                                    area,
+                                    projected,
+                                    remaining,
+                                );
+                            }
+                        }
+                    }
+                }
                 if name != "MeshRenderer3D"
                     || prop_bool(props, &["visible"]).is_some_and(|visible| !visible)
+                    || !render_policy.visibility.effective_visible
+                    || !render_policy.layer_match
                 {
                     continue;
                 }
-                let mesh = prop_string_like(props, &["mesh_path", "meshPath"])
+                let base_mesh_path =
+                    prop_string_like(props, &["mesh_path", "meshPath"]).unwrap_or_default();
+                let mut resolved_mesh_path = base_mesh_path.clone();
+                if let Some(lod) = viewport_lod_state_3d(
+                    entity,
+                    world_origin,
+                    self.viewport_camera_3d.position,
+                ) {
+                    let Some(requested_level) = lod.requested_level else {
+                        continue;
+                    };
+                    let lod0 = prop_string_like(lod.props, &["lod0_mesh"]).unwrap_or_default();
+                    let lod1 = prop_string_like(lod.props, &["lod1_mesh"]).unwrap_or_default();
+                    let lod2 = prop_string_like(lod.props, &["lod2_mesh"]).unwrap_or_default();
+                    resolved_mesh_path = crate::render3d::resolve_lod_mesh_path_3d(
+                        &base_mesh_path,
+                        [&lod0, &lod1, &lod2],
+                        requested_level,
+                    )
+                    .mesh_path
+                    .to_string();
+                }
+                let mesh = (!resolved_mesh_path.trim().is_empty())
+                    .then_some(resolved_mesh_path)
                     .filter(|path| !path.trim().is_empty())
                     .and_then(|path| self.load_viewport_mesh(&path))
                     .or_else(|| {
@@ -4152,18 +6299,48 @@ impl EditorApp {
                 let Some(mesh) = mesh else {
                     continue;
                 };
+                mesh_draws += 1;
+                if self.config.layout.show_mesh_bounds_3d
+                    && let Ok(snapshot) = mesh.snapshot()
+                {
+                    let bounds = snapshot.mesh.bounds;
+                    mesh_bounds.push((
+                        model,
+                        Vec3::new(bounds.center[0], bounds.center[1], bounds.center[2]),
+                        Vec3::new(
+                            (bounds.max[0] - bounds.min[0]).abs() * 0.5,
+                            (bounds.max[1] - bounds.min[1]).abs() * 0.5,
+                            (bounds.max[2] - bounds.min[2]).abs() * 0.5,
+                        ),
+                    ));
+                }
                 let rgba = prop_color(props, "color").unwrap_or([255, 255, 255, 255]);
+                let casts_shadows = prop_bool(props, &["casts_shadows"]).unwrap_or(true);
+                let receives_shadows = prop_bool(props, &["receives_shadows"]).unwrap_or(true);
                 let command = Mesh3DCommand {
                     mesh,
                     model,
                     view_projection,
+                    camera_position: self.viewport_camera_3d.position,
                     tint: Color::rgba(rgba[0], rgba[1], rgba[2], rgba[3]),
                     texture: None,
+                    materials: Vec::new(),
                     shader: None,
                     // Asset inspection should remain useful even when an
                     // imported file has inconsistent winding.
                     double_sided: true,
+                    casts_shadows,
+                    receives_shadows,
                 };
+                if viewport_ambient_occlusion.is_some()
+                    && let Ok(mut bounds) = crate::render3d::mesh_world_bounds_3d(&command)
+                {
+                    bounds.source_index = entity.id as usize;
+                    viewport_ambient_receivers.insert(entity.id, bounds);
+                    if casts_shadows {
+                        viewport_ambient_occluders.push(bounds);
+                    }
+                }
                 let Ok(projected) = project_mesh(&command, &lights) else {
                     continue;
                 };
@@ -4187,33 +6364,155 @@ impl EditorApp {
                             / 3.0;
                         color[channel] = (average.clamp(0.0, 1.0) * 255.0).round() as u8;
                     }
-                    if !active {
-                        color[0] /= 3;
-                        color[1] /= 3;
-                        color[2] /= 3;
-                    }
                     let bounds = triangle_screen_bounds(points);
-                    triangles.push((triangle.depth, entity.id, points, color));
-                    if !self.locked_ids.contains(&entity.id) {
-                        triangle_hits.push(Viewport3DHit {
-                            id: entity.id,
-                            points,
-                            bounds,
-                            depth: triangle.depth,
-                        });
-                    }
+                    let world_points = triangle.vertices.map(|vertex| {
+                        Vec3::new(
+                            vertex.world_position[0],
+                            vertex.world_position[1],
+                            vertex.world_position[2],
+                        )
+                    });
+                    let world_normals = triangle.vertices.map(|vertex| {
+                        Vec3::new(
+                            vertex.world_normal[0],
+                            vertex.world_normal[1],
+                            vertex.world_normal[2],
+                        )
+                    });
+                    triangles.push(Viewport3DDrawTriangle {
+                        id: entity.id,
+                        points,
+                        depths: triangle.vertices.map(|vertex| vertex.ndc[2]),
+                        color,
+                        world_points,
+                        world_normals,
+                        active,
+                        receives_shadows,
+                    });
+                    triangle_hits.push(Viewport3DHit {
+                        id: entity.id,
+                        points,
+                        bounds,
+                        depth: triangle.depth,
+                        world_points,
+                        world_normals,
+                        world_tangents: triangle.vertices.map(|vertex| {
+                            Vec3::new(
+                                vertex.world_tangent[0],
+                                vertex.world_tangent[1],
+                                vertex.world_tangent[2],
+                            )
+                        }),
+                        uvs: triangle.vertices.map(|vertex| vertex.uv),
+                        clip_w: triangle
+                            .vertices
+                            .map(|vertex| vertex.clip_position[3]),
+                        pickable: !self.locked_ids.contains(&entity.id),
+                    });
                 }
             }
         }
 
-        // Painter has no depth buffer, so render opaque preview triangles from
-        // far to near. Picking below still compares per-triangle depth and is
-        // therefore independent of entity iteration order.
-        triangles.sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(Ordering::Equal));
-        for (_, id, points, color) in &triangles {
-            ui.painter
-                .fill_triangle(points[0], points[1], points[2], *color);
-            if self.is_selected(*id)
+        let mut ambient_by_entity = HashMap::new();
+        if viewport_ambient_occlusion.is_some() {
+            for (&id, &receiver) in &viewport_ambient_receivers {
+                ambient_by_entity.insert(
+                    id,
+                    crate::render3d::select_ambient_occluders_3d(
+                        id as usize,
+                        receiver,
+                        &viewport_ambient_occluders,
+                    ),
+                );
+            }
+        }
+        for triangle in &mut triangles {
+            let mut color = triangle.color.map(|channel| channel as f32 / 255.0);
+            if triangle.receives_shadows
+                && let Some(settings) = viewport_ambient_occlusion
+                && let Some(occluders) = ambient_by_entity.get(&triangle.id)
+            {
+                let visibility = (0..3)
+                    .map(|corner| {
+                        crate::render3d::ambient_occlusion_visibility_3d(
+                            settings,
+                            triangle.world_points[corner],
+                            triangle.world_normals[corner],
+                            occluders,
+                        )
+                    })
+                    .sum::<f32>()
+                    / 3.0;
+                color = crate::render3d::apply_ambient_occlusion_srgb(color, visibility);
+            }
+            if let Some(fog) = viewport_fog {
+                let center = scale_vec3(
+                    add_vec3(
+                        add_vec3(triangle.world_points[0], triangle.world_points[1]),
+                        triangle.world_points[2],
+                    ),
+                    1.0 / 3.0,
+                );
+                color = crate::render3d::apply_fog_srgb(
+                    color,
+                    [center.x, center.y, center.z],
+                    self.viewport_camera_3d.position,
+                    fog,
+                );
+            }
+            triangle.color = color.map(|channel| {
+                (channel.clamp(0.0, 1.0) * 255.0).round() as u8
+            });
+            if !triangle.active {
+                triangle.color[0] /= 3;
+                triangle.color[1] /= 3;
+                triangle.color[2] /= 3;
+            }
+        }
+
+        // Resolve geometry exactly like a real 3D renderer: adjacent and
+        // intersecting faces compete per pixel. Average-depth painter sorting
+        // caused large close-up cubes to cut triangular holes into themselves.
+        let framebuffer_pixels =
+            (ui.painter.width() as usize).saturating_mul(ui.painter.height() as usize);
+        self.viewport_3d_depth
+            .resize(framebuffer_pixels, f32::INFINITY);
+        self.viewport_3d_depth.fill(f32::INFINITY);
+        for triangle in &triangles {
+            ui.painter.fill_triangle_depth_tested(
+                triangle.points,
+                triangle.depths,
+                triangle.color,
+                &mut self.viewport_3d_depth,
+            );
+            if self.config.layout.show_wireframe_3d {
+                let wire = [170, 215, 255, 150];
+                ui.painter
+                    .stroke_line(
+                        triangle.points[0].0,
+                        triangle.points[0].1,
+                        triangle.points[1].0,
+                        triangle.points[1].1,
+                        wire,
+                    );
+                ui.painter
+                    .stroke_line(
+                        triangle.points[1].0,
+                        triangle.points[1].1,
+                        triangle.points[2].0,
+                        triangle.points[2].1,
+                        wire,
+                    );
+                ui.painter
+                    .stroke_line(
+                        triangle.points[2].0,
+                        triangle.points[2].1,
+                        triangle.points[0].0,
+                        triangle.points[0].1,
+                        wire,
+                    );
+            }
+            if self.is_selected(triangle.id)
                 && triangles.len() <= (60_000.0 / display_scale).max(8_000.0) as usize
             {
                 let outline = [
@@ -4223,11 +6522,130 @@ impl EditorApp {
                     105,
                 ];
                 ui.painter
-                    .stroke_line(points[0].0, points[0].1, points[1].0, points[1].1, outline);
+                    .stroke_line(
+                        triangle.points[0].0,
+                        triangle.points[0].1,
+                        triangle.points[1].0,
+                        triangle.points[1].1,
+                        outline,
+                    );
                 ui.painter
-                    .stroke_line(points[1].0, points[1].1, points[2].0, points[2].1, outline);
+                    .stroke_line(
+                        triangle.points[1].0,
+                        triangle.points[1].1,
+                        triangle.points[2].0,
+                        triangle.points[2].1,
+                        outline,
+                    );
                 ui.painter
-                    .stroke_line(points[2].0, points[2].1, points[0].0, points[0].1, outline);
+                    .stroke_line(
+                        triangle.points[2].0,
+                        triangle.points[2].1,
+                        triangle.points[0].0,
+                        triangle.points[0].1,
+                        outline,
+                    );
+            }
+        }
+
+        if self.config.layout.show_normals_3d {
+            let normal_length = self.config.layout.grid_3d.abs().clamp(0.1, 2.0) * 0.5;
+            let stride = triangle_hits.len().div_ceil(2_048).max(1);
+            for hit in triangle_hits.iter().step_by(stride).take(2_048) {
+                let center = scale_vec3(
+                    add_vec3(
+                        add_vec3(hit.world_points[0], hit.world_points[1]),
+                        hit.world_points[2],
+                    ),
+                    1.0 / 3.0,
+                );
+                let normal = normalized_vec3(add_vec3(
+                    add_vec3(hit.world_normals[0], hit.world_normals[1]),
+                    hit.world_normals[2],
+                ));
+                if let Some((start, end)) = project_world_segment_clipped(
+                    view_projection,
+                    center,
+                    add_vec3(center, scale_vec3(normal, normal_length)),
+                    area,
+                ) {
+                    ui.painter
+                        .stroke_line(start.0, start.1, end.0, end.1, [80, 235, 220, 205]);
+                }
+            }
+        }
+
+        if self.config.layout.show_tangents_3d {
+            let tangent_length = self.config.layout.grid_3d.abs().clamp(0.1, 2.0) * 0.5;
+            let stride = triangle_hits.len().div_ceil(2_048).max(1);
+            for hit in triangle_hits.iter().step_by(stride).take(2_048) {
+                let center = scale_vec3(
+                    add_vec3(
+                        add_vec3(hit.world_points[0], hit.world_points[1]),
+                        hit.world_points[2],
+                    ),
+                    1.0 / 3.0,
+                );
+                let normal = normalized_vec3(add_vec3(
+                    add_vec3(hit.world_normals[0], hit.world_normals[1]),
+                    hit.world_normals[2],
+                ));
+                let averaged = add_vec3(
+                    add_vec3(hit.world_tangents[0], hit.world_tangents[1]),
+                    hit.world_tangents[2],
+                );
+                let tangent = normalized_vec3(add_vec3(
+                    averaged,
+                    scale_vec3(normal, -dot_vec3(averaged, normal)),
+                ));
+                if let Some((start, end)) = project_world_segment_clipped(
+                    view_projection,
+                    center,
+                    add_vec3(center, scale_vec3(tangent, tangent_length)),
+                    area,
+                ) {
+                    ui.painter
+                        .stroke_line(start.0, start.1, end.0, end.1, [245, 95, 210, 215]);
+                }
+            }
+        }
+
+        if self.config.layout.show_uv_seams_3d {
+            for [start, end] in collect_uv_seam_segments_3d(&triangle_hits, 8_192) {
+                stroke_line_hidpi(
+                    &mut ui.painter,
+                    start,
+                    end,
+                    [255, 196, 64, 235],
+                    display_scale,
+                );
+            }
+        }
+
+        for (model, center, half) in mesh_bounds {
+            draw_wire_box_3d(
+                &mut ui.painter,
+                area,
+                view_projection,
+                model,
+                center,
+                half,
+                [245, 195, 75, 205],
+            );
+        }
+
+        if self.config.layout.show_scene_axes_3d {
+            let length = (self.config.layout.grid_3d.abs() * 5.0).clamp(1.0, 100_000.0);
+            for axis in Viewport3DAxis::ALL {
+                if let Some((start, end)) = project_world_segment_clipped(
+                    view_projection,
+                    Vec3::ZERO,
+                    scale_vec3(axis.vector(), length),
+                    area,
+                ) {
+                    let color = axis.color();
+                    stroke_line_hidpi(&mut ui.painter, start, end, color, display_scale);
+                }
             }
         }
 
@@ -4242,6 +6660,35 @@ impl EditorApp {
             };
             self.draw_entity_proxies_3d(ui, area, view_projection, entity, model);
         }
+
+        if self.config.layout.show_statistics_3d {
+            let elapsed_ms = viewport_cpu_start.elapsed().as_secs_f64() * 1_000.0;
+            let stats = format!(
+                "Scene CPU {:.2} ms   mesh draws {}   triangles {}   lights {}   snap surfaces {}",
+                elapsed_ms,
+                mesh_draws,
+                triangles.len(),
+                lights.len(),
+                triangle_hits.len()
+            );
+            let rect = Rect::new(
+                area.x + 6.0,
+                area.y + 6.0,
+                (ui.painter.text_width(&stats, 12.0) + 16.0).min(area.w - 70.0),
+                19.0,
+            );
+            ui.painter.fill_round_rect(rect, 3.0, [0, 0, 0, 175]);
+            ui.painter.text_clipped(
+                rect.x + 8.0,
+                rect.y + 3.0,
+                &stats,
+                12.0,
+                self.config.theme.text,
+                rect.w - 12.0,
+            );
+        }
+
+        self.draw_orientation_widget_3d(ui, area);
 
         if let Some(id) = self.selected
             && !self.locked_ids.contains(&id)
@@ -4272,9 +6719,17 @@ impl EditorApp {
                     )
                 })
                 .unwrap_or_default();
+            let projection = if self.config.layout.viewport_orthographic_3d {
+                format!(
+                    "ORTHO size {}",
+                    format_num(self.viewport_camera_3d.orthographic_size)
+                )
+            } else {
+                format!("FOV {:.0}°", self.viewport_camera_3d.fov)
+            };
             let hud = format!(
-                "{selected}camera {:.1}, {:.1}, {:.1}   FOV {:.0}°   RMB look + WASD/QE, Shift boosts, MMB pans",
-                position.x, position.y, position.z, self.viewport_camera_3d.fov
+                "{selected}camera {:.1}, {:.1}, {:.1}   {projection}   Alt+LMB orbits, RMB look + WASD/QE, Shift boosts, MMB pans",
+                position.x, position.y, position.z
             );
             let hud_width = (ui.painter.text_width(&hud, 13.0) + 16.0).min(area.w - 12.0);
             let hud_rect = Rect::new(
@@ -4296,6 +6751,81 @@ impl EditorApp {
 
         ui.reset_input_clip();
         ui.painter.set_clip_raw(previous_clip);
+    }
+
+    fn draw_orientation_widget_3d(&mut self, ui: &mut Ui, area: Rect) {
+        if area.w < 110.0 || area.h < 110.0 {
+            return;
+        }
+        let center = (area.right() - 46.0, area.y + 46.0);
+        ui.painter
+            .fill_circle(center.0, center.1, 34.0, [12, 16, 22, 185]);
+        let view_rotation = Mat4::view(Vec3::ZERO, self.viewport_camera_3d.euler);
+        let axes = [
+            (Viewport3DAxis::X, OrthographicView3D::Right, "X"),
+            (Viewport3DAxis::Y, OrthographicView3D::Top, "Y"),
+            (Viewport3DAxis::Z, OrthographicView3D::Front, "Z"),
+        ];
+        let mut projected = axes.map(|(axis, view, label)| {
+            let direction = view_rotation.transform_direction(axis.vector());
+            (
+                direction.z,
+                axis,
+                view,
+                label,
+                (
+                    center.0 + direction.x * 23.0,
+                    center.1 - direction.y * 23.0,
+                ),
+            )
+        });
+        projected.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
+        for (_, axis, view, label, end) in projected {
+            let color = axis.color();
+            stroke_line_hidpi(
+                &mut ui.painter,
+                center,
+                end,
+                [color[0], color[1], color[2], 220],
+                1.0,
+            );
+            ui.painter.fill_circle(end.0, end.1, 7.0, color);
+            ui.painter.text_clipped(
+                end.0 - 4.0,
+                end.1 - 6.0,
+                label,
+                11.0,
+                [255, 255, 255, 255],
+                9.0,
+            );
+            let dx = ui.input.mouse_x - end.0;
+            let dy = ui.input.mouse_y - end.1;
+            if ui.input.mouse_pressed && dx * dx + dy * dy <= 10.0_f32.powi(2) {
+                self.set_orthographic_view_3d(view);
+                ui.input.mouse_pressed = false;
+                ui.wants_redraw = true;
+            }
+        }
+        let projection_label = if self.config.layout.viewport_orthographic_3d {
+            "ORTHO"
+        } else {
+            "PERSP"
+        };
+        let badge = Rect::new(center.0 - 22.0, center.1 + 25.0, 44.0, 15.0);
+        ui.painter.fill_round_rect(badge, 3.0, [6, 8, 12, 210]);
+        ui.painter.text_clipped(
+            badge.x + 4.0,
+            badge.y + 2.0,
+            projection_label,
+            9.0,
+            self.config.theme.text_dim,
+            badge.w - 8.0,
+        );
+        if ui.input.mouse_pressed && badge.contains(ui.input.mouse_x, ui.input.mouse_y) {
+            self.toggle_projection_3d();
+            ui.input.mouse_pressed = false;
+            ui.wants_redraw = true;
+        }
     }
 
     fn draw_grid_3d(&self, ui: &mut Ui, area: Rect, view_projection: Mat4) {
@@ -4381,6 +6911,14 @@ impl EditorApp {
             if self.hidden_ids.contains(&entity.id) || !self.scene.is_active_in_tree(entity.id) {
                 continue;
             }
+            let policy = viewport_render_policy_3d(
+                &self.scene,
+                entity,
+                self.viewport_camera_3d.render_mask,
+            );
+            if !policy.visibility.effective_visible || !policy.layer_match {
+                continue;
+            }
             let Some(model) = self.entity_world_model_3d(entity.id) else {
                 continue;
             };
@@ -4420,6 +6958,9 @@ impl EditorApp {
                         .clamp(0.0, 1.0),
                     casts_shadows: prop_bool(props, &["casts_shadows", "castsShadows"])
                         .unwrap_or(true),
+                    shadow_bias: prop_number(props, &["shadow_bias", "shadowBias"])
+                        .unwrap_or(0.005)
+                        .clamp(0.0, 0.1),
                 });
             }
         }
@@ -4427,12 +6968,20 @@ impl EditorApp {
     }
 
     /// Draw the first enabled scene environment behind the 3D preview. The
-    /// runtime performs perspective-correct equirectangular sampling; the
-    /// editor uses a lightweight yaw-scrolled panorama preview so inspector
-    /// edits remain immediate without adding another full-frame CPU ray pass.
+    /// runtime performs perspective-correct environment sampling; the editor
+    /// uses a lightweight yaw-scrolled panorama or camera-facing cube face so
+    /// inspector edits remain immediate without another full-frame CPU ray pass.
     fn draw_environment_preview_3d(&self, ui: &mut Ui, area: Rect) -> bool {
         let environment = self.scene.entities.iter().find_map(|entity| {
             if self.hidden_ids.contains(&entity.id) || !self.scene.is_active_in_tree(entity.id) {
+                return None;
+            }
+            let policy = viewport_render_policy_3d(
+                &self.scene,
+                entity,
+                self.viewport_camera_3d.render_mask,
+            );
+            if !policy.visibility.effective_visible || !policy.layer_match {
                 return None;
             }
             entity
@@ -4507,6 +7056,42 @@ impl EditorApp {
                     );
                 }
             }
+            "cubemap" | "cube" | "six_face" | "sixface" => {
+                let mut camera_euler = self.viewport_camera_3d.euler;
+                camera_euler.y += prop_number(props, &["rotation"]).unwrap_or(0.0);
+                let direction = Mat4::rotation_euler_degrees(camera_euler)
+                    .transform_direction(Vec3::new(0.0, 0.0, -1.0));
+                let face = if direction.x.abs() >= direction.y.abs()
+                    && direction.x.abs() >= direction.z.abs()
+                {
+                    if direction.x >= 0.0 {
+                        "positive_x"
+                    } else {
+                        "negative_x"
+                    }
+                } else if direction.y.abs() >= direction.z.abs() {
+                    if direction.y >= 0.0 {
+                        "positive_y"
+                    } else {
+                        "negative_y"
+                    }
+                } else if direction.z >= 0.0 {
+                    "positive_z"
+                } else {
+                    "negative_z"
+                };
+                let path = prop_string_like(props, &[face])
+                    .filter(|path| !path.trim().is_empty());
+                let Some(image) = path.as_deref().and_then(|path| self.load_image(path)) else {
+                    return self.draw_environment_gradient_preview(ui, area, props, intensity);
+                };
+                ui.painter.draw_image(
+                    &image,
+                    area,
+                    None,
+                    scaled([255, 255, 255, 255]),
+                );
+            }
             _ => return self.draw_environment_gradient_preview(ui, area, props, intensity),
         }
         true
@@ -4537,6 +7122,91 @@ impl EditorApp {
         true
     }
 
+    fn viewport_fog_3d(&self) -> Option<crate::environment3d::Fog3D> {
+        let props = self.scene.entities.iter().find_map(|entity| {
+            if self.hidden_ids.contains(&entity.id) || !self.scene.is_active_in_tree(entity.id) {
+                return None;
+            }
+            let policy = viewport_render_policy_3d(
+                &self.scene,
+                entity,
+                self.viewport_camera_3d.render_mask,
+            );
+            if !policy.visibility.effective_visible || !policy.layer_match {
+                return None;
+            }
+            entity.components.iter().find_map(|component| match component {
+                Component::Core { name, props }
+                    if matches!(name.as_str(), "Environment3D" | "Skybox3D")
+                        && prop_bool(props, &["enabled"]).unwrap_or(true)
+                        && prop_bool(props, &["fog_enabled"]).unwrap_or(false) =>
+                {
+                    Some(props.as_slice())
+                }
+                _ => None,
+            })
+        })?;
+        let fog_color = prop_color(props, "fog_color").unwrap_or([110, 125, 145, 255]);
+        Some(
+            crate::environment3d::Fog3D {
+                enabled: true,
+                mode: match prop_string_like(props, &["fog_mode"])
+                    .unwrap_or_else(|| "linear".to_string())
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "exponential" | "exp" => crate::environment3d::FogMode3D::Exponential,
+                    "exponential_squared" | "exponential-squared" | "exp2" => {
+                        crate::environment3d::FogMode3D::ExponentialSquared
+                    }
+                    _ => crate::environment3d::FogMode3D::Linear,
+                },
+                color: Color::rgba(fog_color[0], fog_color[1], fog_color[2], fog_color[3]),
+                start_distance: prop_number(props, &["fog_start"]).unwrap_or(10.0),
+                end_distance: prop_number(props, &["fog_end"]).unwrap_or(100.0),
+                density: prop_number(props, &["fog_density"]).unwrap_or(0.02),
+            }
+            .sanitized(),
+        )
+    }
+
+    fn viewport_ambient_occlusion_3d(
+        &self,
+    ) -> Option<crate::environment3d::AmbientOcclusion3D> {
+        let props = self.scene.entities.iter().find_map(|entity| {
+            if self.hidden_ids.contains(&entity.id) || !self.scene.is_active_in_tree(entity.id) {
+                return None;
+            }
+            let policy = viewport_render_policy_3d(
+                &self.scene,
+                entity,
+                self.viewport_camera_3d.render_mask,
+            );
+            if !policy.visibility.effective_visible || !policy.layer_match {
+                return None;
+            }
+            entity.components.iter().find_map(|component| match component {
+                Component::Core { name, props }
+                    if matches!(name.as_str(), "Environment3D" | "Skybox3D")
+                        && prop_bool(props, &["enabled"]).unwrap_or(true)
+                        && prop_bool(props, &["ao_enabled"]).unwrap_or(false) =>
+                {
+                    Some(props.as_slice())
+                }
+                _ => None,
+            })
+        })?;
+        Some(
+            crate::environment3d::AmbientOcclusion3D {
+                enabled: true,
+                radius: prop_number(props, &["ao_radius"]).unwrap_or(2.5),
+                intensity: prop_number(props, &["ao_intensity"]).unwrap_or(0.65),
+                bias: prop_number(props, &["ao_bias"]).unwrap_or(0.025),
+            }
+            .sanitized(),
+        )
+    }
+
     fn draw_entity_proxies_3d(
         &self,
         ui: &mut Ui,
@@ -4556,8 +7226,60 @@ impl EditorApp {
             [175, 180, 188, 210]
         };
         let chrome_scale = viewport_display_scale(ui.input.display_scale);
-        ui.painter
-            .fill_circle(screen.0, screen.1, 2.5 * chrome_scale, base);
+        if self.config.layout.show_pivots_3d {
+            ui.painter
+                .fill_circle(screen.0, screen.1, 2.5 * chrome_scale, base);
+        }
+        let render_policy = viewport_render_policy_3d(
+            &self.scene,
+            entity,
+            self.viewport_camera_3d.render_mask,
+        );
+        if self.config.layout.show_entity_visibility_3d {
+            let (label, color) = if render_policy.visibility.effective_visible {
+                ("VIS VISIBLE".to_string(), [92, 224, 150, 240])
+            } else if render_policy.visibility.hidden_by == Some(entity.id) {
+                ("VIS HIDDEN · LOCAL".to_string(), [255, 96, 102, 240])
+            } else {
+                (
+                    format!(
+                        "VIS HIDDEN · PARENT {}",
+                        render_policy.visibility.hidden_by.unwrap_or_default()
+                    ),
+                    [255, 170, 72, 240],
+                )
+            };
+            ui.painter.text(
+                screen.0 + 10.0 * chrome_scale,
+                screen.1 + 14.0 * chrome_scale,
+                &label,
+                10.0 * chrome_scale,
+                color,
+            );
+        }
+        if self.config.layout.show_render_layers_3d {
+            let label = format!(
+                "RENDER 0x{:08X} · VIEW 0x{:08X} · {}",
+                render_policy.entity_mask,
+                self.viewport_camera_3d.render_mask,
+                if render_policy.layer_match {
+                    "PASS"
+                } else {
+                    "BLOCK"
+                }
+            );
+            ui.painter.text(
+                screen.0 + 10.0 * chrome_scale,
+                screen.1 + 26.0 * chrome_scale,
+                &label,
+                10.0 * chrome_scale,
+                if render_policy.layer_match {
+                    [98, 205, 255, 240]
+                } else {
+                    [255, 96, 102, 240]
+                },
+            );
+        }
 
         for component in &entity.components {
             let Component::Core { name, props } = component else {
@@ -4565,6 +7287,9 @@ impl EditorApp {
             };
             match name.as_str() {
                 "Camera3D" => {
+                    if !self.config.layout.show_camera_frustums_3d {
+                        continue;
+                    }
                     let camera_color = [90, 205, 235, 235];
                     let fov = prop_number(props, &["fov"])
                         .unwrap_or(60.0)
@@ -4580,22 +7305,333 @@ impl EditorApp {
                     );
                 }
                 "Light3D" => {
+                    if !render_policy.visibility.effective_visible || !render_policy.layer_match {
+                        continue;
+                    }
+                    if !self.config.layout.show_light_ranges_3d
+                        && !self.config.layout.show_spot_cones_3d
+                        && !self.config.layout.show_shadow_frustums_3d
+                    {
+                        continue;
+                    }
                     let light_color = prop_color(props, "color").unwrap_or([255, 220, 90, 255]);
-                    ui.painter
-                        .fill_circle(screen.0, screen.1, 5.0 * chrome_scale, light_color);
-                    for index in 0..8 {
-                        let angle = index as f32 * std::f32::consts::TAU / 8.0;
-                        ui.painter.stroke_line(
-                            screen.0 + angle.cos() * 7.0 * chrome_scale,
-                            screen.1 + angle.sin() * 7.0 * chrome_scale,
-                            screen.0 + angle.cos() * 11.0 * chrome_scale,
-                            screen.1 + angle.sin() * 11.0 * chrome_scale,
+                    let kind_name = prop_string_like(props, &["kind"])
+                        .unwrap_or_else(|| "point".to_string())
+                        .to_ascii_lowercase();
+                    let kind = match kind_name.as_str() {
+                        "directional" | "sun" => LightKind3D::Directional,
+                        "spot" | "spotlight" => LightKind3D::Spot,
+                        _ => LightKind3D::Point,
+                    };
+                    let range = prop_number(props, &["range"])
+                        .unwrap_or(10.0)
+                        .abs()
+                        .max(0.001);
+                    let spot_angle = prop_number(props, &["spot_angle", "spotAngle"])
+                        .unwrap_or(45.0)
+                        .clamp(0.1, 179.0);
+                    let rotation = self.entity_world_rotation_3d(entity.id).unwrap_or(model);
+                    let direction = normalized_vec3(
+                        rotation.transform_direction(Vec3::new(0.0, 0.0, -1.0)),
+                    );
+                    let right = normalized_vec3(
+                        rotation.transform_direction(Vec3::new(1.0, 0.0, 0.0)),
+                    );
+                    let up = normalized_vec3(
+                        rotation.transform_direction(Vec3::new(0.0, 1.0, 0.0)),
+                    );
+                    if self.config.layout.show_light_ranges_3d {
+                        ui.painter.fill_circle(
+                            screen.0,
+                            screen.1,
+                            5.0 * chrome_scale,
                             light_color,
+                        );
+                        for index in 0..8 {
+                            let angle = index as f32 * std::f32::consts::TAU / 8.0;
+                            ui.painter.stroke_line(
+                                screen.0 + angle.cos() * 7.0 * chrome_scale,
+                                screen.1 + angle.sin() * 7.0 * chrome_scale,
+                                screen.0 + angle.cos() * 11.0 * chrome_scale,
+                                screen.1 + angle.sin() * 11.0 * chrome_scale,
+                                light_color,
+                            );
+                        }
+                    }
+                    if self.config.layout.show_light_ranges_3d && kind != LightKind3D::Directional {
+                        draw_wire_sphere_3d(
+                            &mut ui.painter,
+                            area,
+                            view_projection,
+                            origin,
+                            range,
+                            [light_color[0], light_color[1], light_color[2], 115],
+                        );
+                    }
+                    if self.config.layout.show_spot_cones_3d && kind == LightKind3D::Spot {
+                        draw_spot_cone_3d(
+                            &mut ui.painter,
+                            area,
+                            view_projection,
+                            origin,
+                            direction,
+                            right,
+                            up,
+                            range,
+                            spot_angle,
+                            [255, 188, 72, 220],
+                        );
+                    }
+                    if self.config.layout.show_shadow_frustums_3d
+                        && prop_bool(props, &["casts_shadows", "castsShadows"]).unwrap_or(true)
+                    {
+                        let light = RenderLight3D {
+                            kind,
+                            position: origin,
+                            direction,
+                            color: Color::rgba(
+                                light_color[0],
+                                light_color[1],
+                                light_color[2],
+                                light_color[3],
+                            ),
+                            intensity: prop_number(props, &["intensity"])
+                                .unwrap_or(1.0)
+                                .max(0.0),
+                            range,
+                            spot_angle_radians: spot_angle.to_radians(),
+                            spot_softness: prop_number(props, &["spot_softness", "spotSoftness"])
+                                .unwrap_or(0.15)
+                                .clamp(0.0, 1.0),
+                            casts_shadows: true,
+                            shadow_bias: prop_number(props, &["shadow_bias", "shadowBias"])
+                                .unwrap_or(0.005)
+                                .clamp(0.0, 0.1),
+                        };
+                        if let Some(shadow) = crate::render3d::shadow_projection_3d(
+                            light,
+                            self.viewport_camera_3d,
+                            (area.w / area.h.max(1.0)).max(0.001),
+                        ) {
+                            draw_world_frustum_3d(
+                                &mut ui.painter,
+                                area,
+                                view_projection,
+                                shadow.corners,
+                                [188, 112, 255, 215],
+                            );
+                        }
+                    }
+                }
+                "ReflectionProbe3D" => {
+                    if !self.config.layout.show_reflection_probes_3d
+                        || !render_policy.visibility.effective_visible
+                        || !render_policy.layer_match
+                        || !prop_bool(props, &["enabled"]).unwrap_or(true)
+                        || !prop_bool(props, &["visible"]).unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    let half = Vec3::new(
+                        prop_number(props, &["size_x"]).unwrap_or(10.0).abs() * 0.5,
+                        prop_number(props, &["size_y"]).unwrap_or(10.0).abs() * 0.5,
+                        prop_number(props, &["size_z"]).unwrap_or(10.0).abs() * 0.5,
+                    );
+                    draw_wire_box_3d(
+                        &mut ui.painter,
+                        area,
+                        view_projection,
+                        model,
+                        Vec3::ZERO,
+                        half,
+                        [75, 220, 210, 210],
+                    );
+                    ui.painter.fill_circle(
+                        screen.0,
+                        screen.1,
+                        4.5 * chrome_scale,
+                        [75, 220, 210, 235],
+                    );
+                    ui.painter.text(
+                        screen.0 + 9.0 * chrome_scale,
+                        screen.1 - 8.0 * chrome_scale,
+                        &format!(
+                            "Probe · priority {} · blend {:.2}",
+                            prop_number(props, &["priority"]).unwrap_or(0.0).round() as i32,
+                            prop_number(props, &["blend_distance"])
+                                .unwrap_or(1.0)
+                                .max(0.0)
+                        ),
+                        10.0 * chrome_scale,
+                        [130, 245, 235, 235],
+                    );
+                }
+                "Rigidbody3D" => {
+                    if !self.config.layout.show_rigid_bodies_3d
+                        || !prop_bool(props, &["enabled"]).unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    let is_static = prop_bool(props, &["is_static", "isStatic"]).unwrap_or(false);
+                    let body_color = if is_static {
+                        [150, 165, 180, 235]
+                    } else {
+                        [70, 210, 235, 235]
+                    };
+                    let radius = 7.0 * chrome_scale;
+                    for (from, to) in [
+                        ((screen.0, screen.1 - radius), (screen.0 + radius, screen.1)),
+                        ((screen.0 + radius, screen.1), (screen.0, screen.1 + radius)),
+                        ((screen.0, screen.1 + radius), (screen.0 - radius, screen.1)),
+                        ((screen.0 - radius, screen.1), (screen.0, screen.1 - radius)),
+                    ] {
+                        stroke_line_hidpi(
+                            &mut ui.painter,
+                            from,
+                            to,
+                            body_color,
+                            chrome_scale,
+                        );
+                    }
+                    ui.painter.fill_circle(
+                        screen.0,
+                        screen.1,
+                        2.25 * chrome_scale,
+                        body_color,
+                    );
+                    if selected {
+                        let continuous =
+                            prop_bool(props, &["continuous_collision", "continuousCollision"])
+                                .unwrap_or(false);
+                        let label = if is_static {
+                            "RB STATIC"
+                        } else if continuous {
+                            "RB DYNAMIC · CCD"
+                        } else {
+                            "RB DYNAMIC"
+                        };
+                        ui.painter.text(
+                            screen.0 + 10.0 * chrome_scale,
+                            screen.1 - 17.0 * chrome_scale,
+                            label,
+                            10.0 * chrome_scale,
+                            body_color,
                         );
                     }
                 }
-                "Collider3D" => {
-                    if prop_bool(props, &["enabled"]).unwrap_or(true) {
+                "Raycast3D" => {
+                    if !self.config.layout.show_raycasts_3d
+                        || !prop_bool(props, &["enabled"]).unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    let local_offset = Vec3::new(
+                        prop_number(props, &["offset_x", "offsetX"]).unwrap_or(0.0),
+                        prop_number(props, &["offset_y", "offsetY"]).unwrap_or(0.0),
+                        prop_number(props, &["offset_z", "offsetZ"]).unwrap_or(0.0),
+                    );
+                    let start = model.transform_point(local_offset);
+                    let direction = normalized_vec3(model.transform_direction(Vec3::new(
+                        prop_number(props, &["direction_x", "directionX"]).unwrap_or(0.0),
+                        prop_number(props, &["direction_y", "directionY"]).unwrap_or(0.0),
+                        prop_number(props, &["direction_z", "directionZ"]).unwrap_or(-1.0),
+                    )));
+                    if length_vec3(direction) <= 1.0e-6 {
+                        continue;
+                    }
+                    let distance = prop_number(props, &["max_distance", "maxDistance"])
+                        .unwrap_or(100.0)
+                        .clamp(0.0, 1_000_000.0);
+                    let end = add_vec3(start, scale_vec3(direction, distance));
+                    let ray_color = [255, 218, 80, 235];
+                    if let Some((from, to)) =
+                        project_world_segment_clipped(view_projection, start, end, area)
+                    {
+                        stroke_line_hidpi(
+                            &mut ui.painter,
+                            from,
+                            to,
+                            ray_color,
+                            chrome_scale,
+                        );
+                        ui.painter.fill_circle(
+                            from.0,
+                            from.1,
+                            2.5 * chrome_scale,
+                            ray_color,
+                        );
+                        let tick = 4.0 * chrome_scale;
+                        ui.painter.stroke_line(
+                            to.0 - tick,
+                            to.1,
+                            to.0 + tick,
+                            to.1,
+                            ray_color,
+                        );
+                        ui.painter.stroke_line(
+                            to.0,
+                            to.1 - tick,
+                            to.0,
+                            to.1 + tick,
+                            ray_color,
+                        );
+                        if selected {
+                            ui.painter.text(
+                                from.0 + 7.0 * chrome_scale,
+                                from.1 + 6.0 * chrome_scale,
+                                "RAYCAST",
+                                10.0 * chrome_scale,
+                                ray_color,
+                            );
+                        }
+                    }
+                }
+                "CharacterController3D" => {
+                    if !self.config.layout.show_colliders_3d
+                        || !prop_bool(props, &["enabled"]).unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    let local_center = Vec3::new(
+                        prop_number(props, &["center_x"]).unwrap_or(0.0),
+                        prop_number(props, &["center_y"]).unwrap_or(0.0),
+                        prop_number(props, &["center_z"]).unwrap_or(0.0),
+                    );
+                    let world_center = model.transform_point(local_center);
+                    let radius = prop_number(props, &["radius"])
+                        .unwrap_or(0.5)
+                        .abs()
+                        .clamp(0.01, 1000.0);
+                    let total_height = prop_number(props, &["height"])
+                        .unwrap_or(2.0)
+                        .abs()
+                        .clamp(radius * 2.0, 10_000.0);
+                    draw_wire_capsule_3d(
+                        &mut ui.painter,
+                        area,
+                        view_projection,
+                        Mat4::translation(world_center),
+                        Vec3::ZERO,
+                        radius,
+                        (total_height * 0.5 - radius).max(0.0),
+                        [78, 205, 255, 225],
+                    );
+                    if selected {
+                        ui.painter.text(
+                            screen.0 + 10.0 * chrome_scale,
+                            screen.1 + 7.0 * chrome_scale,
+                            "CHARACTER",
+                            10.0 * chrome_scale,
+                            [78, 205, 255, 235],
+                        );
+                    }
+                }
+                "Collider3D" | "Trigger3D" => {
+                    let enabled = prop_bool(props, &["enabled"]).unwrap_or(true);
+                    let is_trigger = name == "Trigger3D"
+                        || prop_bool(props, &["is_trigger", "isTrigger"]).unwrap_or(false);
+                    let show_trigger = is_trigger && self.config.layout.show_triggers_3d;
+                    if enabled && (self.config.layout.show_colliders_3d || show_trigger) {
                         let offset = Vec3::new(
                             prop_number(props, &["offset_x", "offsetX"]).unwrap_or(0.0),
                             prop_number(props, &["offset_y", "offsetY"]).unwrap_or(0.0),
@@ -4615,18 +7651,144 @@ impl EditorApp {
                                 .abs()
                                 * 0.5,
                         );
-                        draw_wire_box_3d(
-                            &mut ui.painter,
-                            area,
-                            view_projection,
-                            model,
-                            offset,
-                            half,
-                            [92, 220, 130, 205],
-                        );
+                        let color = if show_trigger {
+                            [255, 166, 64, 225]
+                        } else {
+                            [92, 220, 130, 205]
+                        };
+                        let shape = prop_string_like(props, &["shape"])
+                            .unwrap_or_else(|| "box".to_string())
+                            .to_ascii_lowercase();
+                        match shape.as_str() {
+                            "sphere" => draw_wire_model_sphere_3d(
+                                &mut ui.painter,
+                                area,
+                                view_projection,
+                                model,
+                                offset,
+                                prop_number(props, &["radius"])
+                                    .unwrap_or(0.5)
+                                    .abs()
+                                    .max(0.0001),
+                                color,
+                            ),
+                            "capsule" => draw_wire_capsule_3d(
+                                &mut ui.painter,
+                                area,
+                                view_projection,
+                                model,
+                                offset,
+                                prop_number(props, &["radius"])
+                                    .unwrap_or(0.5)
+                                    .abs()
+                                    .max(0.0001),
+                                prop_number(props, &["height"])
+                                    .unwrap_or(1.0)
+                                    .abs()
+                                    * 0.5,
+                                color,
+                            ),
+                            _ => draw_wire_box_3d(
+                                &mut ui.painter,
+                                area,
+                                view_projection,
+                                model,
+                                offset,
+                                half,
+                                color,
+                            ),
+                        }
+                        if show_trigger && selected {
+                            ui.painter.text(
+                                screen.0 + 10.0 * chrome_scale,
+                                screen.1 + 7.0 * chrome_scale,
+                                "TRIGGER",
+                                10.0 * chrome_scale,
+                                color,
+                            );
+                        }
                     }
                 }
+                "LODGroup3D" => {
+                    if !self.config.layout.show_lod_state_3d
+                        || !prop_bool(props, &["enabled"]).unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    let Some(lod) = viewport_lod_state_3d(
+                        entity,
+                        origin,
+                        self.viewport_camera_3d.position,
+                    ) else {
+                        continue;
+                    };
+                    for (radius, color) in [
+                        (lod.distances.lod1, [85, 210, 255, 120]),
+                        (lod.distances.lod2, [255, 198, 72, 115]),
+                        (lod.distances.cull, [255, 92, 96, 105]),
+                    ] {
+                        if radius > 0.0001 {
+                            draw_wire_sphere_3d(
+                                &mut ui.painter,
+                                area,
+                                view_projection,
+                                origin,
+                                radius,
+                                color,
+                            );
+                        }
+                    }
+                    let label = if let Some(requested_level) = lod.requested_level {
+                        let base_mesh_path = entity
+                            .components
+                            .iter()
+                            .find_map(|component| match component {
+                                Component::Core { name, props }
+                                    if name == "MeshRenderer3D" =>
+                                {
+                                    Some(
+                                        prop_string_like(props, &["mesh_path", "meshPath"])
+                                            .unwrap_or_default(),
+                                    )
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        let lod0 =
+                            prop_string_like(lod.props, &["lod0_mesh"]).unwrap_or_default();
+                        let lod1 =
+                            prop_string_like(lod.props, &["lod1_mesh"]).unwrap_or_default();
+                        let lod2 =
+                            prop_string_like(lod.props, &["lod2_mesh"]).unwrap_or_default();
+                        let selection = crate::render3d::resolve_lod_mesh_path_3d(
+                            &base_mesh_path,
+                            [&lod0, &lod1, &lod2],
+                            requested_level,
+                        );
+                        format!(
+                            "LOD {}  {:.1}u",
+                            selection.active_level, lod.camera_distance
+                        )
+                    } else {
+                        format!("LOD CULLED  {:.1}u", lod.camera_distance)
+                    };
+                    let label_color = if lod.requested_level.is_some() {
+                        [98, 224, 255, 240]
+                    } else {
+                        [255, 92, 96, 240]
+                    };
+                    ui.painter.text(
+                        screen.0 + 10.0 * chrome_scale,
+                        screen.1 - 17.0 * chrome_scale,
+                        &label,
+                        10.0 * chrome_scale,
+                        label_color,
+                    );
+                }
                 "ParticleSystem3D" => {
+                    if !render_policy.visibility.effective_visible || !render_policy.layer_match {
+                        continue;
+                    }
                     let particle_color =
                         prop_color(props, "start_color").unwrap_or([255, 190, 80, 255]);
                     for (dx, dy, radius) in [
@@ -4643,10 +7805,94 @@ impl EditorApp {
                             particle_color,
                         );
                     }
+                    if self.config.layout.show_particle_bounds_3d
+                        && prop_bool(props, &["enabled"]).unwrap_or(true)
+                    {
+                        draw_wire_model_sphere_3d(
+                            &mut ui.painter,
+                            area,
+                            view_projection,
+                            model,
+                            Vec3::ZERO,
+                            estimated_particle_bounds_radius_3d(props),
+                            [255, 196, 70, 175],
+                        );
+                    }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// Rotation-only world basis for an entity. Scale is intentionally omitted
+    /// so local handles stay orthogonal and do not flip or shear under negative
+    /// and non-uniform hierarchy scales.
+    fn entity_world_rotation_3d(&self, id: u64) -> Option<Mat4> {
+        let mut chain = Vec::new();
+        let mut current = Some(id);
+        let mut visited = HashSet::new();
+        while let Some(entity_id) = current {
+            if !visited.insert(entity_id) {
+                return None;
+            }
+            let entity = self.scene.entity(entity_id)?;
+            chain.push(Vec3::new(
+                entity.rotation_x,
+                entity.rotation_y,
+                entity.rotation_z,
+            ));
+            current = entity.parent;
+        }
+        let mut rotation = Mat4::identity();
+        for euler in chain.into_iter().rev() {
+            rotation = rotation.mul(Mat4::rotation_euler_degrees(euler));
+        }
+        Some(rotation)
+    }
+
+    fn move_gizmo_world_axes_3d(&self, id: u64) -> [Vec3; 3] {
+        let basis = match self.config.layout.transform_orientation_3d {
+            TransformOrientation3D::Local => self
+                .entity_world_rotation_3d(id)
+                .unwrap_or_else(Mat4::identity),
+            TransformOrientation3D::World => Mat4::identity(),
+        };
+        Viewport3DAxis::ALL.map(|axis| {
+            let direction = normalized_vec3(basis.transform_direction(axis.vector()));
+            if length_vec3(direction) > 0.5 {
+                direction
+            } else {
+                axis.vector()
+            }
+        })
+    }
+
+    fn viewport_transform_starts_3d(&self, world_axes: [Vec3; 3]) -> Vec<Viewport3DTransformStart> {
+        self.selection_ids_ordered()
+            .into_iter()
+            .filter(|id| !self.locked_ids.contains(id))
+            .filter_map(|id| {
+                let entity = self.scene.entity(id)?;
+                let parent_model = entity
+                    .parent
+                    .and_then(|parent| self.entity_world_model_3d(parent))
+                    .unwrap_or_else(Mat4::identity);
+                let move_basis = world_axes.map(|axis| {
+                    inverse_transform_direction_3d(parent_model, axis).unwrap_or(Vec3::ZERO)
+                });
+                Some(Viewport3DTransformStart {
+                    id,
+                    position: Vec3::new(entity.x, entity.y, entity.position_z),
+                    rotation: Vec3::new(
+                        entity.rotation_x,
+                        entity.rotation_y,
+                        entity.rotation_z,
+                    ),
+                    scale: Vec3::new(entity.scale_x, entity.scale_y, entity.scale_z),
+                    move_basis,
+                })
+            })
+            .collect()
     }
 
     fn transform_gizmo_3d(
@@ -4656,27 +7902,38 @@ impl EditorApp {
         id: u64,
         model: Mat4,
     ) -> Option<Viewport3DGizmo> {
-        let entity = self.scene.entity(id)?;
+        self.scene.entity(id)?;
         let origin_world = model.transform_point(Vec3::ZERO);
         let origin = project_world_point(view_projection, origin_world, area)?;
 
-        // Move handles edit the authored position axes, so they follow the
-        // parent basis. Scale handles follow the entity's rotated local basis.
-        // Normalization deliberately removes entity/parent scale: a scale of
-        // 100 must not make the gizmo itself 100 times larger.
+        // Move handles can use the selected entity's local basis or the fixed
+        // world basis. Scale handles always follow the entity's rotated local
+        // basis. Normalization deliberately removes entity/parent scale: a
+        // scale of 100 must not make the gizmo itself 100 times larger.
         let basis = if self.config.layout.view_tool == ViewTool::Move {
-            entity
-                .parent
-                .and_then(|parent| self.entity_world_model_3d(parent))
-                .unwrap_or_else(Mat4::identity)
+            let axes = self.move_gizmo_world_axes_3d(id);
+            Mat4 {
+                values: [
+                    [axes[0].x, axes[1].x, axes[2].x, 0.0],
+                    [axes[0].y, axes[1].y, axes[2].y, 0.0],
+                    [axes[0].z, axes[1].z, axes[2].z, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+            }
         } else {
             model
         };
         let distance = length_vec3(sub_vec3(origin_world, self.viewport_camera_3d.position))
             .max(self.viewport_camera_3d.near_clip * 2.0);
-        let world_per_pixel =
-            2.0 * distance * (self.viewport_camera_3d.fov.to_radians() * 0.5).tan()
-                / area.h.max(1.0);
+        let world_per_pixel = match self.viewport_camera_3d.projection {
+            Projection3D::Perspective => {
+                2.0 * distance * (self.viewport_camera_3d.fov.to_radians() * 0.5).tan()
+                    / area.h.max(1.0)
+            }
+            Projection3D::Orthographic => {
+                2.0 * self.viewport_camera_3d.orthographic_size / area.h.max(1.0)
+            }
+        };
         let handle_length = (world_per_pixel * 72.0).clamp(0.02, 10_000.0);
         let axes = Viewport3DAxis::ALL.map(|axis| {
             let transformed = normalized_vec3(basis.transform_direction(axis.vector()));
@@ -4690,6 +7947,44 @@ impl EditorApp {
                 axis,
                 end: (end.0, end.1),
             })
+        });
+
+        // Compact plane squares sit between the axis origin and endpoints.
+        // Keeping them away from the center preserves the established free-
+        // move target and makes XY/XZ/YZ unambiguous at normal DPI.
+        let world_axes = Viewport3DAxis::ALL.map(|axis| {
+            let transformed = normalized_vec3(basis.transform_direction(axis.vector()));
+            if length_vec3(transformed) > 0.5 {
+                transformed
+            } else {
+                axis.vector()
+            }
+        });
+        let planes = Viewport3DPlane::ALL.map(|plane| {
+            if self.config.layout.view_tool != ViewTool::Move {
+                return None;
+            }
+            let (first, second) = plane.axes();
+            let first = world_axes[first as usize];
+            let second = world_axes[second as usize];
+            let inner = handle_length * 0.24;
+            let outer = handle_length * 0.48;
+            let offsets = [
+                add_vec3(scale_vec3(first, inner), scale_vec3(second, inner)),
+                add_vec3(scale_vec3(first, outer), scale_vec3(second, inner)),
+                add_vec3(scale_vec3(first, outer), scale_vec3(second, outer)),
+                add_vec3(scale_vec3(first, inner), scale_vec3(second, outer)),
+            ];
+            let mut points = [(0.0, 0.0); 4];
+            for (index, offset) in offsets.into_iter().enumerate() {
+                let point = project_world_point(
+                    view_projection,
+                    add_vec3(origin_world, offset),
+                    area,
+                )?;
+                points[index] = (point.0, point.1);
+            }
+            Some(Viewport3DGizmoPlane { plane, points })
         });
 
         // Rotation rings use normalized model columns so authored/parent scale
@@ -4726,6 +8021,7 @@ impl EditorApp {
         Some(Viewport3DGizmo {
             origin: (origin.0, origin.1),
             axes,
+            planes,
             rotation_rings,
         })
     }
@@ -4767,6 +8063,32 @@ impl EditorApp {
         }
 
         if matches!(tool, ViewTool::Move | ViewTool::Scale | ViewTool::Transform) {
+            if tool == ViewTool::Move {
+                for plane in gizmo.planes.into_iter().flatten() {
+                    let color = plane.plane.color();
+                    ui.painter.fill_triangle(
+                        plane.points[0],
+                        plane.points[1],
+                        plane.points[2],
+                        color,
+                    );
+                    ui.painter.fill_triangle(
+                        plane.points[0],
+                        plane.points[2],
+                        plane.points[3],
+                        color,
+                    );
+                    for index in 0..4 {
+                        stroke_line_hidpi(
+                            &mut ui.painter,
+                            plane.points[index],
+                            plane.points[(index + 1) % 4],
+                            [color[0], color[1], color[2], 220],
+                            chrome_scale,
+                        );
+                    }
+                }
+            }
             for projected in gizmo.axes.into_iter().flatten() {
                 let color = projected.axis.color();
                 ui.painter.stroke_line(
@@ -4833,6 +8155,98 @@ impl EditorApp {
         }
     }
 
+    fn apply_surface_snap_3d(
+        &mut self,
+        drag: &Viewport3DDrag,
+        hit: Viewport3DSurfaceHit,
+    ) -> bool {
+        let pivot_start = self
+            .selected
+            .and_then(|selected| drag.start.iter().find(|start| start.id == selected))
+            .or_else(|| drag.start.first());
+        let Some(pivot_start) = pivot_start else {
+            return false;
+        };
+        let pivot_parent = self
+            .scene
+            .entity(pivot_start.id)
+            .and_then(|entity| entity.parent)
+            .and_then(|parent| self.entity_world_model_3d(parent))
+            .unwrap_or_else(Mat4::identity);
+        let pivot_world = pivot_parent.transform_point(pivot_start.position);
+        let world_delta = sub_vec3(hit.position, pivot_world);
+        if !world_delta.x.is_finite()
+            || !world_delta.y.is_finite()
+            || !world_delta.z.is_finite()
+        {
+            return false;
+        }
+
+        let placements = drag
+            .start
+            .iter()
+            .filter_map(|start| {
+                let parent = self.scene.entity(start.id).and_then(|entity| entity.parent);
+                let parent_model = parent
+                    .and_then(|parent| self.entity_world_model_3d(parent))
+                    .unwrap_or_else(Mat4::identity);
+                let local_delta = inverse_transform_direction_3d(parent_model, world_delta)?;
+                let aligned_rotation = if self.config.layout.align_surface_normal_3d {
+                    let parent_rotation = parent
+                        .and_then(|parent| self.entity_world_rotation_3d(parent))
+                        .unwrap_or_else(Mat4::identity);
+                    let current_rotation = self.entity_world_rotation_3d(start.id)?;
+                    surface_aligned_local_euler_3d(
+                        parent_rotation,
+                        current_rotation,
+                        hit.normal,
+                        camera_forward(self.viewport_camera_3d.euler),
+                    )
+                } else {
+                    None
+                };
+                Some((
+                    start.id,
+                    add_vec3(start.position, local_delta),
+                    aligned_rotation,
+                ))
+            })
+            .collect::<Vec<_>>();
+        if placements.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for (id, position, aligned_rotation) in placements {
+            if let Some(entity) = self.scene.entity_mut(id) {
+                changed |= (entity.x - position.x).abs() > 1.0e-6
+                    || (entity.y - position.y).abs() > 1.0e-6
+                    || (entity.position_z - position.z).abs() > 1.0e-6;
+                entity.x = position.x;
+                entity.y = position.y;
+                entity.position_z = position.z;
+                if let Some(rotation) = aligned_rotation {
+                    changed |= (entity.rotation_x - rotation.x).abs() > 1.0e-5
+                        || (entity.rotation_y - rotation.y).abs() > 1.0e-5
+                        || (entity.rotation_z - rotation.z).abs() > 1.0e-5;
+                    entity.rotation_x = rotation.x;
+                    entity.rotation_y = rotation.y;
+                    entity.rotation_z = rotation.z;
+                }
+            }
+        }
+        self.status = format!(
+            "{} snapped to entity {} {}",
+            if drag.start.len() > 1 {
+                "Selection pivots"
+            } else {
+                "Pivot"
+            },
+            hit.id,
+            if hit.vertex { "vertex" } else { "surface" }
+        );
+        changed
+    }
+
     fn handle_viewport_input_3d(
         &mut self,
         ui: &mut Ui,
@@ -4841,7 +8255,7 @@ impl EditorApp {
         triangle_hits: &[Viewport3DHit],
         proxy_hits: &[Viewport3DProxyHit],
     ) {
-        if ui.input.right_down {
+        if ui.input.right_down || self.viewport_3d_orbit.is_some() {
             return;
         }
 
@@ -4881,6 +8295,37 @@ impl EditorApp {
         // A focus loss may omit a release event on some window systems.
         self.viewport_3d_look = None;
 
+        if let Some(select) = self.box_select {
+            let marquee = rect_from_points(
+                select.start_x,
+                select.start_y,
+                ui.input.mouse_x,
+                ui.input.mouse_y,
+            );
+            if ui.input.mouse_down {
+                if marquee.w > 2.0 || marquee.h > 2.0 {
+                    ui.painter.fill_rect(marquee, [255, 199, 89, 36]);
+                    ui.painter
+                        .stroke_rect(marquee, self.config.theme.selection);
+                }
+                ui.wants_redraw = true;
+                return;
+            }
+
+            self.box_select = None;
+            if marquee.w < 3.0 && marquee.h < 3.0 {
+                if !select.additive {
+                    self.clear_selection();
+                }
+                return;
+            }
+            let ids = viewport_marquee_ids_3d(triangle_hits, proxy_hits, marquee);
+            self.select_many(ids, select.additive);
+            self.status = format!("Marquee selected {} 3D entities", self.selection_count());
+            ui.wants_redraw = true;
+            return;
+        }
+
         if let Some(drag) = self.viewport_3d_drag.clone() {
             if ui.input.mouse_down {
                 let screen_delta = (
@@ -4888,53 +8333,80 @@ impl EditorApp {
                     ui.input.mouse_y - drag.start_mouse.1,
                 );
                 let snap = self.config.layout.snap;
-                // The 2D grid value is measured in pixels. 3D snapping must
-                // instead follow the world-space interval currently visible
-                // in the adaptive ground grid; using e.g. `32` as world units
-                // made ordinary drags appear completely frozen.
-                let snap_step = grid_3d_layout(self.viewport_camera_3d, area).fine_step;
+                // Unlike the legacy 2D pixel grid, this is an explicit,
+                // persisted world-unit interval chosen by the creator.
+                let snap_step = self.config.layout.grid_3d.clamp(0.0001, 100_000.0);
                 let mut changed = false;
-                match drag.mode {
+                let surface_hit = if self.config.layout.surface_snap_3d
+                    && matches!(
+                        drag.mode,
+                        Viewport3DDragMode::MovePlane { .. }
+                            | Viewport3DDragMode::MoveAxis { .. }
+                    )
+                {
+                    let excluded = drag.start.iter().map(|start| start.id).collect();
+                    viewport_surface_hit_3d(
+                        triangle_hits,
+                        ui.input.mouse_x,
+                        ui.input.mouse_y,
+                        &excluded,
+                        self.config.layout.vertex_snap_3d,
+                        viewport_display_scale(ui.input.display_scale),
+                    )
+                } else {
+                    None
+                };
+                if let Some(hit) = surface_hit {
+                    changed = self.apply_surface_snap_3d(&drag, hit);
+                } else {
+                    match drag.mode {
                     Viewport3DDragMode::MovePlane {
-                        screen_x_axis,
-                        screen_y_axis,
+                        first_axis,
+                        second_axis,
+                        screen_first_axis,
+                        screen_second_axis,
                     } => {
-                        let determinant =
-                            screen_x_axis.0 * screen_y_axis.1 - screen_x_axis.1 * screen_y_axis.0;
-                        let (mut local_dx, mut local_dy) = if determinant.abs() > 1.0e-5 {
+                        let determinant = screen_first_axis.0 * screen_second_axis.1
+                            - screen_first_axis.1 * screen_second_axis.0;
+                        let (mut first_delta, mut second_delta) = if determinant.abs() > 1.0e-5 {
                             (
-                                (screen_delta.0 * screen_y_axis.1
-                                    - screen_delta.1 * screen_y_axis.0)
+                                (screen_delta.0 * screen_second_axis.1
+                                    - screen_delta.1 * screen_second_axis.0)
                                     / determinant,
-                                (screen_x_axis.0 * screen_delta.1
-                                    - screen_x_axis.1 * screen_delta.0)
+                                (screen_first_axis.0 * screen_delta.1
+                                    - screen_first_axis.1 * screen_delta.0)
                                     / determinant,
                             )
                         } else {
-                            // Looking exactly edge-on makes the projected XY
-                            // basis singular. Fall back to a bounded camera-
-                            // distance conversion instead of exploding or
-                            // freezing the transform.
-                            let units =
-                                length_vec3(sub_vec3(self.viewport_camera_3d.position, Vec3::ZERO))
-                                    .clamp(1.0, 1_000.0)
-                                    * 0.002;
+                            // Looking edge-on makes a projected plane singular.
+                            // Fall back to a bounded camera-distance conversion
+                            // instead of exploding or freezing the transform.
+                            let units = length_vec3(sub_vec3(
+                                self.viewport_camera_3d.position,
+                                Vec3::ZERO,
+                            ))
+                            .clamp(1.0, 1_000.0)
+                                * 0.002;
                             (screen_delta.0 * units, -screen_delta.1 * units)
                         };
                         if snap {
-                            local_dx = (local_dx / snap_step).round() * snap_step;
-                            local_dy = (local_dy / snap_step).round() * snap_step;
+                            first_delta = (first_delta / snap_step).round() * snap_step;
+                            second_delta = (second_delta / snap_step).round() * snap_step;
                         }
-                        if local_dx.is_finite() && local_dy.is_finite() {
+                        if first_delta.is_finite() && second_delta.is_finite() {
                             for start in &drag.start {
                                 if let Some(entity) = self.scene.entity_mut(start.id) {
-                                    let x = start.position.x + local_dx;
-                                    let y = start.position.y + local_dy;
-                                    changed |= (entity.x - x).abs() > 1.0e-6
-                                        || (entity.y - y).abs() > 1.0e-6;
-                                    entity.x = x;
-                                    entity.y = y;
-                                    // position_z is deliberately untouched.
+                                    let local_delta = add_vec3(
+                                        scale_vec3(start.move_basis[first_axis], first_delta),
+                                        scale_vec3(start.move_basis[second_axis], second_delta),
+                                    );
+                                    let position = add_vec3(start.position, local_delta);
+                                    changed |= (entity.x - position.x).abs() > 1.0e-6
+                                        || (entity.y - position.y).abs() > 1.0e-6
+                                        || (entity.position_z - position.z).abs() > 1.0e-6;
+                                    entity.x = position.x;
+                                    entity.y = position.y;
+                                    entity.position_z = position.z;
                                 }
                             }
                         }
@@ -4953,12 +8425,15 @@ impl EditorApp {
                             if local_delta.is_finite() {
                                 for start in &drag.start {
                                     if let Some(entity) = self.scene.entity_mut(start.id) {
-                                        let before = entity_position_axis_3d(entity, axis);
-                                        let value =
-                                            entity_position_axis_from_vec3(start.position, axis)
-                                                + local_delta;
-                                        set_entity_position_axis_3d(entity, axis, value);
-                                        changed |= (before - value).abs() > 1.0e-6;
+                                        let authored_delta =
+                                            scale_vec3(start.move_basis[axis as usize], local_delta);
+                                        let position = add_vec3(start.position, authored_delta);
+                                        changed |= (entity.x - position.x).abs() > 1.0e-6
+                                            || (entity.y - position.y).abs() > 1.0e-6
+                                            || (entity.position_z - position.z).abs() > 1.0e-6;
+                                        entity.x = position.x;
+                                        entity.y = position.y;
+                                        entity.position_z = position.z;
                                     }
                                 }
                             }
@@ -5030,13 +8505,18 @@ impl EditorApp {
                                 if let Some(entity) = self.scene.entity_mut(start.id) {
                                     let before = entity_rotation_axis_3d(entity, axis);
                                     let start_value = vec3_axis(start.rotation, axis);
-                                    let value =
-                                        stable_drag_rotation_3d(start_value, delta_degrees, snap);
+                                    let value = stable_drag_rotation_3d(
+                                        start_value,
+                                        delta_degrees,
+                                        snap,
+                                        self.config.layout.rotation_snap_3d,
+                                    );
                                     set_entity_rotation_axis_3d(entity, axis, value);
                                     changed |= (before - value).abs() > 1.0e-6;
                                 }
                             }
                         }
+                    }
                     }
                 }
                 if changed {
@@ -5070,62 +8550,73 @@ impl EditorApp {
                 viewport_display_scale(ui.input.display_scale),
             )
         {
-            let start = self
-                .selection_ids_ordered()
-                .into_iter()
-                .filter(|id| !self.locked_ids.contains(id))
-                .filter_map(|id| {
-                    self.scene
-                        .entity(id)
-                        .map(|entity| Viewport3DTransformStart {
-                            id,
-                            position: Vec3::new(entity.x, entity.y, entity.position_z),
-                            rotation: Vec3::new(
-                                entity.rotation_x,
-                                entity.rotation_y,
-                                entity.rotation_z,
-                            ),
-                            scale: Vec3::new(entity.scale_x, entity.scale_y, entity.scale_z),
-                        })
-                })
-                .collect::<Vec<_>>();
-            if start.is_empty() {
-                return;
+            let mut selected = selected;
+            let mut model = model;
+            let mut gizmo = gizmo;
+            if ui.input.ctrl {
+                self.duplicate_selection_with_offset(Vec3::ZERO);
+                let Some(duplicate) = self.selected else {
+                    return;
+                };
+                selected = duplicate;
+                let Some(duplicate_model) = self.entity_world_model_3d(selected) else {
+                    return;
+                };
+                model = duplicate_model;
+                let Some(duplicate_gizmo) =
+                    self.transform_gizmo_3d(area, view_projection, selected, model)
+                else {
+                    return;
+                };
+                gizmo = duplicate_gizmo;
             }
-            let Some(entity) = self.scene.entity(selected) else {
-                return;
-            };
-            let parent_model = entity
-                .parent
-                .and_then(|parent| self.entity_world_model_3d(parent))
-                .unwrap_or_else(Mat4::identity);
-            let local = Vec3::new(entity.x, entity.y, entity.position_z);
-            let origin = parent_model.transform_point(local);
+            let origin = model.transform_point(Vec3::ZERO);
             let Some(screen) = project_world_point(view_projection, origin, area) else {
                 return;
             };
+            let gizmo_world_axes = self.move_gizmo_world_axes_3d(selected);
+            let camera_world_axes = [
+                normalized_vec3(camera_right(self.viewport_camera_3d.euler)),
+                normalized_vec3(camera_up(self.viewport_camera_3d.euler)),
+                normalized_vec3(camera_forward(self.viewport_camera_3d.euler)),
+            ];
+            let mut captured_world_axes = gizmo_world_axes;
             let mode = match hit {
                 Viewport3DGizmoHit::MoveFree => {
-                    let x_point =
-                        parent_model.transform_point(Vec3::new(local.x + 1.0, local.y, local.z));
-                    let y_point =
-                        parent_model.transform_point(Vec3::new(local.x, local.y + 1.0, local.z));
-                    let (Some(screen_x), Some(screen_y)) = (
-                        project_world_point(view_projection, x_point, area),
-                        project_world_point(view_projection, y_point, area),
+                    captured_world_axes = camera_world_axes;
+                    let (Some(screen_first), Some(screen_second)) = (
+                        project_world_point(
+                            view_projection,
+                            add_vec3(origin, camera_world_axes[0]),
+                            area,
+                        ),
+                        project_world_point(
+                            view_projection,
+                            add_vec3(origin, camera_world_axes[1]),
+                            area,
+                        ),
                     ) else {
                         return;
                     };
                     Viewport3DDragMode::MovePlane {
-                        screen_x_axis: (screen_x.0 - screen.0, screen_x.1 - screen.1),
-                        screen_y_axis: (screen_y.0 - screen.0, screen_y.1 - screen.1),
+                        first_axis: 0,
+                        second_axis: 1,
+                        screen_first_axis: (
+                            screen_first.0 - screen.0,
+                            screen_first.1 - screen.1,
+                        ),
+                        screen_second_axis: (
+                            screen_second.0 - screen.0,
+                            screen_second.1 - screen.1,
+                        ),
                     }
                 }
                 Viewport3DGizmoHit::MoveAxis(axis) => {
-                    let local_axis_point = add_vec3(local, axis.vector());
-                    let projected_local_axis = parent_model.transform_point(local_axis_point);
-                    let projected =
-                        project_world_point(view_projection, projected_local_axis, area);
+                    let projected = project_world_point(
+                        view_projection,
+                        add_vec3(origin, gizmo_world_axes[axis as usize]),
+                        area,
+                    );
                     let mut screen_axis = projected
                         .map(|point| (point.0 - screen.0, point.1 - screen.1))
                         .unwrap_or((0.0, 0.0));
@@ -5143,6 +8634,37 @@ impl EditorApp {
                         screen_axis = (direction.0 * 32.0, direction.1 * 32.0);
                     }
                     Viewport3DDragMode::MoveAxis { axis, screen_axis }
+                }
+                Viewport3DGizmoHit::MovePlane(plane) => {
+                    let (first, second) = plane.axes();
+                    let first_index = first as usize;
+                    let second_index = second as usize;
+                    let (Some(screen_first), Some(screen_second)) = (
+                        project_world_point(
+                            view_projection,
+                            add_vec3(origin, gizmo_world_axes[first_index]),
+                            area,
+                        ),
+                        project_world_point(
+                            view_projection,
+                            add_vec3(origin, gizmo_world_axes[second_index]),
+                            area,
+                        ),
+                    ) else {
+                        return;
+                    };
+                    Viewport3DDragMode::MovePlane {
+                        first_axis: first_index,
+                        second_axis: second_index,
+                        screen_first_axis: (
+                            screen_first.0 - screen.0,
+                            screen_first.1 - screen.1,
+                        ),
+                        screen_second_axis: (
+                            screen_second.0 - screen.0,
+                            screen_second.1 - screen.1,
+                        ),
+                    }
                 }
                 Viewport3DGizmoHit::ScaleAxis(axis) => {
                     let Some(projected_axis) = gizmo_axis(gizmo, axis) else {
@@ -5183,6 +8705,10 @@ impl EditorApp {
                     }
                 }
             };
+            let start = self.viewport_transform_starts_3d(captured_world_axes);
+            if start.is_empty() {
+                return;
+            }
             self.viewport_3d_drag = Some(Viewport3DDrag {
                 start_mouse: (ui.input.mouse_x, ui.input.mouse_y),
                 start,
@@ -5197,13 +8723,27 @@ impl EditorApp {
             ui.input.mouse_x,
             ui.input.mouse_y,
         );
-        let Some(id) = hit else {
-            if !ui.input.ctrl {
-                self.clear_selection();
-            }
+        let Some(mut id) = hit else {
+            self.box_select = Some(BoxSelect {
+                start_x: ui.input.mouse_x,
+                start_y: ui.input.mouse_y,
+                additive: ui.input.ctrl || ui.input.shift,
+            });
             return;
         };
-        if ui.input.ctrl {
+        let duplicate_drag = ui.input.ctrl
+            && self.is_selected(id)
+            && matches!(
+                self.config.layout.view_tool,
+                ViewTool::Move | ViewTool::Transform
+            );
+        if duplicate_drag {
+            self.duplicate_selection_with_offset(Vec3::ZERO);
+            let Some(duplicate) = self.selected else {
+                return;
+            };
+            id = duplicate;
+        } else if ui.input.ctrl || ui.input.shift {
             self.toggle_selection(id);
         } else if !self.is_selected(id) {
             self.select_only(id);
@@ -5221,49 +8761,45 @@ impl EditorApp {
             return;
         }
 
-        let Some(entity) = self.scene.entity(id) else {
+        let Some(model) = self.entity_world_model_3d(id) else {
             return;
         };
-        let parent_model = entity
-            .parent
-            .and_then(|parent| self.entity_world_model_3d(parent))
-            .unwrap_or_else(Mat4::identity);
-        let local = Vec3::new(entity.x, entity.y, entity.position_z);
-        let origin = parent_model.transform_point(local);
-        let x_point = parent_model.transform_point(Vec3::new(local.x + 1.0, local.y, local.z));
-        let y_point = parent_model.transform_point(Vec3::new(local.x, local.y + 1.0, local.z));
-        let (Some(screen), Some(screen_x), Some(screen_y)) = (
+        let origin = model.transform_point(Vec3::ZERO);
+        let camera_world_axes = [
+            normalized_vec3(camera_right(self.viewport_camera_3d.euler)),
+            normalized_vec3(camera_up(self.viewport_camera_3d.euler)),
+            normalized_vec3(camera_forward(self.viewport_camera_3d.euler)),
+        ];
+        let (Some(screen), Some(screen_first), Some(screen_second)) = (
             project_world_point(view_projection, origin, area),
-            project_world_point(view_projection, x_point, area),
-            project_world_point(view_projection, y_point, area),
+            project_world_point(
+                view_projection,
+                add_vec3(origin, camera_world_axes[0]),
+                area,
+            ),
+            project_world_point(
+                view_projection,
+                add_vec3(origin, camera_world_axes[1]),
+                area,
+            ),
         ) else {
             return;
         };
-        let start = self
-            .selection_ids_ordered()
-            .into_iter()
-            .filter(|selected| !self.locked_ids.contains(selected))
-            .filter_map(|selected| {
-                self.scene
-                    .entity(selected)
-                    .map(|entity| Viewport3DTransformStart {
-                        id: selected,
-                        position: Vec3::new(entity.x, entity.y, entity.position_z),
-                        rotation: Vec3::new(
-                            entity.rotation_x,
-                            entity.rotation_y,
-                            entity.rotation_z,
-                        ),
-                        scale: Vec3::new(entity.scale_x, entity.scale_y, entity.scale_z),
-                    })
-            })
-            .collect();
+        let start = self.viewport_transform_starts_3d(camera_world_axes);
         self.viewport_3d_drag = Some(Viewport3DDrag {
             start_mouse: (ui.input.mouse_x, ui.input.mouse_y),
             start,
             mode: Viewport3DDragMode::MovePlane {
-                screen_x_axis: (screen_x.0 - screen.0, screen_x.1 - screen.1),
-                screen_y_axis: (screen_y.0 - screen.0, screen_y.1 - screen.1),
+                first_axis: 0,
+                second_axis: 1,
+                screen_first_axis: (
+                    screen_first.0 - screen.0,
+                    screen_first.1 - screen.1,
+                ),
+                screen_second_axis: (
+                    screen_second.0 - screen.0,
+                    screen_second.1 - screen.1,
+                ),
             },
         });
     }
@@ -5493,7 +9029,7 @@ impl EditorApp {
         Vec<crate::lighting::Light>,
         Vec<crate::lighting::Occluder>,
     )> {
-        if !self.config.settings.preview_lighting {
+        if self.scene.kind != SceneKind::TwoD || !self.config.settings.preview_lighting {
             return None;
         }
         let s = &self.scene.lighting;
@@ -7768,6 +11304,12 @@ impl EditorApp {
             );
             y += FIELD_H + 6.0;
 
+            if self.scene.kind == SceneKind::ThreeD {
+                y = self.scene_lighting_inspector_3d(ui, x, width, y);
+                y = self.post_process_inspector(ui, x, width, y);
+                return y + 10.0;
+            }
+
             // 2D lighting: a per-scene toggle exported as `lighting.*` and
             // previewed live in the viewport.
             y = self.section_header(ui, x, width, y, icon::PALETTE, "Lighting");
@@ -8243,6 +11785,138 @@ impl EditorApp {
         y
     }
 
+    /// Scene-level 3D lighting is component-driven. Keep this compact guide in
+    /// the otherwise-empty Scene inspector so creators do not mistake the
+    /// legacy 2D light-map toggle for a master PBR switch.
+    fn scene_lighting_inspector_3d(
+        &mut self,
+        ui: &mut Ui,
+        x: f32,
+        width: f32,
+        mut y: f32,
+    ) -> f32 {
+        y = self.section_header(ui, x, width, y, icon::PALETTE, "3D Lighting");
+        ui.painter.text_wrapped(
+            Rect::new(x + 4.0, y, (width - 8.0).max(1.0), 48.0),
+            "3D lights are active automatically. Select a Light3D to edit its kind, intensity, range, and shadows.",
+            12.0,
+            16.0,
+            self.config.theme.text_dim,
+        );
+        y += 52.0;
+
+        let light_ids = self
+            .scene
+            .entities
+            .iter()
+            .filter(|entity| {
+                entity.components.iter().any(|component| {
+                    matches!(component, Component::Core { name, .. } if name == "Light3D")
+                })
+            })
+            .map(|entity| entity.id)
+            .collect::<Vec<_>>();
+        let active_lights = light_ids
+            .iter()
+            .filter(|&&id| {
+                self.scene.is_active_in_tree(id)
+                    && self.scene.entity(id).is_some_and(|entity| {
+                        entity.components.iter().any(|component| {
+                            matches!(
+                                component,
+                                Component::Core { name, props }
+                                    if name == "Light3D"
+                                        && prop_bool(props, &["visible"]).unwrap_or(true)
+                            )
+                        })
+                    })
+            })
+            .count();
+        ui.painter.text_clipped(
+            x + 4.0,
+            y + 3.0,
+            &format!("Lights: {} active / {} total", active_lights, light_ids.len()),
+            12.0,
+            self.config.theme.text,
+            (width - 8.0).max(1.0),
+        );
+        y += 21.0;
+        let light_button = Rect::new(x, y, width, FIELD_H + 4.0);
+        if let Some(&id) = light_ids.first() {
+            if ui.icon_button(light_button, icon::PALETTE, "Select a 3D light") {
+                self.select_only(id);
+                self.status = "Selected Light3D".to_string();
+            }
+        } else if ui.icon_button(light_button, icon::PALETTE, "Add directional light") {
+            self.add_directional_light_3d();
+        }
+        y += FIELD_H + 10.0;
+
+        let environment_ids = self
+            .scene
+            .entities
+            .iter()
+            .filter(|entity| {
+                entity.components.iter().any(|component| {
+                    matches!(
+                        component,
+                        Component::Core { name, .. }
+                            if matches!(name.as_str(), "Environment3D" | "Skybox3D")
+                    )
+                })
+            })
+            .map(|entity| entity.id)
+            .collect::<Vec<_>>();
+        ui.painter.text_wrapped(
+            Rect::new(x + 4.0, y, (width - 8.0).max(1.0), 34.0),
+            "Environment3D provides the sky and HDR image-based ambient light.",
+            12.0,
+            16.0,
+            self.config.theme.text_dim,
+        );
+        y += 38.0;
+        let environment_button = Rect::new(x, y, width, FIELD_H + 4.0);
+        if let Some(&id) = environment_ids.first() {
+            if ui.icon_button(environment_button, icon::VIEW_IN_AR, "Select environment") {
+                self.select_only(id);
+                self.status = "Selected Environment3D".to_string();
+            }
+        } else if ui.icon_button(environment_button, icon::VIEW_IN_AR, "Add environment") {
+            self.add_environment_3d();
+        }
+        y += FIELD_H + 10.0;
+
+        let probe_ids = self
+            .scene
+            .entities
+            .iter()
+            .filter(|entity| {
+                entity.components.iter().any(|component| {
+                    matches!(component, Component::Core { name, .. } if name == "ReflectionProbe3D")
+                })
+            })
+            .map(|entity| entity.id)
+            .collect::<Vec<_>>();
+        ui.painter.text_wrapped(
+            Rect::new(x + 4.0, y, (width - 8.0).max(1.0), 34.0),
+            "ReflectionProbe3D supplies local cubemap lighting inside an authored volume.",
+            12.0,
+            16.0,
+            self.config.theme.text_dim,
+        );
+        y += 38.0;
+        let probe_button = Rect::new(x, y, width, FIELD_H + 4.0);
+        if let Some(&id) = probe_ids.first() {
+            if ui.icon_button(probe_button, icon::VIEW_IN_AR, "Select reflection probe") {
+                self.select_only(id);
+                self.status = "Selected ReflectionProbe3D".to_string();
+            }
+        } else if ui.icon_button(probe_button, icon::VIEW_IN_AR, "Add reflection probe") {
+            self.add_reflection_probe_3d();
+        }
+        y + FIELD_H + 10.0
+    }
+
     fn component_body(
         &mut self,
         ui: &mut Ui,
@@ -8622,6 +12296,40 @@ impl EditorApp {
                     &id,
                     s,
                     AssetKind::Mesh,
+                    AssetTarget::Prop {
+                        entity,
+                        component: comp,
+                        prop: pi,
+                    },
+                    fx,
+                    fw,
+                    *y,
+                );
+                *y += FIELD_H + 6.0;
+            }
+            PropValue::Material(s) => {
+                dirty |= self.asset_path_row(
+                    ui,
+                    &id,
+                    s,
+                    AssetKind::Material,
+                    AssetTarget::Prop {
+                        entity,
+                        component: comp,
+                        prop: pi,
+                    },
+                    fx,
+                    fw,
+                    *y,
+                );
+                *y += FIELD_H + 6.0;
+            }
+            PropValue::PhysicsMaterial(s) => {
+                dirty |= self.asset_path_row(
+                    ui,
+                    &id,
+                    s,
+                    AssetKind::PhysicsMaterial,
                     AssetTarget::Prop {
                         entity,
                         component: comp,
@@ -10600,11 +14308,26 @@ impl EditorApp {
                 label: format!("Paste {}", c.label()),
             });
         }
-        entries.extend(CORE_COMPONENTS.iter().map(|name| ComponentPickerEntry {
-            action: Action::AddComponent(entity, name.to_string()),
-            glyph: core_icon(name),
-            label: name.to_string(),
-        }));
+        entries.extend(
+            CORE_COMPONENTS
+                .iter()
+                .filter(|name| {
+                    self.scene.kind == SceneKind::ThreeD
+                        || !matches!(
+                            **name,
+                            "Raycast3D"
+                                | "CharacterController3D"
+                                | "LODGroup3D"
+                                | "Visibility3D"
+                                | "RenderLayer3D"
+                        )
+                })
+                .map(|name| ComponentPickerEntry {
+                    action: Action::AddComponent(entity, name.to_string()),
+                    glyph: core_icon(name),
+                    label: name.to_string(),
+                }),
+        );
         // Custom behaviour scripts that opted in via IComponentPicker(Behaviour).
         for (label, path) in self.custom_picker_scripts() {
             entries.push(ComponentPickerEntry {
@@ -10763,7 +14486,7 @@ impl EditorApp {
     }
 
     fn open_scene_menu(&mut self, x: f32, y: f32) {
-        let items = vec![
+        let mut items = vec![
             MenuItem {
                 action: Action::NewScene,
                 glyph: icon::NOTE_ADD,
@@ -10791,7 +14514,11 @@ impl EditorApp {
             MenuItem {
                 action: Action::RunScene,
                 glyph: icon::PLAY,
-                label: "Run Project".into(),
+                label: if self.run_pending() {
+                    "Runtime Preview Running".into()
+                } else {
+                    "Run Project".into()
+                },
                 danger: false,
             },
             MenuItem {
@@ -10819,6 +14546,41 @@ impl EditorApp {
                 danger: false,
             },
         ];
+        if self.run_pending() {
+            items.splice(
+                5..5,
+                [
+                    MenuItem {
+                        action: Action::PauseResumeRun,
+                        glyph: if self.run_paused { icon::PLAY } else { icon::PAUSE },
+                        label: if self.run_paused {
+                            "Resume Runtime".into()
+                        } else {
+                            "Pause Runtime".into()
+                        },
+                        danger: false,
+                    },
+                    MenuItem {
+                        action: Action::StepRun,
+                        glyph: icon::SKIP_NEXT,
+                        label: "Step One Runtime Frame".into(),
+                        danger: false,
+                    },
+                    MenuItem {
+                        action: Action::RestartRun,
+                        glyph: icon::REPLAY,
+                        label: "Restart Runtime".into(),
+                        danger: false,
+                    },
+                    MenuItem {
+                        action: Action::StopRun,
+                        glyph: icon::STOP,
+                        label: "Stop Runtime".into(),
+                        danger: true,
+                    },
+                ],
+            );
+        }
         self.popup = Some(Popup::Menu { x, y, items });
     }
 
@@ -11183,7 +14945,7 @@ impl EditorApp {
     }
 
     fn open_view_tools(&mut self, x: f32, y: f32) {
-        let items = vec![
+        let mut items = vec![
             MenuItem {
                 action: Action::FrameAll,
                 glyph: icon::ZOOM_OUT_MAP,
@@ -11193,7 +14955,11 @@ impl EditorApp {
             MenuItem {
                 action: Action::Zoom100,
                 glyph: icon::CENTER_FOCUS,
-                label: "Zoom to 100%".into(),
+                label: if self.scene.kind == SceneKind::ThreeD {
+                    "Reset Orthographic Scale".into()
+                } else {
+                    "Zoom to 100%".into()
+                },
                 danger: false,
             },
             MenuItem {
@@ -11239,6 +15005,135 @@ impl EditorApp {
                 danger: false,
             },
         ];
+        if self.scene.kind == SceneKind::ThreeD {
+            items.insert(
+                2,
+                MenuItem {
+                    action: Action::ToggleSurfaceSnap3D,
+                    glyph: if self.config.layout.surface_snap_3d {
+                        icon::CHECK
+                    } else {
+                        icon::MY_LOCATION
+                    },
+                    label: if self.config.layout.surface_snap_3d {
+                        "Surface / Pivot Snap     On".into()
+                    } else {
+                        "Surface / Pivot Snap     Off".into()
+                    },
+                    danger: false,
+                },
+            );
+            items.insert(
+                3,
+                MenuItem {
+                    action: Action::ToggleVertexSnap3D,
+                    glyph: if self.config.layout.vertex_snap_3d {
+                        icon::CHECK
+                    } else {
+                        icon::CROP_SQUARE
+                    },
+                    label: if self.config.layout.vertex_snap_3d {
+                        "Vertex Snap     On".into()
+                    } else {
+                        "Vertex Snap     Off".into()
+                    },
+                    danger: false,
+                },
+            );
+            items.insert(
+                4,
+                MenuItem {
+                    action: Action::ToggleAlignSurfaceNormal3D,
+                    glyph: if self.config.layout.align_surface_normal_3d {
+                        icon::CHECK
+                    } else {
+                        icon::ROTATE_RIGHT
+                    },
+                    label: if self.config.layout.align_surface_normal_3d {
+                        "Align to Surface Normal     On".into()
+                    } else {
+                        "Align to Surface Normal     Off".into()
+                    },
+                    danger: false,
+                },
+            );
+            items.splice(
+                5..5,
+                [
+                    MenuItem {
+                        action: Action::ToggleProjection3D,
+                        glyph: icon::VIEW_IN_AR,
+                        label: if self.config.layout.viewport_orthographic_3d {
+                            "Switch to Perspective".into()
+                        } else {
+                            "Switch to Orthographic".into()
+                        },
+                        danger: false,
+                    },
+                    MenuItem {
+                        action: Action::SetOrthographicView3D(OrthographicView3D::Top),
+                        glyph: icon::ARROW_DOWNWARD,
+                        label: "Orthographic Top".into(),
+                        danger: false,
+                    },
+                    MenuItem {
+                        action: Action::SetOrthographicView3D(OrthographicView3D::Front),
+                        glyph: icon::CROP_SQUARE,
+                        label: "Orthographic Front".into(),
+                        danger: false,
+                    },
+                    MenuItem {
+                        action: Action::SetOrthographicView3D(OrthographicView3D::Right),
+                        glyph: icon::CHEVRON_LEFT,
+                        label: "Orthographic Right".into(),
+                        danger: false,
+                    },
+                ],
+            );
+            for slot in 0..4 {
+                let has_bookmark = self
+                    .config
+                    .layout
+                    .camera_bookmarks_3d
+                    .get(slot)
+                    .is_some_and(Option::is_some);
+                items.insert(
+                    9 + slot * 2,
+                    MenuItem {
+                        action: Action::RecallCameraBookmark3D(slot),
+                        glyph: if has_bookmark { icon::MY_LOCATION } else { '\0' },
+                        label: if has_bookmark {
+                            format!("Recall Camera Bookmark {}", slot + 1)
+                        } else {
+                            format!("Camera Bookmark {}     Empty", slot + 1)
+                        },
+                        danger: false,
+                    },
+                );
+                items.insert(
+                    10 + slot * 2,
+                    MenuItem {
+                        action: Action::StoreCameraBookmark3D(slot),
+                        glyph: icon::SAVE,
+                        label: format!("Store Camera Bookmark {}", slot + 1),
+                        danger: false,
+                    },
+                );
+            }
+            items.extend(ViewportDiagnostic3D::ALL.map(|diagnostic| {
+                let enabled = self.viewport_diagnostic_enabled_3d(diagnostic);
+                MenuItem {
+                    action: Action::ToggleViewportDiagnostic3D(diagnostic),
+                    glyph: if enabled { icon::CHECK } else { icon::VISIBILITY },
+                    label: format!(
+                        "{}     {}",
+                        diagnostic.label(),
+                        if enabled { "On" } else { "Off" }
+                    ),
+                    danger: false,
+                }
+            }));
+        }
         self.popup = Some(Popup::Menu { x, y, items });
     }
 
@@ -11423,7 +15318,7 @@ impl EditorApp {
     }
 
     fn open_project_menu(&mut self, x: f32, y: f32) {
-        let items = vec![
+        let mut items = vec![
             MenuItem {
                 action: Action::NewFolder,
                 glyph: icon::CREATE_NEW_FOLDER,
@@ -11461,6 +15356,26 @@ impl EditorApp {
                 danger: false,
             },
         ];
+        if self.scene.kind == SceneKind::ThreeD {
+            items.insert(
+                3,
+                MenuItem {
+                    action: Action::NewMaterial,
+                    glyph: icon::PALETTE,
+                    label: "New 3D Material".into(),
+                    danger: false,
+                },
+            );
+            items.insert(
+                4,
+                MenuItem {
+                    action: Action::NewPhysicsMaterial,
+                    glyph: icon::PALETTE,
+                    label: "New Physics Material".into(),
+                    danger: false,
+                },
+            );
+        }
         self.popup = Some(Popup::Menu { x, y, items });
     }
 
@@ -11486,6 +15401,23 @@ impl EditorApp {
                 action: Action::OpenAnimation(path.clone()),
                 glyph: icon::PLAY,
                 label: "Open Animation".into(),
+                danger: false,
+            });
+        } else if path.extension().is_some_and(|e| e == "neomaterial") {
+            items.push(MenuItem {
+                action: Action::OpenMaterial(path.clone()),
+                glyph: icon::PALETTE,
+                label: "Edit 3D Material".into(),
+                danger: false,
+            });
+        } else if path
+            .extension()
+            .is_some_and(|e| e == "neophysicsmaterial")
+        {
+            items.push(MenuItem {
+                action: Action::OpenPhysicsMaterial(path.clone()),
+                glyph: icon::PALETTE,
+                label: "Edit Physics Material".into(),
                 danger: false,
             });
         } else {
@@ -11543,7 +15475,12 @@ impl EditorApp {
             viewport_camera_sensitivity: self.config.settings.viewport_camera_sensitivity,
             viewport_camera_speed: self.config.settings.viewport_camera_speed,
             viewport_camera_fov: self.config.settings.viewport_camera_fov,
+            viewport_invert_mouse_x: self.config.settings.viewport_invert_mouse_x,
             viewport_invert_mouse_look: self.config.settings.viewport_invert_mouse_look,
+            viewport_fly_without_mouse_hold: self
+                .config
+                .settings
+                .viewport_fly_without_mouse_hold,
         });
     }
 
@@ -11622,6 +15559,16 @@ impl EditorApp {
             Popup::Error { message, copied } => {
                 self.draw_error(ui, message, copied, w, h, interactive)
             }
+            Popup::ParityReport { report, scroll } => {
+                self.draw_parity_report(ui, report, scroll, w, h, interactive)
+            }
+            Popup::VisualRegression {
+                report,
+                baseline,
+                diff,
+            } => self.draw_visual_regression_report(
+                ui, report, baseline, diff, w, h, interactive,
+            ),
             Popup::BuildTarget => self.draw_build_target_picker(ui, w, h, interactive),
             Popup::ProjectWindow {
                 start_scene,
@@ -11671,7 +15618,9 @@ impl EditorApp {
                 viewport_camera_sensitivity,
                 viewport_camera_speed,
                 viewport_camera_fov,
+                viewport_invert_mouse_x,
                 viewport_invert_mouse_look,
+                viewport_fly_without_mouse_hold,
             } => self.draw_editor_settings(
                 ui,
                 theme_name,
@@ -11687,7 +15636,9 @@ impl EditorApp {
                 viewport_camera_sensitivity,
                 viewport_camera_speed,
                 viewport_camera_fov,
+                viewport_invert_mouse_x,
                 viewport_invert_mouse_look,
+                viewport_fly_without_mouse_hold,
                 w,
                 h,
                 interactive,
@@ -11706,6 +15657,33 @@ impl EditorApp {
                 w,
                 h,
                 interactive,
+            ),
+            Popup::MaterialEditor {
+                path,
+                material,
+                preview,
+                preview_key,
+                preview_error,
+                dirty,
+            } => self.draw_material_editor(
+                ui,
+                path,
+                material,
+                preview,
+                preview_key,
+                preview_error,
+                dirty,
+                w,
+                h,
+                interactive,
+            ),
+            Popup::PhysicsMaterialEditor {
+                path,
+                material,
+                error,
+                dirty,
+            } => self.draw_physics_material_editor(
+                ui, path, material, error, dirty, w, h, interactive,
             ),
         }
         if self.popup.is_none() {
@@ -12468,6 +16446,8 @@ impl EditorApp {
                         | (PropValue::Font(_), AssetKind::Font)
                         | (PropValue::Sound(_), AssetKind::Sound)
                         | (PropValue::Mesh(_), AssetKind::Mesh)
+                        | (PropValue::Material(_), AssetKind::Material)
+                        | (PropValue::PhysicsMaterial(_), AssetKind::PhysicsMaterial)
                         | (PropValue::Shader(_), AssetKind::Shader)
                         | (PropValue::Animation(_), AssetKind::Animation)
                 );
@@ -12479,6 +16459,8 @@ impl EditorApp {
                     | PropValue::Font(value)
                     | PropValue::Sound(value)
                     | PropValue::Mesh(value)
+                    | PropValue::Material(value)
+                    | PropValue::PhysicsMaterial(value)
                     | PropValue::Shader(value)
                     | PropValue::Animation(value) => {
                         *value = path.clone();
@@ -12639,6 +16621,416 @@ impl EditorApp {
         }
         if !do_close {
             self.popup = Some(Popup::Error { message, copied });
+        }
+    }
+
+    fn draw_parity_report(
+        &mut self,
+        ui: &mut Ui,
+        report: ParityReport,
+        mut scroll: f32,
+        w: f32,
+        h: f32,
+        interactive: bool,
+    ) {
+        ui.painter
+            .fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 150]);
+        let width = (w - 36.0).clamp(520.0, 980.0);
+        let height = (h - 36.0).clamp(360.0, 680.0);
+        let px = (w - width) * 0.5;
+        let py = (h - height) * 0.5;
+        let panel = Rect::new(px, py, width, height);
+        let passed = report.is_match();
+        let result_color = if passed {
+            [112, 196, 128, 255]
+        } else {
+            [238, 171, 78, 255]
+        };
+        ui.painter
+            .fill_round_rect(panel, 5.0, self.config.theme.panel);
+        ui.painter.stroke_round_rect(panel, 5.0, result_color);
+        ui.icon(
+            px + 18.0,
+            py + 20.0,
+            if passed { icon::CHECK } else { icon::DATA_OBJECT },
+            17.0,
+            result_color,
+        );
+        ui.painter.text(
+            px + 38.0,
+            py + 11.0,
+            "3D Runtime-State Parity",
+            16.0,
+            self.config.theme.text,
+        );
+        let result_summary = if passed {
+            format!(
+                "PASS · {} authored entities match the runtime's initial post-load state",
+                report.authored_entities
+            )
+        } else {
+            format!(
+                "{} mismatches · {} authored entities · {} runtime entities",
+                report.mismatches.len(),
+                report.authored_entities,
+                report.runtime_entities
+            )
+        };
+        ui.painter.text_clipped(
+            px + 18.0,
+            py + 38.0,
+            &result_summary,
+            12.0,
+            result_color,
+            width - 36.0,
+        );
+        let categories = report
+            .category_counts()
+            .into_iter()
+            .map(|(category, count)| format!("{} {count}", category.label()))
+            .collect::<Vec<_>>()
+            .join("   ");
+        ui.painter.text_clipped(
+            px + 18.0,
+            py + 59.0,
+            if categories.is_empty() {
+                "Transforms · hierarchy · components · serializable properties: no state mismatch"
+            } else {
+                &categories
+            },
+            11.0,
+            self.config.theme.text_dim,
+            width - 36.0,
+        );
+        ui.painter.text_clipped(
+            px + 18.0,
+            py + 77.0,
+            "State validator only · native Vulkan framebuffer baselines and cross-backend visual tolerance remain separate checks",
+            10.0,
+            self.config.theme.text_dim,
+            width - 36.0,
+        );
+
+        let footer_h = 48.0;
+        let list = Rect::new(px + 12.0, py + 99.0, width - 24.0, height - 99.0 - footer_h);
+        ui.painter.fill_rect(list, self.config.theme.field);
+        ui.painter.stroke_rect(list, self.config.theme.border);
+        let row_h = 48.0;
+        let content_h = report.mismatches.len() as f32 * row_h;
+        let max_scroll = (content_h - list.h).max(0.0);
+        if interactive
+            && list.contains(ui.input.mouse_x, ui.input.mouse_y)
+            && ui.input.scroll != 0.0
+        {
+            scroll = (scroll - ui.input.scroll * row_h * 2.0).clamp(0.0, max_scroll);
+            ui.wants_redraw = true;
+        }
+        scroll = scroll.clamp(0.0, max_scroll);
+        let previous_clip = ui.painter.push_clip(list);
+        let mut clicked = None;
+        if report.mismatches.is_empty() {
+            ui.painter.text(
+                list.x + 16.0,
+                list.y + 18.0,
+                "No authored/runtime state mismatch was found in the captured initial scene.",
+                13.0,
+                self.config.theme.text,
+            );
+        } else {
+            for (index, mismatch) in report.mismatches.iter().enumerate() {
+                let y = list.y + index as f32 * row_h - scroll;
+                let row = Rect::new(list.x + 1.0, y, list.w - 2.0, row_h - 1.0);
+                if row.bottom() < list.y || row.y > list.bottom() {
+                    continue;
+                }
+                let hovered = row.contains(ui.input.mouse_x, ui.input.mouse_y);
+                if hovered {
+                    ui.painter.fill_rect(row, self.config.theme.panel_alt);
+                    if interactive && ui.input.mouse_pressed {
+                        clicked = Some(mismatch.clone());
+                    }
+                }
+                ui.painter.text(
+                    row.x + 8.0,
+                    row.y + 6.0,
+                    mismatch.category.label(),
+                    10.0,
+                    result_color,
+                );
+                ui.painter.text_clipped(
+                    row.x + 104.0,
+                    row.y + 5.0,
+                    &mismatch.context(),
+                    11.0,
+                    self.config.theme.text,
+                    row.w - 112.0,
+                );
+                ui.painter.text_clipped(
+                    row.x + 104.0,
+                    row.y + 24.0,
+                    &format!(
+                        "expected {}   →   runtime {}",
+                        mismatch.expected, mismatch.actual
+                    ),
+                    10.0,
+                    self.config.theme.text_dim,
+                    row.w - 112.0,
+                );
+            }
+        }
+        ui.painter.set_clip_raw(previous_clip);
+
+        let copy = Rect::new(panel.right() - 204.0, panel.bottom() - 36.0, 92.0, 26.0);
+        let close = Rect::new(panel.right() - 106.0, panel.bottom() - 36.0, 92.0, 26.0);
+        let do_copy = interactive && ui.icon_button(copy, icon::CONTENT_COPY, "Copy report");
+        let do_close = interactive && ui.button(close, "Close");
+        if do_copy {
+            let mut text = format!(
+                "NeoLOVE 3D runtime-state parity\nAuthored entities: {}\nRuntime entities: {}\nMismatches: {}\n",
+                report.authored_entities,
+                report.runtime_entities,
+                report.mismatches.len()
+            );
+            for mismatch in &report.mismatches {
+                text.push_str(&format!(
+                    "\n[{}] {}\n  expected: {}\n  runtime:  {}\n",
+                    mismatch.category.label(),
+                    mismatch.context(),
+                    mismatch.expected,
+                    mismatch.actual
+                ));
+            }
+            if copy_to_clipboard(&text) {
+                self.status = "Copied 3D parity report".to_string();
+            } else {
+                let path = self.project_root.join(".neolove").join("parity-report.txt");
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&path, text);
+                self.status = format!("Clipboard unavailable; wrote {}", path.display());
+            }
+        }
+        if let Some(mismatch) = clicked {
+            self.activate_parity_mismatch(&mismatch);
+        } else if !do_close {
+            self.popup = Some(Popup::ParityReport { report, scroll });
+        }
+    }
+
+    fn draw_visual_regression_report(
+        &mut self,
+        ui: &mut Ui,
+        report: VisualDiffReport,
+        baseline: PathBuf,
+        diff: Option<PathBuf>,
+        w: f32,
+        h: f32,
+        interactive: bool,
+    ) {
+        ui.painter
+            .fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 150]);
+        let width = (w - 36.0).clamp(500.0, 760.0);
+        let height = (h - 36.0).clamp(320.0, 430.0);
+        let px = (w - width) * 0.5;
+        let py = (h - height) * 0.5;
+        let panel = Rect::new(px, py, width, height);
+        let result_color = if report.passed {
+            [112, 196, 128, 255]
+        } else {
+            [238, 112, 106, 255]
+        };
+        ui.painter
+            .fill_round_rect(panel, 5.0, self.config.theme.panel);
+        ui.painter.stroke_round_rect(panel, 5.0, result_color);
+        ui.icon(
+            px + 18.0,
+            py + 20.0,
+            if report.passed {
+                icon::CHECK
+            } else {
+                icon::DATA_OBJECT
+            },
+            17.0,
+            result_color,
+        );
+        ui.painter.text(
+            px + 39.0,
+            py + 11.0,
+            "3D Game View Visual Regression",
+            16.0,
+            self.config.theme.text,
+        );
+        ui.painter.text_clipped(
+            px + 18.0,
+            py + 42.0,
+            &report.summary(),
+            12.0,
+            result_color,
+            width - 36.0,
+        );
+
+        let metrics = Rect::new(px + 14.0, py + 70.0, width - 28.0, 74.0);
+        ui.painter.fill_rect(metrics, self.config.theme.field);
+        ui.painter.stroke_rect(metrics, self.config.theme.border);
+        let columns = [
+            (
+                "CHANGED PIXELS",
+                format!(
+                    "{} / {}  ({:.3}%)",
+                    report.changed_pixels,
+                    report.compared_pixels,
+                    report.changed_pixel_ratio * 100.0
+                ),
+            ),
+            (
+                "MEAN RGB ERROR",
+                format!("{:.3} / {:.3}", report.mean_absolute_error, report.tolerance.mean_absolute_error),
+            ),
+            (
+                "MAX CHANNEL",
+                format!(
+                    "{}  · threshold {}",
+                    report.max_channel_error, report.tolerance.channel_threshold
+                ),
+            ),
+        ];
+        let column_w = metrics.w / columns.len() as f32;
+        for (index, (label, value)) in columns.iter().enumerate() {
+            let x = metrics.x + index as f32 * column_w;
+            if index > 0 {
+                ui.painter.fill_rect(
+                    Rect::new(x, metrics.y + 8.0, 1.0, metrics.h - 16.0),
+                    self.config.theme.border,
+                );
+            }
+            ui.painter.text(
+                x + 10.0,
+                metrics.y + 12.0,
+                label,
+                10.0,
+                self.config.theme.text_dim,
+            );
+            ui.painter.text_clipped(
+                x + 10.0,
+                metrics.y + 37.0,
+                value,
+                12.0,
+                self.config.theme.text,
+                column_w - 20.0,
+            );
+        }
+
+        let mut y = metrics.bottom() + 17.0;
+        let bounds = report
+            .mismatch_bounds
+            .map(|bounds| {
+                format!(
+                    "x {} · y {} · {}×{}",
+                    bounds.x, bounds.y, bounds.width, bounds.height
+                )
+            })
+            .unwrap_or_else(|| "none".to_string());
+        for (label, value) in [
+            ("RESULT", report.reason.clone()),
+            ("PROFILE", report.comparison_profile.clone()),
+            (
+                "BACKENDS",
+                format!(
+                    "{} → {}",
+                    if report.baseline_backend.is_empty() {
+                        "unknown"
+                    } else {
+                        &report.baseline_backend
+                    },
+                    if report.current_backend.is_empty() {
+                        "unknown"
+                    } else {
+                        &report.current_backend
+                    }
+                ),
+            ),
+            ("MISMATCH BOUNDS", bounds),
+            ("BASELINE", baseline.display().to_string()),
+            (
+                "DIFF ARTIFACT",
+                diff.as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| {
+                        if report.passed {
+                            "not written for a passing comparison".to_string()
+                        } else {
+                            "could not write diff artifact".to_string()
+                        }
+                    }),
+            ),
+        ] {
+            ui.painter.text(
+                px + 18.0,
+                y,
+                label,
+                10.0,
+                self.config.theme.text_dim,
+            );
+            ui.painter.text_clipped(
+                px + 142.0,
+                y - 1.0,
+                &value,
+                11.0,
+                self.config.theme.text,
+                width - 160.0,
+            );
+            y += 23.0;
+        }
+        ui.painter.text_clipped(
+            px + 18.0,
+            panel.bottom() - 64.0,
+            "Same-backend checks are strict; cross-backend checks permit measured one-pixel AA coverage while retaining the RGB mean-error gate.",
+            10.0,
+            self.config.theme.text_dim,
+            width - 230.0,
+        );
+
+        let copy = Rect::new(panel.right() - 204.0, panel.bottom() - 36.0, 92.0, 26.0);
+        let close = Rect::new(panel.right() - 106.0, panel.bottom() - 36.0, 92.0, 26.0);
+        let do_copy = interactive && ui.icon_button(copy, icon::CONTENT_COPY, "Copy report");
+        let do_close = interactive && ui.button(close, "Close");
+        if do_copy {
+            let text = format!(
+                "NeoLOVE 3D Game View visual regression\n{}\nProfile: {}\nBackends: {} -> {}\nDimensions: {}x{}\nChanged pixels: {} / {} ({:.5}%)\nMean RGB error: {:.5}\nMax channel error: {}\nMismatch bounds: {}\nBaseline: {}\nDiff: {}\n",
+                report.summary(),
+                report.comparison_profile,
+                report.baseline_backend,
+                report.current_backend,
+                report.width,
+                report.height,
+                report.changed_pixels,
+                report.compared_pixels,
+                report.changed_pixel_ratio * 100.0,
+                report.mean_absolute_error,
+                report.max_channel_error,
+                report
+                    .mismatch_bounds
+                    .map(|bounds| format!("{},{} {}x{}", bounds.x, bounds.y, bounds.width, bounds.height))
+                    .unwrap_or_else(|| "none".to_string()),
+                baseline.display(),
+                diff.as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+            );
+            self.status = if copy_to_clipboard(&text) {
+                "Copied visual regression report".to_string()
+            } else {
+                "Clipboard unavailable; JSON report remains in .neolove/visual-regression"
+                    .to_string()
+            };
+        }
+        if !do_close {
+            self.popup = Some(Popup::VisualRegression {
+                report,
+                baseline,
+                diff,
+            });
         }
     }
 
@@ -13281,12 +17673,27 @@ impl EditorApp {
 
         let yes = Rect::new(px + width - 200.0, py + height - 36.0, 90.0, 26.0);
         let no = Rect::new(px + width - 104.0, py + height - 36.0, 90.0, 26.0);
+        let is_recovery = matches!(&action, Pending::RecoverDocument(_));
+        let confirm_label = if is_recovery { "Recover" } else { "Yes" };
+        let cancel_label = if is_recovery { "Discard" } else { "Cancel" };
+        let confirm_color = if is_recovery {
+            self.config.theme.button
+        } else {
+            self.config.theme.danger
+        };
         let confirm = interactive
-            && ui.button_colored(yes, "Yes", self.config.theme.danger, [255, 255, 255, 255]);
-        let cancel = interactive && ui.button(no, "Cancel");
+            && ui.button_colored(
+                yes,
+                confirm_label,
+                confirm_color,
+                [255, 255, 255, 255],
+            );
+        let cancel = interactive && ui.button(no, cancel_label);
         if confirm {
             self.perform_pending(action);
-        } else if !cancel {
+        } else if cancel {
+            self.cancel_pending(action);
+        } else {
             self.popup = Some(Popup::Confirm { message, action });
         }
     }
@@ -13364,7 +17771,9 @@ impl EditorApp {
         mut viewport_camera_sensitivity: f32,
         mut viewport_camera_speed: f32,
         mut viewport_camera_fov: f32,
+        mut viewport_invert_mouse_x: bool,
         mut viewport_invert_mouse_look: bool,
+        mut viewport_fly_without_mouse_hold: bool,
         w: f32,
         h: f32,
         interactive: bool,
@@ -13372,7 +17781,7 @@ impl EditorApp {
         ui.painter
             .fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 120]);
         let width = (w - 24.0).min(640.0).max(400.0);
-        let height = 500.0_f32.min(h - 24.0).max(360.0);
+        let height = 550.0_f32.min(h - 24.0).max(420.0);
         let px = (w - width) * 0.5;
         let py = (h - height) * 0.5;
         let panel = Rect::new(px, py, width, height);
@@ -13397,7 +17806,7 @@ impl EditorApp {
 
         let mut y = py + 42.0;
         ui.painter
-            .text(px + 16.0, y, "APPEARANCE", 11.0, self.config.theme.text_dim);
+            .text(px + 16.0, y, "Appearance", 12.0, self.config.theme.text_dim);
         y += 17.0;
         let preset_width = (width - 32.0) / theme_presets().len() as f32;
         let previous_theme_name = theme_name.clone();
@@ -13477,8 +17886,8 @@ impl EditorApp {
             ui.painter.text(
                 px + 16.0,
                 y,
-                "CUSTOM PALETTE",
-                11.0,
+                "Custom palette",
+                12.0,
                 self.config.theme.text_dim,
             );
             y += 17.0;
@@ -13568,7 +17977,7 @@ impl EditorApp {
         }
 
         ui.painter
-            .text(px + 16.0, y, "WORKFLOW", 11.0, self.config.theme.text_dim);
+            .text(px + 16.0, y, "Workflow", 12.0, self.config.theme.text_dim);
         y += 17.0;
         let preference_width = (width - 32.0) * 0.5;
         for (index, (label, value)) in [
@@ -13603,8 +18012,8 @@ impl EditorApp {
         ui.painter.text(
             px + 16.0,
             y,
-            "VIEWPORT CAMERA",
-            11.0,
+            "Viewport camera",
+            12.0,
             self.config.theme.text_dim,
         );
         y += 17.0;
@@ -13651,20 +18060,34 @@ impl EditorApp {
             );
         }
 
-        let invert_y = y + 70.0;
-        ui.painter.text_clipped(
-            px + 44.0,
-            invert_y + 4.0,
-            "Invert vertical mouse look",
-            12.0,
-            self.config.theme.text,
-            (width - 76.0).max(0.0),
-        );
-        if let Some(next) = ui.checkbox(
-            Rect::new(px + 16.0, invert_y, FIELD_H, FIELD_H),
-            viewport_invert_mouse_look,
-        ) {
-            viewport_invert_mouse_look = next;
+        let option_y = y + 70.0;
+        let option_width = (width - 32.0) * 0.5;
+        for (index, (label, value)) in [
+            ("Invert horizontal look", &mut viewport_invert_mouse_x),
+            ("Invert vertical look", &mut viewport_invert_mouse_look),
+            (
+                "Fly keys without holding RMB",
+                &mut viewport_fly_without_mouse_hold,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let column = index % 2;
+            let row = index / 2;
+            let item_x = px + 16.0 + column as f32 * option_width;
+            let item_y = option_y + row as f32 * 25.0;
+            ui.painter.text_clipped(
+                item_x + 28.0,
+                item_y + 4.0,
+                label,
+                12.0,
+                self.config.theme.text,
+                (option_width - 34.0).max(0.0),
+            );
+            if let Some(next) = ui.checkbox(Rect::new(item_x, item_y, FIELD_H, FIELD_H), *value) {
+                *value = next;
+            }
         }
 
         let save = Rect::new(panel.right() - 204.0, panel.bottom() - 36.0, 92.0, 26.0);
@@ -13700,7 +18123,9 @@ impl EditorApp {
                     viewport_camera_sensitivity,
                     viewport_camera_speed,
                     viewport_camera_fov,
+                    viewport_invert_mouse_x,
                     viewport_invert_mouse_look,
+                    viewport_fly_without_mouse_hold,
                 });
                 return;
             }
@@ -13717,7 +18142,10 @@ impl EditorApp {
                 viewport_camera_sensitivity.clamp(0.05, 8.0);
             self.config.settings.viewport_camera_speed = viewport_camera_speed.clamp(0.1, 1_000.0);
             self.config.settings.viewport_camera_fov = viewport_camera_fov.clamp(20.0, 140.0);
+            self.config.settings.viewport_invert_mouse_x = viewport_invert_mouse_x;
             self.config.settings.viewport_invert_mouse_look = viewport_invert_mouse_look;
+            self.config.settings.viewport_fly_without_mouse_hold =
+                viewport_fly_without_mouse_hold;
             self.config.custom_theme = custom_theme.clone();
             self.config.theme = if theme_name == "custom" {
                 custom_theme
@@ -13746,7 +18174,9 @@ impl EditorApp {
                 viewport_camera_sensitivity,
                 viewport_camera_speed,
                 viewport_camera_fov,
+                viewport_invert_mouse_x,
                 viewport_invert_mouse_look,
+                viewport_fly_without_mouse_hold,
             });
         }
     }
@@ -13932,6 +18362,560 @@ impl EditorApp {
                 height,
                 fullscreen,
                 resizable,
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_material_editor(
+        &mut self,
+        ui: &mut Ui,
+        path: PathBuf,
+        mut material: Material3DFile,
+        mut preview: Option<Rc<image::RgbaImage>>,
+        mut preview_key: String,
+        mut preview_error: Option<String>,
+        mut dirty: bool,
+        w: f32,
+        h: f32,
+        interactive: bool,
+    ) {
+        ui.painter
+            .fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 132]);
+        let panel_w = (w - 24.0).min(940.0).max(560.0);
+        let panel_h = (h - 24.0).min(668.0).max(520.0);
+        let px = (w - panel_w) * 0.5;
+        let py = (h - panel_h) * 0.5;
+        let panel = Rect::new(px, py, panel_w, panel_h);
+        ui.painter
+            .fill_round_rect(panel, 6.0, self.config.theme.panel);
+        ui.painter
+            .stroke_round_rect(panel, 6.0, self.config.theme.accent);
+
+        ui.icon(
+            px + 20.0,
+            py + 24.0,
+            icon::PALETTE,
+            17.0,
+            self.config.theme.accent,
+        );
+        let title = path
+            .strip_prefix(&self.project_root)
+            .unwrap_or(&path)
+            .to_string_lossy();
+        ui.painter.text_clipped(
+            px + 39.0,
+            py + 15.0,
+            &format!("PBR Material  /{title}{}", if dirty { "  •" } else { "" }),
+            16.0,
+            self.config.theme.text,
+            panel_w - 58.0,
+        );
+
+        let preview_w = (panel_w * 0.37).clamp(230.0, 338.0);
+        let preview_panel = Rect::new(px + 16.0, py + 48.0, preview_w, panel_h - 98.0);
+        ui.painter
+            .fill_rect(preview_panel, self.config.theme.panel_alt);
+        ui.painter
+            .stroke_rect(preview_panel, self.config.theme.border);
+        let image_size = (preview_panel.w - 24.0)
+            .min(preview_panel.h - 154.0)
+            .max(150.0);
+        let image_rect = Rect::new(
+            preview_panel.x + (preview_panel.w - image_size) * 0.5,
+            preview_panel.y + 32.0,
+            image_size,
+            image_size,
+        );
+        ui.painter.fill_rect(image_rect, [31, 34, 40, 255]);
+        if let Some(image) = &preview {
+            ui.painter
+                .draw_image(image, image_rect, None, [255, 255, 255, 255]);
+        }
+        ui.painter.stroke_rect(image_rect, self.config.theme.border);
+        ui.painter.text(
+            preview_panel.x + 12.0,
+            preview_panel.y + 10.0,
+            "RUNTIME SOFTWARE PBR",
+            12.0,
+            self.config.theme.text_dim,
+        );
+        let swatch = Rect::new(
+            preview_panel.x + 14.0,
+            image_rect.bottom() + 14.0,
+            42.0,
+            28.0,
+        );
+        ui.painter.fill_round_rect(
+            swatch,
+            3.0,
+            material.base_color.map(|channel| {
+                (channel.clamp(0.0, 1.0) * 255.0).round() as u8
+            }),
+        );
+        ui.painter.stroke_round_rect(
+            swatch,
+            3.0,
+            self.config.theme.border,
+        );
+        ui.painter.text(
+            swatch.right() + 10.0,
+            swatch.y + 1.0,
+            &format!(
+                "METALLIC {}   ROUGHNESS {}",
+                format_num(material.metallic),
+                format_num(material.roughness)
+            ),
+            11.0,
+            self.config.theme.text_dim,
+        );
+        ui.painter.text(
+            swatch.right() + 10.0,
+            swatch.y + 15.0,
+            &format!("{}  /  {}-SIDED", material.alpha_mode.to_uppercase(), if material.double_sided { "TWO" } else { "ONE" }),
+            11.0,
+            self.config.theme.text_dim,
+        );
+        if let Some(error) = &preview_error {
+            ui.painter.text_wrapped(
+                Rect::new(
+                    preview_panel.x + 14.0,
+                    swatch.bottom() + 12.0,
+                    preview_panel.w - 28.0,
+                    (preview_panel.bottom() - swatch.bottom() - 20.0).max(24.0),
+                ),
+                &format!("Preview blocked\n{error}"),
+                12.0,
+                15.0,
+                [238, 112, 106, 255],
+            );
+        } else {
+            ui.painter.text_wrapped(
+                Rect::new(
+                    preview_panel.x + 14.0,
+                    swatch.bottom() + 12.0,
+                    preview_panel.w - 28.0,
+                    46.0,
+                ),
+                "Base and emissive maps decode as sRGB. Normal and ORM maps remain linear.",
+                12.0,
+                15.0,
+                self.config.theme.text_dim,
+            );
+        }
+
+        let edit = Rect::new(
+            preview_panel.right() + 14.0,
+            preview_panel.y,
+            panel.right() - preview_panel.right() - 30.0,
+            preview_panel.h,
+        );
+        ui.painter.fill_rect(edit, self.config.theme.panel_alt);
+        ui.painter.stroke_rect(edit, self.config.theme.border);
+        let ex = edit.x + 12.0;
+        let ew = edit.w - 24.0;
+        let mut y = edit.y + 10.0;
+
+        self.inspector_label(ui, ex, y + 4.0, "Name", 74.0);
+        let name = ui.text_field(
+            "material_name",
+            Rect::new(ex + 76.0, y, ew - 76.0, FIELD_H),
+            &material.name,
+        );
+        if name.changed && name.text != material.name {
+            material.name = name.text;
+            dirty = true;
+        }
+        y += 30.0;
+        ui.painter.text(ex, y, "SURFACE FACTORS", 11.0, self.config.theme.accent);
+        y += 18.0;
+        for (index, label) in ["Base R", "Base G", "Base B", "Base A"].into_iter().enumerate() {
+            if material_float_control(
+                ui,
+                &self.config.theme,
+                &format!("material_base_{index}"),
+                label,
+                &mut material.base_color[index],
+                0.0,
+                1.0,
+                ex,
+                ew,
+                y,
+                interactive,
+            ) {
+                dirty = true;
+            }
+            y += 24.0;
+        }
+        for (id, label, value) in [
+            ("material_metallic", "Metallic", &mut material.metallic),
+            ("material_roughness", "Roughness", &mut material.roughness),
+        ] {
+            if material_float_control(
+                ui,
+                &self.config.theme,
+                id,
+                label,
+                value,
+                0.0,
+                1.0,
+                ex,
+                ew,
+                y,
+                interactive,
+            ) {
+                dirty = true;
+            }
+            y += 24.0;
+        }
+        for (index, label) in ["Emit R", "Emit G", "Emit B"].into_iter().enumerate() {
+            if material_float_control(
+                ui,
+                &self.config.theme,
+                &format!("material_emit_{index}"),
+                label,
+                &mut material.emissive[index],
+                0.0,
+                8.0,
+                ex,
+                ew,
+                y,
+                interactive,
+            ) {
+                dirty = true;
+            }
+            y += 24.0;
+        }
+
+        self.inspector_label(ui, ex, y + 4.0, "Alpha", 74.0);
+        if interactive && ui.button(Rect::new(ex + 76.0, y, 88.0, FIELD_H), &material.alpha_mode)
+        {
+            material.alpha_mode = match material.alpha_mode.as_str() {
+                "opaque" => "mask",
+                "mask" => "blend",
+                _ => "opaque",
+            }
+            .to_string();
+            dirty = true;
+        }
+        if material.alpha_mode == "mask"
+            && material_float_control(
+                ui,
+                &self.config.theme,
+                "material_cutoff",
+                "Cutoff",
+                &mut material.alpha_cutoff,
+                0.0,
+                1.0,
+                ex + 172.0,
+                ew - 172.0,
+                y,
+                interactive,
+            )
+        {
+            dirty = true;
+        }
+        y += 26.0;
+        self.inspector_label(ui, ex, y + 4.0, "Double sided", 92.0);
+        if let Some(next) = ui.checkbox(
+            Rect::new(ex + 94.0, y, FIELD_H, FIELD_H),
+            material.double_sided,
+        ) {
+            if next != material.double_sided {
+                material.double_sided = next;
+                dirty = true;
+            }
+        }
+        y += 29.0;
+        ui.painter.text(ex, y, "TEXTURE INPUTS", 11.0, self.config.theme.accent);
+        y += 17.0;
+        for (id, label, color_space, texture) in [
+            (
+                "base",
+                "Base Color",
+                "sRGB",
+                &mut material.base_color_texture,
+            ),
+            ("normal", "Normal", "Linear", &mut material.normal_texture),
+            (
+                "orm",
+                "ORM  (G roughness / B metallic)",
+                "Linear",
+                &mut material.metallic_roughness_texture,
+            ),
+            ("emissive", "Emissive", "sRGB", &mut material.emissive_texture),
+        ] {
+            if material_texture_control(
+                ui,
+                &self.config.theme,
+                id,
+                label,
+                color_space,
+                texture,
+                ex,
+                ew,
+                y,
+            ) {
+                dirty = true;
+            }
+            y += 45.0;
+        }
+
+        let next_key = self.material_preview_key(&path, &material);
+        if next_key != preview_key {
+            preview_key = next_key;
+            match self.render_material_preview(&path, &material) {
+                Ok(image) => {
+                    preview = Some(image);
+                    preview_error = None;
+                }
+                Err(error) => preview_error = Some(error),
+            }
+            ui.wants_redraw = true;
+        }
+
+        let save = Rect::new(panel.right() - 204.0, panel.bottom() - 38.0, 92.0, 27.0);
+        let close = Rect::new(panel.right() - 104.0, panel.bottom() - 38.0, 90.0, 27.0);
+        let save_clicked = interactive
+            && ui.button_colored(save, "Save", self.config.theme.button, self.config.theme.text);
+        let close_clicked = interactive && ui.button(close, "Close");
+        if save_clicked {
+            match self.save_material_document(&path, &material) {
+                Ok(()) => {
+                    dirty = false;
+                    preview_error = None;
+                    self.status = format!("Saved 3D material {}", path.display());
+                }
+                Err(error) => {
+                    preview_error = Some(error.clone());
+                    self.status = format!("Material save blocked: {error}");
+                }
+            }
+        }
+        if dirty {
+            ui.painter.text(
+                panel.x + 17.0,
+                panel.bottom() - 29.0,
+                "Unsaved changes",
+                12.0,
+                self.config.theme.accent,
+            );
+        }
+        if !close_clicked {
+            self.popup = Some(Popup::MaterialEditor {
+                path,
+                material,
+                preview,
+                preview_key,
+                preview_error,
+                dirty,
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_physics_material_editor(
+        &mut self,
+        ui: &mut Ui,
+        path: PathBuf,
+        mut material: PhysicsMaterial3DFile,
+        mut error: Option<String>,
+        mut dirty: bool,
+        w: f32,
+        h: f32,
+        interactive: bool,
+    ) {
+        ui.painter
+            .fill_rect(Rect::new(0.0, 0.0, w, h), [0, 0, 0, 132]);
+        let panel_w = (w - 24.0).min(680.0).max(500.0);
+        let panel_h = (h - 24.0).min(410.0).max(330.0);
+        let px = (w - panel_w) * 0.5;
+        let py = (h - panel_h) * 0.5;
+        let panel = Rect::new(px, py, panel_w, panel_h);
+        ui.painter
+            .fill_round_rect(panel, 6.0, self.config.theme.panel);
+        ui.painter
+            .stroke_round_rect(panel, 6.0, self.config.theme.accent);
+
+        ui.icon(
+            px + 20.0,
+            py + 24.0,
+            icon::PALETTE,
+            17.0,
+            self.config.theme.accent,
+        );
+        let title = path
+            .strip_prefix(&self.project_root)
+            .unwrap_or(&path)
+            .to_string_lossy();
+        ui.painter.text_clipped(
+            px + 39.0,
+            py + 15.0,
+            &format!(
+                "Physics Material  /{title}{}",
+                if dirty { "  •" } else { "" }
+            ),
+            16.0,
+            self.config.theme.text,
+            panel_w - 58.0,
+        );
+
+        let summary = Rect::new(px + 16.0, py + 48.0, 225.0, panel_h - 98.0);
+        ui.painter
+            .fill_rect(summary, self.config.theme.panel_alt);
+        ui.painter.stroke_rect(summary, self.config.theme.border);
+        ui.painter.text(
+            summary.x + 12.0,
+            summary.y + 11.0,
+            "RUNTIME COLLISION RESPONSE",
+            11.0,
+            self.config.theme.accent,
+        );
+        ui.painter.text_wrapped(
+            Rect::new(
+                summary.x + 12.0,
+                summary.y + 38.0,
+                summary.w - 24.0,
+                72.0,
+            ),
+            "Every Collider3D bound to this asset reads its live friction and restitution on the next runtime update.",
+            12.0,
+            16.0,
+            self.config.theme.text_dim,
+        );
+        for (index, (label, value, color)) in [
+            ("FRICTION", material.friction, [92, 220, 130, 255]),
+            ("BOUNCE", material.restitution, [255, 166, 64, 255]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let y = summary.y + 128.0 + index as f32 * 58.0;
+            ui.painter.text(
+                summary.x + 12.0,
+                y,
+                &format!("{label}  {}", format_num(value)),
+                11.0,
+                self.config.theme.text,
+            );
+            let track = Rect::new(summary.x + 12.0, y + 21.0, summary.w - 24.0, 9.0);
+            ui.painter.fill_round_rect(track, 4.5, self.config.theme.field);
+            ui.painter.fill_round_rect(
+                Rect::new(track.x, track.y, track.w * value.clamp(0.0, 1.0), track.h),
+                4.5,
+                color,
+            );
+        }
+
+        let edit = Rect::new(
+            summary.right() + 14.0,
+            summary.y,
+            panel.right() - summary.right() - 30.0,
+            summary.h,
+        );
+        ui.painter.fill_rect(edit, self.config.theme.panel_alt);
+        ui.painter.stroke_rect(edit, self.config.theme.border);
+        let ex = edit.x + 12.0;
+        let ew = edit.w - 24.0;
+        let mut y = edit.y + 12.0;
+        self.inspector_label(ui, ex, y + 4.0, "Name", 76.0);
+        let name = ui.text_field(
+            "physics_material_name",
+            Rect::new(ex + 78.0, y, ew - 78.0, FIELD_H),
+            &material.name,
+        );
+        if name.changed && name.text != material.name {
+            material.name = name.text;
+            dirty = true;
+            error = None;
+        }
+        y += 39.0;
+        ui.painter.text(ex, y, "SURFACE FACTORS", 11.0, self.config.theme.accent);
+        y += 20.0;
+        if material_float_control(
+            ui,
+            &self.config.theme,
+            "physics_material_friction",
+            "Friction",
+            &mut material.friction,
+            0.0,
+            1.0,
+            ex,
+            ew,
+            y,
+            interactive,
+        ) {
+            dirty = true;
+            error = None;
+        }
+        y += 31.0;
+        if material_float_control(
+            ui,
+            &self.config.theme,
+            "physics_material_restitution",
+            "Restitution",
+            &mut material.restitution,
+            0.0,
+            1.0,
+            ex,
+            ew,
+            y,
+            interactive,
+        ) {
+            dirty = true;
+            error = None;
+        }
+        y += 42.0;
+        ui.painter.text_wrapped(
+            Rect::new(ex, y, ew, 52.0),
+            "Collider restitution/friction fields remain explicit fallbacks when no physics material is assigned.",
+            12.0,
+            16.0,
+            self.config.theme.text_dim,
+        );
+        if let Some(message) = &error {
+            ui.painter.text_wrapped(
+                Rect::new(ex, edit.bottom() - 59.0, ew, 49.0),
+                message,
+                11.0,
+                14.0,
+                [238, 112, 106, 255],
+            );
+        }
+
+        let save = Rect::new(panel.right() - 204.0, panel.bottom() - 38.0, 92.0, 27.0);
+        let close = Rect::new(panel.right() - 104.0, panel.bottom() - 38.0, 90.0, 27.0);
+        let save_clicked = interactive
+            && ui.button_colored(save, "Save", self.config.theme.button, self.config.theme.text);
+        let close_clicked = interactive && ui.button(close, "Close");
+        if save_clicked {
+            match self.save_physics_material_document(&path, &material) {
+                Ok(()) => {
+                    dirty = false;
+                    error = None;
+                    self.status = format!("Saved physics material {}", path.display());
+                }
+                Err(save_error) => {
+                    error = Some(save_error.clone());
+                    self.status = format!("Physics material save blocked: {save_error}");
+                }
+            }
+        }
+        if dirty {
+            ui.painter.text(
+                panel.x + 17.0,
+                panel.bottom() - 29.0,
+                "Unsaved changes",
+                12.0,
+                self.config.theme.accent,
+            );
+        }
+        if !close_clicked {
+            self.popup = Some(Popup::PhysicsMaterialEditor {
+                path,
+                material,
+                error,
+                dirty,
             });
         }
     }
@@ -14231,6 +19215,11 @@ impl EditorApp {
                 self.export_luau();
             }
             Action::RunScene => self.run_scene(),
+            Action::RunSceneFromSelectedCamera => self.run_scene_from_selected_camera(),
+            Action::PauseResumeRun => self.pause_resume_run(),
+            Action::StepRun => self.step_run(),
+            Action::RestartRun => self.restart_run(),
+            Action::StopRun => self.stop_run(),
             Action::AddComponent(id, name) => {
                 if let Some(e) = self.scene.entity_mut(id) {
                     if name == "Script" {
@@ -14319,10 +19308,30 @@ impl EditorApp {
                 Pending::CreateAnimation,
                 "animation.neoanim",
             ),
+            Action::NewMaterial => {
+                if self.scene.kind == SceneKind::ThreeD {
+                    self.open_prompt(
+                        "New 3D material name",
+                        Pending::CreateMaterial,
+                        "material.neomaterial",
+                    );
+                }
+            }
+            Action::NewPhysicsMaterial => {
+                if self.scene.kind == SceneKind::ThreeD {
+                    self.open_prompt(
+                        "New physics material name",
+                        Pending::CreatePhysicsMaterial,
+                        "physics_material.neophysicsmaterial",
+                    );
+                }
+            }
             Action::RevealInExplorer => self.reveal_in_explorer(),
             Action::OpenProjectInVscode => self.open_project_in_vscode(),
             Action::OpenPath(p) => self.open_path(&p),
             Action::OpenAnimation(p) => self.open_animation_path(p),
+            Action::OpenMaterial(p) => self.open_material_path(p),
+            Action::OpenPhysicsMaterial(p) => self.open_physics_material_path(p),
             Action::OpenScene(p) => self.open_scene_path(p),
             Action::EnterFolder(p) => self.navigate_bin(p),
             Action::OpenSelectionTools(x, y) => self.open_selection_tools(x, y),
@@ -14562,16 +19571,71 @@ impl EditorApp {
                 }
                 self.dirty = true;
             }
+            Action::ToggleSurfaceSnap3D => {
+                self.config.layout.surface_snap_3d = !self.config.layout.surface_snap_3d;
+                if !self.config.layout.surface_snap_3d {
+                    self.config.layout.vertex_snap_3d = false;
+                    self.config.layout.align_surface_normal_3d = false;
+                }
+                self.dirty = true;
+                self.status = if self.config.layout.surface_snap_3d {
+                    "3D surface / pivot snapping enabled".to_string()
+                } else {
+                    "3D surface / pivot snapping disabled".to_string()
+                };
+            }
+            Action::ToggleVertexSnap3D => {
+                self.config.layout.vertex_snap_3d = !self.config.layout.vertex_snap_3d;
+                if self.config.layout.vertex_snap_3d {
+                    self.config.layout.surface_snap_3d = true;
+                }
+                self.dirty = true;
+                self.status = if self.config.layout.vertex_snap_3d {
+                    "3D vertex snapping enabled".to_string()
+                } else {
+                    "3D vertex snapping disabled".to_string()
+                };
+            }
+            Action::ToggleAlignSurfaceNormal3D => {
+                self.config.layout.align_surface_normal_3d =
+                    !self.config.layout.align_surface_normal_3d;
+                if self.config.layout.align_surface_normal_3d {
+                    self.config.layout.surface_snap_3d = true;
+                }
+                self.dirty = true;
+                self.status = if self.config.layout.align_surface_normal_3d {
+                    "3D align-to-surface-normal enabled".to_string()
+                } else {
+                    "3D align-to-surface-normal disabled".to_string()
+                };
+            }
+            Action::ToggleProjection3D => self.toggle_projection_3d(),
+            Action::SetOrthographicView3D(view) => self.set_orthographic_view_3d(view),
+            Action::StoreCameraBookmark3D(slot) => self.store_camera_bookmark_3d(slot),
+            Action::RecallCameraBookmark3D(slot) => self.recall_camera_bookmark_3d(slot),
+            Action::ToggleViewportDiagnostic3D(diagnostic) => {
+                self.toggle_viewport_diagnostic_3d(diagnostic);
+            }
         }
     }
 
     fn perform_pending(&mut self, action: Pending) {
         match action {
             Pending::LoadScene => self.load(),
-            Pending::Quit => self.should_quit = true,
+            Pending::Quit => {
+                self.discard_all_dirty_recovery_snapshots();
+                self.should_quit = true;
+            }
+            Pending::RecoverDocument(path) => self.recover_document(path),
             Pending::CloseDocument(index) => self.close_document(index),
             Pending::UpdateEngine => self.launch_update(),
             _ => {}
+        }
+    }
+
+    fn cancel_pending(&mut self, action: Pending) {
+        if let Pending::RecoverDocument(path) = action {
+            self.discard_recovery_for_document(&path);
         }
     }
 
@@ -14582,6 +19646,8 @@ impl EditorApp {
             Pending::CreateScript => self.create_script(&value),
             Pending::CreateShader => self.create_shader(&value),
             Pending::CreateAnimation => self.create_animation(&value),
+            Pending::CreateMaterial => self.create_material(&value),
+            Pending::CreatePhysicsMaterial => self.create_physics_material(&value),
             Pending::RenameEntity(id) => {
                 if let Some(e) = self.scene.entity_mut(id) {
                     e.name = value;
@@ -14605,6 +19671,61 @@ impl EditorApp {
         self.select_only(id);
         self.mark_dirty();
         self.status = "Added entity".to_string();
+    }
+
+    fn add_directional_light_3d(&mut self) {
+        if self.scene.kind != SceneKind::ThreeD {
+            return;
+        }
+        let id = self.scene.add_entity("Directional Light", 4.0, 6.0).id;
+        let entity = self
+            .scene
+            .entity_mut(id)
+            .expect("a newly-added 3D light entity must exist");
+        entity.position_z = 4.0;
+        entity.rotation_x = -45.0;
+        entity.rotation_y = -35.0;
+        let mut light = Component::core("Light3D");
+        if let Component::Core { props, .. } = &mut light
+            && let Some(kind) = props.iter_mut().find(|prop| prop.name == "kind")
+            && let PropValue::Enum { value, .. } = &mut kind.value
+        {
+            *value = "directional".to_string();
+        }
+        entity.components.push(light);
+        self.select_only(id);
+        self.mark_dirty();
+        self.status = "Added directional Light3D".to_string();
+    }
+
+    fn add_environment_3d(&mut self) {
+        if self.scene.kind != SceneKind::ThreeD {
+            return;
+        }
+        let id = self.scene.add_entity("Environment", 0.0, 0.0).id;
+        self.scene
+            .entity_mut(id)
+            .expect("a newly-added 3D environment entity must exist")
+            .components
+            .push(Component::core("Environment3D"));
+        self.select_only(id);
+        self.mark_dirty();
+        self.status = "Added Environment3D".to_string();
+    }
+
+    fn add_reflection_probe_3d(&mut self) {
+        if self.scene.kind != SceneKind::ThreeD {
+            return;
+        }
+        let id = self.scene.add_entity("Reflection Probe", 0.0, 2.0).id;
+        self.scene
+            .entity_mut(id)
+            .expect("a newly-added reflection probe entity must exist")
+            .components
+            .push(Component::core("ReflectionProbe3D"));
+        self.select_only(id);
+        self.mark_dirty();
+        self.status = "Added ReflectionProbe3D".to_string();
     }
 
     fn copy_entity(&mut self, id: u64) {
@@ -14750,14 +19871,66 @@ impl EditorApp {
                 if self.document_kind == DocumentKind::Prefab {
                     self.propagate_saved_prefab();
                 }
-                self.status = format!("Saved {}", self.scene_path.display());
+                let cleanup_error = if self.scene.kind == SceneKind::ThreeD {
+                    remove_recovery_snapshot(&self.project_root, &self.scene_path).err()
+                } else {
+                    None
+                };
+                self.status = if let Some(error) = cleanup_error {
+                    format!(
+                        "Saved {}, but could not clear recovery data: {error}",
+                        self.scene_path.display()
+                    )
+                } else {
+                    format!("Saved {}", self.scene_path.display())
+                };
             }
             Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
 
     fn load(&mut self) {
-        self.load_scene_file(self.scene_path.clone());
+        let path = self.scene_path.clone();
+        let previous_kind = self.scene.kind;
+        let loaded = match self.document_kind {
+            DocumentKind::Scene => Scene::load(&path),
+            DocumentKind::Prefab => load_prefab_file(&path).and_then(|entities| {
+                if entities.is_empty() {
+                    return Err("prefab contains no entities".to_string());
+                }
+                let name = path
+                    .file_stem()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Prefab".to_string());
+                let mut scene = Scene::from_prefab(name, entities);
+                scene.kind = previous_kind;
+                Ok(scene)
+            }),
+        };
+        match loaded {
+            Ok(scene) => {
+                if previous_kind == SceneKind::ThreeD
+                    && let Err(error) = remove_recovery_snapshot(&self.project_root, &path)
+                {
+                    eprintln!(
+                        "warning: failed to clear recovery while reloading {}: {error}",
+                        path.display()
+                    );
+                }
+                self.scene = scene.clone();
+                self.scene_dirty = false;
+                if let Some(document) = self.documents.get_mut(self.active_document) {
+                    document.scene = scene;
+                    document.dirty = false;
+                }
+                self.undo_stack.clear();
+                self.redo_stack.clear();
+                self.undo_baseline = self.scene.to_json().unwrap_or_default();
+                self.clear_scene_view_state();
+                self.status = format!("Reloaded {}", path.display());
+            }
+            Err(error) => self.status = format!("Reload failed: {error}"),
+        }
     }
 
     fn open_scene_path(&mut self, path: PathBuf) {
@@ -14828,6 +20001,9 @@ impl EditorApp {
                     self.status = format!("Prefab propagated, but scene save failed: {error}");
                 } else {
                     document.dirty = false;
+                    if document.scene.kind == SceneKind::ThreeD {
+                        let _ = remove_recovery_snapshot(&self.project_root, &document.path);
+                    }
                 }
                 updated += count;
             }
@@ -14845,6 +20021,9 @@ impl EditorApp {
             if let Ok(mut scene) = Scene::load(&path) {
                 let count = scene.refresh_prefab_instances(&source, &prototype);
                 if count > 0 && scene.save(&path).is_ok() {
+                    if scene.kind == SceneKind::ThreeD {
+                        let _ = remove_recovery_snapshot(&self.project_root, &path);
+                    }
                     updated += count;
                 }
             }
@@ -14860,20 +20039,52 @@ impl EditorApp {
             return;
         }
         self.scene.name = trimmed.to_string();
+        self.mark_dirty();
         // Rename the on-disk file to match (slugified).
         let slug = slugify(trimmed);
         let new_path = self.project_root.join(format!("{slug}.neoscene"));
-        if self.scene_path.exists() && new_path != self.scene_path {
-            if let Err(e) = std::fs::rename(&self.scene_path, &new_path) {
-                self.status = format!("Renamed scene; file rename failed: {e}");
-                self.scene_path = new_path;
+        let old_path = self.scene_path.clone();
+        if old_path.exists() && new_path != old_path {
+            if let Err(error) = std::fs::rename(&old_path, &new_path) {
+                self.status = format!("Scene name changed, but file rename failed: {error}");
                 return;
             }
         }
-        self.scene_path = new_path;
-        let _ = self.scene.save(&self.scene_path);
-        self.scene_dirty = false;
-        self.status = format!("Renamed scene to {}", self.scene_path.display());
+        self.scene_path = new_path.clone();
+        match self.scene.save(&new_path) {
+            Ok(()) => {
+                self.scene_dirty = false;
+                if let Some(document) = self.documents.get_mut(self.active_document) {
+                    document.path = new_path.clone();
+                    document.scene = self.scene.clone();
+                    document.dirty = false;
+                }
+                if self.scene.kind == SceneKind::ThreeD {
+                    let _ = remove_recovery_snapshot(&self.project_root, &old_path);
+                    let _ = remove_recovery_snapshot(&self.project_root, &new_path);
+                }
+                self.status = format!("Renamed scene to {}", new_path.display());
+            }
+            Err(error) => {
+                if let Some(document) = self.documents.get_mut(self.active_document) {
+                    document.path = new_path.clone();
+                    document.scene = self.scene.clone();
+                    document.dirty = true;
+                }
+                if self.scene.kind == SceneKind::ThreeD
+                    && write_recovery_snapshot(
+                        &self.project_root,
+                        &new_path,
+                        self.document_kind,
+                        &self.scene,
+                    )
+                    .is_ok()
+                {
+                    let _ = remove_recovery_snapshot(&self.project_root, &old_path);
+                }
+                self.status = format!("Scene renamed, but save failed: {error}");
+            }
+        }
     }
 
     fn create_folder(&mut self, name: &str) {
@@ -14956,6 +20167,332 @@ impl EditorApp {
             }
             Err(error) => self.status = format!("Create animation failed: {error}"),
         }
+    }
+
+    fn create_material(&mut self, name: &str) {
+        if self.scene.kind != SceneKind::ThreeD {
+            return;
+        }
+        let mut name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if !name.ends_with(".neomaterial") {
+            name.push_str(".neomaterial");
+        }
+        let path = self.bin_dir.join(&name);
+        if path.exists() {
+            self.popup = Some(Popup::Error {
+                message: format!(
+                    "Material was not created because '{}' already exists.",
+                    path.display()
+                ),
+                copied: false,
+            });
+            return;
+        }
+        let material = Material3DFile {
+            name: path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("Material3D")
+                .to_string(),
+            ..Material3DFile::default()
+        };
+        match self.save_material_document(&path, &material) {
+            Ok(()) => {
+                self.status = format!("Created 3D material {name}");
+                self.popup = Some(Popup::MaterialEditor {
+                    path,
+                    material,
+                    preview: None,
+                    preview_key: String::new(),
+                    preview_error: None,
+                    dirty: false,
+                });
+            }
+            Err(error) => {
+                self.popup = Some(Popup::Error {
+                    message: format!("Create material failed for '{}': {error}", path.display()),
+                    copied: false,
+                });
+            }
+        }
+    }
+
+    fn create_physics_material(&mut self, name: &str) {
+        if self.scene.kind != SceneKind::ThreeD {
+            return;
+        }
+        let mut name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if !name.ends_with(".neophysicsmaterial") {
+            name.push_str(".neophysicsmaterial");
+        }
+        let path = self.bin_dir.join(&name);
+        if path.exists() {
+            self.popup = Some(Popup::Error {
+                message: format!(
+                    "Physics material was not created because '{}' already exists.",
+                    path.display()
+                ),
+                copied: false,
+            });
+            return;
+        }
+        let material = PhysicsMaterial3DFile {
+            name: path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("PhysicsMaterial3D")
+                .to_string(),
+            ..PhysicsMaterial3DFile::default()
+        };
+        match self.save_physics_material_document(&path, &material) {
+            Ok(()) => {
+                self.status = format!("Created physics material {name}");
+                self.popup = Some(Popup::PhysicsMaterialEditor {
+                    path,
+                    material,
+                    error: None,
+                    dirty: false,
+                });
+            }
+            Err(error) => {
+                self.popup = Some(Popup::Error {
+                    message: format!(
+                        "Create physics material failed for '{}': {error}",
+                        path.display()
+                    ),
+                    copied: false,
+                });
+            }
+        }
+    }
+
+    fn open_physics_material_path(&mut self, path: PathBuf) {
+        match std::fs::read_to_string(&path)
+            .map_err(|error| format!("read failed: {error}"))
+            .and_then(|text| {
+                serde_json::from_str::<PhysicsMaterial3DFile>(&text)
+                    .map_err(|error| format!("JSON decode failed: {error}"))
+            })
+            .and_then(|material| {
+                self.validate_physics_material_document(&material)?;
+                Ok(material)
+            }) {
+            Ok(material) => {
+                self.popup = Some(Popup::PhysicsMaterialEditor {
+                    path,
+                    material,
+                    error: None,
+                    dirty: false,
+                });
+            }
+            Err(error) => {
+                self.popup = Some(Popup::Error {
+                    message: format!(
+                        "Could not open physics material '{}': {error}",
+                        path.display()
+                    ),
+                    copied: false,
+                });
+            }
+        }
+    }
+
+    fn validate_physics_material_document(
+        &self,
+        material: &PhysicsMaterial3DFile,
+    ) -> Result<(), String> {
+        let assets =
+            AssetManager::with_data_root(self.project_root.clone(), self.project_root.clone());
+        assets
+            .physics_material_from_file(material.clone())
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn save_physics_material_document(
+        &self,
+        path: &Path,
+        material: &PhysicsMaterial3DFile,
+    ) -> Result<(), String> {
+        self.validate_physics_material_document(material)?;
+        let bytes = serde_json::to_vec_pretty(material)
+            .map_err(|error| format!("JSON encode failed: {error}"))?;
+        std::fs::write(path, bytes).map_err(|error| format!("write failed: {error}"))
+    }
+
+    fn open_material_path(&mut self, path: PathBuf) {
+        match std::fs::read_to_string(&path)
+            .map_err(|error| format!("read failed: {error}"))
+            .and_then(|text| {
+                serde_json::from_str::<Material3DFile>(&text)
+                    .map_err(|error| format!("JSON decode failed: {error}"))
+            }) {
+            Ok(material) => {
+                self.popup = Some(Popup::MaterialEditor {
+                    path,
+                    material,
+                    preview: None,
+                    preview_key: String::new(),
+                    preview_error: None,
+                    dirty: false,
+                });
+            }
+            Err(error) => {
+                self.popup = Some(Popup::Error {
+                    message: format!("Could not open material '{}': {error}", path.display()),
+                    copied: false,
+                });
+            }
+        }
+    }
+
+    fn validate_material_document(
+        &self,
+        path: &Path,
+        material: &Material3DFile,
+    ) -> Result<crate::mesh::MaterialHandle, String> {
+        let mut assets =
+            AssetManager::with_data_root(self.project_root.clone(), self.project_root.clone());
+        assets
+            .material_from_file(material.clone(), path)
+            .map_err(|error| error.to_string())
+    }
+
+    fn save_material_document(
+        &self,
+        path: &Path,
+        material: &Material3DFile,
+    ) -> Result<(), String> {
+        self.validate_material_document(path, material)?;
+        let bytes = serde_json::to_vec_pretty(material)
+            .map_err(|error| format!("JSON encode failed: {error}"))?;
+        std::fs::write(path, bytes).map_err(|error| format!("write failed: {error}"))
+    }
+
+    fn material_preview_key(&self, path: &Path, material: &Material3DFile) -> String {
+        let mut key = serde_json::to_string(material).unwrap_or_default();
+        let directory = path.parent().unwrap_or_else(|| Path::new("."));
+        for texture in [
+            &material.base_color_texture,
+            &material.normal_texture,
+            &material.metallic_roughness_texture,
+            &material.emissive_texture,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let source = Path::new(&texture.source);
+            let resolved = if source.is_absolute() {
+                source.to_path_buf()
+            } else {
+                directory.join(source)
+            };
+            key.push_str(&format!("|{}", resolved.display()));
+            if let Ok(metadata) = std::fs::metadata(&resolved) {
+                key.push_str(&format!("|{}", metadata.len()));
+                if let Ok(modified) = metadata.modified() {
+                    key.push_str(&format!("|{modified:?}"));
+                }
+            }
+        }
+        key
+    }
+
+    fn render_material_preview(
+        &self,
+        path: &Path,
+        material: &Material3DFile,
+    ) -> Result<Rc<image::RgbaImage>, String> {
+        const SIZE: u32 = 320;
+        let handle = self.validate_material_document(path, material)?;
+        let mesh = primitive_mesh(
+            "sphere",
+            PrimitiveOptions {
+                radius: 0.92,
+                segments: 40,
+                rings: 24,
+                ..PrimitiveOptions::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let camera = RenderCamera3D {
+            position: Vec3::new(0.0, 0.0, 3.1),
+            euler: Vec3::ZERO,
+            projection: Projection3D::Perspective,
+            fov: 39.0,
+            orthographic_size: 3.0,
+            near_clip: 0.05,
+            far_clip: 20.0,
+            render_mask: crate::render3d::ALL_RENDER_LAYERS_3D,
+        };
+        let command = Mesh3DCommand {
+            mesh,
+            model: Mat4::rotation_euler_degrees(Vec3::new(-12.0, 24.0, 0.0)),
+            view_projection: camera.view_projection(1.0),
+            camera_position: camera.position,
+            tint: Color::WHITE,
+            texture: None,
+            materials: vec![Some(handle)],
+            shader: None,
+            double_sided: material.double_sided,
+            casts_shadows: false,
+            receives_shadows: true,
+        };
+        let lights = [
+            RenderLight3D {
+                kind: LightKind3D::Directional,
+                position: Vec3::ZERO,
+                direction: normalized_vec3(Vec3::new(-0.35, -0.45, -1.0)),
+                color: Color::rgba(255, 244, 226, 255),
+                intensity: 2.6,
+                range: 20.0,
+                spot_angle_radians: 1.0,
+                spot_softness: 0.0,
+                casts_shadows: false,
+                shadow_bias: 0.005,
+            },
+            RenderLight3D {
+                kind: LightKind3D::Point,
+                position: Vec3::new(-2.2, 1.1, 2.0),
+                direction: Vec3::new(0.0, 0.0, -1.0),
+                color: Color::rgba(116, 164, 255, 255),
+                intensity: 8.0,
+                range: 6.0,
+                spot_angle_radians: 1.0,
+                spot_softness: 0.0,
+                casts_shadows: false,
+                shadow_bias: 0.005,
+            },
+        ];
+        let mut renderer = renderer::SoftwareRenderer::new(SIZE, SIZE);
+        renderer.draw_commands_with_3d_lights(
+            &[renderer::DrawCommand::Mesh3D(command)],
+            &lights,
+            None,
+        )?;
+        let mut image = image::RgbaImage::from_raw(SIZE, SIZE, renderer.pixels().to_vec())
+            .ok_or_else(|| "software PBR preview returned an invalid pixel buffer".to_string())?;
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            let checker = if (x / 20 + y / 20) % 2 == 0 {
+                [31_u8, 34, 40]
+            } else {
+                [40_u8, 44, 51]
+            };
+            let alpha = pixel.0[3] as f32 / 255.0;
+            for (channel, background) in checker.into_iter().enumerate() {
+                pixel.0[channel] = (pixel.0[channel] as f32 * alpha
+                    + background as f32 * (1.0 - alpha))
+                    .round() as u8;
+            }
+            pixel.0[3] = 255;
+        }
+        Ok(Rc::new(image))
     }
 
     fn open_animation_path(&mut self, path: PathBuf) {
@@ -15147,6 +20684,20 @@ impl EditorApp {
             self.open_animation_path(path.to_path_buf());
             return;
         }
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "neomaterial")
+        {
+            self.open_material_path(path.to_path_buf());
+            return;
+        }
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "neophysicsmaterial")
+        {
+            self.open_physics_material_path(path.to_path_buf());
+            return;
+        }
         #[cfg(target_os = "macos")]
         let cmd = "open";
         #[cfg(target_os = "windows")]
@@ -15271,6 +20822,7 @@ impl EditorApp {
                 continue;
             }
             let path = self.documents[index].path.clone();
+            let is_three_d = self.documents[index].scene.kind == SceneKind::ThreeD;
             let result = match self.documents[index].kind {
                 DocumentKind::Scene => self.documents[index].scene.save(&path),
                 DocumentKind::Prefab => {
@@ -15282,7 +20834,17 @@ impl EditorApp {
                 }
             };
             match result {
-                Ok(()) => self.documents[index].dirty = false,
+                Ok(()) => {
+                    self.documents[index].dirty = false;
+                    if is_three_d
+                        && let Err(error) = remove_recovery_snapshot(&self.project_root, &path)
+                    {
+                        self.status = format!(
+                            "Saved {}, but could not clear recovery data: {error}",
+                            path.display()
+                        );
+                    }
+                }
                 Err(error) => {
                     self.status = format!("Save failed for {}: {error}", path.display());
                     ok = false;
@@ -15293,12 +20855,104 @@ impl EditorApp {
     }
 
     fn run_scene(&mut self) {
-        if self.config.settings.autosave_before_run && !self.save_all_open_documents() {
+        self.run_scene_with_camera(None);
+    }
+
+    fn run_scene_from_selected_camera(&mut self) {
+        let Some(camera) = self.selected.filter(|id| {
+            self.scene.entity(*id).is_some_and(|entity| {
+                entity.components.iter().any(
+                    |component| matches!(component, Component::Core { name, .. } if name == "Camera3D"),
+                )
+            })
+        }) else {
+            self.status = "Select an entity with Camera3D to play from it".to_string();
+            return;
+        };
+        self.run_scene_with_camera(Some(camera));
+    }
+
+    fn stage_three_d_run(&mut self, camera: Option<u64>) -> Result<(PathBuf, PathBuf), String> {
+        self.sync_active_document();
+        let mut scene = self.scene.clone();
+        if let Some(camera) = camera {
+            let mut found = false;
+            for entity in &mut scene.entities {
+                for component in &mut entity.components {
+                    let Component::Core { name, props } = component else {
+                        continue;
+                    };
+                    if name != "Camera3D" {
+                        continue;
+                    }
+                    let enabled = entity.id == camera;
+                    found |= enabled;
+                    if let Some(prop) = props.iter_mut().find(|prop| prop.name == "enabled") {
+                        prop.value = PropValue::Bool(enabled);
+                    }
+                }
+            }
+            if !found {
+                return Err("selected play camera no longer exists".to_string());
+            }
+        }
+        let stage_dir = self
+            .project_root
+            .join(".neolove")
+            .join("play")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&stage_dir)
+            .map_err(|error| format!("create isolated play directory: {error}"))?;
+        let scene_path = stage_dir.join("scene.neoscene");
+        scene
+            .save(&scene_path)
+            .map_err(|error| format!("stage unsaved scene: {error}"))?;
+        let relative_scene = project_relative_path(&self.project_root, &scene_path);
+        let entry_path = stage_dir.join("main.luau");
+        std::fs::write(&entry_path, scene.to_luau_loader(&relative_scene))
+            .map_err(|error| format!("stage runtime loader: {error}"))?;
+        Ok((stage_dir, entry_path))
+    }
+
+    fn cleanup_run_stage(&mut self) {
+        let Some(path) = self.run_stage_dir.take() else {
+            return;
+        };
+        let allowed = self.project_root.join(".neolove").join("play");
+        if path.starts_with(&allowed) {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    fn run_scene_with_camera(&mut self, camera: Option<u64>) {
+        if self.run_rx.is_some() {
+            self.status = "Runtime preview is already running".to_string();
             return;
         }
-        if !self.export_luau() {
-            return;
-        }
+        let embedded_three_d = self.scene.kind == SceneKind::ThreeD;
+        let staged_entry = if embedded_three_d {
+            self.cleanup_run_stage();
+            match self.stage_three_d_run(camera) {
+                Ok((stage_dir, entry)) => {
+                    self.run_stage_dir = Some(stage_dir);
+                    Some(entry)
+                }
+                Err(error) => {
+                    self.status = format!("Run failed: {error}");
+                    return;
+                }
+            }
+        } else {
+            // Preserve the established 2D workflow exactly: its optional
+            // autosave and generated entry point remain unchanged.
+            if self.config.settings.autosave_before_run && !self.save_all_open_documents() {
+                return;
+            }
+            if !self.export_luau() {
+                return;
+            }
+            None
+        };
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
             Err(e) => {
@@ -15313,14 +20967,26 @@ impl EditorApp {
         let ipc_addr = match crate::editor_ipc::LoggerSession::start() {
             Ok(session) => {
                 let addr = session.addr.clone();
+                self.run_command_tx = Some(session.command_sender());
+                self.runtime_state = Some(session.state.clone());
                 self.pending_logger_session = Some(session);
                 Some(addr)
             }
             Err(error) => {
                 eprintln!("warning: failed to start logger session: {error}");
+                self.run_command_tx = None;
+                self.runtime_state = None;
                 None
             }
         };
+        if embedded_three_d && ipc_addr.is_none() {
+            self.cleanup_run_stage();
+            self.status =
+                "Run failed: embedded Game View could not open its localhost runtime channel"
+                    .to_string();
+            return;
+        }
+        let embedded_size = self.game_view_size;
         let (tx, rx) = std::sync::mpsc::channel();
         // Run the game on a worker thread, capturing its output, so the editor
         // stays responsive and can surface a startup error when it exits.
@@ -15330,6 +20996,13 @@ impl EditorApp {
             crate::mobile_emulation::apply_env(&mut command, &mobile_profile);
             if let Some(addr) = &ipc_addr {
                 command.env("NEOLOVE_EDITOR_IPC", addr);
+            }
+            if let Some(entry) = staged_entry {
+                command
+                    .env("NEOLOVE_EDITOR_ENTRY", entry)
+                    .env("NEOLOVE_EDITOR_EMBEDDED", "1")
+                    .env("NEOLOVE_EDITOR_EMBEDDED_WIDTH", embedded_size.0.to_string())
+                    .env("NEOLOVE_EDITOR_EMBEDDED_HEIGHT", embedded_size.1.to_string());
             }
             let outcome = match command.output() {
                 Ok(out) if out.status.success() => None,
@@ -15346,7 +21019,84 @@ impl EditorApp {
             let _ = tx.send(outcome);
         });
         self.run_rx = Some(rx);
-        self.status = "Running preview…".to_string();
+        self.run_paused = false;
+        if embedded_three_d {
+            self.game_view_active = true;
+            self.game_view_focused = false;
+            self.game_frame = None;
+            self.game_frame_serial = 0;
+            self.status = if camera.is_some() {
+                "Running isolated 3D Game View from selected camera…".to_string()
+            } else {
+                "Running isolated 3D Game View…".to_string()
+            };
+        } else {
+            self.status = "Running preview…".to_string();
+        }
+    }
+
+    fn send_run_command(&mut self, command: crate::editor_ipc::IpcCommand) -> bool {
+        let Some(sender) = &self.run_command_tx else {
+            self.status = "Runtime controls are unavailable for this preview".to_string();
+            return false;
+        };
+        if sender.send(command).is_err() {
+            self.status = "Runtime control connection is closed".to_string();
+            return false;
+        }
+        true
+    }
+
+    fn pause_resume_run(&mut self) {
+        if self.run_rx.is_none() {
+            self.status = "No runtime preview is running".to_string();
+            return;
+        }
+        let command = if self.run_paused {
+            crate::editor_ipc::IpcCommand::Resume
+        } else {
+            crate::editor_ipc::IpcCommand::Pause
+        };
+        if self.send_run_command(command) {
+            self.run_paused = !self.run_paused;
+            self.status = if self.run_paused {
+                "Runtime preview paused".to_string()
+            } else {
+                "Runtime preview resumed".to_string()
+            };
+        }
+    }
+
+    fn step_run(&mut self) {
+        if self.run_rx.is_none() {
+            self.status = "No runtime preview is running".to_string();
+            return;
+        }
+        if self.send_run_command(crate::editor_ipc::IpcCommand::Step) {
+            self.run_paused = true;
+            self.status = "Runtime advanced by one fixed 1/60-second frame".to_string();
+        }
+    }
+
+    fn stop_run(&mut self) {
+        if self.run_rx.is_none() {
+            self.status = "No runtime preview is running".to_string();
+            return;
+        }
+        if self.send_run_command(crate::editor_ipc::IpcCommand::Stop) {
+            self.status = "Stopping runtime preview…".to_string();
+        }
+    }
+
+    fn restart_run(&mut self) {
+        if self.run_rx.is_none() {
+            self.run_scene();
+            return;
+        }
+        if self.send_run_command(crate::editor_ipc::IpcCommand::Stop) {
+            self.restart_run_after_exit = true;
+            self.status = "Restarting runtime preview…".to_string();
+        }
     }
 
     fn build_project(&mut self, target: BuildTarget) {
@@ -15408,6 +21158,10 @@ impl EditorApp {
         self.run_rx.is_some()
     }
 
+    pub fn embedded_game_view_active(&self) -> bool {
+        self.scene.kind == SceneKind::ThreeD && self.run_pending()
+    }
+
     pub fn build_pending(&self) -> bool {
         self.build_rx.is_some()
     }
@@ -15429,6 +21183,11 @@ impl EditorApp {
         match result {
             Ok(outcome) => {
                 self.run_rx = None;
+                self.run_command_tx = None;
+                self.run_paused = false;
+                self.game_view_focused = false;
+                self.cleanup_run_stage();
+                let restart = std::mem::take(&mut self.restart_run_after_exit);
                 match outcome {
                     Some(message) => {
                         self.status = "Preview exited with an error".to_string();
@@ -15439,11 +21198,21 @@ impl EditorApp {
                     }
                     None => self.status = "Preview closed".to_string(),
                 }
+                if restart {
+                    self.run_scene();
+                }
                 true
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
                 self.run_rx = None;
+                self.run_command_tx = None;
+                self.run_paused = false;
+                self.game_view_focused = false;
+                self.cleanup_run_stage();
+                if std::mem::take(&mut self.restart_run_after_exit) {
+                    self.run_scene();
+                }
                 true
             }
         }
@@ -15539,6 +21308,7 @@ fn default_editor_camera_3d(fov: f32) -> RenderCamera3D {
         orthographic_size: 10.0,
         near_clip: 0.05,
         far_clip: 2_000.0,
+        render_mask: crate::render3d::ALL_RENDER_LAYERS_3D,
     }
 }
 
@@ -15569,12 +21339,19 @@ fn grid_3d_layout(camera: RenderCamera3D, area: Rect) -> Grid3DLayout {
     // estimate than camera height alone when looking almost horizontally.
     let centre_distance = (ground_height / forward.y.abs().max(0.15))
         .clamp(camera.near_clip.max(0.01), camera.far_clip.max(1.0));
-    let vertical_span =
-        centre_distance * 2.0 * (camera.fov.clamp(1.0, 179.0).to_radians() * 0.5).tan();
+    let vertical_span = match camera.projection {
+        Projection3D::Perspective => {
+            centre_distance
+                * 2.0
+                * (camera.fov.clamp(1.0, 179.0).to_radians() * 0.5).tan()
+        }
+        Projection3D::Orthographic => camera.orthographic_size.max(0.0001) * 2.0,
+    };
     let fine_step =
         nice_grid_step(vertical_span / area.h.max(1.0) * TARGET_FINE_PIXELS).clamp(0.01, 1_000.0);
 
     let desired_extent = (centre_distance * 32.0)
+        .max(vertical_span * 4.0)
         .max(centre_distance * (area.w / area.h.max(1.0)).max(1.0) * 24.0)
         .max(256.0)
         .max(fine_step * FINE_HALF_LINES as f32 * 8.0)
@@ -15639,6 +21416,92 @@ fn length_vec3(value: Vec3) -> f32 {
     (value.x * value.x + value.y * value.y + value.z * value.z).sqrt()
 }
 
+fn dot_vec3(left: Vec3, right: Vec3) -> f32 {
+    left.x * right.x + left.y * right.y + left.z * right.z
+}
+
+fn cross_vec3(left: Vec3, right: Vec3) -> Vec3 {
+    Vec3::new(
+        left.y * right.z - left.z * right.y,
+        left.z * right.x - left.x * right.z,
+        left.x * right.y - left.y * right.x,
+    )
+}
+
+fn inverse_rotation_direction_3d(rotation: Mat4, world: Vec3) -> Vec3 {
+    let m = rotation.values;
+    Vec3::new(
+        m[0][0] * world.x + m[1][0] * world.y + m[2][0] * world.z,
+        m[0][1] * world.x + m[1][1] * world.y + m[2][1] * world.z,
+        m[0][2] * world.x + m[1][2] * world.y + m[2][2] * world.z,
+    )
+}
+
+fn rotation_matrix_to_euler_xyz_degrees_3d(rotation: Mat4) -> Option<Vec3> {
+    let m = rotation.values;
+    let y = (-m[2][0]).clamp(-1.0, 1.0).asin();
+    let cosine_y = y.cos();
+    let (x, z) = if cosine_y.abs() > 1.0e-5 {
+        (m[2][1].atan2(m[2][2]), m[1][0].atan2(m[0][0]))
+    } else {
+        ((-m[1][2]).atan2(m[1][1]), 0.0)
+    };
+    let euler = Vec3::new(x.to_degrees(), y.to_degrees(), z.to_degrees());
+    if euler.x.is_finite() && euler.y.is_finite() && euler.z.is_finite() {
+        Some(euler)
+    } else {
+        None
+    }
+}
+
+fn surface_aligned_local_euler_3d(
+    parent_world_rotation: Mat4,
+    current_world_rotation: Mat4,
+    surface_normal: Vec3,
+    camera_forward_direction: Vec3,
+) -> Option<Vec3> {
+    let up = normalized_vec3(surface_normal);
+    if length_vec3(up) <= 0.5 {
+        return None;
+    }
+    let current_forward = normalized_vec3(
+        current_world_rotation.transform_direction(Vec3::new(0.0, 0.0, 1.0)),
+    );
+    let project_to_surface = |direction: Vec3| {
+        sub_vec3(direction, scale_vec3(up, dot_vec3(direction, up)))
+    };
+    let mut forward = project_to_surface(current_forward);
+    if length_vec3(forward) <= 1.0e-4 {
+        forward = project_to_surface(camera_forward_direction);
+    }
+    if length_vec3(forward) <= 1.0e-4 {
+        let fallback = if up.z.abs() < 0.9 {
+            Vec3::new(0.0, 0.0, 1.0)
+        } else {
+            Vec3::new(1.0, 0.0, 0.0)
+        };
+        forward = project_to_surface(fallback);
+    }
+    forward = normalized_vec3(forward);
+    let right = normalized_vec3(cross_vec3(up, forward));
+    let forward = normalized_vec3(cross_vec3(right, up));
+    if length_vec3(right) <= 0.5 || length_vec3(forward) <= 0.5 {
+        return None;
+    }
+
+    let local_right = inverse_rotation_direction_3d(parent_world_rotation, right);
+    let local_up = inverse_rotation_direction_3d(parent_world_rotation, up);
+    let local_forward = inverse_rotation_direction_3d(parent_world_rotation, forward);
+    rotation_matrix_to_euler_xyz_degrees_3d(Mat4 {
+        values: [
+            [local_right.x, local_up.x, local_forward.x, 0.0],
+            [local_right.y, local_up.y, local_forward.y, 0.0],
+            [local_right.z, local_up.z, local_forward.z, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+    })
+}
+
 fn normalized_vec3(value: Vec3) -> Vec3 {
     let length = length_vec3(value);
     if length <= f32::EPSILON || !length.is_finite() {
@@ -15674,19 +21537,38 @@ fn viewport_drop_position_3d(
 ) -> Vec3 {
     let ndc_x = ((mouse_x - area.x) / area.w.max(1.0)) * 2.0 - 1.0;
     let ndc_y = 1.0 - ((mouse_y - area.y) / area.h.max(1.0)) * 2.0;
-    let tangent = (camera.fov.to_radians() * 0.5).tan();
     let aspect = area.w / area.h.max(1.0);
-    let direction = normalized_vec3(add_vec3(
-        camera_forward(camera.euler),
-        add_vec3(
-            scale_vec3(camera_right(camera.euler), ndc_x * tangent * aspect),
-            scale_vec3(camera_up(camera.euler), ndc_y * tangent),
-        ),
-    ));
+    let forward = camera_forward(camera.euler);
+    let right = camera_right(camera.euler);
+    let up = camera_up(camera.euler);
+    let (origin, direction) = match camera.projection {
+        Projection3D::Perspective => {
+            let tangent = (camera.fov.to_radians() * 0.5).tan();
+            let direction = normalized_vec3(add_vec3(
+                forward,
+                add_vec3(
+                    scale_vec3(right, ndc_x * tangent * aspect),
+                    scale_vec3(up, ndc_y * tangent),
+                ),
+            ));
+            (camera.position, direction)
+        }
+        Projection3D::Orthographic => {
+            let half_height = camera.orthographic_size.max(0.0001);
+            let origin = add_vec3(
+                camera.position,
+                add_vec3(
+                    scale_vec3(right, ndc_x * half_height * aspect),
+                    scale_vec3(up, ndc_y * half_height),
+                ),
+            );
+            (origin, forward)
+        }
+    };
     // Prefer the conventional XZ ground plane. If the camera is parallel to
     // it or points away, place the asset a comfortable distance down the ray.
     let ground_t = if direction.y.abs() > 1.0e-5 {
-        -camera.position.y / direction.y
+        -origin.y / direction.y
     } else {
         -1.0
     };
@@ -15695,7 +21577,7 @@ fn viewport_drop_position_3d(
     } else {
         6.0
     };
-    add_vec3(camera.position, scale_vec3(direction, distance))
+    add_vec3(origin, scale_vec3(direction, distance))
 }
 
 fn scene_world_model_3d_cached(
@@ -15868,6 +21750,69 @@ fn triangle_screen_bounds(points: [(f32, f32); 3]) -> Rect {
     Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
 }
 
+type QuantizedWorldEdge = ([i64; 3], [i64; 3]);
+
+fn quantized_world_point(point: Vec3) -> [i64; 3] {
+    [point.x, point.y, point.z].map(|value| {
+        if value.is_finite() {
+            (value * 10_000.0).round() as i64
+        } else {
+            0
+        }
+    })
+}
+
+fn quantized_world_edge(a: Vec3, b: Vec3) -> (QuantizedWorldEdge, bool) {
+    let a = quantized_world_point(a);
+    let b = quantized_world_point(b);
+    if a <= b {
+        ((a, b), false)
+    } else {
+        ((b, a), true)
+    }
+}
+
+fn uv_edge_differs(left: [[f32; 2]; 2], right: [[f32; 2]; 2]) -> bool {
+    left.into_iter()
+        .flatten()
+        .zip(right.into_iter().flatten())
+        .any(|(left, right)| (left - right).abs() > 0.001)
+}
+
+fn collect_uv_seam_segments_3d(
+    hits: &[Viewport3DHit],
+    limit: usize,
+) -> Vec<[(f32, f32); 2]> {
+    let mut first_edges = HashMap::<
+        QuantizedWorldEdge,
+        ([[f32; 2]; 2], [(f32, f32); 2]),
+    >::new();
+    let mut seams = Vec::new();
+    for hit in hits.iter().take(60_000) {
+        for [first, second] in [[0, 1], [1, 2], [2, 0]] {
+            let (key, reversed) =
+                quantized_world_edge(hit.world_points[first], hit.world_points[second]);
+            let mut edge_uvs = [hit.uvs[first], hit.uvs[second]];
+            let mut edge_points = [hit.points[first], hit.points[second]];
+            if reversed {
+                edge_uvs.swap(0, 1);
+                edge_points.swap(0, 1);
+            }
+            if let Some((previous_uvs, _)) = first_edges.get(&key) {
+                if uv_edge_differs(*previous_uvs, edge_uvs) {
+                    seams.push(edge_points);
+                    if seams.len() >= limit {
+                        return seams;
+                    }
+                }
+            } else {
+                first_edges.insert(key, (edge_uvs, edge_points));
+            }
+        }
+    }
+    seams
+}
+
 fn point_in_triangle_3d_preview(point: (f32, f32), triangle: [(f32, f32); 3]) -> bool {
     let edge = |a: (f32, f32), b: (f32, f32), p: (f32, f32)| {
         (p.0 - a.0) * (b.1 - a.1) - (p.1 - a.1) * (b.0 - a.0)
@@ -15888,7 +21833,8 @@ fn viewport_hit_3d(
 ) -> Option<u64> {
     let mut closest: Option<(f32, u64)> = None;
     for hit in triangles {
-        if hit.bounds.contains(mouse_x, mouse_y)
+        if hit.pickable
+            && hit.bounds.contains(mouse_x, mouse_y)
             && point_in_triangle_3d_preview((mouse_x, mouse_y), hit.points)
             && closest.is_none_or(|(depth, _)| hit.depth < depth)
         {
@@ -15905,6 +21851,264 @@ fn viewport_hit_3d(
         }
     }
     closest.map(|(_, id)| id)
+}
+
+fn viewport_marquee_ids_3d(
+    triangles: &[Viewport3DHit],
+    proxies: &[Viewport3DProxyHit],
+    marquee: Rect,
+) -> Vec<u64> {
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    for hit in triangles {
+        if hit.pickable && rects_intersect(marquee, hit.bounds) && seen.insert(hit.id) {
+            ids.push(hit.id);
+        }
+    }
+    for hit in proxies {
+        let bounds = Rect::new(
+            hit.x - hit.radius,
+            hit.y - hit.radius,
+            hit.radius * 2.0,
+            hit.radius * 2.0,
+        );
+        if rects_intersect(marquee, bounds) && seen.insert(hit.id) {
+            ids.push(hit.id);
+        }
+    }
+    ids
+}
+
+fn screen_barycentric_3d_preview(
+    point: (f32, f32),
+    triangle: [(f32, f32); 3],
+) -> Option<[f32; 3]> {
+    let denominator = (triangle[1].1 - triangle[2].1) * (triangle[0].0 - triangle[2].0)
+        + (triangle[2].0 - triangle[1].0) * (triangle[0].1 - triangle[2].1);
+    if !denominator.is_finite() || denominator.abs() <= 1.0e-6 {
+        return None;
+    }
+    let first = ((triangle[1].1 - triangle[2].1) * (point.0 - triangle[2].0)
+        + (triangle[2].0 - triangle[1].0) * (point.1 - triangle[2].1))
+        / denominator;
+    let second = ((triangle[2].1 - triangle[0].1) * (point.0 - triangle[2].0)
+        + (triangle[0].0 - triangle[2].0) * (point.1 - triangle[2].1))
+        / denominator;
+    let third = 1.0 - first - second;
+    if [first, second, third].into_iter().all(f32::is_finite) {
+        Some([first, second, third])
+    } else {
+        None
+    }
+}
+
+/// Resolve the visible transformed mesh surface under the cursor. World
+/// position and normal use perspective-correct interpolation, matching the
+/// runtime raster path rather than a flat screen-space approximation.
+fn viewport_surface_hit_3d(
+    triangles: &[Viewport3DHit],
+    mouse_x: f32,
+    mouse_y: f32,
+    excluded: &HashSet<u64>,
+    vertex_snap: bool,
+    display_scale: f32,
+) -> Option<Viewport3DSurfaceHit> {
+    if vertex_snap {
+        let radius_squared = (14.0 * display_scale).powi(2);
+        let mut closest: Option<(f32, f32, Viewport3DSurfaceHit)> = None;
+        for hit in triangles.iter().filter(|hit| !excluded.contains(&hit.id)) {
+            for index in 0..3 {
+                let dx = mouse_x - hit.points[index].0;
+                let dy = mouse_y - hit.points[index].1;
+                let distance = dx * dx + dy * dy;
+                if distance > radius_squared {
+                    continue;
+                }
+                let candidate = Viewport3DSurfaceHit {
+                    id: hit.id,
+                    position: hit.world_points[index],
+                    normal: normalized_vec3(hit.world_normals[index]),
+                    vertex: true,
+                };
+                if closest.is_none_or(|(best_distance, best_depth, _)| {
+                    distance < best_distance - 0.01
+                        || ((distance - best_distance).abs() <= 0.01 && hit.depth < best_depth)
+                }) {
+                    closest = Some((distance, hit.depth, candidate));
+                }
+            }
+        }
+        if let Some((_, _, hit)) = closest {
+            return Some(hit);
+        }
+    }
+
+    let point = (mouse_x, mouse_y);
+    let hit = triangles
+        .iter()
+        .filter(|hit| !excluded.contains(&hit.id))
+        .filter(|hit| {
+            hit.bounds.contains(mouse_x, mouse_y)
+                && point_in_triangle_3d_preview(point, hit.points)
+        })
+        .min_by(|left, right| {
+            left.depth
+                .partial_cmp(&right.depth)
+                .unwrap_or(Ordering::Equal)
+        })?;
+    let barycentric = screen_barycentric_3d_preview(point, hit.points)?;
+    let mut weights = [0.0; 3];
+    let mut total = 0.0;
+    for index in 0..3 {
+        weights[index] = barycentric[index] / hit.clip_w[index].abs().max(1.0e-6);
+        total += weights[index];
+    }
+    if !total.is_finite() || total.abs() <= 1.0e-6 {
+        return None;
+    }
+    for weight in &mut weights {
+        *weight /= total;
+    }
+    let mut position = Vec3::ZERO;
+    let mut normal = Vec3::ZERO;
+    for index in 0..3 {
+        position = add_vec3(position, scale_vec3(hit.world_points[index], weights[index]));
+        normal = add_vec3(normal, scale_vec3(hit.world_normals[index], weights[index]));
+    }
+    Some(Viewport3DSurfaceHit {
+        id: hit.id,
+        position,
+        normal: normalized_vec3(normal),
+        vertex: false,
+    })
+}
+
+fn append_box_collider_surface_hits_3d(
+    hits: &mut Vec<Viewport3DHit>,
+    id: u64,
+    model: Mat4,
+    view_projection: Mat4,
+    area: Rect,
+    offset: Vec3,
+    half: Vec3,
+) {
+    let local = [
+        Vec3::new(offset.x - half.x, offset.y - half.y, offset.z - half.z),
+        Vec3::new(offset.x + half.x, offset.y - half.y, offset.z - half.z),
+        Vec3::new(offset.x + half.x, offset.y + half.y, offset.z - half.z),
+        Vec3::new(offset.x - half.x, offset.y + half.y, offset.z - half.z),
+        Vec3::new(offset.x - half.x, offset.y - half.y, offset.z + half.z),
+        Vec3::new(offset.x + half.x, offset.y - half.y, offset.z + half.z),
+        Vec3::new(offset.x + half.x, offset.y + half.y, offset.z + half.z),
+        Vec3::new(offset.x - half.x, offset.y + half.y, offset.z + half.z),
+    ];
+    let world = local.map(|point| model.transform_point(point));
+    let center = model.transform_point(offset);
+    let faces = [
+        [0usize, 3, 2, 1],
+        [4, 5, 6, 7],
+        [0, 1, 5, 4],
+        [3, 7, 6, 2],
+        [0, 4, 7, 3],
+        [1, 2, 6, 5],
+    ];
+    for face in faces {
+        for indices in [[face[0], face[1], face[2]], [face[0], face[2], face[3]]] {
+            let world_points = indices.map(|index| world[index]);
+            let mut points = [(0.0, 0.0); 3];
+            let mut depth = 0.0;
+            let mut clip_w = [0.0; 3];
+            let mut visible = true;
+            for index in 0..3 {
+                let Some(projected) =
+                    project_world_point(view_projection, world_points[index], area)
+                else {
+                    visible = false;
+                    break;
+                };
+                points[index] = (projected.0, projected.1);
+                depth += projected.2 / 3.0;
+                clip_w[index] = view_projection
+                    .transform_vec4([
+                        world_points[index].x,
+                        world_points[index].y,
+                        world_points[index].z,
+                        1.0,
+                    ])[3];
+            }
+            if !visible {
+                continue;
+            }
+            let mut normal = normalized_vec3(cross_vec3(
+                sub_vec3(world_points[1], world_points[0]),
+                sub_vec3(world_points[2], world_points[0]),
+            ));
+            let triangle_center = scale_vec3(
+                add_vec3(add_vec3(world_points[0], world_points[1]), world_points[2]),
+                1.0 / 3.0,
+            );
+            if dot_vec3(normal, sub_vec3(triangle_center, center)) < 0.0 {
+                normal = scale_vec3(normal, -1.0);
+            }
+            hits.push(Viewport3DHit {
+                id,
+                points,
+                bounds: triangle_screen_bounds(points),
+                depth,
+                world_points,
+                world_normals: [normal; 3],
+                world_tangents: [Vec3::ZERO; 3],
+                uvs: [[0.0; 2]; 3],
+                clip_w,
+                // Collider chrome remains a placement target, not a second
+                // competing geometry-picking surface.
+                pickable: false,
+            });
+        }
+    }
+}
+
+fn append_projected_collider_surface_hits_3d(
+    hits: &mut Vec<Viewport3DHit>,
+    id: u64,
+    area: Rect,
+    projected: impl IntoIterator<Item = ProjectedTriangle>,
+    limit: usize,
+) {
+    for triangle in projected.into_iter().take(limit) {
+        let points = triangle.vertices.map(|vertex| {
+            (
+                area.x + (vertex.ndc[0] * 0.5 + 0.5) * area.w,
+                area.y + (0.5 - vertex.ndc[1] * 0.5) * area.h,
+            )
+        });
+        hits.push(Viewport3DHit {
+            id,
+            points,
+            bounds: triangle_screen_bounds(points),
+            depth: triangle.depth,
+            world_points: triangle.vertices.map(|vertex| {
+                Vec3::new(
+                    vertex.world_position[0],
+                    vertex.world_position[1],
+                    vertex.world_position[2],
+                )
+            }),
+            world_normals: triangle.vertices.map(|vertex| {
+                Vec3::new(
+                    vertex.world_normal[0],
+                    vertex.world_normal[1],
+                    vertex.world_normal[2],
+                )
+            }),
+            world_tangents: [Vec3::ZERO; 3],
+            uvs: [[0.0; 2]; 3],
+            clip_w: triangle
+                .vertices
+                .map(|vertex| vertex.clip_position[3]),
+            pickable: false,
+        });
+    }
 }
 
 fn gizmo_axis(gizmo: Viewport3DGizmo, axis: Viewport3DAxis) -> Option<Viewport3DGizmoAxis> {
@@ -15925,6 +22129,38 @@ fn normalized_vec2(value: (f32, f32)) -> (f32, f32) {
         (1.0, 0.0)
     } else {
         (value.0 / length, value.1 / length)
+    }
+}
+
+/// Convert a world-space displacement through the inverse of a transform's
+/// linear 3x3 portion. Translation is irrelevant. This deliberately supports
+/// non-uniform and negative scales; a truly singular parent returns `None`
+/// instead of injecting infinities into the authored child transform.
+fn inverse_transform_direction_3d(transform: Mat4, world: Vec3) -> Option<Vec3> {
+    let m = transform.values;
+    let (a, b, c) = (m[0][0], m[0][1], m[0][2]);
+    let (d, e, f) = (m[1][0], m[1][1], m[1][2]);
+    let (g, h, i) = (m[2][0], m[2][1], m[2][2]);
+    let determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if !determinant.is_finite() || determinant.abs() <= 1.0e-12 {
+        return None;
+    }
+    let inverse_det = determinant.recip();
+    let local = Vec3::new(
+        ((e * i - f * h) * world.x + (c * h - b * i) * world.y
+            + (b * f - c * e) * world.z)
+            * inverse_det,
+        ((f * g - d * i) * world.x + (a * i - c * g) * world.y
+            + (c * d - a * f) * world.z)
+            * inverse_det,
+        ((d * h - e * g) * world.x + (b * g - a * h) * world.y
+            + (a * e - b * d) * world.z)
+            * inverse_det,
+    );
+    if local.x.is_finite() && local.y.is_finite() && local.z.is_finite() {
+        Some(local)
+    } else {
+        None
     }
 }
 
@@ -16038,6 +22274,35 @@ fn viewport_gizmo_hit_3d(
         _ => {}
     }
 
+    if tool == ViewTool::Move {
+        let mut closest_plane: Option<(f32, Viewport3DPlane)> = None;
+        for plane in gizmo.planes.into_iter().flatten() {
+            if point_in_triangle_3d_preview(point, [
+                plane.points[0],
+                plane.points[1],
+                plane.points[2],
+            ]) || point_in_triangle_3d_preview(point, [
+                plane.points[0],
+                plane.points[2],
+                plane.points[3],
+            ]) {
+                let center = plane
+                    .points
+                    .into_iter()
+                    .fold((0.0, 0.0), |sum, value| {
+                        (sum.0 + value.0 * 0.25, sum.1 + value.1 * 0.25)
+                    });
+                let distance = vector2_length((point.0 - center.0, point.1 - center.1));
+                if closest_plane.is_none_or(|(best, _)| distance < best) {
+                    closest_plane = Some((distance, plane.plane));
+                }
+            }
+        }
+        if let Some((_, plane)) = closest_plane {
+            return Some(Viewport3DGizmoHit::MovePlane(plane));
+        }
+    }
+
     if matches!(tool, ViewTool::Rotate | ViewTool::Transform)
         && let Some(hit) = viewport_rotation_ring_hit_3d(gizmo, mouse_x, mouse_y, display_scale)
     {
@@ -16067,29 +22332,6 @@ fn vec3_axis(value: Vec3, axis: Viewport3DAxis) -> f32 {
         Viewport3DAxis::X => value.x,
         Viewport3DAxis::Y => value.y,
         Viewport3DAxis::Z => value.z,
-    }
-}
-
-fn entity_position_axis_from_vec3(value: Vec3, axis: Viewport3DAxis) -> f32 {
-    vec3_axis(value, axis)
-}
-
-fn entity_position_axis_3d(entity: &Entity, axis: Viewport3DAxis) -> f32 {
-    match axis {
-        Viewport3DAxis::X => entity.x,
-        Viewport3DAxis::Y => entity.y,
-        Viewport3DAxis::Z => entity.position_z,
-    }
-}
-
-fn set_entity_position_axis_3d(entity: &mut Entity, axis: Viewport3DAxis, value: f32) {
-    if !value.is_finite() {
-        return;
-    }
-    match axis {
-        Viewport3DAxis::X => entity.x = value,
-        Viewport3DAxis::Y => entity.y = value,
-        Viewport3DAxis::Z => entity.position_z = value,
     }
 }
 
@@ -16142,12 +22384,18 @@ fn stable_drag_scale_3d(start: f32, factor: f32, snap: bool) -> f32 {
     sign * magnitude.clamp(MIN_ABS_SCALE, MAX_ABS_SCALE)
 }
 
-fn stable_drag_rotation_3d(start: f32, delta_degrees: f32, snap: bool) -> f32 {
+fn stable_drag_rotation_3d(
+    start: f32,
+    delta_degrees: f32,
+    snap: bool,
+    snap_degrees: f32,
+) -> f32 {
     const MAX_ABS_ROTATION: f32 = 1_000_000.0;
     let mut value = (start + delta_degrees.clamp(-36_000.0, 36_000.0))
         .clamp(-MAX_ABS_ROTATION, MAX_ABS_ROTATION);
     if snap {
-        value = (value / 15.0).round() * 15.0;
+        let increment = finite_or(snap_degrees.abs(), 15.0).clamp(0.01, 360.0);
+        value = (value / increment).round() * increment;
     }
     if value.is_finite() {
         value
@@ -16158,7 +22406,7 @@ fn stable_drag_rotation_3d(start: f32, delta_degrees: f32, snap: bool) -> f32 {
 
 fn entity_proxy_radius_3d(entity: &Entity) -> f32 {
     if entity.components.iter().any(|component| {
-        matches!(component, Component::Core { name, .. } if matches!(name.as_str(), "Camera3D" | "Light3D" | "Collider3D"))
+        matches!(component, Component::Core { name, .. } if matches!(name.as_str(), "Camera3D" | "Light3D" | "ReflectionProbe3D" | "Collider3D" | "Trigger3D" | "CharacterController3D" | "AudioSource3D" | "AudioListener3D"))
     }) {
         12.0
     } else {
@@ -16204,6 +22452,264 @@ fn draw_wire_box_3d(
     ] {
         if let (Some(start), Some(end)) = (points[start], points[end]) {
             painter.stroke_line(start.0, start.1, end.0, end.1, color);
+        }
+    }
+}
+
+fn draw_wire_sphere_3d(
+    painter: &mut Painter<'_>,
+    area: Rect,
+    view_projection: Mat4,
+    center: Vec3,
+    radius: f32,
+    color: Rgba,
+) {
+    const SEGMENTS: usize = 32;
+    let radius = radius.abs().max(0.0001);
+    for plane in 0..3 {
+        let mut previous = None;
+        for index in 0..=SEGMENTS {
+            let angle = index as f32 * std::f32::consts::TAU / SEGMENTS as f32;
+            let (sine, cosine) = angle.sin_cos();
+            let offset = match plane {
+                0 => Vec3::new(cosine * radius, sine * radius, 0.0),
+                1 => Vec3::new(cosine * radius, 0.0, sine * radius),
+                _ => Vec3::new(0.0, cosine * radius, sine * radius),
+            };
+            let point = add_vec3(center, offset);
+            if let Some(start) = previous
+                && let Some((from, to)) =
+                    project_world_segment_clipped(view_projection, start, point, area)
+            {
+                painter.stroke_line(from.0, from.1, to.0, to.1, color);
+            }
+            previous = Some(point);
+        }
+    }
+}
+
+fn draw_world_frustum_3d(
+    painter: &mut Painter<'_>,
+    area: Rect,
+    view_projection: Mat4,
+    corners: [Vec3; 8],
+    color: Rgba,
+) {
+    for (start, end) in [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ] {
+        if let Some((from, to)) = project_world_segment_clipped(
+            view_projection,
+            corners[start],
+            corners[end],
+            area,
+        ) {
+            painter.stroke_line(from.0, from.1, to.0, to.1, color);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_spot_cone_3d(
+    painter: &mut Painter<'_>,
+    area: Rect,
+    view_projection: Mat4,
+    origin: Vec3,
+    direction: Vec3,
+    right: Vec3,
+    up: Vec3,
+    range: f32,
+    angle_degrees: f32,
+    color: Rgba,
+) {
+    const SEGMENTS: usize = 32;
+    let direction = normalized_vec3(direction);
+    let right = normalized_vec3(right);
+    let up = normalized_vec3(up);
+    if [direction, right, up]
+        .into_iter()
+        .any(|axis| length_vec3(axis) <= 1.0e-6)
+    {
+        return;
+    }
+    let range = range.abs().max(0.001);
+    let radius = (angle_degrees.clamp(0.1, 179.0).to_radians() * 0.5).tan() * range;
+    let center = add_vec3(origin, scale_vec3(direction, range));
+    let mut ring = [Vec3::ZERO; SEGMENTS];
+    for (index, point) in ring.iter_mut().enumerate() {
+        let angle = index as f32 * std::f32::consts::TAU / SEGMENTS as f32;
+        *point = add_vec3(
+            center,
+            add_vec3(
+                scale_vec3(right, angle.cos() * radius),
+                scale_vec3(up, angle.sin() * radius),
+            ),
+        );
+    }
+    for index in 0..SEGMENTS {
+        if let Some((from, to)) = project_world_segment_clipped(
+            view_projection,
+            ring[index],
+            ring[(index + 1) % SEGMENTS],
+            area,
+        ) {
+            painter.stroke_line(from.0, from.1, to.0, to.1, color);
+        }
+        if index % 8 == 0
+            && let Some((from, to)) =
+                project_world_segment_clipped(view_projection, origin, ring[index], area)
+        {
+            painter.stroke_line(from.0, from.1, to.0, to.1, color);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_wire_model_arc_3d(
+    painter: &mut Painter<'_>,
+    area: Rect,
+    view_projection: Mat4,
+    model: Mat4,
+    center: Vec3,
+    first_axis: Vec3,
+    second_axis: Vec3,
+    radius: f32,
+    start_angle: f32,
+    end_angle: f32,
+    color: Rgba,
+) {
+    const SEGMENTS: usize = 24;
+    let radius = radius.abs().max(0.0001);
+    let mut previous = None;
+    for index in 0..=SEGMENTS {
+        let amount = index as f32 / SEGMENTS as f32;
+        let angle = start_angle + (end_angle - start_angle) * amount;
+        let local = add_vec3(
+            center,
+            add_vec3(
+                scale_vec3(first_axis, angle.cos() * radius),
+                scale_vec3(second_axis, angle.sin() * radius),
+            ),
+        );
+        let world = model.transform_point(local);
+        if let Some(start) = previous
+            && let Some((from, to)) =
+                project_world_segment_clipped(view_projection, start, world, area)
+        {
+            painter.stroke_line(from.0, from.1, to.0, to.1, color);
+        }
+        previous = Some(world);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_wire_model_sphere_3d(
+    painter: &mut Painter<'_>,
+    area: Rect,
+    view_projection: Mat4,
+    model: Mat4,
+    center: Vec3,
+    radius: f32,
+    color: Rgba,
+) {
+    for (first_axis, second_axis) in [
+        (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)),
+        (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0)),
+        (Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)),
+    ] {
+        draw_wire_model_arc_3d(
+            painter,
+            area,
+            view_projection,
+            model,
+            center,
+            first_axis,
+            second_axis,
+            radius,
+            0.0,
+            std::f32::consts::TAU,
+            color,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_wire_capsule_3d(
+    painter: &mut Painter<'_>,
+    area: Rect,
+    view_projection: Mat4,
+    model: Mat4,
+    center: Vec3,
+    radius: f32,
+    half_height: f32,
+    color: Rgba,
+) {
+    let radius = radius.abs().max(0.0001);
+    let half_height = half_height.abs();
+    let top = add_vec3(center, Vec3::new(0.0, half_height, 0.0));
+    let bottom = add_vec3(center, Vec3::new(0.0, -half_height, 0.0));
+    let x = Vec3::new(1.0, 0.0, 0.0);
+    let y = Vec3::new(0.0, 1.0, 0.0);
+    let z = Vec3::new(0.0, 0.0, 1.0);
+
+    for ring_center in [top, bottom] {
+        draw_wire_model_arc_3d(
+            painter,
+            area,
+            view_projection,
+            model,
+            ring_center,
+            x,
+            z,
+            radius,
+            0.0,
+            std::f32::consts::TAU,
+            color,
+        );
+    }
+    for (arc_center, start, end) in [
+        (top, 0.0, std::f32::consts::PI),
+        (bottom, std::f32::consts::PI, std::f32::consts::TAU),
+    ] {
+        for horizontal in [x, z] {
+            draw_wire_model_arc_3d(
+                painter,
+                area,
+                view_projection,
+                model,
+                arc_center,
+                horizontal,
+                y,
+                radius,
+                start,
+                end,
+                color,
+            );
+        }
+    }
+    for side in [
+        Vec3::new(radius, 0.0, 0.0),
+        Vec3::new(-radius, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, radius),
+        Vec3::new(0.0, 0.0, -radius),
+    ] {
+        let start = model.transform_point(add_vec3(bottom, side));
+        let end = model.transform_point(add_vec3(top, side));
+        if let Some((from, to)) =
+            project_world_segment_clipped(view_projection, start, end, area)
+        {
+            painter.stroke_line(from.0, from.1, to.0, to.1, color);
         }
     }
 }
@@ -16848,12 +23354,206 @@ fn prop_number(props: &[Prop], names: &[&str]) -> Option<f32> {
     })
 }
 
+fn prop_integer(props: &[Prop], names: &[&str]) -> Option<i64> {
+    prop_by_name(props, names).and_then(|prop| match &prop.value {
+        PropValue::Int(value) => Some(*value as i64),
+        PropValue::Number(value) if value.is_finite() => Some(*value as i64),
+        PropValue::Text(value) => value.trim().parse::<i64>().ok(),
+        _ => None,
+    })
+}
+
 fn prop_bool(props: &[Prop], names: &[&str]) -> Option<bool> {
     prop_by_name(props, names).and_then(|prop| match &prop.value {
         PropValue::Bool(value) => Some(*value),
         PropValue::Text(value) => value.trim().parse::<bool>().ok(),
         _ => None,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ViewportVisibilityState3D {
+    effective_visible: bool,
+    hidden_by: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ViewportRenderPolicy3D {
+    visibility: ViewportVisibilityState3D,
+    entity_mask: u32,
+    layer_match: bool,
+}
+
+fn enabled_core_props_3d<'a>(entity: &'a Entity, expected: &str) -> Option<&'a [Prop]> {
+    entity.components.iter().find_map(|component| match component {
+        Component::Core { name, props }
+            if name == expected && prop_bool(props, &["enabled"]).unwrap_or(true) =>
+        {
+            Some(props.as_slice())
+        }
+        _ => None,
+    })
+}
+
+fn viewport_visibility_state_3d(scene: &Scene, id: u64) -> ViewportVisibilityState3D {
+    let mut current = Some(id);
+    let mut visited = HashSet::new();
+    let mut hidden_by = None;
+    while let Some(candidate) = current {
+        if !visited.insert(candidate) {
+            return ViewportVisibilityState3D {
+                effective_visible: false,
+                hidden_by: Some(candidate),
+            };
+        }
+        let Some(entity) = scene.entity(candidate) else {
+            break;
+        };
+        if let Some(props) = enabled_core_props_3d(entity, "Visibility3D") {
+            if !prop_bool(props, &["visible"]).unwrap_or(true) && hidden_by.is_none() {
+                hidden_by = Some(candidate);
+            }
+            if !prop_bool(props, &["inherit_parent"]).unwrap_or(true) {
+                break;
+            }
+        }
+        current = entity.parent;
+    }
+    ViewportVisibilityState3D {
+        effective_visible: hidden_by.is_none(),
+        hidden_by,
+    }
+}
+
+fn viewport_render_policy_3d(
+    scene: &Scene,
+    entity: &Entity,
+    camera_mask: u32,
+) -> ViewportRenderPolicy3D {
+    let entity_mask = enabled_core_props_3d(entity, "RenderLayer3D")
+        .and_then(|props| prop_integer(props, &["mask"]))
+        .map(crate::render3d::sanitize_render_mask_3d)
+        .unwrap_or(1);
+    ViewportRenderPolicy3D {
+        visibility: viewport_visibility_state_3d(scene, entity.id),
+        entity_mask,
+        layer_match: crate::render3d::render_layers_intersect_3d(camera_mask, entity_mask),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ViewportLodState3D<'a> {
+    props: &'a [Prop],
+    camera_distance: f32,
+    requested_level: Option<usize>,
+    distances: crate::render3d::LodDistances3D,
+}
+
+fn viewport_lod_state_3d<'a>(
+    entity: &'a Entity,
+    world_origin: Vec3,
+    camera_position: Vec3,
+) -> Option<ViewportLodState3D<'a>> {
+    let props = entity.components.iter().find_map(|component| match component {
+        Component::Core { name, props }
+            if name == "LODGroup3D" && prop_bool(props, &["enabled"]).unwrap_or(true) =>
+        {
+            Some(props.as_slice())
+        }
+        _ => None,
+    })?;
+    let delta = Vec3::new(
+        world_origin.x - camera_position.x,
+        world_origin.y - camera_position.y,
+        world_origin.z - camera_position.z,
+    );
+    let camera_distance = length_vec3(delta);
+    let lod1 = prop_number(props, &["lod1_distance"]).unwrap_or(20.0);
+    let lod2 = prop_number(props, &["lod2_distance"]).unwrap_or(50.0);
+    let cull = prop_number(props, &["cull_distance"]).unwrap_or(100.0);
+    let force_value = prop_string_like(props, &["force_level"])
+        .unwrap_or_else(|| "automatic".to_string());
+    Some(ViewportLodState3D {
+        props,
+        camera_distance,
+        requested_level: crate::render3d::select_lod_level_3d(
+            camera_distance,
+            lod1,
+            lod2,
+            cull,
+            crate::render3d::parse_lod_force_3d(&force_value),
+        ),
+        distances: crate::render3d::lod_distances_3d(lod1, lod2, cull),
+    })
+}
+
+/// Conservative authored-space bound for the native ParticleSystem3D pool.
+/// Drag can only reduce travel, so omitting it keeps the overlay safely outside
+/// all particles while avoiding simulation or runtime-state mutation in Scene
+/// View.
+fn estimated_particle_bounds_radius_3d(props: &[Prop]) -> f32 {
+    let lifetime = prop_number(props, &["lifetime_max", "lifetimeMax"])
+        .or_else(|| prop_number(props, &["lifetime"]))
+        .unwrap_or(2.0)
+        .abs()
+        .min(10_000.0);
+    let speed = prop_number(props, &["speed_max", "speedMax"])
+        .or_else(|| prop_number(props, &["speed"]))
+        .unwrap_or(3.0)
+        .abs()
+        .min(100_000.0);
+    let gravity = Vec3::new(
+        prop_number(props, &["gravity_x", "gravityX"]).unwrap_or(0.0),
+        prop_number(props, &["gravity_y", "gravityY"]).unwrap_or(-9.81),
+        prop_number(props, &["gravity_z", "gravityZ"]).unwrap_or(0.0),
+    );
+    let gravity_travel = length_vec3(gravity).min(100_000.0) * lifetime * lifetime * 0.5;
+    let emitter_extent = match prop_string_like(props, &["shape"])
+        .unwrap_or_else(|| "point".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "box" => length_vec3(Vec3::new(
+            prop_number(props, &["box_size_x", "boxSizeX"])
+                .unwrap_or(2.0)
+                .abs()
+                * 0.5,
+            prop_number(props, &["box_size_y", "boxSizeY"])
+                .unwrap_or(2.0)
+                .abs()
+                * 0.5,
+            prop_number(props, &["box_size_z", "boxSizeZ"])
+                .unwrap_or(2.0)
+                .abs()
+                * 0.5,
+        )),
+        "sphere" => prop_number(props, &["sphere_radius", "sphereRadius"])
+            .unwrap_or(1.0)
+            .abs(),
+        "cone" => {
+            let length = prop_number(props, &["cone_length", "coneLength"])
+                .unwrap_or(1.0)
+                .abs();
+            let angle = prop_number(props, &["cone_angle", "coneAngle"])
+                .unwrap_or(30.0)
+                .abs()
+                .min(89.0)
+                .to_radians();
+            length.hypot(length * angle.tan())
+        }
+        _ => 0.0,
+    };
+    let particle_radius = prop_number(props, &["start_size", "startSize"])
+        .unwrap_or(0.25)
+        .abs()
+        .max(
+            prop_number(props, &["end_size", "endSize"])
+                .unwrap_or(0.0)
+                .abs(),
+        )
+        * 0.5;
+    (emitter_extent + speed * lifetime + gravity_travel + particle_radius)
+        .clamp(0.001, 100_000.0)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -16937,6 +23637,8 @@ fn prop_string_like(props: &[Prop], names: &[&str]) -> Option<String> {
         | PropValue::Font(value)
         | PropValue::Sound(value)
         | PropValue::Mesh(value)
+        | PropValue::Material(value)
+        | PropValue::PhysicsMaterial(value)
         | PropValue::Shader(value)
         | PropValue::Animation(value) => Some(value.clone()),
         PropValue::Enum { value, .. } => Some(value.clone()),
@@ -17519,6 +24221,8 @@ fn core_icon(name: &str) -> char {
         "Rect2D" | "Shape2D" => icon::CROP_SQUARE,
         "ParticleSystem2D" => icon::PALETTE,
         "SpatialSound2D" => icon::AUDIOTRACK,
+        "AudioSource3D" => icon::AUDIOTRACK,
+        "AudioListener3D" => icon::MY_LOCATION,
         "TextBox" | "TextLabel" | "RudimentaryTextLabel" | "TextInput" => icon::TITLE,
         "Sprite2D" | "SpriteSheet2D" | "Image2D" | "NineSliceSprite2D" | "TileTexture2D"
         | "Tilemap2D" | "Spritebox2D" => icon::IMAGE,
@@ -17697,6 +24401,8 @@ fn file_icon(name: &str) -> char {
         "ttf" | "otf" => icon::FONT_DOWNLOAD,
         "glsl" | "frag" | "vert" | "fs" | "vs" | "shader" => icon::DATA_OBJECT,
         "neoanim" | "animation" | "anim" => icon::PLAY,
+        "neomaterial" => icon::PALETTE,
+        "neophysicsmaterial" => icon::PALETTE,
         "luau" | "lua" => icon::DATA_OBJECT,
         "toml" | "json" | "txt" | "md" | "neoscene" => icon::ARTICLE,
         "neoprefab" => icon::VIEW_IN_AR,
@@ -17806,6 +24512,8 @@ fn normalize_config(config: &mut EditorConfig) {
         finite_or(config.settings.viewport_camera_speed, 10.0).clamp(0.1, 1_000.0);
     config.settings.viewport_camera_fov =
         finite_or(config.settings.viewport_camera_fov, 60.0).clamp(20.0, 140.0);
+    config.layout.rotation_snap_3d =
+        finite_or(config.layout.rotation_snap_3d.abs(), 15.0).clamp(0.01, 360.0);
 }
 
 fn finite_or(value: f32, fallback: f32) -> f32 {
@@ -18197,6 +24905,143 @@ fn upsert_toml_section_key(lines: &mut Vec<String>, section: &str, key: &str, va
     lines.insert(insert_at, format!("{key} = {value}"));
 }
 
+#[allow(clippy::too_many_arguments)]
+fn material_float_control(
+    ui: &mut Ui,
+    theme: &Theme,
+    id: &str,
+    label: &str,
+    value: &mut f32,
+    min: f32,
+    max: f32,
+    x: f32,
+    width: f32,
+    y: f32,
+    interactive: bool,
+) -> bool {
+    let mut changed = false;
+    let label_w = 72.0_f32.min((width * 0.3).max(38.0));
+    let value_w = 54.0_f32.min((width * 0.24).max(42.0));
+    let slider_w = (width - label_w - value_w - 7.0).max(18.0);
+    ui.painter.text_clipped(
+        x,
+        y + 4.0,
+        label,
+        12.0,
+        theme.text_dim,
+        label_w - 4.0,
+    );
+    if interactive
+        && let Some(next) = ui.slider(
+            Rect::new(x + label_w, y + 2.0, slider_w, FIELD_H - 4.0),
+            *value,
+            min,
+            max,
+        )
+        && *value != next
+    {
+        *value = next;
+        changed = true;
+    }
+    let field = ui.text_field(
+        id,
+        Rect::new(x + label_w + slider_w + 7.0, y, value_w, FIELD_H),
+        &format_num(*value),
+    );
+    if field.changed
+        && let Ok(next) = field.text.trim().parse::<f32>()
+    {
+        let next = next.clamp(min, max);
+        if *value != next {
+            *value = next;
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn material_texture_control(
+    ui: &mut Ui,
+    theme: &Theme,
+    id: &str,
+    label: &str,
+    color_space: &str,
+    texture: &mut Option<MaterialTextureFile>,
+    x: f32,
+    width: f32,
+    y: f32,
+) -> bool {
+    let mut changed = false;
+    ui.painter.text_clipped(
+        x,
+        y,
+        label,
+        11.0,
+        theme.text,
+        (width - 58.0).max(20.0),
+    );
+    ui.painter.text_clipped(
+        x + (width - 54.0).max(0.0),
+        y,
+        color_space,
+        10.0,
+        theme.text_dim,
+        54.0,
+    );
+    let control_y = y + 16.0;
+    if let Some(next) = ui.checkbox(
+        Rect::new(x, control_y, FIELD_H, FIELD_H),
+        texture.is_some(),
+    ) {
+        if next && texture.is_none() {
+            *texture = Some(MaterialTextureFile::default());
+            changed = true;
+        } else if !next && texture.is_some() {
+            *texture = None;
+            changed = true;
+        }
+    }
+    if let Some(binding) = texture {
+        let uv_w = 42.0;
+        let source = ui.text_field(
+            &format!("material_texture_{id}"),
+            Rect::new(
+                x + FIELD_H + 5.0,
+                control_y,
+                (width - FIELD_H - uv_w - 12.0).max(36.0),
+                FIELD_H,
+            ),
+            &binding.source,
+        );
+        if source.changed && source.text != binding.source {
+            binding.source = source.text;
+            changed = true;
+        }
+        let uv = ui.text_field(
+            &format!("material_texture_uv_{id}"),
+            Rect::new(x + width - uv_w, control_y, uv_w, FIELD_H),
+            &binding.tex_coord.to_string(),
+        );
+        if uv.changed
+            && let Ok(next) = uv.text.trim().parse::<u32>()
+            && next != binding.tex_coord
+        {
+            binding.tex_coord = next;
+            changed = true;
+        }
+    } else {
+        ui.painter.text(
+            x + FIELD_H + 7.0,
+            control_y + 4.0,
+            "Not assigned",
+            12.0,
+            theme.text_dim,
+        );
+    }
+    changed
+}
+
 fn format_num(value: f32) -> String {
     if value.fract() == 0.0 {
         format!("{}", value as i64)
@@ -18270,8 +25115,7 @@ mod tests {
             Self::with_size(scene, 1280, 760)
         }
         fn with_size(scene: Scene, w: usize, h: usize) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("neolove_editor_test_{}", std::process::id()));
+            let dir = unique_test_path("harness");
             let _ = std::fs::create_dir_all(&dir);
             let app = EditorApp::new(
                 dir.clone(),
@@ -18359,6 +25203,268 @@ mod tests {
     }
 
     #[test]
+    fn three_d_recovery_snapshot_round_trips_through_the_scene_loader() {
+        let root = unique_test_path("recovery_round_trip");
+        std::fs::create_dir_all(&root).expect("recovery test directory");
+        let source = root.join("world.neoscene");
+        let authored = Scene::new_for_kind(SceneKind::ThreeD);
+        authored.save(&source).expect("save authored scene");
+
+        let mut edited = authored.clone();
+        edited.name = "Recovered world".to_string();
+        edited.add_entity("Unsaved mesh", 3.0, 4.0);
+        let snapshot = write_recovery_snapshot(
+            &root,
+            &source,
+            DocumentKind::Scene,
+            &edited,
+        )
+        .expect("write recovery snapshot");
+        assert!(snapshot.exists());
+
+        let recovered = load_recovery_snapshot(
+            &root,
+            &source,
+            DocumentKind::Scene,
+            true,
+        )
+        .expect("load recovery snapshot")
+        .expect("current recovery snapshot");
+        assert_eq!(
+            recovered.to_json().expect("serialize recovered scene"),
+            edited.to_json().expect("serialize edited scene")
+        );
+        let next = recovered.clone().add_entity("Allocated after recovery", 0.0, 0.0);
+        assert!(
+            !edited.entities.iter().any(|entity| entity.id == next.id),
+            "Scene::from_json must restore the next entity id"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove recovery test directory");
+    }
+
+    #[test]
+    fn periodic_recovery_captures_all_dirty_3d_tabs_but_never_2d() {
+        let root = unique_test_path("recovery_tabs");
+        std::fs::create_dir_all(&root).expect("recovery tabs directory");
+        let first_path = root.join("first.neoscene");
+        let second_path = root.join("second.neoscene");
+        let first = Scene::new_for_kind(SceneKind::ThreeD);
+        let second = Scene::new_for_kind(SceneKind::ThreeD);
+        first.save(&first_path).expect("save first scene");
+        second.save(&second_path).expect("save second scene");
+
+        let mut app = EditorApp::new(
+            root.clone(),
+            first_path.clone(),
+            first,
+            EditorConfig::default(),
+        );
+        app.scene.name = "Dirty first".to_string();
+        app.mark_dirty();
+        app.add_document(second_path.clone(), second, DocumentKind::Scene);
+        app.scene.name = "Dirty second".to_string();
+        app.mark_dirty();
+        app.last_recovery_snapshot = Instant::now() - RECOVERY_SNAPSHOT_INTERVAL;
+        app.maybe_write_recovery_snapshots();
+        assert!(recovery_snapshot_path(&root, &first_path).exists());
+        assert!(recovery_snapshot_path(&root, &second_path).exists());
+
+        let two_d_root = unique_test_path("recovery_2d_isolation");
+        std::fs::create_dir_all(&two_d_root).expect("2D recovery test directory");
+        let two_d_path = two_d_root.join("legacy.neoscene");
+        let mut two_d = EditorApp::new(
+            two_d_root.clone(),
+            two_d_path.clone(),
+            Scene::default(),
+            EditorConfig::default(),
+        );
+        two_d.scene.name = "Dirty legacy scene".to_string();
+        two_d.mark_dirty();
+        two_d.last_recovery_snapshot = Instant::now() - RECOVERY_SNAPSHOT_INTERVAL;
+        two_d.maybe_write_recovery_snapshots();
+        assert!(
+            !recovery_snapshot_path(&two_d_root, &two_d_path).exists(),
+            "the 3D recovery system must not create data for a 2D document"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove recovery tabs directory");
+        std::fs::remove_dir_all(two_d_root).expect("remove 2D recovery test directory");
+    }
+
+    #[test]
+    fn startup_recovery_restores_dirty_state_and_a_real_save_clears_it() {
+        let root = unique_test_path("recovery_startup");
+        std::fs::create_dir_all(&root).expect("startup recovery directory");
+        let source = root.join("main.neoscene");
+        let authored = Scene::new_for_kind(SceneKind::ThreeD);
+        authored.save(&source).expect("save authored scene");
+        let mut edited = authored.clone();
+        edited.name = "Recovered on startup".to_string();
+        write_recovery_snapshot(
+            &root,
+            &source,
+            DocumentKind::Scene,
+            &edited,
+        )
+        .expect("write startup recovery");
+
+        let mut app = EditorApp::new(
+            root.clone(),
+            source.clone(),
+            Scene::load(&source).expect("load authored scene"),
+            EditorConfig::default(),
+        );
+        assert!(matches!(
+            app.popup,
+            Some(Popup::Confirm {
+                action: Pending::RecoverDocument(ref path),
+                ..
+            }) if path == &source
+        ));
+        app.popup = None;
+        app.perform_pending(Pending::RecoverDocument(source.clone()));
+        assert_eq!(app.scene.name, "Recovered on startup");
+        assert!(app.scene_dirty);
+        assert!(app.documents[0].dirty);
+        assert!(!app.undo_stack.is_empty(), "recovery should be undoable");
+
+        app.save();
+        assert!(!app.scene_dirty);
+        assert!(!recovery_snapshot_path(&root, &source).exists());
+        assert_eq!(
+            Scene::load(&source).expect("load saved recovery").name,
+            "Recovered on startup"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove startup recovery directory");
+    }
+
+    #[test]
+    fn recovery_uses_a_valid_backup_and_ignores_stale_or_mismatched_data() {
+        let root = unique_test_path("recovery_validation");
+        std::fs::create_dir_all(&root).expect("recovery validation directory");
+        let source = root.join("main.neoscene");
+        let authored = Scene::new_for_kind(SceneKind::ThreeD);
+        authored.save(&source).expect("save authored scene");
+        let mut edited = authored.clone();
+        edited.name = "Backup recovery".to_string();
+        let target = write_recovery_snapshot(
+            &root,
+            &source,
+            DocumentKind::Scene,
+            &edited,
+        )
+        .expect("write recovery");
+        let backup = recovery_backup_path(&target);
+        std::fs::copy(&target, &backup).expect("copy recovery backup");
+        std::fs::write(&target, b"not valid recovery data").expect("corrupt current snapshot");
+        let recovered = load_recovery_snapshot(
+            &root,
+            &source,
+            DocumentKind::Scene,
+            true,
+        )
+        .expect("fall back to backup")
+        .expect("valid backup recovery");
+        assert_eq!(recovered.name, "Backup recovery");
+
+        let mut snapshot: RecoverySnapshot = serde_json::from_slice(
+            &std::fs::read(&backup).expect("read recovery backup"),
+        )
+        .expect("parse recovery backup");
+        std::fs::remove_file(&target).expect("remove corrupt current recovery");
+        let mut newer_authored = authored.clone();
+        newer_authored.name = "Newer authored file".to_string();
+        newer_authored
+            .save(&source)
+            .expect("replace the authored scene after recovery was written");
+        assert!(
+            load_recovery_snapshot(
+                &root,
+                &source,
+                DocumentKind::Scene,
+                true,
+            )
+            .expect("stale recovery is not corrupt")
+            .is_none(),
+            "changed authored bytes must make the prior recovery stale"
+        );
+
+        snapshot.source_modified_unix_nanos = modified_unix_nanos(&source).expect("source stamp");
+        snapshot.source_content_hash = file_content_hash(&source).expect("source fingerprint");
+        snapshot.source = "different.neoscene".to_string();
+        std::fs::write(
+            &backup,
+            serde_json::to_vec_pretty(&snapshot).expect("serialize mismatched recovery"),
+        )
+        .expect("write mismatched recovery");
+        assert!(
+            load_recovery_snapshot(
+                &root,
+                &source,
+                DocumentKind::Scene,
+                true,
+            )
+            .is_err(),
+            "a hash-path collision or mismatched snapshot must be rejected"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove recovery validation directory");
+    }
+
+    #[test]
+    fn discarding_recovery_and_reloading_are_explicit_and_effective() {
+        let root = unique_test_path("recovery_discard_reload");
+        std::fs::create_dir_all(&root).expect("recovery discard directory");
+        let source = root.join("main.neoscene");
+        let mut authored = Scene::new_for_kind(SceneKind::ThreeD);
+        authored.name = "Saved on disk".to_string();
+        authored.save(&source).expect("save authored scene");
+        let mut edited = authored.clone();
+        edited.name = "Unsaved recovery".to_string();
+        write_recovery_snapshot(
+            &root,
+            &source,
+            DocumentKind::Scene,
+            &edited,
+        )
+        .expect("write discardable recovery");
+
+        let mut app = EditorApp::new(
+            root.clone(),
+            source.clone(),
+            authored,
+            EditorConfig::default(),
+        );
+        app.popup = None;
+        app.cancel_pending(Pending::RecoverDocument(source.clone()));
+        assert!(!recovery_snapshot_path(&root, &source).exists());
+
+        app.scene.name = "Unsaved live edit".to_string();
+        app.mark_dirty();
+        app.perform_pending(Pending::LoadScene);
+        assert_eq!(app.scene.name, "Saved on disk");
+        assert!(!app.scene_dirty);
+        assert!(!app.documents[0].dirty);
+
+        app.scene.name = "Discarded at quit".to_string();
+        app.mark_dirty();
+        app.last_recovery_snapshot = Instant::now() - RECOVERY_SNAPSHOT_INTERVAL;
+        app.maybe_write_recovery_snapshots();
+        assert!(recovery_snapshot_path(&root, &source).exists());
+        app.perform_pending(Pending::Quit);
+        app.last_recovery_snapshot = Instant::now() - RECOVERY_SNAPSHOT_INTERVAL;
+        app.maybe_write_recovery_snapshots();
+        assert!(
+            !recovery_snapshot_path(&root, &source).exists(),
+            "an explicit discard-and-quit must not recreate recovery data"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove recovery discard directory");
+    }
+
+    #[test]
     fn default_scene_has_no_components() {
         let h = Harness::new(Scene::default());
         assert!(h.app.scene.entities[0].components.is_empty());
@@ -18396,6 +25502,73 @@ mod tests {
         off.lighting.enabled = false;
         let h2 = Harness::new(off);
         assert!(h2.app.gather_scene_lighting().is_none());
+    }
+
+    #[test]
+    fn three_d_scene_never_uses_the_legacy_2d_lighting_preview() {
+        let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
+        scene.lighting.enabled = true;
+        scene.lighting.ambient = [0, 0, 0, 255];
+        let mut legacy_light = scene.add_entity("Legacy Light2D", 32.0, 48.0);
+        legacy_light.components.push(Component::core("Light2D"));
+        let id = legacy_light.id;
+        scene.replace_entity(id, legacy_light);
+
+        let harness = Harness::new(scene);
+        assert!(
+            harness.app.gather_scene_lighting().is_none(),
+            "the 2D light-map compositor must not multiply a 3D Scene View"
+        );
+    }
+
+    #[test]
+    fn three_d_scene_lighting_quick_actions_create_runtime_components() {
+        let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
+        scene.entities.clear();
+        let mut harness = Harness::new(scene);
+
+        harness.app.add_directional_light_3d();
+        let light = harness
+            .app
+            .scene
+            .entities
+            .iter()
+            .find(|entity| entity.name == "Directional Light")
+            .expect("directional light quick action");
+        let light_props = light
+            .components
+            .iter()
+            .find_map(|component| match component {
+                Component::Core { name, props } if name == "Light3D" => Some(props),
+                _ => None,
+            })
+            .expect("Light3D component");
+        assert_eq!(
+            prop_string_like(light_props, &["kind"]).as_deref(),
+            Some("directional")
+        );
+        assert_eq!((light.rotation_x, light.rotation_y), (-45.0, -35.0));
+
+        harness.app.add_environment_3d();
+        assert!(harness.app.scene.entities.iter().any(|entity| {
+            entity.components.iter().any(|component| {
+                matches!(component, Component::Core { name, .. } if name == "Environment3D")
+            })
+        }));
+        harness.app.add_reflection_probe_3d();
+        assert!(harness.app.scene.entities.iter().any(|entity| {
+            entity.components.iter().any(|component| {
+                matches!(component, Component::Core { name, .. } if name == "ReflectionProbe3D")
+            })
+        }));
+        assert!(harness.app.scene_dirty);
+
+        let mut two_d = Harness::new(Scene::default());
+        let before = two_d.app.scene.entities.len();
+        two_d.app.add_directional_light_3d();
+        two_d.app.add_environment_3d();
+        two_d.app.add_reflection_probe_3d();
+        assert_eq!(two_d.app.scene.entities.len(), before);
     }
 
     #[test]
@@ -18526,24 +25699,31 @@ mod tests {
         config.settings.viewport_camera_sensitivity = 2.25;
         config.settings.viewport_camera_speed = 48.0;
         config.settings.viewport_camera_fov = 82.0;
+        config.settings.viewport_invert_mouse_x = true;
         config.settings.viewport_invert_mouse_look = true;
+        config.settings.viewport_fly_without_mouse_hold = false;
+        config.layout.rotation_snap_3d = 7.5;
         save_config(&path, &config).expect("save viewport camera config");
 
         let loaded = load_config(&path);
         assert_eq!(loaded.settings.viewport_camera_sensitivity, 2.25);
         assert_eq!(loaded.settings.viewport_camera_speed, 48.0);
         assert_eq!(loaded.settings.viewport_camera_fov, 82.0);
+        assert!(loaded.settings.viewport_invert_mouse_x);
         assert!(loaded.settings.viewport_invert_mouse_look);
+        assert!(!loaded.settings.viewport_fly_without_mouse_hold);
+        assert_eq!(loaded.layout.rotation_snap_3d, 7.5);
 
         std::fs::write(
             &path,
-            r#"{"settings":{"viewport_camera_sensitivity":99.0,"viewport_camera_speed":0.0,"viewport_camera_fov":180.0}}"#,
+            r#"{"layout":{"rotation_snap_3d":9999.0},"settings":{"viewport_camera_sensitivity":99.0,"viewport_camera_speed":0.0,"viewport_camera_fov":180.0}}"#,
         )
         .expect("write out-of-range viewport camera config");
         let clamped = load_config(&path);
         assert_eq!(clamped.settings.viewport_camera_sensitivity, 8.0);
         assert_eq!(clamped.settings.viewport_camera_speed, 0.1);
         assert_eq!(clamped.settings.viewport_camera_fov, 140.0);
+        assert_eq!(clamped.layout.rotation_snap_3d, 360.0);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -18876,6 +26056,10 @@ mod tests {
         assert!(AssetKind::Sound.accepts(Path::new("music.flac")));
         assert!(AssetKind::Mesh.accepts(Path::new("models/robot.FBX")));
         assert!(AssetKind::Mesh.accepts(Path::new("models/level.glb")));
+        assert!(AssetKind::Material.accepts(Path::new("materials/steel.neomaterial")));
+        assert!(AssetKind::PhysicsMaterial.accepts(Path::new(
+            "materials/rubber.NEOPHYSICSMATERIAL"
+        )));
         assert!(AssetKind::Shader.accepts(Path::new("glow.GLSL")));
         assert!(!AssetKind::Sound.accepts(Path::new("notes.txt")));
 
@@ -18936,6 +26120,57 @@ mod tests {
         assert_eq!(
             harness.app.scene.entity(id).expect("entity").values[1].value,
             VarValue::Color([12, 34, 56, 78])
+        );
+        let collider_index = harness
+            .app
+            .scene
+            .entity(id)
+            .expect("entity")
+            .components
+            .len();
+        harness
+            .app
+            .scene
+            .entity_mut(id)
+            .expect("entity")
+            .components
+            .push(Component::core("Collider3D"));
+        let physics_material_index = match &harness
+            .app
+            .scene
+            .entity(id)
+            .expect("entity")
+            .components[collider_index]
+        {
+            Component::Core { props, .. } => props
+                .iter()
+                .position(|prop| prop.name == "physics_material")
+                .expect("physics material prop"),
+            _ => unreachable!(),
+        };
+        harness.app.assign_asset(
+            AssetTarget::Prop {
+                entity: id,
+                component: collider_index,
+                prop: physics_material_index,
+            },
+            AssetKind::PhysicsMaterial,
+            "assets/materials/rubber.neophysicsmaterial".into(),
+        );
+        let Component::Core { props, .. } = &harness
+            .app
+            .scene
+            .entity(id)
+            .expect("entity")
+            .components[collider_index]
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            props[physics_material_index].value,
+            PropValue::PhysicsMaterial(
+                "assets/materials/rubber.neophysicsmaterial".into()
+            )
         );
         assert!(harness.app.scene_dirty);
     }
@@ -19850,6 +27085,63 @@ mod tests {
         };
         assert!(entries.iter().any(|entry| entry.label == "Health"));
         assert_eq!(h.app.focus.as_deref(), Some("component_picker_search"));
+    }
+
+    #[test]
+    fn component_picker_keeps_metadata_shared_and_visual_policy_3d_only() {
+        let mut two_d = Harness::new(Scene::default());
+        let two_d_id = two_d.app.scene.entities[0].id;
+        two_d.app.open_add_component_menu(two_d_id, 10.0, 10.0);
+        let Some(Popup::ComponentPicker { entries, .. }) = two_d.app.popup.as_ref() else {
+            panic!("2D component picker should open");
+        };
+        for name in [
+            "Raycast3D",
+            "CharacterController3D",
+            "LODGroup3D",
+            "Visibility3D",
+            "RenderLayer3D",
+        ] {
+            assert!(
+                entries.iter().all(|entry| entry.label != name),
+                "{name} must not alter the 2D component workflow"
+            );
+        }
+        for name in ["Tag", "Layer"] {
+            assert!(
+                entries.iter().any(|entry| entry.label == name),
+                "{name} must be authorable in a 2D scene"
+            );
+        }
+        for alias in ["Tag3D", "Layer3D"] {
+            assert!(
+                entries.iter().all(|entry| entry.label != alias),
+                "compatibility alias {alias} must not appear in the picker"
+            );
+        }
+
+        let mut three_d = Harness::new(Scene::new_for_kind(SceneKind::ThreeD));
+        let three_d_id = three_d.app.scene.entities[0].id;
+        three_d
+            .app
+            .open_add_component_menu(three_d_id, 10.0, 10.0);
+        let Some(Popup::ComponentPicker { entries, .. }) = three_d.app.popup.as_ref() else {
+            panic!("3D component picker should open");
+        };
+        for name in [
+            "Raycast3D",
+            "CharacterController3D",
+            "LODGroup3D",
+            "Visibility3D",
+            "RenderLayer3D",
+            "Tag",
+            "Layer",
+        ] {
+            assert!(
+                entries.iter().any(|entry| entry.label == name),
+                "{name} must be authorable in a 3D scene"
+            );
+        }
     }
 
     #[test]
@@ -21451,6 +28743,12 @@ mod tests {
             points: [(10.0, 10.0), (90.0, 10.0), (50.0, 90.0)],
             bounds: Rect::new(10.0, 10.0, 80.0, 80.0),
             depth: 0.8,
+            world_points: [Vec3::ZERO; 3],
+            world_normals: [Vec3::new(0.0, 1.0, 0.0); 3],
+            world_tangents: [Vec3::new(1.0, 0.0, 0.0); 3],
+            uvs: [[0.0; 2]; 3],
+            clip_w: [1.0; 3],
+            pickable: true,
         };
         let near = Viewport3DHit {
             id: 2,
@@ -21459,6 +28757,294 @@ mod tests {
         };
         assert_eq!(viewport_hit_3d(&[far, near], &[], 50.0, 40.0), Some(2));
         assert_eq!(viewport_hit_3d(&[far], &[], 5.0, 5.0), None);
+    }
+
+    #[test]
+    fn three_d_marquee_deduplicates_meshes_and_proxies_and_skips_locked_surfaces() {
+        let visible = Viewport3DHit {
+            id: 1,
+            points: [(20.0, 20.0), (40.0, 20.0), (30.0, 40.0)],
+            bounds: Rect::new(20.0, 20.0, 20.0, 20.0),
+            depth: 0.3,
+            world_points: [Vec3::ZERO; 3],
+            world_normals: [Vec3::new(0.0, 1.0, 0.0); 3],
+            world_tangents: [Vec3::new(1.0, 0.0, 0.0); 3],
+            uvs: [[0.0; 2]; 3],
+            clip_w: [1.0; 3],
+            pickable: true,
+        };
+        let duplicate_triangle = Viewport3DHit {
+            depth: 0.4,
+            ..visible
+        };
+        let locked_surface = Viewport3DHit {
+            id: 3,
+            pickable: false,
+            ..visible
+        };
+        let proxies = [
+            Viewport3DProxyHit {
+                id: 1,
+                x: 30.0,
+                y: 30.0,
+                radius: 5.0,
+                depth: 0.3,
+            },
+            Viewport3DProxyHit {
+                id: 2,
+                x: 70.0,
+                y: 70.0,
+                radius: 8.0,
+                depth: 0.2,
+            },
+            Viewport3DProxyHit {
+                id: 4,
+                x: 170.0,
+                y: 170.0,
+                radius: 8.0,
+                depth: 0.2,
+            },
+        ];
+        assert_eq!(
+            viewport_marquee_ids_3d(
+                &[visible, duplicate_triangle, locked_surface],
+                &proxies,
+                Rect::new(10.0, 10.0, 100.0, 100.0),
+            ),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn three_d_surface_and_vertex_snap_use_transformed_mesh_data_even_when_locked() {
+        let locked = Viewport3DHit {
+            id: 42,
+            points: [(0.0, 0.0), (10.0, 0.0), (0.0, 10.0)],
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+            depth: 0.25,
+            world_points: [
+                Vec3::new(10.0, 20.0, 30.0),
+                Vec3::new(20.0, 20.0, 30.0),
+                Vec3::new(10.0, 30.0, 30.0),
+            ],
+            world_normals: [Vec3::new(0.0, 0.0, 1.0); 3],
+            world_tangents: [Vec3::new(1.0, 0.0, 0.0); 3],
+            uvs: [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            clip_w: [1.0; 3],
+            pickable: false,
+        };
+        assert_eq!(viewport_hit_3d(&[locked], &[], 2.0, 3.0), None);
+
+        let surface = viewport_surface_hit_3d(
+            &[locked],
+            2.0,
+            3.0,
+            &HashSet::new(),
+            false,
+            1.0,
+        )
+        .expect("surface hit");
+        assert_eq!(surface.id, 42);
+        assert!((surface.position.x - 12.0).abs() < 0.001);
+        assert!((surface.position.y - 23.0).abs() < 0.001);
+        assert!((surface.position.z - 30.0).abs() < 0.001);
+        assert!(!surface.vertex);
+
+        let vertex = viewport_surface_hit_3d(
+            &[locked],
+            0.5,
+            0.5,
+            &HashSet::new(),
+            true,
+            1.0,
+        )
+        .expect("vertex hit");
+        assert_eq!(vertex.position, Vec3::new(10.0, 20.0, 30.0));
+        assert!(vertex.vertex);
+
+        let excluded = HashSet::from([42]);
+        assert!(
+            viewport_surface_hit_3d(&[locked], 2.0, 3.0, &excluded, false, 1.0).is_none()
+        );
+    }
+
+    #[test]
+    fn three_d_box_colliders_are_bounded_surface_snap_targets() {
+        let area = Rect::new(0.0, 0.0, 800.0, 600.0);
+        let camera = default_editor_camera_3d(60.0);
+        let view_projection = camera.view_projection(area.w / area.h);
+        let model = Mat4::trs(
+            Vec3::new(0.5, -0.25, 0.75),
+            Vec3::new(18.0, 31.0, -12.0),
+            Vec3::new(-2.0, 0.5, 3.0),
+        );
+        let offset = Vec3::new(0.2, 0.1, -0.3);
+        let mut hits = Vec::new();
+        append_box_collider_surface_hits_3d(
+            &mut hits,
+            77,
+            model,
+            view_projection,
+            area,
+            offset,
+            Vec3::new(1.0, 2.0, 0.5),
+        );
+        assert_eq!(hits.len(), 12);
+        let center = model.transform_point(offset);
+        for hit in &hits {
+            assert_eq!(hit.id, 77);
+            assert!(!hit.pickable);
+            let triangle_center = scale_vec3(
+                add_vec3(
+                    add_vec3(hit.world_points[0], hit.world_points[1]),
+                    hit.world_points[2],
+                ),
+                1.0 / 3.0,
+            );
+            assert!(
+                dot_vec3(hit.world_normals[0], sub_vec3(triangle_center, center)) > 0.0,
+                "normal should face out from a negative/non-uniform box"
+            );
+        }
+        let target = hits[0];
+        let point = (
+            (target.points[0].0 + target.points[1].0 + target.points[2].0) / 3.0,
+            (target.points[0].1 + target.points[1].1 + target.points[2].1) / 3.0,
+        );
+        let snapped = viewport_surface_hit_3d(
+            &[target],
+            point.0,
+            point.1,
+            &HashSet::new(),
+            false,
+            1.0,
+        )
+        .expect("collider surface hit");
+        assert_eq!(snapped.id, 77);
+        assert!(dot_vec3(snapped.normal, target.world_normals[0]) > 0.999);
+
+        for shape in ["sphere", "capsule"] {
+            let mesh = crate::mesh::primitive_mesh(shape, crate::mesh::PrimitiveOptions::default())
+                .expect("collider primitive");
+            let command = Mesh3DCommand {
+                mesh,
+                model,
+                view_projection,
+                camera_position: camera.position,
+                tint: Color::rgba(255, 255, 255, 255),
+                texture: None,
+                materials: Vec::new(),
+                shader: None,
+                double_sided: true,
+                casts_shadows: false,
+                receives_shadows: false,
+            };
+            let projected = project_mesh(&command, &[]).expect("project collider primitive");
+            let mut primitive_hits = Vec::new();
+            append_projected_collider_surface_hits_3d(
+                &mut primitive_hits,
+                88,
+                area,
+                projected,
+                32,
+            );
+            assert_eq!(primitive_hits.len(), 32, "{shape}");
+            assert!(primitive_hits.iter().all(|hit| !hit.pickable));
+            assert!(primitive_hits.iter().all(|hit| {
+                let normal = hit.world_normals[0];
+                normal.x.is_finite() && normal.y.is_finite() && normal.z.is_finite()
+            }));
+        }
+    }
+
+    #[test]
+    fn three_d_surface_snap_places_group_pivot_and_aligns_local_up_to_normal() {
+        let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
+        let parent = scene.entities[0].id;
+        {
+            let entity = scene.entity_mut(parent).expect("parent");
+            entity.rotation_y = 35.0;
+            entity.scale_x = -2.0;
+            entity.scale_y = 0.5;
+            entity.scale_z = 3.0;
+        }
+        let first = scene.add_entity("First", 1.0, 2.0).id;
+        scene.entity_mut(first).expect("first").parent = Some(parent);
+        let second = scene.add_entity("Second", 4.0, -1.0).id;
+        scene.entity_mut(second).expect("second").parent = Some(parent);
+        let mut harness = Harness::new(scene);
+        harness.app.select_many(vec![first, second], false);
+        harness.app.selected = Some(first);
+        harness.app.config.layout.align_surface_normal_3d = true;
+        let starts = harness.app.viewport_transform_starts_3d([
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        ]);
+        let drag = Viewport3DDrag {
+            start_mouse: (0.0, 0.0),
+            start: starts,
+            mode: Viewport3DDragMode::MoveAxis {
+                axis: Viewport3DAxis::X,
+                screen_axis: (1.0, 0.0),
+            },
+        };
+        let before_first = harness
+            .app
+            .entity_world_model_3d(first)
+            .expect("first model")
+            .transform_point(Vec3::ZERO);
+        let before_second = harness
+            .app
+            .entity_world_model_3d(second)
+            .expect("second model")
+            .transform_point(Vec3::ZERO);
+        let target = Vec3::new(12.0, -3.0, 8.0);
+        let normal = normalized_vec3(Vec3::new(0.25, 1.0, -0.4));
+        assert!(harness.app.apply_surface_snap_3d(
+            &drag,
+            Viewport3DSurfaceHit {
+                id: 999,
+                position: target,
+                normal,
+                vertex: false,
+            }
+        ));
+        harness.app.world_model_3d_cache.borrow_mut().clear();
+        let after_first = harness
+            .app
+            .entity_world_model_3d(first)
+            .expect("moved first")
+            .transform_point(Vec3::ZERO);
+        let after_second = harness
+            .app
+            .entity_world_model_3d(second)
+            .expect("moved second")
+            .transform_point(Vec3::ZERO);
+        assert!(length_vec3(sub_vec3(after_first, target)) < 0.001);
+        let before_offset = sub_vec3(before_second, before_first);
+        let after_offset = sub_vec3(after_second, after_first);
+        assert!(length_vec3(sub_vec3(before_offset, after_offset)) < 0.001);
+
+        let world_rotation = harness.app.entity_world_rotation_3d(first).expect("rotation");
+        let world_up = normalized_vec3(
+            world_rotation.transform_direction(Vec3::new(0.0, 1.0, 0.0)),
+        );
+        assert!(dot_vec3(world_up, normal) > 0.999);
+    }
+
+    #[test]
+    fn three_d_snap_mode_actions_keep_dependent_modes_consistent() {
+        let mut harness = Harness::new(Scene::new_for_kind(SceneKind::ThreeD));
+        harness.app.perform(Action::ToggleVertexSnap3D);
+        assert!(harness.app.config.layout.vertex_snap_3d);
+        assert!(harness.app.config.layout.surface_snap_3d);
+        harness.app.perform(Action::ToggleAlignSurfaceNormal3D);
+        assert!(harness.app.config.layout.align_surface_normal_3d);
+        harness.app.perform(Action::ToggleSurfaceSnap3D);
+        assert!(!harness.app.config.layout.surface_snap_3d);
+        assert!(!harness.app.config.layout.vertex_snap_3d);
+        assert!(!harness.app.config.layout.align_surface_normal_3d);
     }
 
     #[test]
@@ -21628,7 +29214,7 @@ mod tests {
     }
 
     #[test]
-    fn three_d_screen_plane_drag_updates_xy_and_preserves_z() {
+    fn three_d_direct_drag_uses_a_camera_facing_plane() {
         let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
         let id = scene.add_entity("Draggable", 0.0, 0.0).id;
         scene.entity_mut(id).expect("entity").position_z = 1.25;
@@ -21664,8 +29250,100 @@ mod tests {
             ..Default::default()
         });
         let entity = harness.app.scene.entity(id).expect("dragged entity");
-        assert!(entity.x.abs() > 0.01 || entity.y.abs() > 0.01);
-        assert_eq!(entity.position_z, 1.25);
+        let delta = Vec3::new(entity.x, entity.y, entity.position_z - 1.25);
+        assert!(length_vec3(delta) > 0.01);
+        assert!(
+            delta.z.abs() > 0.01,
+            "a camera-facing drag must not be silently constrained to XY"
+        );
+        let forward = camera_forward(harness.app.viewport_camera_3d.euler);
+        assert!(
+            dot_vec3(delta, forward).abs() < 0.001,
+            "drag delta {delta:?} left the camera plane"
+        );
+    }
+
+    #[test]
+    fn inverse_transform_direction_supports_negative_non_uniform_parent_scale() {
+        let transform = Mat4::trs(
+            Vec3::new(7.0, -3.0, 11.0),
+            Vec3::new(23.0, -41.0, 67.0),
+            Vec3::new(-2.5, 0.125, 40.0),
+        );
+        let local = Vec3::new(3.25, -8.0, 0.75);
+        let world = transform.transform_direction(local);
+        let recovered = inverse_transform_direction_3d(transform, world).expect("invertible TRS");
+        assert!((recovered.x - local.x).abs() < 0.001);
+        assert!((recovered.y - local.y).abs() < 0.001);
+        assert!((recovered.z - local.z).abs() < 0.001);
+
+        let singular = Mat4::scale(Vec3::new(1.0, 0.0, 1.0));
+        assert!(inverse_transform_direction_3d(singular, Vec3::new(1.0, 2.0, 3.0)).is_none());
+    }
+
+    #[test]
+    fn three_d_local_and_world_move_orientations_are_explicit() {
+        let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
+        let id = scene.add_entity("Rotated", 0.0, 0.0).id;
+        scene.entity_mut(id).expect("entity").rotation_z = 90.0;
+        let mut harness = Harness::new(scene);
+
+        harness.app.config.layout.transform_orientation_3d = TransformOrientation3D::Local;
+        let local = harness.app.move_gizmo_world_axes_3d(id);
+        assert!(local[0].x.abs() < 0.001);
+        assert!((local[0].y - 1.0).abs() < 0.001);
+
+        harness.app.config.layout.transform_orientation_3d = TransformOrientation3D::World;
+        let world = harness.app.move_gizmo_world_axes_3d(id);
+        assert!((world[0].x - 1.0).abs() < 0.001);
+        assert!(world[0].y.abs() < 0.001);
+    }
+
+    #[test]
+    fn three_d_world_move_basis_preserves_multi_selection_under_different_parents() {
+        let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
+        let first_parent = scene.entities[0].id;
+        {
+            let parent = scene.entity_mut(first_parent).expect("first parent");
+            parent.rotation_z = 90.0;
+            parent.scale_x = -2.0;
+            parent.scale_y = 0.5;
+            parent.scale_z = 3.0;
+        }
+        let second_parent = scene.add_entity("Second parent", 0.0, 0.0).id;
+        {
+            let parent = scene.entity_mut(second_parent).expect("second parent");
+            parent.rotation_y = -37.0;
+            parent.scale_x = 0.25;
+            parent.scale_y = -4.0;
+            parent.scale_z = 2.0;
+        }
+        let first = scene.add_entity("First child", 1.0, 2.0).id;
+        scene.entity_mut(first).expect("first child").parent = Some(first_parent);
+        let second = scene.add_entity("Second child", -3.0, 4.0).id;
+        scene.entity_mut(second).expect("second child").parent = Some(second_parent);
+
+        let mut harness = Harness::new(scene);
+        harness.app.select_many(vec![first, second], false);
+        let starts = harness.app.viewport_transform_starts_3d([
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        ]);
+        assert_eq!(starts.len(), 2);
+        for start in starts {
+            let parent = harness
+                .app
+                .scene
+                .entity(start.id)
+                .and_then(|entity| entity.parent)
+                .and_then(|parent| harness.app.entity_world_model_3d(parent))
+                .expect("parent model");
+            let reconstructed = parent.transform_direction(start.move_basis[0]);
+            assert!((reconstructed.x - 1.0).abs() < 0.001);
+            assert!(reconstructed.y.abs() < 0.001);
+            assert!(reconstructed.z.abs() < 0.001);
+        }
     }
 
     #[test]
@@ -21764,6 +29442,225 @@ mod tests {
         assert!(entity.x > 0.1, "x={}", entity.x);
         assert_eq!(entity.y, 0.0);
         assert_eq!(entity.position_z, 0.75);
+    }
+
+    #[test]
+    fn three_d_ctrl_gizmo_drag_duplicates_and_moves_in_one_undo_command() {
+        let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
+        let original = scene.add_entity("Duplicate me", 0.0, 0.0).id;
+        let original_count = scene.entities.len();
+        let mut harness = Harness::new(scene);
+        harness.app.config.layout.view_tool = ViewTool::Move;
+        harness.app.config.layout.transform_orientation_3d = TransformOrientation3D::World;
+        harness.app.config.layout.snap = false;
+        harness.app.select_only(original);
+        harness.frame(FrameInput::default());
+        let area = harness.app.last_viewport;
+        let projection = harness
+            .app
+            .viewport_camera_3d
+            .view_projection(area.w / area.h.max(1.0));
+        let model = harness
+            .app
+            .entity_world_model_3d(original)
+            .expect("original model");
+        let gizmo = harness
+            .app
+            .transform_gizmo_3d(area, projection, original, model)
+            .expect("gizmo");
+        let handle = gizmo_axis(gizmo, Viewport3DAxis::X).expect("X handle");
+        let direction =
+            normalized_vec2((handle.end.0 - gizmo.origin.0, handle.end.1 - gizmo.origin.1));
+
+        harness.frame(FrameInput {
+            mouse_x: handle.end.0,
+            mouse_y: handle.end.1,
+            mouse_pressed: true,
+            mouse_down: true,
+            ctrl: true,
+            ..Default::default()
+        });
+        let duplicate = harness.app.selected.expect("duplicate selected");
+        assert_ne!(duplicate, original);
+        assert_eq!(harness.app.scene.entities.len(), original_count + 1);
+        harness.frame(FrameInput {
+            mouse_x: handle.end.0 + direction.0 * 60.0,
+            mouse_y: handle.end.1 + direction.1 * 60.0,
+            mouse_down: true,
+            ctrl: true,
+            ..Default::default()
+        });
+        harness.frame(FrameInput {
+            mouse_x: handle.end.0 + direction.0 * 60.0,
+            mouse_y: handle.end.1 + direction.1 * 60.0,
+            ..Default::default()
+        });
+        harness.frame(FrameInput::default());
+        assert_eq!(harness.app.scene.entity(original).expect("original").x, 0.0);
+        assert!(
+            harness
+                .app
+                .scene
+                .entity(duplicate)
+                .expect("duplicate")
+                .x
+                > 0.1
+        );
+
+        harness.app.undo();
+        assert_eq!(harness.app.scene.entities.len(), original_count);
+        assert!(harness.app.scene.entity(duplicate).is_none());
+    }
+
+    #[test]
+    fn three_d_plane_handles_select_xy_xz_and_yz() {
+        let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
+        let id = scene.add_entity("Plane mover", 0.0, 0.0).id;
+        let mut harness = Harness::new(scene);
+        harness.app.config.layout.view_tool = ViewTool::Move;
+        harness.app.config.layout.transform_orientation_3d = TransformOrientation3D::World;
+        harness.app.select_only(id);
+        harness.frame(FrameInput::default());
+        let area = harness.app.last_viewport;
+        let projection = harness
+            .app
+            .viewport_camera_3d
+            .view_projection(area.w / area.h.max(1.0));
+        let model = harness.app.entity_world_model_3d(id).expect("model");
+        let gizmo = harness
+            .app
+            .transform_gizmo_3d(area, projection, id, model)
+            .expect("gizmo");
+
+        for expected in Viewport3DPlane::ALL {
+            let plane = gizmo
+                .planes
+                .into_iter()
+                .flatten()
+                .find(|plane| plane.plane == expected)
+                .expect("plane handle");
+            let center = plane
+                .points
+                .into_iter()
+                .fold((0.0, 0.0), |sum, point| {
+                    (sum.0 + point.0 * 0.25, sum.1 + point.1 * 0.25)
+                });
+            assert_eq!(
+                viewport_gizmo_hit_3d(gizmo, ViewTool::Move, center.0, center.1, 1.0),
+                Some(Viewport3DGizmoHit::MovePlane(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn three_d_xz_plane_drag_changes_xz_but_not_y() {
+        let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
+        let id = scene.add_entity("XZ mover", 0.0, 2.0).id;
+        let mut harness = Harness::new(scene);
+        harness.app.config.layout.view_tool = ViewTool::Move;
+        harness.app.config.layout.transform_orientation_3d = TransformOrientation3D::World;
+        harness.app.config.layout.snap = false;
+        harness.app.select_only(id);
+        harness.frame(FrameInput::default());
+        let area = harness.app.last_viewport;
+        let projection = harness
+            .app
+            .viewport_camera_3d
+            .view_projection(area.w / area.h.max(1.0));
+        let model = harness.app.entity_world_model_3d(id).expect("model");
+        let gizmo = harness
+            .app
+            .transform_gizmo_3d(area, projection, id, model)
+            .expect("gizmo");
+        let plane = gizmo
+            .planes
+            .into_iter()
+            .flatten()
+            .find(|plane| plane.plane == Viewport3DPlane::Xz)
+            .expect("XZ plane");
+        let center = plane
+            .points
+            .into_iter()
+            .fold((0.0, 0.0), |sum, point| {
+                (sum.0 + point.0 * 0.25, sum.1 + point.1 * 0.25)
+            });
+        harness.frame(FrameInput {
+            mouse_x: center.0,
+            mouse_y: center.1,
+            mouse_pressed: true,
+            mouse_down: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            harness.app.viewport_3d_drag.as_ref().map(|drag| drag.mode),
+            Some(Viewport3DDragMode::MovePlane {
+                first_axis: 0,
+                second_axis: 2,
+                ..
+            })
+        ));
+        harness.frame(FrameInput {
+            mouse_x: center.0 + 38.0,
+            mouse_y: center.1 + 21.0,
+            mouse_down: true,
+            ..Default::default()
+        });
+        let entity = harness.app.scene.entity(id).expect("moved entity");
+        assert!(entity.x.abs() > 0.01 || entity.position_z.abs() > 0.01);
+        assert!((entity.y - 2.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn three_d_grid_snap_uses_the_authored_world_unit_increment() {
+        let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
+        let id = scene.add_entity("Snapped mover", 0.0, 0.0).id;
+        let mut harness = Harness::new(scene);
+        harness.app.config.layout.view_tool = ViewTool::Move;
+        harness.app.config.layout.transform_orientation_3d = TransformOrientation3D::World;
+        harness.app.config.layout.snap = true;
+        harness.app.config.layout.grid_3d = 0.25;
+        harness.app.select_only(id);
+        harness.frame(FrameInput::default());
+        let area = harness.app.last_viewport;
+        let projection = harness
+            .app
+            .viewport_camera_3d
+            .view_projection(area.w / area.h.max(1.0));
+        let model = harness.app.entity_world_model_3d(id).expect("model");
+        let gizmo = harness
+            .app
+            .transform_gizmo_3d(area, projection, id, model)
+            .expect("gizmo");
+        let handle = gizmo_axis(gizmo, Viewport3DAxis::X).expect("X handle");
+        let origin_world = model.transform_point(Vec3::ZERO);
+        let origin_screen = project_world_point(projection, origin_world, area).expect("origin");
+        let unit_screen = project_world_point(
+            projection,
+            add_vec3(origin_world, Vec3::new(1.0, 0.0, 0.0)),
+            area,
+        )
+        .expect("unit X");
+        let screen_axis = (
+            unit_screen.0 - origin_screen.0,
+            unit_screen.1 - origin_screen.1,
+        );
+        harness.frame(FrameInput {
+            mouse_x: handle.end.0,
+            mouse_y: handle.end.1,
+            mouse_pressed: true,
+            mouse_down: true,
+            ..Default::default()
+        });
+        harness.frame(FrameInput {
+            mouse_x: handle.end.0 + screen_axis.0 * 1.37,
+            mouse_y: handle.end.1 + screen_axis.1 * 1.37,
+            mouse_down: true,
+            ..Default::default()
+        });
+        let entity = harness.app.scene.entity(id).expect("snapped entity");
+        assert!((entity.x - 1.25).abs() < 0.001, "x={}", entity.x);
+        assert_eq!(entity.y, 0.0);
+        assert_eq!(entity.position_z, 0.0);
     }
 
     #[test]
@@ -22072,6 +29969,789 @@ mod tests {
     }
 
     #[test]
+    fn three_d_orthographic_grid_density_tracks_visible_world_size() {
+        let area = Rect::new(0.0, 0.0, 1200.0, 600.0);
+        let mut camera = default_editor_camera_3d(60.0);
+        camera.projection = Projection3D::Orthographic;
+        camera.orthographic_size = 5.0;
+        let close = grid_3d_layout(camera, area);
+        camera.position = add_vec3(camera.position, Vec3::new(0.0, 1_000.0, 0.0));
+        let distant = grid_3d_layout(camera, area);
+        assert_eq!(close.fine_step, distant.fine_step);
+
+        camera.orthographic_size = 50.0;
+        let zoomed_out = grid_3d_layout(camera, area);
+        assert!(zoomed_out.fine_step > distant.fine_step);
+    }
+
+    #[test]
+    fn three_d_orthographic_drop_uses_parallel_cursor_rays() {
+        let area = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let camera = RenderCamera3D {
+            position: Vec3::new(0.0, 10.0, 0.0),
+            euler: Vec3::new(-90.0, 0.0, 0.0),
+            projection: Projection3D::Orthographic,
+            orthographic_size: 5.0,
+            ..RenderCamera3D::default()
+        };
+        let center = viewport_drop_position_3d(camera, area, 100.0, 50.0);
+        let right = viewport_drop_position_3d(camera, area, 200.0, 50.0);
+        assert!(center.x.abs() < 0.001 && center.y.abs() < 0.001);
+        assert!((right.x - 10.0).abs() < 0.001);
+        assert!(right.y.abs() < 0.001);
+        assert!((right.z - center.z).abs() < 0.001);
+    }
+
+    #[test]
+    fn three_d_alt_orbit_preserves_target_distance_and_scales_for_dpi() {
+        let orbit = |display_scale: f32, drag_x: f32| {
+            let mut harness = Harness::new(Scene::new_for_kind(SceneKind::ThreeD));
+            harness.frame(FrameInput::default());
+            let area = harness.app.last_viewport;
+            let start = Vec3::new(3.0, 2.0, 9.0);
+            let target = Vec3::new(1.0, 1.0, 1.0);
+            harness.app.viewport_camera_3d.position = start;
+            harness.app.viewport_camera_3d.euler = Vec3::new(-10.0, 15.0, 0.0);
+            harness.app.viewport_3d_orbit_target = Some(target);
+            harness.frame(FrameInput {
+                mouse_x: area.x + area.w * 0.5,
+                mouse_y: area.y + area.h * 0.5,
+                mouse_pressed: true,
+                mouse_down: true,
+                alt: true,
+                display_scale,
+                ..Default::default()
+            });
+            harness.frame(FrameInput {
+                mouse_x: area.x + area.w * 0.5 + drag_x,
+                mouse_y: area.y + area.h * 0.5 + 8.0 * display_scale,
+                mouse_down: true,
+                alt: true,
+                display_scale,
+                ..Default::default()
+            });
+            let distance = length_vec3(sub_vec3(harness.app.viewport_camera_3d.position, target));
+            (
+                harness.app.viewport_camera_3d.euler,
+                distance,
+                length_vec3(sub_vec3(start, target)),
+                harness.app.viewport_3d_orbit_target,
+            )
+        };
+
+        let normal = orbit(1.0, 16.0);
+        let hidpi = orbit(2.0, 32.0);
+        assert!((normal.0.x - hidpi.0.x).abs() < 0.001);
+        assert!((normal.0.y - hidpi.0.y).abs() < 0.001);
+        assert!((normal.1 - normal.2).abs() < 0.001);
+        assert!((hidpi.1 - hidpi.2).abs() < 0.001);
+        assert_eq!(normal.3, Some(Vec3::new(1.0, 1.0, 1.0)));
+    }
+
+    #[test]
+    fn three_d_projection_views_widget_and_scroll_are_persistent() {
+        let mut harness = Harness::new(Scene::new_for_kind(SceneKind::ThreeD));
+        harness.app.config.layout.viewport_orthographic_3d = true;
+        harness.app.config.layout.viewport_orthographic_size_3d = 8.0;
+        harness.frame(FrameInput::default());
+        assert_eq!(
+            harness.app.viewport_camera_3d.projection,
+            Projection3D::Orthographic
+        );
+        harness.frame(FrameInput {
+            mouse_x: harness.app.last_viewport.x + harness.app.last_viewport.w * 0.5,
+            mouse_y: harness.app.last_viewport.y + harness.app.last_viewport.h * 0.5,
+            scroll: 1.0,
+            ..Default::default()
+        });
+        assert!(harness.app.config.layout.viewport_orthographic_size_3d < 8.0);
+
+        let area = harness.app.last_viewport;
+        let widget_center = (area.right() - 46.0, area.y + 46.0);
+        harness.click(widget_center.0, widget_center.1 + 32.0);
+        assert!(!harness.app.config.layout.viewport_orthographic_3d);
+        assert_eq!(
+            harness.app.viewport_camera_3d.projection,
+            Projection3D::Perspective
+        );
+    }
+
+    #[test]
+    fn three_d_orthographic_views_center_the_navigation_target() {
+        let mut harness = Harness::new(Scene::new_for_kind(SceneKind::ThreeD));
+        let target = Vec3::new(7.0, -2.0, 4.0);
+        harness.app.viewport_3d_orbit_target = Some(target);
+        for (view, expected_euler) in [
+            (OrthographicView3D::Top, Vec3::new(-90.0, 0.0, 0.0)),
+            (OrthographicView3D::Front, Vec3::ZERO),
+            (OrthographicView3D::Right, Vec3::new(0.0, 90.0, 0.0)),
+        ] {
+            harness.app.set_orthographic_view_3d(view);
+            assert_eq!(harness.app.viewport_camera_3d.euler, expected_euler);
+            assert!(harness.app.config.layout.viewport_orthographic_3d);
+            let forward = camera_forward(harness.app.viewport_camera_3d.euler);
+            let centered = add_vec3(
+                harness.app.viewport_camera_3d.position,
+                scale_vec3(
+                    forward,
+                    length_vec3(sub_vec3(harness.app.viewport_camera_3d.position, target)),
+                ),
+            );
+            assert!(length_vec3(sub_vec3(centered, target)) < 0.001);
+        }
+    }
+
+    #[test]
+    fn three_d_camera_bookmarks_round_trip_projection_and_config() {
+        let mut harness = Harness::new(Scene::new_for_kind(SceneKind::ThreeD));
+        harness.app.viewport_camera_3d.position = Vec3::new(12.0, -4.0, 30.0);
+        harness.app.viewport_camera_3d.euler = Vec3::new(-22.0, 81.0, 3.0);
+        harness.app.config.layout.viewport_orthographic_3d = true;
+        harness.app.config.layout.viewport_orthographic_size_3d = 42.0;
+        harness.app.config.settings.viewport_camera_fov = 73.0;
+        harness.app.store_camera_bookmark_3d(2);
+
+        let serialized = serde_json::to_string(&harness.app.config).expect("serialize config");
+        let restored: EditorConfig = serde_json::from_str(&serialized).expect("restore config");
+        let bookmark = restored.layout.camera_bookmarks_3d[2]
+            .as_ref()
+            .expect("bookmark");
+        assert_eq!(bookmark.position, [12.0, -4.0, 30.0]);
+        assert_eq!(bookmark.euler, [-22.0, 81.0, 3.0]);
+        assert!(bookmark.orthographic);
+        assert_eq!(bookmark.orthographic_size, 42.0);
+        assert_eq!(bookmark.fov, 73.0);
+
+        harness.app.viewport_camera_3d.position = Vec3::ZERO;
+        harness.app.viewport_camera_3d.euler = Vec3::ZERO;
+        harness.app.config.layout.viewport_orthographic_3d = false;
+        harness.app.recall_camera_bookmark_3d(2);
+        assert_eq!(
+            harness.app.viewport_camera_3d.position,
+            Vec3::new(12.0, -4.0, 30.0)
+        );
+        assert_eq!(
+            harness.app.viewport_camera_3d.euler,
+            Vec3::new(-22.0, 81.0, 3.0)
+        );
+        assert!(harness.app.config.layout.viewport_orthographic_3d);
+    }
+
+    #[test]
+    fn three_d_diagnostics_are_persisted_editor_only_switches() {
+        let mut harness = Harness::new(Scene::new_for_kind(SceneKind::ThreeD));
+        let authored_before = harness.app.scene.to_json().expect("scene json");
+        let initial = ViewportDiagnostic3D::ALL.map(|diagnostic| {
+            harness.app.viewport_diagnostic_enabled_3d(diagnostic)
+        });
+        for diagnostic in ViewportDiagnostic3D::ALL {
+            harness.app.toggle_viewport_diagnostic_3d(diagnostic);
+        }
+        for (index, diagnostic) in ViewportDiagnostic3D::ALL.into_iter().enumerate() {
+            assert_eq!(
+                harness.app.viewport_diagnostic_enabled_3d(diagnostic),
+                !initial[index]
+            );
+        }
+        assert_eq!(
+            harness.app.scene.to_json().expect("scene json after toggles"),
+            authored_before,
+            "diagnostic overlays must never mutate runtime scene data"
+        );
+        assert!(!harness.app.scene_dirty);
+
+        let serialized = serde_json::to_string(&harness.app.config).expect("serialize config");
+        let restored: EditorConfig = serde_json::from_str(&serialized).expect("restore config");
+        assert!(restored.layout.show_wireframe_3d);
+        assert!(restored.layout.show_normals_3d);
+        assert!(restored.layout.show_tangents_3d);
+        assert!(restored.layout.show_uv_seams_3d);
+        assert!(restored.layout.show_mesh_bounds_3d);
+        assert!(restored.layout.show_scene_axes_3d);
+        assert!(restored.layout.show_statistics_3d);
+        assert!(!restored.layout.show_pivots_3d);
+        assert!(!restored.layout.show_colliders_3d);
+        assert!(restored.layout.show_rigid_bodies_3d);
+        assert!(restored.layout.show_triggers_3d);
+        assert!(restored.layout.show_raycasts_3d);
+        assert!(!restored.layout.show_camera_frustums_3d);
+        assert!(!restored.layout.show_light_ranges_3d);
+        assert!(restored.layout.show_spot_cones_3d);
+        assert!(restored.layout.show_shadow_frustums_3d);
+        assert!(!restored.layout.show_reflection_probes_3d);
+        assert!(restored.layout.show_particle_bounds_3d);
+        assert!(restored.layout.show_lod_state_3d);
+        assert!(restored.layout.show_render_layers_3d);
+        assert!(restored.layout.show_entity_visibility_3d);
+
+        let mut two_d = Harness::new(Scene::default());
+        two_d
+            .app
+            .toggle_viewport_diagnostic_3d(ViewportDiagnostic3D::Wireframe);
+        assert!(!two_d.app.config.layout.show_wireframe_3d);
+    }
+
+    #[test]
+    fn three_d_diagnostic_overlays_render_together_without_changing_scene() {
+        let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
+        let mesh_id = scene.add_entity("Diagnostic mesh", 0.0, 0.0).id;
+        scene
+            .entity_mut(mesh_id)
+            .expect("diagnostic mesh")
+            .components
+            .push(Component::core("MeshRenderer3D"));
+        scene
+            .entity_mut(mesh_id)
+            .expect("diagnostic mesh")
+            .components
+            .push(Component::core("LODGroup3D"));
+        let spot_id = scene.add_entity("Diagnostic spot", 2.0, 3.0).id;
+        let mut spot = Component::core("Light3D");
+        if let Component::Core { props, .. } = &mut spot
+            && let Some(prop) = props.iter_mut().find(|prop| prop.name == "kind")
+            && let PropValue::Enum { value, .. } = &mut prop.value
+        {
+            *value = "spot".to_string();
+        }
+        let spot_entity = scene.entity_mut(spot_id).expect("diagnostic spot");
+        spot_entity.position_z = 4.0;
+        spot_entity.rotation_x = -25.0;
+        spot_entity.components.push(spot);
+        let controller_id = scene.add_entity("Diagnostic character", 1.0, 1.0).id;
+        let controller_entity = scene
+            .entity_mut(controller_id)
+            .expect("diagnostic character");
+        controller_entity.position_z = 1.0;
+        controller_entity
+            .components
+            .push(Component::core("CharacterController3D"));
+        let mut harness = Harness::new(scene);
+        harness.app.config.layout.show_wireframe_3d = true;
+        harness.app.config.layout.show_normals_3d = true;
+        harness.app.config.layout.show_tangents_3d = true;
+        harness.app.config.layout.show_uv_seams_3d = true;
+        harness.app.config.layout.show_mesh_bounds_3d = true;
+        harness.app.config.layout.show_pivots_3d = true;
+        harness.app.config.layout.show_scene_axes_3d = true;
+        harness.app.config.layout.show_colliders_3d = true;
+        harness.app.config.layout.show_rigid_bodies_3d = true;
+        harness.app.config.layout.show_triggers_3d = true;
+        harness.app.config.layout.show_raycasts_3d = true;
+        harness.app.config.layout.show_camera_frustums_3d = true;
+        harness.app.config.layout.show_light_ranges_3d = true;
+        harness.app.config.layout.show_spot_cones_3d = true;
+        harness.app.config.layout.show_shadow_frustums_3d = true;
+        harness.app.config.layout.show_reflection_probes_3d = true;
+        harness.app.config.layout.show_particle_bounds_3d = true;
+        harness.app.config.layout.show_lod_state_3d = true;
+        harness.app.config.layout.show_render_layers_3d = true;
+        harness.app.config.layout.show_entity_visibility_3d = true;
+        harness.app.config.layout.show_statistics_3d = true;
+        let authored_before = harness.app.scene.to_json().expect("scene json");
+        harness.frame(FrameInput::default());
+        assert_eq!(harness.app.scene.to_json().expect("scene json"), authored_before);
+        assert!(harness.buffer.iter().any(|pixel| *pixel != 0));
+        let tangent_pixels = harness
+            .buffer
+            .iter()
+            .filter(|&&pixel| {
+                let red = ((pixel >> 16) & 0xff) as u8;
+                let green = ((pixel >> 8) & 0xff) as u8;
+                let blue = (pixel & 0xff) as u8;
+                red > 170 && green < 145 && blue > 135
+            })
+            .count();
+        assert!(tangent_pixels > 0, "expected magenta tangent overlay pixels");
+        let controller_pixels = harness
+            .buffer
+            .iter()
+            .filter(|&&pixel| {
+                let red = ((pixel >> 16) & 0xff) as u8;
+                let green = ((pixel >> 8) & 0xff) as u8;
+                let blue = (pixel & 0xff) as u8;
+                red < 130 && green > 170 && blue > 200
+            })
+            .count();
+        assert!(
+            controller_pixels > 0,
+            "expected cyan CharacterController3D collider pixels"
+        );
+    }
+
+    #[test]
+    fn lod_group_3d_scene_view_uses_shared_runtime_selection_and_culling() {
+        let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
+        scene.entities.clear();
+        let mesh_id = scene.add_entity("LOD preview", 0.0, 0.0).id;
+        scene
+            .entity_mut(mesh_id)
+            .expect("LOD preview")
+            .components
+            .extend([
+                Component::core("MeshRenderer3D"),
+                Component::core("LODGroup3D"),
+            ]);
+
+        let mut visible = Harness::new(scene.clone());
+        visible.app.selected = None;
+        visible.app.selected_ids.clear();
+        visible.app.config.layout.show_grid = false;
+        visible.app.config.layout.show_pivots_3d = false;
+        visible.app.config.layout.show_colliders_3d = false;
+        visible.app.config.layout.show_camera_frustums_3d = false;
+        visible.app.config.layout.show_light_ranges_3d = false;
+        let camera_position = visible.app.viewport_camera_3d.position;
+        let entity = visible.app.scene.entity(mesh_id).expect("LOD preview");
+        let state = viewport_lod_state_3d(entity, Vec3::ZERO, camera_position)
+            .expect("authored LOD state");
+        assert_eq!(state.requested_level, Some(0));
+        let authored_visible = visible.app.scene.to_json().expect("visible scene JSON");
+        visible.frame(FrameInput::default());
+        assert_eq!(
+            visible.app.scene.to_json().expect("visible scene JSON"),
+            authored_visible,
+            "Scene View LOD preview must not write runtime state into authored data"
+        );
+
+        let mut culled_scene = scene;
+        let lod_props = culled_scene
+            .entity_mut(mesh_id)
+            .expect("LOD preview")
+            .components
+            .iter_mut()
+            .find_map(|component| match component {
+                Component::Core { name, props } if name == "LODGroup3D" => Some(props),
+                _ => None,
+            })
+            .expect("LODGroup3D props");
+        for (name, value) in [
+            ("lod1_distance", 0.03),
+            ("lod2_distance", 0.06),
+            ("cull_distance", 0.1),
+        ] {
+            lod_props
+                .iter_mut()
+                .find(|prop| prop.name == name)
+                .unwrap_or_else(|| panic!("{name} property"))
+                .value = PropValue::Number(value);
+        }
+
+        let mut culled = Harness::new(culled_scene);
+        culled.app.selected = None;
+        culled.app.selected_ids.clear();
+        culled.app.config.layout.show_grid = false;
+        culled.app.config.layout.show_pivots_3d = false;
+        culled.app.config.layout.show_colliders_3d = false;
+        culled.app.config.layout.show_camera_frustums_3d = false;
+        culled.app.config.layout.show_light_ranges_3d = false;
+        let entity = culled.app.scene.entity(mesh_id).expect("LOD preview");
+        let state = viewport_lod_state_3d(
+            entity,
+            Vec3::ZERO,
+            culled.app.viewport_camera_3d.position,
+        )
+        .expect("authored LOD state");
+        assert_eq!(state.requested_level, None);
+        let authored_culled = culled.app.scene.to_json().expect("culled scene JSON");
+        culled.frame(FrameInput::default());
+        assert_eq!(
+            culled.app.scene.to_json().expect("culled scene JSON"),
+            authored_culled
+        );
+
+        let changed_pixels = visible
+            .buffer
+            .iter()
+            .zip(&culled.buffer)
+            .filter(|(visible, culled)| visible != culled)
+            .count();
+        assert!(
+            changed_pixels > 100,
+            "automatic Scene View culling should remove rendered mesh pixels, only {changed_pixels} changed"
+        );
+    }
+
+    #[test]
+    fn scene_view_visibility_inheritance_and_render_masks_match_runtime_policy() {
+        let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
+        scene.entities.clear();
+        let parent = scene.add_entity("Hidden parent", 0.0, 0.0).id;
+        let child = scene.add_entity("Layered mesh", 0.0, 0.0).id;
+        scene.entity_mut(child).expect("child").parent = Some(parent);
+        scene
+            .entity_mut(parent)
+            .expect("parent")
+            .components
+            .push(Component::core("Visibility3D"));
+        scene
+            .entity_mut(child)
+            .expect("child")
+            .components
+            .extend([
+                Component::core("MeshRenderer3D"),
+                Component::core("Visibility3D"),
+                Component::core("RenderLayer3D"),
+            ]);
+        let parent_visibility = scene
+            .entity_mut(parent)
+            .expect("parent")
+            .components
+            .iter_mut()
+            .find_map(|component| match component {
+                Component::Core { name, props } if name == "Visibility3D" => Some(props),
+                _ => None,
+            })
+            .expect("parent visibility");
+        parent_visibility
+            .iter_mut()
+            .find(|prop| prop.name == "visible")
+            .expect("visible property")
+            .value = PropValue::Bool(false);
+
+        let inherited = viewport_render_policy_3d(
+            &scene,
+            scene.entity(child).expect("child"),
+            crate::render3d::ALL_RENDER_LAYERS_3D,
+        );
+        assert!(!inherited.visibility.effective_visible);
+        assert_eq!(inherited.visibility.hidden_by, Some(parent));
+        assert!(inherited.layer_match);
+
+        let mut harness = Harness::new(scene);
+        harness.app.selected = None;
+        harness.app.selected_ids.clear();
+        harness.app.config.layout.show_grid = false;
+        harness.app.config.layout.show_pivots_3d = false;
+        harness.app.config.layout.show_colliders_3d = false;
+        harness.app.config.layout.show_camera_frustums_3d = false;
+        harness.app.config.layout.show_light_ranges_3d = false;
+        let authored = harness.app.scene.to_json().expect("authored hidden scene");
+        harness.frame(FrameInput::default());
+        assert_eq!(harness.app.scene.to_json().expect("hidden scene"), authored);
+        let inherited_hidden = harness.buffer.clone();
+
+        let child_visibility = harness
+            .app
+            .scene
+            .entity_mut(child)
+            .expect("child")
+            .components
+            .iter_mut()
+            .find_map(|component| match component {
+                Component::Core { name, props } if name == "Visibility3D" => Some(props),
+                _ => None,
+            })
+            .expect("child visibility");
+        child_visibility
+            .iter_mut()
+            .find(|prop| prop.name == "inherit_parent")
+            .expect("inherit property")
+            .value = PropValue::Bool(false);
+        let authored = harness.app.scene.to_json().expect("authored visible scene");
+        harness.frame(FrameInput::default());
+        assert_eq!(harness.app.scene.to_json().expect("visible scene"), authored);
+        let visible = harness.buffer.clone();
+        assert!(visible
+            .iter()
+            .zip(&inherited_hidden)
+            .filter(|(left, right)| left != right)
+            .count()
+            > 100);
+
+        harness.app.viewport_camera_3d.render_mask = 0b0010;
+        let blocked = viewport_render_policy_3d(
+            &harness.app.scene,
+            harness.app.scene.entity(child).expect("child"),
+            harness.app.viewport_camera_3d.render_mask,
+        );
+        assert!(!blocked.layer_match);
+        let authored = harness.app.scene.to_json().expect("authored blocked scene");
+        harness.frame(FrameInput::default());
+        assert_eq!(harness.app.scene.to_json().expect("blocked scene"), authored);
+        let masked_out = harness.buffer.clone();
+        assert!(visible
+            .iter()
+            .zip(&masked_out)
+            .filter(|(left, right)| left != right)
+            .count()
+            > 100);
+
+        let render_layer = harness
+            .app
+            .scene
+            .entity_mut(child)
+            .expect("child")
+            .components
+            .iter_mut()
+            .find_map(|component| match component {
+                Component::Core { name, props } if name == "RenderLayer3D" => Some(props),
+                _ => None,
+            })
+            .expect("render layer");
+        render_layer
+            .iter_mut()
+            .find(|prop| prop.name == "mask")
+            .expect("mask property")
+            .value = PropValue::Int(0b0010);
+        let matching = viewport_render_policy_3d(
+            &harness.app.scene,
+            harness.app.scene.entity(child).expect("child"),
+            harness.app.viewport_camera_3d.render_mask,
+        );
+        assert!(matching.layer_match);
+        harness.frame(FrameInput::default());
+        assert!(harness
+            .buffer
+            .iter()
+            .zip(&masked_out)
+            .filter(|(left, right)| left != right)
+            .count()
+            > 100);
+    }
+
+    #[test]
+    fn particle_bounds_conservatively_cover_authored_emission() {
+        let mut props = crate::scene::core_component_props("ParticleSystem3D");
+        let default_radius = estimated_particle_bounds_radius_3d(&props);
+        assert!((default_radius - 25.745).abs() < 0.001);
+
+        for (name, value) in [("shape", "sphere"), ("sphere_radius", "4")] {
+            let prop = props
+                .iter_mut()
+                .find(|prop| prop.name == name)
+                .expect("particle property");
+            prop.value = if name == "shape" {
+                PropValue::Enum {
+                    value: value.to_string(),
+                    options: vec!["point", "box", "sphere", "cone"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                }
+            } else {
+                PropValue::Number(value.parse().expect("radius"))
+            };
+        }
+        assert!((estimated_particle_bounds_radius_3d(&props) - 29.745).abs() < 0.001);
+    }
+
+    #[test]
+    fn rigid_body_trigger_and_particle_bounds_render_independently() {
+        let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
+        let entity_id = scene.add_entity("Physics diagnostics", 1.5, 0.0).id;
+        let body = Component::core("Rigidbody3D");
+        let mut collider = Component::core("Trigger3D");
+        let mut particles = Component::core("ParticleSystem3D");
+        let mut raycast = Component::core("Raycast3D");
+        if let Component::Core { props, .. } = &mut collider {
+            if let Some(prop) = props.iter_mut().find(|prop| prop.name == "shape") {
+                prop.value = PropValue::Enum {
+                    value: "capsule".to_string(),
+                    options: vec!["box", "sphere", "capsule", "mesh"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                };
+            }
+        }
+        if let Component::Core { props, .. } = &mut particles {
+            for (name, value) in [
+                ("gravity_x", 0.0),
+                ("gravity_y", 0.0),
+                ("gravity_z", 0.0),
+                ("lifetime_max", 0.5),
+                ("speed_max", 0.5),
+            ] {
+                if let Some(prop) = props.iter_mut().find(|prop| prop.name == name) {
+                    prop.value = PropValue::Number(value);
+                }
+            }
+        }
+        if let Component::Core { props, .. } = &mut raycast
+            && let Some(prop) = props.iter_mut().find(|prop| prop.name == "max_distance")
+        {
+            prop.value = PropValue::Number(2.0);
+        }
+        scene
+            .entity_mut(entity_id)
+            .expect("diagnostic entity")
+            .components
+            .extend([body, collider, particles, raycast]);
+
+        let authored_before = scene.to_json().expect("scene json");
+        let render =
+            |rigid_bodies: bool, triggers: bool, raycasts: bool, particle_bounds: bool| {
+            let mut harness = Harness::new(scene.clone());
+            harness.app.viewport_camera_3d = RenderCamera3D::default();
+            harness.app.config.layout.show_pivots_3d = false;
+            harness.app.config.layout.show_colliders_3d = false;
+            harness.app.config.layout.show_camera_frustums_3d = false;
+            harness.app.config.layout.show_light_ranges_3d = false;
+            harness.app.config.layout.show_rigid_bodies_3d = rigid_bodies;
+            harness.app.config.layout.show_triggers_3d = triggers;
+            harness.app.config.layout.show_raycasts_3d = raycasts;
+            harness.app.config.layout.show_particle_bounds_3d = particle_bounds;
+            harness.frame(FrameInput::default());
+            assert_eq!(
+                harness.app.scene.to_json().expect("scene json"),
+                authored_before
+            );
+            harness.buffer
+        };
+        let baseline = render(false, false, false, false);
+        for (label, output) in [
+            ("rigid body", render(true, false, false, false)),
+            ("trigger", render(false, true, false, false)),
+            ("raycast", render(false, false, true, false)),
+            ("particle bound", render(false, false, false, true)),
+        ] {
+            let changed = baseline
+                .iter()
+                .zip(output.iter())
+                .filter(|(before, after)| before != after)
+                .count();
+            assert!(changed > 8, "expected {label} overlay pixels, got {changed}");
+        }
+    }
+
+    #[test]
+    fn uv_seam_matching_is_world_edge_order_independent() {
+        let left = Vec3::new(-1.0, 0.5, 2.0);
+        let right = Vec3::new(1.0, 0.5, 2.0);
+        let (forward, forward_reversed) = quantized_world_edge(left, right);
+        let (backward, backward_reversed) = quantized_world_edge(right, left);
+        assert_eq!(forward, backward);
+        assert_ne!(forward_reversed, backward_reversed);
+        assert!(!uv_edge_differs([[0.0, 0.2], [0.1, 0.2]], [[0.0, 0.2], [0.1, 0.2]]));
+        assert!(uv_edge_differs([[0.0, 0.2], [0.1, 0.2]], [[1.0, 0.2], [0.9, 0.2]]));
+
+        let first = Viewport3DHit {
+            id: 1,
+            points: [(10.0, 10.0), (30.0, 10.0), (20.0, 30.0)],
+            bounds: Rect::new(10.0, 10.0, 20.0, 20.0),
+            depth: 0.2,
+            world_points: [left, right, Vec3::new(0.0, 1.5, 2.0)],
+            world_normals: [Vec3::new(0.0, 0.0, 1.0); 3],
+            world_tangents: [Vec3::new(1.0, 0.0, 0.0); 3],
+            uvs: [[0.0, 0.2], [0.1, 0.2], [0.05, 1.0]],
+            clip_w: [1.0; 3],
+            pickable: true,
+        };
+        let second = Viewport3DHit {
+            points: [(30.0, 10.0), (10.0, 10.0), (20.0, -10.0)],
+            world_points: [right, left, Vec3::new(0.0, -0.5, 2.0)],
+            uvs: [[0.9, 0.2], [1.0, 0.2], [0.95, 1.0]],
+            ..first
+        };
+        assert_eq!(
+            collect_uv_seam_segments_3d(&[first, second], 8),
+            vec![[(10.0, 10.0), (30.0, 10.0)]]
+        );
+    }
+
+    #[test]
+    fn three_d_real_runtime_controls_emit_pause_step_resume_restart_and_stop() {
+        let mut harness = Harness::new(Scene::new_for_kind(SceneKind::ThreeD));
+        let (_outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        harness.app.run_rx = Some(outcome_rx);
+        harness.app.run_command_tx = Some(command_tx);
+
+        harness.app.pause_resume_run();
+        assert_eq!(
+            command_rx.try_recv().expect("pause"),
+            crate::editor_ipc::IpcCommand::Pause
+        );
+        assert!(harness.app.run_paused);
+
+        harness.app.step_run();
+        assert_eq!(
+            command_rx.try_recv().expect("step"),
+            crate::editor_ipc::IpcCommand::Step
+        );
+        assert!(harness.app.run_paused);
+        assert!(harness.app.status.contains("1/60-second"));
+
+        harness.app.pause_resume_run();
+        assert_eq!(
+            command_rx.try_recv().expect("resume"),
+            crate::editor_ipc::IpcCommand::Resume
+        );
+        assert!(!harness.app.run_paused);
+
+        harness.app.stop_run();
+        assert_eq!(
+            command_rx.try_recv().expect("stop"),
+            crate::editor_ipc::IpcCommand::Stop
+        );
+
+        harness.app.restart_run();
+        assert_eq!(
+            command_rx.try_recv().expect("restart stop"),
+            crate::editor_ipc::IpcCommand::Stop
+        );
+        assert!(harness.app.restart_run_after_exit);
+    }
+
+    #[test]
+    fn three_d_light_range_proxy_draws_three_projected_great_circles() {
+        let fonts = load_fonts().expect("fonts");
+        let mut buffer = vec![0u32; 300 * 300];
+        let mut painter = Painter::new(&mut buffer, 300, 300, fonts);
+        let area = Rect::new(0.0, 0.0, 300.0, 300.0);
+        let camera = RenderCamera3D {
+            position: Vec3::new(0.0, 0.0, 8.0),
+            ..RenderCamera3D::default()
+        };
+        painter.clear([18, 18, 18, 255]);
+        draw_wire_sphere_3d(
+            &mut painter,
+            area,
+            camera.view_projection(1.0),
+            Vec3::ZERO,
+            2.0,
+            [255, 220, 90, 255],
+        );
+        drop(painter);
+        let yellow = buffer
+            .iter()
+            .filter(|pixel| {
+                let red = (**pixel >> 16) & 0xff;
+                let green = (**pixel >> 8) & 0xff;
+                let blue = **pixel & 0xff;
+                red > 180 && green > 150 && blue < 150
+            })
+            .count();
+        assert!(yellow > 100, "expected visible light range, got {yellow} pixels");
+    }
+
+    #[test]
+    fn three_d_orthographic_gizmo_size_does_not_depend_on_camera_distance() {
+        let scene = Scene::new_for_kind(SceneKind::ThreeD);
+        let id = scene.entities[0].id;
+        let mut harness = Harness::new(scene);
+        harness.app.config.layout.view_tool = ViewTool::Move;
+        harness.app.viewport_camera_3d.projection = Projection3D::Orthographic;
+        harness.app.viewport_camera_3d.orthographic_size = 5.0;
+        harness.app.viewport_camera_3d.euler = Vec3::ZERO;
+        let area = Rect::new(0.0, 0.0, 800.0, 600.0);
+        let model = harness.app.entity_world_model_3d(id).expect("model");
+        let handle_length = |harness: &mut Harness, z: f32| {
+            harness.app.viewport_camera_3d.position = Vec3::new(0.0, 0.0, z);
+            let view_projection = harness.app.viewport_camera_3d.view_projection(4.0 / 3.0);
+            let gizmo = harness
+                .app
+                .transform_gizmo_3d(area, view_projection, id, model)
+                .expect("gizmo");
+            let x = gizmo.axes[0].expect("x axis").end;
+            ((x.0 - gizmo.origin.0).powi(2) + (x.1 - gizmo.origin.1).powi(2)).sqrt()
+        };
+        let near = handle_length(&mut harness, 5.0);
+        let far = handle_length(&mut harness, 500.0);
+        assert!((near - far).abs() < 0.01, "near={near}, far={far}");
+    }
+
+    #[test]
     fn grid_steps_use_stable_one_two_five_intervals() {
         assert_eq!(nice_grid_step(0.011), 0.02);
         assert_eq!(nice_grid_step(0.21), 0.5);
@@ -22122,6 +30802,84 @@ mod tests {
         let inverted_delta = inverted.app.viewport_camera_3d.euler.x - inverted_start;
         assert!((normal_delta + inverted_delta).abs() < 0.001);
         assert!(normal_delta > 0.0 && inverted_delta < 0.0);
+    }
+
+    #[test]
+    fn three_d_horizontal_mouse_look_can_be_inverted_independently() {
+        let yaw_delta = |invert_x| {
+            let mut harness = Harness::new(Scene::new_for_kind(SceneKind::ThreeD));
+            harness.app.config.settings.viewport_invert_mouse_x = invert_x;
+            let start = harness.app.viewport_camera_3d.euler.y;
+            harness.frame(FrameInput {
+                mouse_x: 640.0,
+                mouse_y: 300.0,
+                right_pressed: true,
+                right_down: true,
+                ..Default::default()
+            });
+            harness.frame(FrameInput {
+                mouse_x: 660.0,
+                mouse_y: 300.0,
+                right_down: true,
+                ..Default::default()
+            });
+            harness.app.viewport_camera_3d.euler.y - start
+        };
+
+        let normal = yaw_delta(false);
+        let inverted = yaw_delta(true);
+        assert!(normal > 0.0 && inverted < 0.0);
+        assert!((normal + inverted).abs() < 0.001);
+    }
+
+    #[test]
+    fn three_d_fly_keys_move_while_hovered_without_holding_right_mouse() {
+        let mut harness = Harness::new(Scene::new_for_kind(SceneKind::ThreeD));
+        harness.frame(FrameInput::default());
+        harness.app.config.settings.viewport_fly_without_mouse_hold = true;
+        harness.app.viewport_3d_last_frame =
+            Instant::now() - std::time::Duration::from_millis(40);
+        let start = harness.app.viewport_camera_3d.position;
+        let area = harness.app.last_viewport;
+        harness.frame(FrameInput {
+            mouse_x: area.x + area.w * 0.5,
+            mouse_y: area.y + area.h * 0.5,
+            key_w: true,
+            ..Default::default()
+        });
+
+        assert!(
+            length_vec3(sub_vec3(harness.app.viewport_camera_3d.position, start)) > 0.1,
+            "hovered fly keys should move without RMB"
+        );
+    }
+
+    #[test]
+    fn maximized_view_has_click_and_escape_restore_paths_even_with_game_input_focus() {
+        let mut click = Harness::new(Scene::new_for_kind(SceneKind::ThreeD));
+        click.app.maximize_view = true;
+        click.frame(FrameInput::default());
+        let area = click.app.last_viewport;
+        click.click(area.right() - 80.0, area.y + 16.0);
+        assert!(!click.app.maximize_view, "visible restore button did not exit");
+
+        let mut escape = Harness::new(Scene::new_for_kind(SceneKind::ThreeD));
+        escape.app.maximize_view = true;
+        escape.app.game_view_active = true;
+        escape.app.game_view_focused = true;
+        escape.frame(FrameInput {
+            escape: true,
+            ..Default::default()
+        });
+        assert!(!escape.app.maximize_view, "Escape did not restore panels");
+        assert!(!escape.app.game_view_focused, "runtime input focus was not released");
+    }
+
+    #[test]
+    fn three_d_rotation_snap_uses_the_configured_increment() {
+        assert_eq!(stable_drag_rotation_3d(1.0, 7.0, true, 2.5), 7.5);
+        assert_eq!(stable_drag_rotation_3d(1.0, 7.0, false, 2.5), 8.0);
+        assert_eq!(stable_drag_rotation_3d(0.0, 16.0, true, 15.0), 15.0);
     }
 
     #[test]
@@ -22228,5 +30986,458 @@ mod tests {
             cyan > 80,
             "camera proxy should be visually substantial, got {cyan} pixels"
         );
+    }
+
+    #[test]
+    fn reusable_material_creation_is_three_d_only_and_runtime_loadable() {
+        let root = unique_test_path("material_create");
+        std::fs::create_dir_all(&root).expect("material test directory");
+        let mut scene = Scene::default();
+        scene.kind = SceneKind::ThreeD;
+        let mut app = EditorApp::new(
+            root.clone(),
+            root.join("scene.neoscene"),
+            scene,
+            EditorConfig::default(),
+        );
+        app.bin_dir = root.clone();
+        app.create_material("brushed_steel");
+
+        let path = root.join("brushed_steel.neomaterial");
+        assert!(path.is_file());
+        let document: Material3DFile = serde_json::from_slice(
+            &std::fs::read(&path).expect("created material bytes"),
+        )
+        .expect("created material JSON");
+        assert_eq!(document.version, 1);
+        assert_eq!(document.name, "brushed_steel");
+        assert!(matches!(app.popup, Some(Popup::MaterialEditor { .. })));
+        AssetManager::with_data_root(root.clone(), root.clone())
+            .load_material(path.to_string_lossy().as_ref())
+            .expect("runtime must load editor-authored material");
+
+        let two_d_root = unique_test_path("material_create_2d");
+        std::fs::create_dir_all(&two_d_root).expect("2D material test directory");
+        let mut two_d = EditorApp::new(
+            two_d_root.clone(),
+            two_d_root.join("scene.neoscene"),
+            Scene::default(),
+            EditorConfig::default(),
+        );
+        two_d.bin_dir = two_d_root.clone();
+        two_d.create_material("must_not_exist");
+        assert!(!two_d_root.join("must_not_exist.neomaterial").exists());
+    }
+
+    #[test]
+    fn reusable_physics_material_creation_is_three_d_only_and_runtime_loadable() {
+        let root = unique_test_path("physics_material_create");
+        std::fs::create_dir_all(&root).expect("physics material test directory");
+        let mut scene = Scene::default();
+        scene.kind = SceneKind::ThreeD;
+        let mut app = EditorApp::new(
+            root.clone(),
+            root.join("scene.neoscene"),
+            scene,
+            EditorConfig::default(),
+        );
+        app.bin_dir = root.clone();
+        app.create_physics_material("rubber");
+
+        let path = root.join("rubber.neophysicsmaterial");
+        assert!(path.is_file());
+        let document: PhysicsMaterial3DFile =
+            serde_json::from_slice(&std::fs::read(&path).expect("physics material bytes"))
+                .expect("physics material JSON");
+        assert_eq!(document.version, 1);
+        assert_eq!(document.name, "rubber");
+        assert_eq!(document.friction, 0.5);
+        assert_eq!(document.restitution, 0.0);
+        assert!(matches!(
+            app.popup,
+            Some(Popup::PhysicsMaterialEditor { .. })
+        ));
+        AssetManager::with_data_root(root.clone(), root.clone())
+            .load_physics_material(path.to_string_lossy().as_ref())
+            .expect("runtime must load editor-authored physics material");
+
+        let invalid = PhysicsMaterial3DFile {
+            friction: 2.0,
+            ..document
+        };
+        let error = app
+            .validate_physics_material_document(&invalid)
+            .expect_err("out-of-range friction must fail");
+        assert!(error.contains("friction"));
+
+        let two_d_root = unique_test_path("physics_material_create_2d");
+        std::fs::create_dir_all(&two_d_root).expect("2D physics material test directory");
+        let mut two_d = EditorApp::new(
+            two_d_root.clone(),
+            two_d_root.join("scene.neoscene"),
+            Scene::default(),
+            EditorConfig::default(),
+        );
+        two_d.bin_dir = two_d_root.clone();
+        two_d.create_physics_material("must_not_exist");
+        assert!(!two_d_root
+            .join("must_not_exist.neophysicsmaterial")
+            .exists());
+    }
+
+    #[test]
+    fn project_material_action_is_exposed_only_for_three_d_projects() {
+        let mut two_d = Harness::new(Scene::default());
+        two_d.app.open_project_menu(40.0, 40.0);
+        let Some(Popup::Menu { items, .. }) = &two_d.app.popup else {
+            panic!("project menu");
+        };
+        assert!(!items
+            .iter()
+            .any(|item| matches!(item.action, Action::NewMaterial)));
+        assert!(!items
+            .iter()
+            .any(|item| matches!(item.action, Action::NewPhysicsMaterial)));
+
+        let mut scene = Scene::default();
+        scene.kind = SceneKind::ThreeD;
+        let mut three_d = Harness::new(scene);
+        three_d.app.open_project_menu(40.0, 40.0);
+        let Some(Popup::Menu { items, .. }) = &three_d.app.popup else {
+            panic!("3D project menu");
+        };
+        assert!(items
+            .iter()
+            .any(|item| matches!(item.action, Action::NewMaterial)));
+        assert!(items
+            .iter()
+            .any(|item| matches!(item.action, Action::NewPhysicsMaterial)));
+    }
+
+    #[test]
+    fn material_validation_reports_missing_texture_and_corrupt_json_paths() {
+        let root = unique_test_path("material_errors");
+        std::fs::create_dir_all(&root).expect("material error test directory");
+        let mut scene = Scene::default();
+        scene.kind = SceneKind::ThreeD;
+        let mut app = EditorApp::new(
+            root.clone(),
+            root.join("scene.neoscene"),
+            scene,
+            EditorConfig::default(),
+        );
+        let material_path = root.join("broken.neomaterial");
+        let material = Material3DFile {
+            base_color_texture: Some(MaterialTextureFile {
+                source: "textures/missing.png".to_string(),
+                tex_coord: 0,
+            }),
+            ..Material3DFile::default()
+        };
+        let error = app
+            .validate_material_document(&material_path, &material)
+            .expect_err("missing texture must block runtime material");
+        assert!(error.contains("missing.png"), "{error}");
+
+        std::fs::write(&material_path, b"{ not json").expect("corrupt material");
+        app.open_material_path(material_path.clone());
+        let Some(Popup::Error { message, .. }) = app.popup else {
+            panic!("corrupt material should open an error dialog");
+        };
+        assert!(message.contains(&material_path.display().to_string()));
+        assert!(message.contains("JSON decode failed"));
+    }
+
+    #[test]
+    fn material_editor_preview_uses_real_software_pbr_and_renders_at_narrow_width() {
+        let mut scene = Scene::default();
+        scene.kind = SceneKind::ThreeD;
+        let mut harness = Harness::with_size(scene, 640, 620);
+        let path = harness.app.project_root.join("preview.neomaterial");
+        let material = Material3DFile {
+            name: "Preview Gold".to_string(),
+            base_color: [0.92, 0.53, 0.08, 1.0],
+            metallic: 0.9,
+            roughness: 0.24,
+            ..Material3DFile::default()
+        };
+        let image = harness
+            .app
+            .render_material_preview(&path, &material)
+            .expect("software PBR preview");
+        assert_eq!(image.dimensions(), (320, 320));
+        let distinct = image
+            .pixels()
+            .map(|pixel| pixel.0)
+            .collect::<HashSet<_>>()
+            .len();
+        assert!(distinct > 32, "lit preview should contain shading detail");
+
+        harness.app.popup = Some(Popup::MaterialEditor {
+            path,
+            material,
+            preview: None,
+            preview_key: String::new(),
+            preview_error: None,
+            dirty: false,
+        });
+        harness.frame(FrameInput::default());
+        harness.frame(FrameInput::default());
+        assert!(matches!(
+            harness.app.popup,
+            Some(Popup::MaterialEditor {
+                preview: Some(_),
+                preview_error: None,
+                ..
+            })
+        ));
+        assert!(harness.buffer.iter().any(|pixel| *pixel != 0));
+    }
+
+    #[test]
+    fn three_d_play_staging_preserves_authored_files_and_overrides_only_staged_camera() {
+        let root = unique_test_path("isolated_play_stage");
+        std::fs::create_dir_all(&root).expect("play stage project");
+        let authored_path = root.join("scene.neoscene");
+        std::fs::write(&authored_path, b"authored sentinel").expect("authored sentinel");
+
+        let mut scene = Scene::default();
+        scene.kind = SceneKind::ThreeD;
+        let first = scene.entities[0].id;
+        scene
+            .entity_mut(first)
+            .expect("first camera entity")
+            .components
+            .push(Component::core("Camera3D"));
+        let second = scene.add_entity("Preview Camera", 4.0, 5.0).id;
+        scene
+            .entity_mut(second)
+            .expect("second camera entity")
+            .components
+            .push(Component::core("Camera3D"));
+        scene.name = "Unsaved Runtime State".into();
+        let mut app = EditorApp::new(
+            root.clone(),
+            authored_path.clone(),
+            scene,
+            EditorConfig::default(),
+        );
+        app.scene_dirty = true;
+
+        let (stage_dir, entry) = app
+            .stage_three_d_run(Some(second))
+            .expect("stage unsaved 3D scene");
+        let staged = Scene::load(&stage_dir.join("scene.neoscene")).expect("staged scene");
+        assert_eq!(staged.name, "Unsaved Runtime State");
+        let camera_enabled = |entity: &Entity| {
+            entity.components.iter().find_map(|component| {
+                let Component::Core { name, props } = component else {
+                    return None;
+                };
+                (name == "Camera3D").then(|| {
+                    props.iter().find_map(|prop| {
+                        (prop.name == "enabled").then(|| match prop.value {
+                            PropValue::Bool(value) => value,
+                            _ => false,
+                        })
+                    })
+                })
+            })
+        };
+        assert_eq!(
+            camera_enabled(staged.entity(first).expect("first staged camera")),
+            Some(Some(false))
+        );
+        assert_eq!(
+            camera_enabled(staged.entity(second).expect("second staged camera")),
+            Some(Some(true))
+        );
+        assert!(
+            std::fs::read_to_string(entry)
+                .expect("staged entry")
+                .contains(".neolove/play/")
+        );
+        assert_eq!(
+            std::fs::read(&authored_path).expect("authored file remains"),
+            b"authored sentinel"
+        );
+
+        app.run_stage_dir = Some(stage_dir.clone());
+        app.cleanup_run_stage();
+        assert!(!stage_dir.exists());
+        assert!(authored_path.exists());
+    }
+
+    #[test]
+    fn streamed_runtime_frame_decodes_and_draws_in_embedded_game_view() {
+        use image::ImageEncoder as _;
+
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(
+                &[220, 40, 20, 255, 20, 120, 230, 255],
+                2,
+                1,
+                image::ColorType::Rgba8,
+            )
+            .expect("frame PNG");
+        let state = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::editor_ipc::LoggerState {
+                latest_frame: Some(crate::editor_ipc::RuntimeFrame {
+                    serial: 42,
+                    width: 2,
+                    height: 1,
+                    png_base64: base64::engine::general_purpose::STANDARD.encode(png),
+                    backend: "software-embedded".into(),
+                    fps: 60.0,
+                    update_ms: 1.25,
+                    render_ms: 2.5,
+                    draw_calls: 3,
+                    triangles: 12,
+                }),
+                ..Default::default()
+            },
+        ));
+        let mut scene = Scene::default();
+        scene.kind = SceneKind::ThreeD;
+        let mut harness = Harness::with_size(scene, 760, 560);
+        harness.app.runtime_state = Some(state);
+        harness.app.game_view_active = true;
+        harness.frame(FrameInput::default());
+
+        assert_eq!(harness.app.game_frame_serial, 42);
+        assert_eq!(harness.app.game_frame_backend, "software-embedded");
+        assert_eq!(
+            harness
+                .app
+                .game_frame
+                .as_ref()
+                .expect("decoded frame")
+                .get_pixel(0, 0)
+                .0,
+            [220, 40, 20, 255]
+        );
+        assert!(harness.buffer.iter().any(|pixel| *pixel != 0));
+    }
+
+    #[test]
+    fn runtime_parity_report_uses_initial_snapshot_and_links_authored_entity() {
+        let mut scene = Scene::default();
+        scene.kind = SceneKind::ThreeD;
+        let entity = scene.entities.first().expect("entity");
+        let authored_id = entity.id;
+        let initial = crate::window::EntitySnapshot {
+            id: 900,
+            source_id: Some(authored_id),
+            name: entity.name.clone(),
+            parent: None,
+            x: entity.x + 4.0,
+            y: entity.y,
+            rotation: entity.rotation,
+            scale: entity.scale,
+            enabled: true,
+            fields: vec![
+                ("position_z".into(), entity.position_z.to_string()),
+                ("rotation_x".into(), entity.rotation_x.to_string()),
+                ("rotation_y".into(), entity.rotation_y.to_string()),
+                ("rotation_z".into(), entity.rotation_z.to_string()),
+                ("scale_x".into(), entity.scale_x.to_string()),
+                ("scale_y".into(), entity.scale_y.to_string()),
+                ("scale_z".into(), entity.scale_z.to_string()),
+            ],
+            components: Vec::new(),
+        };
+        let state = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::editor_ipc::LoggerState {
+                entities: vec![initial.clone()],
+                initial_entities: Some(vec![initial]),
+                ..Default::default()
+            },
+        ));
+        let mut harness = Harness::with_size(scene, 900, 620);
+        harness.app.runtime_state = Some(state);
+        harness.app.run_runtime_parity_validation();
+
+        let Some(Popup::ParityReport { report, .. }) = harness.app.popup.take() else {
+            panic!("expected structured parity report");
+        };
+        let mismatch = report
+            .mismatches
+            .iter()
+            .find(|mismatch| mismatch.property.as_deref() == Some("x"))
+            .expect("transform mismatch")
+            .clone();
+        assert_eq!(mismatch.entity_id, Some(authored_id));
+        assert_eq!(
+            mismatch.category,
+            super::super::parity3d::ParityCategory::Transform
+        );
+        harness.app.activate_parity_mismatch(&mismatch);
+        assert_eq!(harness.app.selected, Some(authored_id));
+        assert!(harness.app.status.contains("TRANSFORM parity"));
+    }
+
+    #[test]
+    fn game_view_visual_baseline_round_trip_writes_metrics_and_failure_diff() {
+        let mut scene = Scene::default();
+        scene.kind = SceneKind::ThreeD;
+        scene.name = format!("Visual Gate {}", uuid::Uuid::new_v4());
+        let mut harness = Harness::with_size(scene, 900, 620);
+        harness.app.game_frame_backend = "software-embedded".into();
+        let baseline = image::RgbaImage::from_pixel(8, 8, image::Rgba([20, 40, 80, 255]));
+        harness.app.game_frame = Some(Rc::new(baseline.clone()));
+        harness.app.set_game_visual_baseline();
+        let baseline_path = harness.app.visual_baseline_path(8, 8);
+        assert!(baseline_path.exists());
+
+        harness.app.compare_game_visual_baseline();
+        let Some(Popup::VisualRegression { report, .. }) = harness.app.popup.take() else {
+            panic!("expected passing visual report");
+        };
+        assert!(report.passed);
+        assert_eq!(report.comparison_profile, "same-backend-strict");
+
+        harness.app.game_frame_backend = "vulkan-embedded".into();
+        harness.app.compare_game_visual_baseline();
+        let Some(Popup::VisualRegression { report, .. }) = harness.app.popup.take() else {
+            panic!("expected passing cross-backend visual report");
+        };
+        assert!(report.passed);
+        assert_eq!(report.comparison_profile, "cross-backend-aa-aware");
+        assert_eq!(
+            report.tolerance,
+            super::super::visual_regression3d::VisualTolerance::cross_backend()
+        );
+
+        let mut changed = baseline;
+        changed.put_pixel(3, 4, image::Rgba([255, 0, 255, 255]));
+        harness.app.game_frame = Some(Rc::new(changed));
+        harness.app.compare_game_visual_baseline();
+        let Some(Popup::VisualRegression { report, diff, .. }) = harness.app.popup.take() else {
+            panic!("expected failing visual report");
+        };
+        assert!(!report.passed);
+        assert_eq!(
+            report.mismatch_bounds,
+            Some(super::super::visual_regression3d::PixelBounds {
+                x: 3,
+                y: 4,
+                width: 1,
+                height: 1,
+            })
+        );
+        assert!(diff.as_ref().is_some_and(|path| path.exists()));
+
+        let stem = harness.app.visual_regression_stem(8, 8);
+        let artifact_dir = harness
+            .app
+            .project_root
+            .join(".neolove")
+            .join("visual-regression");
+        assert!(artifact_dir.join(format!("{stem}-latest-report.json")).exists());
+        let _ = std::fs::remove_file(baseline_path);
+        let _ = std::fs::remove_file(harness.app.visual_baseline_metadata_path(8, 8));
+        let _ = std::fs::remove_file(artifact_dir.join(format!("{stem}-latest-report.json")));
+        let _ = std::fs::remove_file(artifact_dir.join(format!("{stem}-latest-diff.png")));
     }
 }

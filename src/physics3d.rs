@@ -6,10 +6,14 @@
 //! all query work uses affine matrices internally.
 //!
 //! Primitive contacts deliberately report whether their geometry is exact.
-//! Mesh-vs-shape contacts and primitives distorted into non-uniform ellipsoids
-//! are bounds-only candidates; callers may use those for trigger notification,
-//! but must not mistake them for an exact contact manifold.
+//! Destination-overlap mesh-vs-shape contacts are bounds-only candidates;
+//! callers must not mistake them for exact manifolds. Continuous collider casts
+//! can explicitly consume conservative bounds hits to prevent tunneling and
+//! retain that quality tag. Spheres and capsules never land here: a non-uniform
+//! scale is re-rounded into the shape rather than shearing it into an ellipsoid
+//! that no exact test could resolve.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 
@@ -810,6 +814,55 @@ pub(crate) struct Collider3D {
     pub body_is_static: bool,
 }
 
+/// Sphere and capsule colliders stay round under non-uniform scale: the radius
+/// follows the largest scale across the axes the shape spans, and the capsule
+/// segment follows its own local-Y axis, rather than shearing the primitive
+/// into an ellipsoid.
+///
+/// This is not only the convention authors expect from a sphere collider on a
+/// stretched entity — it is what keeps the shape solvable. An ellipsoid has no
+/// exact manifold here, so a stretched round collider degrades to a bounds-only
+/// contact, which the response layer refuses to resolve; bodies built that way
+/// fall straight through the world. Baking the scale into the shape and handing
+/// back a unit scale keeps one geometry for every query path — bounds, ray,
+/// sweep, and contact — so they cannot disagree.
+///
+/// Returns `None` for shapes that already carry their scale exactly (boxes and
+/// triangle meshes) and for round shapes that are already uniformly scaled.
+fn round_geometry_under_scale(
+    shape: &ColliderShape3D,
+    scale: Vec3,
+) -> Option<(ColliderShape3D, Vec3)> {
+    let lengths = [scale.x.abs(), scale.y.abs(), scale.z.abs()];
+    if !lengths.iter().all(|length| length.is_finite()) {
+        return None;
+    }
+    let unit_scale = Vec3::new(1.0, 1.0, 1.0);
+    match shape {
+        ColliderShape3D::Sphere { radius } if !scale_is_uniform(lengths) => {
+            let largest = lengths[0].max(lengths[1]).max(lengths[2]);
+            Some((
+                ColliderShape3D::Sphere {
+                    radius: radius * largest,
+                },
+                unit_scale,
+            ))
+        }
+        ColliderShape3D::Capsule {
+            radius,
+            half_height,
+        } if !scale_is_uniform(lengths) => Some((
+            ColliderShape3D::Capsule {
+                // The segment runs along local Y; the cap radius spans X and Z.
+                radius: radius * lengths[0].max(lengths[2]),
+                half_height: half_height * lengths[1],
+            },
+            unit_scale,
+        )),
+        _ => None,
+    }
+}
+
 impl Collider3D {
     pub(crate) fn new(id: u64, shape: ColliderShape3D) -> Self {
         Self {
@@ -833,10 +886,27 @@ impl Collider3D {
         }
     }
 
+    /// The collider as every query path must see it, with any non-uniform scale
+    /// on a round shape baked into the shape itself. See
+    /// [`round_geometry_under_scale`]. The owned branch only ever clones a
+    /// sphere or capsule, so it never copies mesh acceleration data.
+    fn normalized(&self) -> Cow<'_, Self> {
+        match round_geometry_under_scale(&self.shape, self.transform.scale) {
+            Some((shape, scale)) => {
+                let mut collider = self.clone();
+                collider.shape = shape;
+                collider.transform.scale = scale;
+                Cow::Owned(collider)
+            }
+            None => Cow::Borrowed(self),
+        }
+    }
+
     pub(crate) fn world_aabb(&self) -> Physics3dResult<Aabb3D> {
-        self.shape.validate()?;
-        let model = self.transform.matrix()?;
-        let bounds = match &self.shape {
+        let this = self.normalized();
+        this.shape.validate()?;
+        let model = this.transform.matrix()?;
+        let bounds = match &this.shape {
             ColliderShape3D::Box { half_extents } => Aabb3D {
                 min: scale(*half_extents, -1.0),
                 max: *half_extents,
@@ -920,8 +990,9 @@ impl Collider3D {
         ray: Ray3D,
         max_distance: f32,
     ) -> Physics3dResult<Option<RaycastHit3D>> {
-        self.shape.validate()?;
-        let transform = self.transform.prepare()?;
+        let this = self.normalized();
+        this.shape.validate()?;
+        let transform = this.transform.prepare()?;
         let local_ray = LocalRay {
             origin: transform.point_to_local(ray.origin),
             direction: transform.direction_to_local(ray.direction),
@@ -935,7 +1006,7 @@ impl Collider3D {
             ));
         }
 
-        let local_hit = match &self.shape {
+        let local_hit = match &this.shape {
             ColliderShape3D::Box { half_extents } => {
                 ray_box(local_ray, *half_extents, max_distance)
             }
@@ -1034,6 +1105,971 @@ pub(crate) fn raycast_nearest(
     Ok(best)
 }
 
+/// Earliest continuous hit for an upright world-space capsule translated by a
+/// displacement. The returned normal points out of the hit surface toward the
+/// controller, making it directly usable for sliding and slope tests.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CapsuleSweepHit3D {
+    pub collider_id: u64,
+    pub distance: f32,
+    pub position: Vec3,
+    pub normal: Vec3,
+    pub is_trigger: bool,
+}
+
+/// Earliest translational hit between one authored collider and another.
+/// `normal` points out of the obstacle toward the moving collider. Exact
+/// primitive pairs and round-shape/triangle casts report `Exact`; the fallback
+/// used for box/mesh and non-uniform round shapes is deliberately conservative
+/// and reports `Bounds`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ColliderSweepHit3D {
+    pub collider_id: u64,
+    pub distance: f32,
+    pub position: Vec3,
+    pub normal: Vec3,
+    pub is_trigger: bool,
+    pub response_enabled: bool,
+    pub quality: ContactQuality3D,
+    pub restitution: f32,
+    pub friction: f32,
+}
+
+/// Continuous translational hits for an authored collider. One nearest hit is
+/// returned per obstacle and output order is deterministic. Callers can allow
+/// trigger hits to pass while selecting the first response-enabled solid hit.
+pub(crate) fn sweep_collider_hits(
+    colliders: &[Collider3D],
+    moving: &Collider3D,
+    displacement: Vec3,
+    exclude_entity_id: Option<u64>,
+) -> Physics3dResult<Vec<ColliderSweepHit3D>> {
+    if !vec3_is_finite(displacement) {
+        return Err(Physics3dError::InvalidRay(
+            "collider sweep displacement must be finite".into(),
+        ));
+    }
+    moving.shape.validate()?;
+    let distance = dot(displacement, displacement).sqrt();
+    if !distance.is_finite() {
+        return Err(Physics3dError::InvalidRay(
+            "collider sweep displacement overflowed".into(),
+        ));
+    }
+    let direction = if distance > DIRECTION_EPSILON {
+        scale(displacement, distance.recip())
+    } else {
+        Vec3::ZERO
+    };
+    let mut hits = Vec::new();
+    for obstacle in colliders {
+        if !obstacle.enabled
+            || Some(obstacle.id) == exclude_entity_id
+            || obstacle.id == moving.id
+            || !moving.filter.allows(obstacle.filter)
+        {
+            continue;
+        }
+        let hit = match &obstacle.shape {
+            ColliderShape3D::TriangleMesh(mesh) => {
+                sweep_collider_mesh(moving, direction, distance, obstacle, mesh)?
+            }
+            _ => sweep_collider_primitive(moving, direction, distance, obstacle)?,
+        };
+        if let Some(hit) = hit {
+            hits.push(hit);
+        }
+    }
+    hits.sort_unstable_by(|left, right| {
+        left.distance
+            .total_cmp(&right.distance)
+            .then_with(|| left.collider_id.cmp(&right.collider_id))
+            .then_with(|| left.is_trigger.cmp(&right.is_trigger))
+    });
+    Ok(hits)
+}
+
+fn collider_sweep_hit(
+    obstacle: &Collider3D,
+    distance: f32,
+    position: Vec3,
+    normal: Vec3,
+    quality: ContactQuality3D,
+    moving: &Collider3D,
+) -> ColliderSweepHit3D {
+    ColliderSweepHit3D {
+        collider_id: obstacle.id,
+        distance,
+        position,
+        normal,
+        is_trigger: obstacle.is_trigger,
+        response_enabled: obstacle.response_enabled,
+        quality,
+        restitution: moving.restitution.max(obstacle.restitution),
+        friction: (moving.friction * obstacle.friction).sqrt(),
+    }
+}
+
+fn sweep_collider_primitive(
+    moving: &Collider3D,
+    direction: Vec3,
+    max_distance: f32,
+    obstacle: &Collider3D,
+) -> Physics3dResult<Option<ColliderSweepHit3D>> {
+    let mut probe = moving.clone();
+    // Filtering was already performed by the outer query. This reciprocal
+    // proxy avoids an asymmetric layer/mask pair being rejected a second time.
+    probe.filter = CollisionFilter3D::new(obstacle.filter.mask, obstacle.filter.layer);
+    let origin = moving.transform.position;
+    let contact_at = |distance: f32, probe: &mut Collider3D| -> Physics3dResult<_> {
+        probe.transform.position = add(origin, scale(direction, distance));
+        Ok(contact_pair(probe, obstacle)?.filter(|contact| {
+            let surface_normal = scale(contact.normal, -1.0);
+            direction == Vec3::ZERO
+                || dot(direction, surface_normal) < -1.0e-6
+                || (contact.penetration > 1.0e-5 && dot(direction, surface_normal) <= 0.0)
+        }))
+    };
+    if let Some(contact) = contact_at(0.0, &mut probe)? {
+        return Ok(Some(collider_sweep_hit(
+            obstacle,
+            0.0,
+            contact.point,
+            scale(contact.normal, -1.0),
+            contact.quality,
+            moving,
+        )));
+    }
+    if max_distance <= DIRECTION_EPSILON {
+        return Ok(None);
+    }
+
+    let moving_bounds = moving.world_aabb()?;
+    let moving_center = moving_bounds.center();
+    let extent = moving_bounds.half_extents();
+    let obstacle_bounds = obstacle.world_aabb()?;
+    let expanded = Aabb3D {
+        min: sub(obstacle_bounds.min, extent),
+        max: add(obstacle_bounds.max, extent),
+    };
+    let Some((entry, exit)) = expanded.ray_interval(
+        LocalRay {
+            origin: moving_center,
+            direction,
+        },
+        max_distance,
+    ) else {
+        return Ok(None);
+    };
+    let entry = entry.clamp(0.0, max_distance);
+    let exit = exit.clamp(entry, max_distance);
+    let smallest_extent = extent.x.min(extent.y).min(extent.z).max(1.0e-5);
+    let step = (smallest_extent * 0.25).max(1.0e-5);
+    let sample_count = (((exit - entry) / step).ceil() as usize)
+        .saturating_add(1)
+        .clamp(1, 65_536);
+    let mut previous = entry;
+    for index in 0..=sample_count {
+        let sample = if index == sample_count {
+            exit
+        } else {
+            (entry + (exit - entry) * index as f32 / sample_count as f32).min(exit)
+        };
+        if let Some(mut contact) = contact_at(sample, &mut probe)? {
+            let mut low = previous.min(sample);
+            let mut high = sample;
+            for _ in 0..24 {
+                let middle = low * 0.5 + high * 0.5;
+                if contact_at(middle, &mut probe)?.is_some() {
+                    high = middle;
+                } else {
+                    low = middle;
+                }
+            }
+            if let Some(refined) = contact_at(high, &mut probe)? {
+                contact = refined;
+            }
+            return Ok(Some(collider_sweep_hit(
+                obstacle,
+                high,
+                contact.point,
+                scale(contact.normal, -1.0),
+                contact.quality,
+                moving,
+            )));
+        }
+        previous = sample;
+        if sample >= exit {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+fn sweep_collider_mesh(
+    moving: &Collider3D,
+    direction: Vec3,
+    max_distance: f32,
+    obstacle: &Collider3D,
+    mesh: &MeshCollider3D,
+) -> Physics3dResult<Option<ColliderSweepHit3D>> {
+    match contact_shape(moving)? {
+        Some(ExactContactShape3D::Sphere(sphere)) => Ok(sweep_world_sphere_mesh(
+            sphere.center,
+            sphere.radius,
+            direction,
+            max_distance,
+            obstacle,
+            mesh,
+        )?
+        .map(|hit| {
+            collider_sweep_hit(
+                obstacle,
+                hit.distance,
+                hit.position,
+                hit.normal,
+                ContactQuality3D::Exact,
+                moving,
+            )
+        })),
+        Some(ExactContactShape3D::Capsule(capsule)) => {
+            let segment = sub(capsule.end, capsule.start);
+            let segment_length = dot(segment, segment).sqrt();
+            let sample_count = ((segment_length / capsule.radius.max(0.0001)).ceil() as usize)
+                .max(1)
+                .min(256);
+            let mut best: Option<SphereTriangleSweepHit> = None;
+            for index in 0..=sample_count {
+                let amount = index as f32 / sample_count as f32;
+                let center = add(capsule.start, scale(segment, amount));
+                let maximum = best.map_or(max_distance, |hit| hit.distance.min(max_distance));
+                if let Some(hit) = sweep_world_sphere_mesh(
+                    center,
+                    capsule.radius,
+                    direction,
+                    maximum,
+                    obstacle,
+                    mesh,
+                )? && best.is_none_or(|current| hit.distance < current.distance)
+                {
+                    best = Some(hit);
+                }
+            }
+            Ok(best.map(|hit| {
+                collider_sweep_hit(
+                    obstacle,
+                    hit.distance,
+                    hit.position,
+                    hit.normal,
+                    ContactQuality3D::Exact,
+                    moving,
+                )
+            }))
+        }
+        // A swept bounds traversal is intentionally conservative for boxes,
+        // dynamic meshes, and non-uniform round shapes. It visits triangle
+        // leaves rather than treating the entire mesh bounds as a solid block.
+        _ => sweep_collider_bounds_mesh(moving, direction, max_distance, obstacle, mesh),
+    }
+}
+
+fn sweep_world_sphere_mesh(
+    origin: Vec3,
+    radius: f32,
+    direction: Vec3,
+    max_distance: f32,
+    obstacle: &Collider3D,
+    mesh: &MeshCollider3D,
+) -> Physics3dResult<Option<SphereTriangleSweepHit>> {
+    let model = obstacle.transform.matrix()?;
+    let swept_bounds = Aabb3D {
+        min: Vec3::new(
+            origin.x.min(origin.x + direction.x * max_distance) - radius,
+            origin.y.min(origin.y + direction.y * max_distance) - radius,
+            origin.z.min(origin.z + direction.z * max_distance) - radius,
+        ),
+        max: Vec3::new(
+            origin.x.max(origin.x + direction.x * max_distance) + radius,
+            origin.y.max(origin.y + direction.y * max_distance) + radius,
+            origin.z.max(origin.z + direction.z * max_distance) + radius,
+        ),
+    };
+    let Some(root) = mesh.geometry.nodes.first() else {
+        return Ok(None);
+    };
+    if !root.bounds.transformed(model).overlaps(swept_bounds) {
+        return Ok(None);
+    }
+    let mut stack = [0usize; MESH_BVH_STACK_SIZE];
+    stack[0] = 0;
+    let mut stack_len = 1usize;
+    let mut best: Option<SphereTriangleSweepHit> = None;
+    while stack_len > 0 {
+        stack_len -= 1;
+        let node = mesh.geometry.nodes[stack[stack_len]];
+        if !node.bounds.transformed(model).overlaps(swept_bounds) {
+            continue;
+        }
+        if node.is_leaf() {
+            for &triangle_index in
+                &mesh.geometry.triangle_order[node.first..node.first + node.count]
+            {
+                let triangle = mesh.geometry.triangles[triangle_index];
+                let vertices = triangle.vertices.map(|point| model.transform_point(point));
+                let maximum = best.map_or(max_distance, |hit| hit.distance.min(max_distance));
+                if let Some(hit) =
+                    sweep_sphere_triangle(origin, radius, direction, maximum, vertices)
+                    && best.is_none_or(|current| hit.distance < current.distance)
+                {
+                    best = Some(hit);
+                }
+            }
+        } else {
+            for child in [node.left, node.right] {
+                if stack_len < MESH_BVH_STACK_SIZE {
+                    stack[stack_len] = child;
+                    stack_len += 1;
+                }
+            }
+        }
+    }
+    Ok(best)
+}
+
+fn sweep_collider_bounds_mesh(
+    moving: &Collider3D,
+    direction: Vec3,
+    max_distance: f32,
+    obstacle: &Collider3D,
+    mesh: &MeshCollider3D,
+) -> Physics3dResult<Option<ColliderSweepHit3D>> {
+    let moving_bounds = moving.world_aabb()?;
+    let center = moving_bounds.center();
+    let extent = moving_bounds.half_extents();
+    let end = add(center, scale(direction, max_distance));
+    let swept_bounds = Aabb3D {
+        min: Vec3::new(
+            center.x.min(end.x) - extent.x,
+            center.y.min(end.y) - extent.y,
+            center.z.min(end.z) - extent.z,
+        ),
+        max: Vec3::new(
+            center.x.max(end.x) + extent.x,
+            center.y.max(end.y) + extent.y,
+            center.z.max(end.z) + extent.z,
+        ),
+    };
+    let model = obstacle.transform.matrix()?;
+    let Some(root) = mesh.geometry.nodes.first() else {
+        return Ok(None);
+    };
+    if !root.bounds.transformed(model).overlaps(swept_bounds) {
+        return Ok(None);
+    }
+    let ray = LocalRay {
+        origin: center,
+        direction,
+    };
+    let mut stack = [0usize; MESH_BVH_STACK_SIZE];
+    stack[0] = 0;
+    let mut stack_len = 1usize;
+    let mut best: Option<(f32, Vec3)> = None;
+    while stack_len > 0 {
+        stack_len -= 1;
+        let node = mesh.geometry.nodes[stack[stack_len]];
+        if !node.bounds.transformed(model).overlaps(swept_bounds) {
+            continue;
+        }
+        if node.is_leaf() {
+            for &triangle_index in
+                &mesh.geometry.triangle_order[node.first..node.first + node.count]
+            {
+                let triangle = mesh.geometry.triangles[triangle_index];
+                let mut triangle_bounds =
+                    Aabb3D::from_point(model.transform_point(triangle.vertices[0]));
+                triangle_bounds.include_point(model.transform_point(triangle.vertices[1]));
+                triangle_bounds.include_point(model.transform_point(triangle.vertices[2]));
+                let expanded = Aabb3D {
+                    min: sub(triangle_bounds.min, extent),
+                    max: add(triangle_bounds.max, extent),
+                };
+                let maximum = best.map_or(max_distance, |hit| hit.0.min(max_distance));
+                if let Some((distance, normal)) = ray_aabb_entry_normal(expanded, ray, maximum)
+                    && best.is_none_or(|current| distance < current.0)
+                {
+                    best = Some((distance, normal));
+                }
+            }
+        } else {
+            for child in [node.left, node.right] {
+                if stack_len < MESH_BVH_STACK_SIZE {
+                    stack[stack_len] = child;
+                    stack_len += 1;
+                }
+            }
+        }
+    }
+    Ok(best.map(|(distance, normal)| {
+        let at = add(center, scale(direction, distance));
+        let support =
+            extent.x * normal.x.abs() + extent.y * normal.y.abs() + extent.z * normal.z.abs();
+        collider_sweep_hit(
+            obstacle,
+            distance,
+            sub(at, scale(normal, support)),
+            normal,
+            ContactQuality3D::Bounds,
+            moving,
+        )
+    }))
+}
+
+fn ray_aabb_entry_normal(bounds: Aabb3D, ray: LocalRay, max_distance: f32) -> Option<(f32, Vec3)> {
+    let origins = [ray.origin.x, ray.origin.y, ray.origin.z];
+    let directions = [ray.direction.x, ray.direction.y, ray.direction.z];
+    let minima = [bounds.min.x, bounds.min.y, bounds.min.z];
+    let maxima = [bounds.max.x, bounds.max.y, bounds.max.z];
+    let mut enter = 0.0f32;
+    let mut exit = max_distance;
+    let mut normal = normalize(scale(ray.direction, -1.0));
+    for axis in 0..3 {
+        if directions[axis].abs() <= DIRECTION_EPSILON {
+            if origins[axis] < minima[axis] || origins[axis] > maxima[axis] {
+                return None;
+            }
+            continue;
+        }
+        let inverse = directions[axis].recip();
+        let mut near = (minima[axis] - origins[axis]) * inverse;
+        let mut far = (maxima[axis] - origins[axis]) * inverse;
+        let mut near_normal = axis_vector(axis, -1.0);
+        if near > far {
+            std::mem::swap(&mut near, &mut far);
+            near_normal = axis_vector(axis, 1.0);
+        }
+        if near > enter {
+            enter = near;
+            normal = near_normal;
+        }
+        exit = exit.min(far);
+        if enter > exit {
+            return None;
+        }
+    }
+    (enter <= max_distance && exit >= 0.0).then_some((enter.max(0.0), normal))
+}
+
+pub(crate) fn sweep_capsule_nearest(
+    colliders: &[Collider3D],
+    center: Vec3,
+    radius: f32,
+    half_height: f32,
+    displacement: Vec3,
+    query: QueryFilter3D,
+    exclude_entity_id: Option<u64>,
+) -> Physics3dResult<Option<CapsuleSweepHit3D>> {
+    if !vec3_is_finite(center)
+        || !vec3_is_finite(displacement)
+        || !radius.is_finite()
+        || radius <= 0.0
+        || !half_height.is_finite()
+        || half_height < 0.0
+    {
+        return Err(Physics3dError::InvalidShape(
+            "capsule sweep center/displacement must be finite, radius positive, and half height non-negative"
+                .into(),
+        ));
+    }
+    let distance = dot(displacement, displacement).sqrt();
+    if !distance.is_finite() {
+        return Err(Physics3dError::InvalidRay(
+            "capsule sweep displacement overflowed".into(),
+        ));
+    }
+    let direction = if distance > DIRECTION_EPSILON {
+        scale(displacement, distance.recip())
+    } else {
+        Vec3::ZERO
+    };
+    let mut best: Option<CapsuleSweepHit3D> = None;
+    for collider in colliders {
+        if !collider.enabled
+            || Some(collider.id) == exclude_entity_id
+            || (!query.include_triggers && collider.is_trigger)
+            || !query.collision.allows(collider.filter)
+        {
+            continue;
+        }
+        let maximum = best.map_or(distance, |hit| hit.distance.min(distance));
+        let candidate = match &collider.shape {
+            ColliderShape3D::TriangleMesh(mesh) => sweep_capsule_mesh(
+                center,
+                radius,
+                half_height,
+                direction,
+                maximum,
+                collider,
+                mesh,
+            )?,
+            _ => {
+                sweep_capsule_primitive(center, radius, half_height, direction, maximum, collider)?
+            }
+        };
+        if let Some(candidate) = candidate
+            && best.is_none_or(|current| {
+                candidate.distance < current.distance
+                    || (candidate.distance == current.distance
+                        && candidate.collider_id < current.collider_id)
+            })
+        {
+            best = Some(candidate);
+        }
+    }
+    Ok(best)
+}
+
+fn sweep_capsule_primitive(
+    center: Vec3,
+    radius: f32,
+    half_height: f32,
+    direction: Vec3,
+    max_distance: f32,
+    obstacle: &Collider3D,
+) -> Physics3dResult<Option<CapsuleSweepHit3D>> {
+    let mut moving = Collider3D::new(
+        u64::MAX,
+        ColliderShape3D::Capsule {
+            radius,
+            half_height,
+        },
+    );
+    // The outer sweep query has already applied the caller's collision filter.
+    // Give this internal narrow-phase proxy a reciprocal filter so
+    // `contact_pair` cannot reject a valid asymmetric layer/mask pairing by
+    // comparing the obstacle with an accidental copy of its own filter.
+    moving.filter = CollisionFilter3D::new(obstacle.filter.mask, obstacle.filter.layer);
+    moving.transform.position = center;
+
+    let contact_at = |distance: f32, moving: &mut Collider3D| -> Physics3dResult<_> {
+        moving.transform.position = add(center, scale(direction, distance));
+        Ok(contact_pair(moving, obstacle)?.filter(|contact| {
+            let surface_normal = scale(contact.normal, -1.0);
+            contact.penetration > 1.0e-5
+                || direction == Vec3::ZERO
+                || dot(direction, surface_normal) < -1.0e-6
+        }))
+    };
+    if let Some(contact) = contact_at(0.0, &mut moving)? {
+        return Ok(Some(CapsuleSweepHit3D {
+            collider_id: obstacle.id,
+            distance: 0.0,
+            position: contact.point,
+            normal: scale(contact.normal, -1.0),
+            is_trigger: obstacle.is_trigger,
+        }));
+    }
+    if max_distance <= DIRECTION_EPSILON {
+        return Ok(None);
+    }
+
+    // Restrict refinement to the swept capsule/obstacle AABB interval. Within
+    // that conservative interval, quarter-radius samples cannot tunnel through
+    // any primitive feature narrower than the capsule diameter.
+    let bounds = obstacle.world_aabb()?;
+    let extent = Vec3::new(radius, radius + half_height, radius);
+    let expanded = Aabb3D {
+        min: sub(bounds.min, extent),
+        max: add(bounds.max, extent),
+    };
+    let Some((entry, exit)) = expanded.ray_interval(
+        LocalRay {
+            origin: center,
+            direction,
+        },
+        max_distance,
+    ) else {
+        return Ok(None);
+    };
+    let entry = entry.clamp(0.0, max_distance);
+    let exit = exit.clamp(entry, max_distance);
+    let step = (radius * 0.25).max(0.0025);
+    let sample_count = (((exit - entry) / step).ceil() as usize)
+        .saturating_add(1)
+        .min(16_384);
+    let mut previous = entry;
+    for index in 0..=sample_count {
+        let sample = if index == sample_count {
+            exit
+        } else {
+            (entry + step * index as f32).min(exit)
+        };
+        if let Some(mut contact) = contact_at(sample, &mut moving)? {
+            let mut low = previous.min(sample);
+            let mut high = sample;
+            for _ in 0..20 {
+                let middle = low * 0.5 + high * 0.5;
+                if contact_at(middle, &mut moving)?.is_some() {
+                    high = middle;
+                } else {
+                    low = middle;
+                }
+            }
+            if let Some(refined) = contact_at(high, &mut moving)? {
+                contact = refined;
+            }
+            return Ok(Some(CapsuleSweepHit3D {
+                collider_id: obstacle.id,
+                distance: high,
+                position: contact.point,
+                normal: scale(contact.normal, -1.0),
+                is_trigger: obstacle.is_trigger,
+            }));
+        }
+        previous = sample;
+        if sample >= exit {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+fn sweep_capsule_mesh(
+    center: Vec3,
+    radius: f32,
+    half_height: f32,
+    direction: Vec3,
+    max_distance: f32,
+    obstacle: &Collider3D,
+    mesh: &MeshCollider3D,
+) -> Physics3dResult<Option<CapsuleSweepHit3D>> {
+    let segment_count = ((half_height * 2.0 / radius.max(0.0001)).ceil() as usize)
+        .max(1)
+        .min(128);
+    let model = obstacle.transform.matrix()?;
+    let mut best: Option<CapsuleSweepHit3D> = None;
+    for sample_index in 0..=segment_count {
+        let amount = sample_index as f32 / segment_count as f32;
+        let y = -half_height + half_height * 2.0 * amount;
+        let origin = add(center, Vec3::new(0.0, y, 0.0));
+        let maximum = best.map_or(max_distance, |hit| hit.distance.min(max_distance));
+        let swept_bounds = Aabb3D {
+            min: Vec3::new(
+                origin.x.min(origin.x + direction.x * maximum) - radius,
+                origin.y.min(origin.y + direction.y * maximum) - radius,
+                origin.z.min(origin.z + direction.z * maximum) - radius,
+            ),
+            max: Vec3::new(
+                origin.x.max(origin.x + direction.x * maximum) + radius,
+                origin.y.max(origin.y + direction.y * maximum) + radius,
+                origin.z.max(origin.z + direction.z * maximum) + radius,
+            ),
+        };
+        let Some(root) = mesh.geometry.nodes.first() else {
+            continue;
+        };
+        if !root.bounds.transformed(model).overlaps(swept_bounds) {
+            continue;
+        }
+        let mut stack = [0usize; MESH_BVH_STACK_SIZE];
+        stack[0] = 0;
+        let mut stack_len = 1usize;
+        while stack_len > 0 {
+            stack_len -= 1;
+            let node = mesh.geometry.nodes[stack[stack_len]];
+            if !node.bounds.transformed(model).overlaps(swept_bounds) {
+                continue;
+            }
+            if node.is_leaf() {
+                for &triangle_index in
+                    &mesh.geometry.triangle_order[node.first..node.first + node.count]
+                {
+                    let triangle = mesh.geometry.triangles[triangle_index];
+                    let vertices = triangle.vertices.map(|point| model.transform_point(point));
+                    let maximum = best.map_or(max_distance, |hit| hit.distance.min(max_distance));
+                    if let Some(hit) =
+                        sweep_sphere_triangle(origin, radius, direction, maximum, vertices)
+                        && best.is_none_or(|current| hit.distance < current.distance)
+                    {
+                        best = Some(CapsuleSweepHit3D {
+                            collider_id: obstacle.id,
+                            distance: hit.distance,
+                            position: hit.position,
+                            normal: hit.normal,
+                            is_trigger: obstacle.is_trigger,
+                        });
+                    }
+                }
+            } else {
+                for child in [node.left, node.right] {
+                    if stack_len < MESH_BVH_STACK_SIZE {
+                        stack[stack_len] = child;
+                        stack_len += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(best)
+}
+
+#[derive(Clone, Copy)]
+struct SphereTriangleSweepHit {
+    distance: f32,
+    position: Vec3,
+    normal: Vec3,
+}
+
+fn sweep_sphere_triangle(
+    origin: Vec3,
+    radius: f32,
+    direction: Vec3,
+    max_distance: f32,
+    triangle: [Vec3; 3],
+) -> Option<SphereTriangleSweepHit> {
+    let raw_normal = cross(sub(triangle[1], triangle[0]), sub(triangle[2], triangle[0]));
+    let normal = normalize(raw_normal);
+    if normal == Vec3::ZERO {
+        return None;
+    }
+    let closest = closest_point_on_triangle(origin, triangle);
+    let initial_delta = sub(origin, closest);
+    let initial_distance_squared = dot(initial_delta, initial_delta);
+    if initial_distance_squared <= radius * radius {
+        let contact_normal = if initial_distance_squared > DIRECTION_EPSILON * DIRECTION_EPSILON {
+            scale(initial_delta, initial_distance_squared.sqrt().recip())
+        } else if dot(sub(origin, triangle[0]), normal) < 0.0 {
+            scale(normal, -1.0)
+        } else {
+            normal
+        };
+        return Some(SphereTriangleSweepHit {
+            distance: 0.0,
+            position: closest,
+            normal: contact_normal,
+        });
+    }
+    if max_distance <= DIRECTION_EPSILON {
+        return None;
+    }
+
+    let mut best: Option<SphereTriangleSweepHit> = None;
+    let signed_distance = dot(sub(origin, triangle[0]), normal);
+    let side = if signed_distance < 0.0 { -1.0 } else { 1.0 };
+    let face_normal = scale(normal, side);
+    let denominator = dot(direction, normal);
+    if denominator.abs() > DIRECTION_EPSILON {
+        let distance = (side * radius - signed_distance) / denominator;
+        if distance >= 0.0 && distance <= max_distance {
+            let sphere_center = add(origin, scale(direction, distance));
+            let surface = sub(sphere_center, scale(face_normal, radius));
+            if point_in_triangle(surface, triangle, normal) {
+                best = Some(SphereTriangleSweepHit {
+                    distance,
+                    position: surface,
+                    normal: face_normal,
+                });
+            }
+        }
+    }
+
+    let ray = LocalRay { origin, direction };
+    for vertex in triangle {
+        if let Some(hit) = ray_sphere(ray, vertex, radius, max_distance)
+            && best.is_none_or(|current| hit.distance < current.distance)
+        {
+            let center = add(origin, scale(direction, hit.distance));
+            best = Some(SphereTriangleSweepHit {
+                distance: hit.distance,
+                position: vertex,
+                normal: normalize(sub(center, vertex)),
+            });
+        }
+    }
+    for (start, end) in [
+        (triangle[0], triangle[1]),
+        (triangle[1], triangle[2]),
+        (triangle[2], triangle[0]),
+    ] {
+        if let Some(hit) = ray_capsule_segment(ray, start, end, radius, max_distance)
+            && best.is_none_or(|current| hit.distance < current.distance)
+        {
+            let center = add(origin, scale(direction, hit.distance));
+            let edge_point = closest_point_on_segment(start, end, center);
+            best = Some(SphereTriangleSweepHit {
+                distance: hit.distance,
+                position: edge_point,
+                normal: normalize(sub(center, edge_point)),
+            });
+        }
+    }
+    best
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CharacterMoveSettings3D {
+    pub radius: f32,
+    pub half_height: f32,
+    pub skin_width: f32,
+    pub max_slope_cosine: f32,
+    pub step_height: f32,
+    pub ground_snap_distance: f32,
+    pub max_iterations: usize,
+    pub query: QueryFilter3D,
+    pub exclude_entity_id: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CharacterMoveResult3D {
+    pub displacement: Vec3,
+    pub grounded: bool,
+    pub ground_entity_id: Option<u64>,
+    pub ground_normal: Vec3,
+    pub collisions: Vec<CapsuleSweepHit3D>,
+}
+
+pub(crate) fn move_character_capsule(
+    colliders: &[Collider3D],
+    center: Vec3,
+    desired_displacement: Vec3,
+    settings: CharacterMoveSettings3D,
+) -> Physics3dResult<CharacterMoveResult3D> {
+    if !vec3_is_finite(desired_displacement)
+        || !settings.skin_width.is_finite()
+        || !settings.max_slope_cosine.is_finite()
+        || !settings.step_height.is_finite()
+        || !settings.ground_snap_distance.is_finite()
+    {
+        return Err(Physics3dError::InvalidShape(
+            "character movement settings and displacement must be finite".into(),
+        ));
+    }
+    let skin = settings.skin_width.max(0.0).min(settings.radius * 0.5);
+    let slope_cosine = settings.max_slope_cosine.clamp(-1.0, 1.0);
+    let mut position = center;
+    let mut remaining = desired_displacement;
+    let mut collisions = Vec::new();
+    let mut grounded = false;
+    let mut ground_entity_id = None;
+    let mut ground_normal = Vec3::new(0.0, 1.0, 0.0);
+
+    let sweep = |origin: Vec3, displacement: Vec3| {
+        sweep_capsule_nearest(
+            colliders,
+            origin,
+            settings.radius,
+            settings.half_height,
+            displacement,
+            settings.query,
+            settings.exclude_entity_id,
+        )
+    };
+
+    for _ in 0..settings.max_iterations.clamp(1, 16) {
+        let remaining_length = dot(remaining, remaining).sqrt();
+        if remaining_length <= DIRECTION_EPSILON {
+            break;
+        }
+        let Some(hit) = sweep(position, remaining)? else {
+            position = add(position, remaining);
+            break;
+        };
+        let direction = scale(remaining, remaining_length.recip());
+        let travel = (hit.distance - skin).max(0.0).min(remaining_length);
+        position = add(position, scale(direction, travel));
+        let untraveled = sub(remaining, scale(direction, travel));
+        let walkable = hit.normal.y >= slope_cosine;
+        if walkable {
+            grounded = true;
+            ground_entity_id = Some(hit.collider_id);
+            ground_normal = hit.normal;
+        }
+        collisions.push(hit);
+
+        // A blocked horizontal move can climb a bounded step only when there
+        // is head clearance, the entire horizontal remainder clears at the
+        // raised position, and a walkable surface is found below it.
+        let horizontal = Vec3::new(untraveled.x, 0.0, untraveled.z);
+        if !walkable
+            && settings.step_height > DIRECTION_EPSILON
+            && dot(horizontal, horizontal) > DIRECTION_EPSILON * DIRECTION_EPSILON
+        {
+            let rise = settings.step_height.max(0.0) + skin;
+            let upward = Vec3::new(0.0, rise, 0.0);
+            let head_clear = sweep(position, upward)?.is_none();
+            if head_clear {
+                let raised = add(position, upward);
+                if sweep(raised, horizontal)?.is_none() {
+                    let forward = add(raised, horizontal);
+                    let down_distance = rise + settings.ground_snap_distance.max(0.0) + skin;
+                    if let Some(step_ground) = sweep(forward, Vec3::new(0.0, -down_distance, 0.0))?
+                        && step_ground.normal.y >= slope_cosine
+                    {
+                        let descent = (step_ground.distance - skin).max(0.0);
+                        position = add(forward, Vec3::new(0.0, -descent, 0.0));
+                        grounded = true;
+                        ground_entity_id = Some(step_ground.collider_id);
+                        ground_normal = step_ground.normal;
+                        collisions.push(step_ground);
+                        remaining = Vec3::new(0.0, untraveled.y.max(0.0), 0.0);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Remove only the component entering the surface. The remainder is
+        // retained along the tangent, yielding stable wall and slope sliding.
+        let slide_normal = if !walkable
+            && hit.normal.y > 0.0
+            && hit.normal.x * hit.normal.x + hit.normal.z * hit.normal.z
+                > DIRECTION_EPSILON * DIRECTION_EPSILON
+        {
+            // Treat an over-limit uphill face as a wall in the horizontal
+            // plane. This prevents horizontal input from climbing a slope that
+            // failed the authored limit while preserving gravity/downhill
+            // motion and lateral wall sliding.
+            normalize(Vec3::new(hit.normal.x, 0.0, hit.normal.z))
+        } else {
+            hit.normal
+        };
+        let into_surface = dot(untraveled, slide_normal);
+        remaining = if into_surface < 0.0 {
+            sub(untraveled, scale(slide_normal, into_surface))
+        } else {
+            untraveled
+        };
+    }
+
+    if !grounded
+        && desired_displacement.y <= DIRECTION_EPSILON
+        && settings.ground_snap_distance > DIRECTION_EPSILON
+    {
+        let snap_distance = settings.ground_snap_distance + skin;
+        if let Some(hit) = sweep(position, Vec3::new(0.0, -snap_distance, 0.0))?
+            && hit.normal.y >= slope_cosine
+        {
+            // Preserve the configured skin separation even when the ordinary
+            // displacement was shorter than the gap and moved the capsule
+            // slightly closer this frame. A negative descent is the small
+            // upward correction that prevents gravity-driven sinking/jitter.
+            let descent = hit.distance - skin;
+            position.y -= descent;
+            grounded = true;
+            ground_entity_id = Some(hit.collider_id);
+            ground_normal = hit.normal;
+            collisions.push(hit);
+        }
+    }
+
+    Ok(CharacterMoveResult3D {
+        displacement: sub(position, center),
+        grounded,
+        ground_entity_id,
+        ground_normal,
+        collisions,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BroadphasePair3D {
     pub first_index: usize,
@@ -1116,8 +2152,11 @@ pub(crate) fn broadphase_pairs(colliders: &[Collider3D]) -> Physics3dResult<Vec<
 }
 
 /// Describes how closely a generated contact represents the authored shape.
-/// Bounds contacts are intentionally useful for triggers and diagnostics only;
-/// the runtime response helper ignores them.
+/// Bounds contacts are conservative. The discrete runtime response helper
+/// ignores them; opt-in translational CCD may stop on them to prevent tunneling
+/// where an exact cast is unavailable. Only triangle meshes reach this now —
+/// round shapes are re-rounded under non-uniform scale by
+/// [`round_geometry_under_scale`] rather than degrading to bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ContactQuality3D {
     Exact,
@@ -1179,6 +2218,7 @@ enum ExactContactShape3D {
 }
 
 fn contact_shape(collider: &Collider3D) -> Physics3dResult<Option<ExactContactShape3D>> {
+    let collider = collider.normalized();
     collider.shape.validate()?;
     let model = collider.transform.matrix()?;
     let matrix = model.values;
@@ -1283,8 +2323,14 @@ pub(crate) fn contact_pair(
         (Some(ExactContactShape3D::Capsule(first)), Some(ExactContactShape3D::Capsule(second))) => {
             Some(contact_capsule_capsule(first, second))
         }
-        // Capsule-box contact manifolds and all mesh contacts are intentionally
-        // bounds-only until a shape-accurate solver is available.
+        (Some(ExactContactShape3D::Capsule(first)), Some(ExactContactShape3D::Box(second))) => {
+            Some(contact_capsule_obb(first, second))
+        }
+        (Some(ExactContactShape3D::Box(first)), Some(ExactContactShape3D::Capsule(second))) => {
+            Some(contact_capsule_obb(second, first).map(ContactGeometry3D::flipped))
+        }
+        // Mesh contacts remain query/trigger bounds until a general manifold
+        // solver lands. Continuous capsule sweeps use exact mesh triangles.
         _ => None,
     };
 
@@ -1541,6 +2587,119 @@ fn contact_capsule_capsule(
     let (first_point, second_point) =
         closest_points_on_segments(first.start, first.end, second.start, second.end);
     contact_ball_ball(first_point, first.radius, second_point, second.radius)
+}
+
+fn contact_capsule_obb(capsule: WorldCapsule3D, obb: Obb3D) -> Option<ContactGeometry3D> {
+    let to_local = |point: Vec3| {
+        let offset = sub(point, obb.center);
+        Vec3::new(
+            dot(offset, obb.axes[0]),
+            dot(offset, obb.axes[1]),
+            dot(offset, obb.axes[2]),
+        )
+    };
+    let half = Vec3::new(
+        obb.half_extents[0],
+        obb.half_extents[1],
+        obb.half_extents[2],
+    );
+    let start = to_local(capsule.start);
+    let end = to_local(capsule.end);
+    let delta = sub(end, start);
+    let closest_box = |point: Vec3| {
+        Vec3::new(
+            point.x.clamp(-half.x, half.x),
+            point.y.clamp(-half.y, half.y),
+            point.z.clamp(-half.z, half.z),
+        )
+    };
+    let distance_squared = |amount: f32| {
+        let point = add(start, scale(delta, amount));
+        let box_point = closest_box(point);
+        dot(sub(point, box_point), sub(point, box_point))
+    };
+
+    // Squared distance from a segment to a convex box is convex along the
+    // segment. A bounded ternary refinement avoids the fragile case split of
+    // the classic slab/edge derivation while remaining deterministic.
+    let mut low = 0.0f32;
+    let mut high = 1.0f32;
+    for _ in 0..32 {
+        let third = (high - low) / 3.0;
+        let left = low + third;
+        let right = high - third;
+        if distance_squared(left) <= distance_squared(right) {
+            high = right;
+        } else {
+            low = left;
+        }
+    }
+    let amount = (low + high) * 0.5;
+    let capsule_local = add(start, scale(delta, amount));
+    let box_local = closest_box(capsule_local);
+    let toward_capsule = sub(capsule_local, box_local);
+    let distance_squared = dot(toward_capsule, toward_capsule);
+    if distance_squared > capsule.radius * capsule.radius {
+        return None;
+    }
+
+    let local_to_world_direction = |direction: Vec3| {
+        add(
+            scale(obb.axes[0], direction.x),
+            add(
+                scale(obb.axes[1], direction.y),
+                scale(obb.axes[2], direction.z),
+            ),
+        )
+    };
+    let local_to_world_point = |point: Vec3| {
+        add(
+            obb.center,
+            add(
+                scale(obb.axes[0], point.x),
+                add(scale(obb.axes[1], point.y), scale(obb.axes[2], point.z)),
+            ),
+        )
+    };
+    if distance_squared > DIRECTION_EPSILON * DIRECTION_EPSILON {
+        let distance = distance_squared.sqrt();
+        // Contact normal points from the capsule (first) toward the box.
+        let normal = scale(local_to_world_direction(toward_capsule), -distance.recip());
+        let capsule_world = local_to_world_point(capsule_local);
+        let box_world = local_to_world_point(box_local);
+        return Some(ContactGeometry3D {
+            normal,
+            penetration: (capsule.radius - distance).max(0.0),
+            point: scale(
+                add(add(capsule_world, scale(normal, capsule.radius)), box_world),
+                0.5,
+            ),
+        });
+    }
+
+    // The closest segment point is inside the box. Select the nearest face;
+    // the contact normal points inward so subtracting it ejects the capsule.
+    let gaps = [
+        half.x - capsule_local.x.abs(),
+        half.y - capsule_local.y.abs(),
+        half.z - capsule_local.z.abs(),
+    ];
+    let axis = if gaps[0] <= gaps[1] && gaps[0] <= gaps[2] {
+        0
+    } else if gaps[1] <= gaps[2] {
+        1
+    } else {
+        2
+    };
+    let coordinate = component(capsule_local, axis);
+    let outward_local = axis_vector(axis, if coordinate < 0.0 { -1.0 } else { 1.0 });
+    let outward = local_to_world_direction(outward_local);
+    let capsule_world = local_to_world_point(capsule_local);
+    Some(ContactGeometry3D {
+        normal: scale(outward, -1.0),
+        penetration: capsule.radius + gaps[axis].max(0.0),
+        point: add(capsule_world, scale(outward, gaps[axis].max(0.0))),
+    })
 }
 
 fn closest_point_on_segment(start: Vec3, end: Vec3, point: Vec3) -> Vec3 {
@@ -1838,6 +2997,117 @@ fn ray_capsule(
     })
 }
 
+fn ray_capsule_segment(
+    ray: LocalRay,
+    start: Vec3,
+    end: Vec3,
+    radius: f32,
+    max_distance: f32,
+) -> Option<LocalShapeHit> {
+    let segment = sub(end, start);
+    let length = dot(segment, segment).sqrt();
+    if length <= DIRECTION_EPSILON {
+        return ray_sphere(ray, start, radius, max_distance).map(|hit| LocalShapeHit {
+            distance: hit.distance,
+            normal: hit.normal,
+            triangle_index: None,
+            barycentric: None,
+            mesh_normal: false,
+        });
+    }
+    let y_axis = scale(segment, length.recip());
+    let helper = if y_axis.y.abs() < 0.9 {
+        Vec3::new(0.0, 1.0, 0.0)
+    } else {
+        Vec3::new(1.0, 0.0, 0.0)
+    };
+    let x_axis = normalize(cross(helper, y_axis));
+    let z_axis = normalize(cross(x_axis, y_axis));
+    let center = scale(add(start, end), 0.5);
+    let to_local_point = |point: Vec3| {
+        let delta = sub(point, center);
+        Vec3::new(dot(delta, x_axis), dot(delta, y_axis), dot(delta, z_axis))
+    };
+    let to_local_direction = |direction: Vec3| {
+        Vec3::new(
+            dot(direction, x_axis),
+            dot(direction, y_axis),
+            dot(direction, z_axis),
+        )
+    };
+    let mut hit = ray_capsule(
+        LocalRay {
+            origin: to_local_point(ray.origin),
+            direction: to_local_direction(ray.direction),
+        },
+        radius,
+        length * 0.5,
+        max_distance,
+    )?;
+    hit.normal = add(
+        scale(x_axis, hit.normal.x),
+        add(scale(y_axis, hit.normal.y), scale(z_axis, hit.normal.z)),
+    );
+    Some(hit)
+}
+
+fn point_in_triangle(point: Vec3, triangle: [Vec3; 3], normal: Vec3) -> bool {
+    const EDGE_EPSILON: f32 = 1.0e-5;
+    for (start, end) in [
+        (triangle[0], triangle[1]),
+        (triangle[1], triangle[2]),
+        (triangle[2], triangle[0]),
+    ] {
+        if dot(cross(sub(end, start), sub(point, start)), normal) < -EDGE_EPSILON {
+            return false;
+        }
+    }
+    true
+}
+
+fn closest_point_on_triangle(point: Vec3, triangle: [Vec3; 3]) -> Vec3 {
+    // Real-Time Collision Detection, Christer Ericson, section 5.1.5.
+    let a = triangle[0];
+    let b = triangle[1];
+    let c = triangle[2];
+    let ab = sub(b, a);
+    let ac = sub(c, a);
+    let ap = sub(point, a);
+    let d1 = dot(ab, ap);
+    let d2 = dot(ac, ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return a;
+    }
+    let bp = sub(point, b);
+    let d3 = dot(ab, bp);
+    let d4 = dot(ac, bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return b;
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        return add(a, scale(ab, d1 / (d1 - d3)));
+    }
+    let cp = sub(point, c);
+    let d5 = dot(ab, cp);
+    let d6 = dot(ac, cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return c;
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        return add(a, scale(ac, d2 / (d2 - d6)));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0 {
+        return add(b, scale(sub(c, b), (d4 - d3) / ((d4 - d3) + (d5 - d6))));
+    }
+    let denominator = (va + vb + vc).recip();
+    let v = vb * denominator;
+    let w = vc * denominator;
+    add(a, add(scale(ab, v), scale(ac, w)))
+}
+
 /// Double-sided Moller-Trumbore test performed in f64 to keep edge and large
 /// world-coordinate queries stable while retaining compact f32 engine data.
 fn ray_triangle(ray: LocalRay, vertices: [Vec3; 3], max_distance: f32) -> Option<(f32, [f32; 3])> {
@@ -2099,6 +3369,323 @@ mod tests {
     }
 
     #[test]
+    fn capsule_box_contacts_are_exact_for_rotated_slopes() {
+        let mut capsule = Collider3D::new(
+            1,
+            ColliderShape3D::Capsule {
+                radius: 0.5,
+                half_height: 0.5,
+            },
+        );
+        capsule.transform.position = Vec3::new(0.0, 1.1, 0.0);
+        let mut slope = Collider3D::new(
+            2,
+            ColliderShape3D::Box {
+                half_extents: Vec3::new(3.0, 0.5, 3.0),
+            },
+        );
+        slope.transform.euler = Vec3::new(0.0, 0.0, 15.0);
+
+        let contact = contact_pair(&capsule, &slope)
+            .expect("capsule/box query")
+            .expect("capsule overlaps rotated slope");
+        assert_eq!(contact.quality, ContactQuality3D::Exact);
+        assert!(contact.penetration >= 0.0);
+        assert!(contact.normal.y < -0.8, "normal should point toward slope");
+    }
+
+    #[test]
+    fn capsule_sweep_hits_boxes_mesh_faces_and_thin_obstacles_without_tunneling() {
+        let ground = Collider3D::new(
+            10,
+            ColliderShape3D::Box {
+                half_extents: Vec3::new(5.0, 0.5, 5.0),
+            },
+        );
+        let hit = sweep_capsule_nearest(
+            &[ground],
+            Vec3::new(0.0, 3.0, 0.0),
+            0.5,
+            0.5,
+            Vec3::new(0.0, -5.0, 0.0),
+            QueryFilter3D::default(),
+            None,
+        )
+        .expect("box sweep")
+        .expect("box hit");
+        assert_close(hit.distance, 1.5);
+        assert_close(hit.normal.y, 1.0);
+
+        let floor_mesh = triangle_handle([[-5.0, 0.0, -5.0], [0.0, 0.0, 5.0], [5.0, 0.0, -5.0]]);
+        let floor = Collider3D::new(
+            11,
+            ColliderShape3D::triangle_mesh(floor_mesh).expect("floor mesh collider"),
+        );
+        let hit = sweep_capsule_nearest(
+            &[floor],
+            Vec3::new(0.0, 3.0, 0.0),
+            0.5,
+            0.5,
+            Vec3::new(0.0, -5.0, 0.0),
+            QueryFilter3D::default(),
+            None,
+        )
+        .expect("mesh sweep")
+        .expect("mesh hit");
+        assert_close(hit.distance, 2.0);
+        assert_close(hit.normal.y, 1.0);
+
+        let mut thin_wall = Collider3D::new(
+            12,
+            ColliderShape3D::Box {
+                half_extents: Vec3::new(0.01, 5.0, 5.0),
+            },
+        );
+        thin_wall.transform.position = Vec3::ZERO;
+        let hit = sweep_capsule_nearest(
+            &[thin_wall],
+            Vec3::new(-100.0, 0.0, 0.0),
+            0.5,
+            0.5,
+            Vec3::new(200.0, 0.0, 0.0),
+            QueryFilter3D::default(),
+            None,
+        )
+        .expect("thin-wall sweep")
+        .expect("thin wall must not tunnel");
+        assert!(
+            (hit.distance - 99.49).abs() < 0.01,
+            "distance={}",
+            hit.distance
+        );
+        assert_close(hit.normal.x, -1.0);
+
+        let mut filtered = Collider3D::new(
+            13,
+            ColliderShape3D::Box {
+                half_extents: Vec3::new(1.0, 1.0, 1.0),
+            },
+        );
+        filtered.filter = CollisionFilter3D::new(0b0010, 0b0001);
+        let blocked = sweep_capsule_nearest(
+            &[filtered.clone()],
+            Vec3::new(-3.0, 0.0, 0.0),
+            0.5,
+            0.5,
+            Vec3::new(6.0, 0.0, 0.0),
+            QueryFilter3D {
+                collision: CollisionFilter3D::new(0b0001, 0b0001),
+                include_triggers: false,
+            },
+            None,
+        )
+        .expect("filtered sweep");
+        assert!(blocked.is_none());
+        let allowed = sweep_capsule_nearest(
+            &[filtered],
+            Vec3::new(-3.0, 0.0, 0.0),
+            0.5,
+            0.5,
+            Vec3::new(6.0, 0.0, 0.0),
+            QueryFilter3D {
+                collision: CollisionFilter3D::new(0b0001, 0b0010),
+                include_triggers: false,
+            },
+            None,
+        )
+        .expect("allowed sweep");
+        assert!(allowed.is_some());
+    }
+
+    #[test]
+    fn authored_collider_sweep_reports_thin_primitive_mesh_trigger_and_filter_hits() {
+        let mut moving = Collider3D::new(100, ColliderShape3D::Sphere { radius: 0.5 });
+        moving.transform.position = Vec3::new(-10.0, 0.0, 0.0);
+        moving.filter = CollisionFilter3D::new(0b0001, 0b0110);
+
+        let mut trigger = Collider3D::new(
+            101,
+            ColliderShape3D::Box {
+                half_extents: Vec3::new(0.05, 2.0, 2.0),
+            },
+        );
+        trigger.transform.position.x = -5.0;
+        trigger.is_trigger = true;
+        trigger.filter = CollisionFilter3D::new(0b0010, 0b0001);
+
+        let mut wall = Collider3D::new(
+            102,
+            ColliderShape3D::Box {
+                half_extents: Vec3::new(0.01, 2.0, 2.0),
+            },
+        );
+        wall.filter = CollisionFilter3D::new(0b0100, 0b0001);
+
+        let mut excluded = Collider3D::new(
+            103,
+            ColliderShape3D::Box {
+                half_extents: Vec3::new(0.05, 2.0, 2.0),
+            },
+        );
+        excluded.transform.position.x = -7.0;
+        excluded.filter = CollisionFilter3D::new(0b1000, 0b0001);
+
+        let hits = sweep_collider_hits(
+            &[excluded, trigger, wall],
+            &moving,
+            Vec3::new(20.0, 0.0, 0.0),
+            Some(moving.id),
+        )
+        .expect("authored collider sweep");
+        assert_eq!(hits.len(), 2, "filtered obstacle must be absent");
+        assert_eq!(hits[0].collider_id, 101);
+        assert!(hits[0].is_trigger);
+        assert!((hits[0].distance - 4.45).abs() < 0.01);
+        assert_eq!(hits[1].collider_id, 102);
+        assert!(!hits[1].is_trigger);
+        assert_eq!(hits[1].quality, ContactQuality3D::Exact);
+        assert!((hits[1].distance - 9.49).abs() < 0.01);
+        assert_close(hits[1].normal.x, -1.0);
+
+        let mesh = triangle_handle([[0.0, -3.0, -3.0], [0.0, 3.0, -3.0], [0.0, 0.0, 3.0]]);
+        let mut mesh_wall = Collider3D::new(
+            104,
+            ColliderShape3D::triangle_mesh(mesh).expect("mesh wall"),
+        );
+        mesh_wall.filter = CollisionFilter3D::new(0b0100, 0b0001);
+        let mesh_hits = sweep_collider_hits(
+            &[mesh_wall],
+            &moving,
+            Vec3::new(20.0, 0.0, 0.0),
+            Some(moving.id),
+        )
+        .expect("sphere/mesh sweep");
+        assert_eq!(mesh_hits.len(), 1);
+        assert_eq!(mesh_hits[0].quality, ContactQuality3D::Exact);
+        assert!((mesh_hits[0].distance - 9.5).abs() < 0.01);
+        assert_close(mesh_hits[0].normal.x, -1.0);
+
+        let mut separating = moving.clone();
+        separating.transform.position.x = -0.4;
+        let mut separating_wall = Collider3D::new(
+            105,
+            ColliderShape3D::Box {
+                half_extents: Vec3::new(0.1, 2.0, 2.0),
+            },
+        );
+        separating_wall.filter = CollisionFilter3D::new(0b0100, 0b0001);
+        assert!(
+            sweep_collider_hits(
+                &[separating_wall],
+                &separating,
+                Vec3::new(-2.0, 0.0, 0.0),
+                Some(separating.id),
+            )
+            .expect("separating sweep")
+            .is_empty(),
+            "CCD must not pin a body that is exiting an initial overlap"
+        );
+    }
+
+    #[test]
+    fn character_move_steps_over_low_obstacles_and_slides_along_walls() {
+        let mut floor = Collider3D::new(
+            20,
+            ColliderShape3D::Box {
+                half_extents: Vec3::new(10.0, 0.5, 10.0),
+            },
+        );
+        floor.transform.position.y = -0.5;
+        let mut step = Collider3D::new(
+            21,
+            ColliderShape3D::Box {
+                half_extents: Vec3::new(0.25, 0.1, 1.0),
+            },
+        );
+        step.transform.position = Vec3::new(1.0, 0.1, 0.0);
+        let settings = CharacterMoveSettings3D {
+            radius: 0.5,
+            half_height: 0.5,
+            skin_width: 0.02,
+            max_slope_cosine: 50.0f32.to_radians().cos(),
+            step_height: 0.3,
+            ground_snap_distance: 0.2,
+            max_iterations: 6,
+            query: QueryFilter3D::default(),
+            exclude_entity_id: None,
+        };
+        let result = move_character_capsule(
+            &[floor.clone(), step],
+            Vec3::new(0.0, 1.02, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            settings,
+        )
+        .expect("step movement");
+        assert!(
+            result.displacement.x > 1.95,
+            "did not clear step: {result:?}"
+        );
+        assert!(result.grounded);
+        assert_eq!(result.ground_entity_id, Some(20));
+
+        let mut wall = Collider3D::new(
+            22,
+            ColliderShape3D::Box {
+                half_extents: Vec3::new(0.1, 5.0, 5.0),
+            },
+        );
+        wall.transform.position.x = 1.0;
+        let mut no_step = settings;
+        no_step.step_height = 0.0;
+        no_step.ground_snap_distance = 0.0;
+        let result = move_character_capsule(
+            &[wall],
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::new(2.0, 0.0, 1.0),
+            no_step,
+        )
+        .expect("wall slide");
+        assert!(result.displacement.x > 0.35 && result.displacement.x < 0.41);
+        assert!(
+            result.displacement.z > 0.95,
+            "lost tangential motion: {result:?}"
+        );
+
+        let mut steep_slope = Collider3D::new(
+            23,
+            ColliderShape3D::Box {
+                half_extents: Vec3::new(3.0, 0.5, 3.0),
+            },
+        );
+        steep_slope.transform.euler.z = 60.0;
+        let mut slope_settings = no_step;
+        slope_settings.ground_snap_distance = 0.2;
+        slope_settings.max_slope_cosine = 45.0f32.to_radians().cos();
+        let blocked_slope = move_character_capsule(
+            &[steep_slope.clone()],
+            Vec3::new(0.0, 3.0, 0.0),
+            Vec3::new(0.0, -5.0, 0.0),
+            slope_settings,
+        )
+        .expect("steep-slope movement");
+        assert!(
+            !blocked_slope.grounded,
+            "a 60-degree surface must not ground a 45-degree controller: {blocked_slope:?}"
+        );
+
+        slope_settings.max_slope_cosine = 70.0f32.to_radians().cos();
+        let walkable_slope = move_character_capsule(
+            &[steep_slope],
+            Vec3::new(0.0, 3.0, 0.0),
+            Vec3::new(0.0, -5.0, 0.0),
+            slope_settings,
+        )
+        .expect("walkable-slope movement");
+        assert!(walkable_slope.grounded, "{walkable_slope:?}");
+        assert_eq!(walkable_slope.ground_entity_id, Some(23));
+    }
+
+    #[test]
     fn rotated_mesh_reports_transformed_winding_normal_and_distance() {
         let mesh = triangle_handle([[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]]);
         let mut collider = Collider3D::new(
@@ -2249,7 +3836,7 @@ mod tests {
     }
 
     #[test]
-    fn mesh_and_nonuniform_round_shapes_are_explicitly_bounds_only() {
+    fn mesh_contacts_are_explicitly_bounds_only() {
         let mesh = triangle_handle([[-2.0, -2.0, 0.0], [2.0, -2.0, 0.0], [0.0, 2.0, 0.0]]);
         let mesh = Collider3D::new(
             20,
@@ -2260,13 +3847,58 @@ mod tests {
             .expect("mesh contact query")
             .expect("bounds overlap");
         assert_eq!(mesh_contact.quality, ContactQuality3D::Bounds);
+    }
 
+    #[test]
+    fn nonuniformly_scaled_round_shapes_stay_round_and_exact() {
+        // A stretched sphere takes its largest scale rather than becoming an
+        // ellipsoid, so it keeps an exact — and therefore resolvable — contact.
+        // Left as an ellipsoid it would only ever produce a bounds contact, and
+        // a rigidbody carrying it would fall through the world.
+        let sphere = Collider3D::new(21, ColliderShape3D::Sphere { radius: 0.5 });
         let mut stretched = Collider3D::new(22, ColliderShape3D::Sphere { radius: 1.0 });
         stretched.transform.scale = Vec3::new(2.0, 1.0, 1.0);
+        stretched.transform.position = Vec3::new(-2.0, 0.0, 0.0);
         let round_contact = contact_pair(&stretched, &sphere)
-            .expect("ellipsoid bounds query")
-            .expect("bounds overlap");
-        assert_eq!(round_contact.quality, ContactQuality3D::Bounds);
+            .expect("stretched sphere query")
+            .expect("spheres overlap");
+        assert_eq!(round_contact.quality, ContactQuality3D::Exact);
+        assert_close(round_contact.normal.x, 1.0);
+        // Radius 1.0 * max scale 2.0, plus 0.5, less the 2.0 centre distance.
+        assert_close(round_contact.penetration, 0.5);
+
+        // Bounds, rays, and contacts must all read the same baked geometry.
+        let bounds = stretched.world_aabb().expect("stretched sphere bounds");
+        assert_close(bounds.min.y, -2.0);
+        assert_close(bounds.max.y, 2.0);
+        let hit = stretched
+            .raycast(
+                Ray3D::new(Vec3::new(-2.0, 5.0, 0.0), Vec3::new(0.0, -1.0, 0.0))
+                    .expect("downward ray"),
+                10.0,
+                QueryFilter3D::default(),
+            )
+            .expect("stretched sphere raycast")
+            .expect("ray hits the stretched sphere");
+        assert_close(hit.distance, 3.0);
+
+        // A stretched capsule keeps its own local-Y segment and takes the
+        // larger of the two perpendicular scales for its cap radius.
+        let mut capsule = Collider3D::new(
+            23,
+            ColliderShape3D::Capsule {
+                radius: 0.5,
+                half_height: 1.0,
+            },
+        );
+        capsule.transform.scale = Vec3::new(2.0, 3.0, 1.0);
+        let capsule_bounds = capsule.world_aabb().expect("stretched capsule bounds");
+        assert_close(capsule_bounds.max.x, 1.0);
+        assert_close(capsule_bounds.max.y, 4.0);
+        let capsule_contact = contact_pair(&capsule, &sphere)
+            .expect("stretched capsule query")
+            .expect("capsule overlaps the sphere");
+        assert_eq!(capsule_contact.quality, ContactQuality3D::Exact);
     }
 
     #[test]

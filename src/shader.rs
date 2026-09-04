@@ -253,9 +253,23 @@ layout(binding = {}) uniform sampler __neolove_{name}_sampler;\n\
         next_binding += 2;
     }
 
+    let body = body_lines.join("\n").replace("gl_FragColor", "f_color");
+    if !body.contains("void main") {
+        return Err("fragment shader is missing void main".to_string());
+    }
+    // Runtime fragment shaders historically authored display-referred output.
+    // The native scene now blends in a linear RGBA16F target, so retain that
+    // public contract by decoding the custom result before it enters the HDR
+    // frame graph. The final presentation pass performs the matching encode.
+    let body = body.replacen("void main", "void __neolove_display_main", 1);
     out.push('\n');
-    out.push_str(&body_lines.join("\n").replace("gl_FragColor", "f_color"));
-    out.push('\n');
+    out.push_str(&body);
+    out.push_str(
+        "\nvoid main() {\n\
+    __neolove_display_main();\n\
+    f_color.rgb = pow(max(f_color.rgb, vec3(0.0)), vec3(2.2));\n\
+}\n",
+    );
 
     Ok((out, float_uniforms, texture_uniforms))
 }
@@ -533,6 +547,22 @@ mod tests {
         assert!(source.contains("varying mediump vec2 uv;"));
         assert!(source.contains("varying mediump vec4 color;"));
         assert!(source.contains("texture2D(Texture, uv)"));
+    }
+
+    #[cfg(all(not(target_os = "emscripten"), feature = "vulkan"))]
+    #[test]
+    fn native_custom_fragment_preserves_display_space_contract_in_hdr_scene() {
+        let (source, uniforms, textures) = build_runtime_fragment_source(
+            "#version 450\nuniform float Gain;\n\
+             void main() { gl_FragColor = texture2D(Texture, uv) * color * Gain; }",
+        )
+        .expect("runtime fragment source");
+        assert!(source.contains("void __neolove_display_main()"));
+        assert!(source.contains("__neolove_display_main();"));
+        assert!(source.contains("f_color.rgb = pow(max(f_color.rgb"));
+        assert!(!source.contains("gl_FragColor"));
+        assert_eq!(uniforms, vec![("Gain".to_string(), 1)]);
+        assert!(textures.is_empty());
     }
 
     #[test]

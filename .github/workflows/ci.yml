@@ -20,7 +20,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libasound2-dev
+          sudo apt-get install -y pkg-config libasound2-dev xvfb mesa-vulkan-drivers
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -39,6 +39,25 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets --all-features
+
+      - name: Build 3D visual parity runner
+        if: runner.os == 'Linux'
+        run: cargo build --features vulkan
+
+      - name: Validate software and Vulkan 3D runtime parity
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          fixture=test-artifacts/projects/3d-parity-pbr
+          baseline="$fixture/baseline/software-320x180.png"
+          xvfb-run -a target/debug/neolove validate-3d "$fixture" \
+            --baseline "$baseline" --backend software --width 320 --height 180 \
+            --report "$RUNNER_TEMP/3d-software-report.json" \
+            --diff "$RUNNER_TEMP/3d-software-diff.png"
+          xvfb-run -a target/debug/neolove validate-3d "$fixture" \
+            --baseline "$baseline" --backend vulkan --width 320 --height 180 \
+            --report "$RUNNER_TEMP/3d-vulkan-report.json" \
+            --diff "$RUNNER_TEMP/3d-vulkan-diff.png"
 
       - name: Check WebAssembly Bootstrap Build
         if: runner.os == 'Linux'

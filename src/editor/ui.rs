@@ -39,6 +39,10 @@ pub mod icon {
     pub const FOLDER_OPEN: char = '\u{e2c8}';
     pub const DELETE: char = '\u{e872}';
     pub const PLAY: char = '\u{e037}';
+    pub const PAUSE: char = '\u{e034}';
+    pub const STOP: char = '\u{e047}';
+    pub const SKIP_NEXT: char = '\u{e044}';
+    pub const REPLAY: char = '\u{e042}';
     pub const CODE: char = '\u{e86f}';
     pub const GRID_ON: char = '\u{e3ec}';
     pub const GRID_OFF: char = '\u{e3eb}';
@@ -636,6 +640,90 @@ impl<'a> Painter<'a> {
                         *pixel = packed;
                     } else {
                         *pixel = blend(*pixel, color);
+                    }
+                }
+                w0 += x_step0;
+                w1 += x_step1;
+                w2 += x_step2;
+            }
+        }
+    }
+
+    /// Fill a screen-space triangle using the same zero-to-one depth convention
+    /// as the 3D renderers. `depth_buffer` is framebuffer-sized and is shared by
+    /// every triangle in one Scene View pass, so intersecting/adjacent faces are
+    /// resolved per pixel instead of by an unreliable average triangle depth.
+    pub fn fill_triangle_depth_tested(
+        &mut self,
+        points: [(f32, f32); 3],
+        depths: [f32; 3],
+        color: Rgba,
+        depth_buffer: &mut [f32],
+    ) {
+        if color[3] == 0
+            || depth_buffer.len() != self.width.saturating_mul(self.height)
+            || points
+                .iter()
+                .flat_map(|point| [point.0, point.1])
+                .chain(depths)
+                .any(|value| !value.is_finite())
+        {
+            return;
+        }
+
+        let [p0, p1, p2] = points;
+        let area = edge(p0, p1, p2);
+        if area.abs() < 1e-6 {
+            return;
+        }
+        let sign = area.signum();
+        let inverse_area = area.abs().recip();
+        let x0 = (p0.0.min(p1.0).min(p2.0).floor() as i64).max(self.clip[0]);
+        let x1 = (p0.0.max(p1.0).max(p2.0).ceil() as i64).min(self.clip[2]);
+        let y0 = (p0.1.min(p1.1).min(p2.1).floor() as i64).max(self.clip[1]);
+        let y1 = (p0.1.max(p1.1).max(p2.1).ceil() as i64).min(self.clip[3]);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+
+        let sample = (x0 as f32 + 0.5, y0 as f32 + 0.5);
+        let row_w0 = edge(p1, p2, sample) * sign;
+        let row_w1 = edge(p2, p0, sample) * sign;
+        let row_w2 = edge(p0, p1, sample) * sign;
+        let x_step0 = -(p2.1 - p1.1) * sign;
+        let x_step1 = -(p0.1 - p2.1) * sign;
+        let x_step2 = -(p1.1 - p0.1) * sign;
+        let y_step0 = (p2.0 - p1.0) * sign;
+        let y_step1 = (p0.0 - p2.0) * sign;
+        let y_step2 = (p1.0 - p0.0) * sign;
+        let opaque = color[3] == 255;
+        let packed = pack(color);
+
+        for y in y0..y1 {
+            let row_offset = y as usize * self.width;
+            let row_delta = (y - y0) as f32;
+            let mut w0 = row_w0 + y_step0 * row_delta;
+            let mut w1 = row_w1 + y_step1 * row_delta;
+            let mut w2 = row_w2 + y_step2 * row_delta;
+            for x in x0..x1 {
+                if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
+                    let barycentric = [
+                        w0 * inverse_area,
+                        w1 * inverse_area,
+                        w2 * inverse_area,
+                    ];
+                    let depth = depths[0] * barycentric[0]
+                        + depths[1] * barycentric[1]
+                        + depths[2] * barycentric[2];
+                    let pixel_index = row_offset + x as usize;
+                    if (0.0..=1.0).contains(&depth) && depth < depth_buffer[pixel_index] {
+                        depth_buffer[pixel_index] = depth;
+                        let pixel = &mut self.buffer[pixel_index];
+                        if opaque {
+                            *pixel = packed;
+                        } else {
+                            *pixel = blend(*pixel, color);
+                        }
                     }
                 }
                 w0 += x_step0;
@@ -1368,6 +1456,8 @@ pub struct FrameInput {
     /// Modifier keys held during this frame.
     pub ctrl: bool,
     pub shift: bool,
+    /// Alt/Option enables orbit-around-selection in the 3D Scene View.
+    pub alt: bool,
     /// `F` frames the selection; `F2` renames it; `0` resets the view.
     pub focus_selection: bool,
     pub rename: bool,
@@ -1384,6 +1474,9 @@ pub struct FrameInput {
     pub key_d: bool,
     pub key_q: bool,
     pub key_e: bool,
+    /// Complete runtime key state from the editor window. Scene View ignores
+    /// this; the embedded 3D Game View forwards it to the isolated runtime.
+    pub runtime_keys_down: Vec<String>,
     /// Physical pixels per logical window point. Viewport interaction divides
     /// pointer travel by this so camera sensitivity is DPI-independent.
     pub display_scale: f32,
@@ -2605,6 +2698,36 @@ mod tests {
         painter.fill_triangle((0.0, 0.0), (0.0, 10.0), (10.0, 10.0), [255, 255, 255, 255]);
         assert_ne!(buf[8 * 12 + 2], 0, "(2,8) is inside the triangle");
         assert_eq!(buf[2 * 12 + 8], 0, "(8,2) is outside the triangle");
+    }
+
+    #[test]
+    fn depth_tested_triangles_keep_the_nearest_fragment_regardless_of_draw_order() {
+        let fonts = load_fonts().expect("load fonts");
+        for near_first in [false, true] {
+            let mut buffer = vec![0u32; 12 * 12];
+            let mut depth = vec![f32::INFINITY; buffer.len()];
+            let mut painter = Painter::new(&mut buffer, 12, 12, fonts.clone());
+            let points = [(1.0, 1.0), (1.0, 11.0), (11.0, 11.0)];
+            let mut draw = |depth_value, color| {
+                painter.fill_triangle_depth_tested(
+                    points,
+                    [depth_value; 3],
+                    color,
+                    &mut depth,
+                );
+            };
+            if near_first {
+                draw(0.2, [255, 0, 0, 255]);
+                draw(0.8, [0, 0, 255, 255]);
+            } else {
+                draw(0.8, [0, 0, 255, 255]);
+                draw(0.2, [255, 0, 0, 255]);
+            }
+            drop(draw);
+            drop(painter);
+            assert_eq!(buffer[8 * 12 + 3], 0xff0000);
+            assert!((depth[8 * 12 + 3] - 0.2).abs() < 1e-6);
+        }
     }
 
     #[test]

@@ -44,6 +44,9 @@ pub struct Runtime {
     exit_reason: Rc<RefCell<Option<String>>>,
     physics_world: Option<PhysicsWorld>,
     physics_signature: u64,
+    /// Cheap no-physics guard. Once set it intentionally stays set; the full
+    /// marker scan remains authoritative after a project has used physics.
+    physics_ever_registered: Rc<Cell<bool>>,
     platform: SharedPlatformState,
     render_state: SharedRenderState,
     root_table: Option<Table>,
@@ -66,10 +69,24 @@ struct PendingComponentAwake {
 }
 
 /// A single line of runtime output, forwarded to the editor's logger window.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeLogLine {
     pub level: String,
     pub message: String,
+    #[serde(default)]
+    pub entity_id: Option<usize>,
+    #[serde(default)]
+    pub component_index: Option<usize>,
+    #[serde(default)]
+    pub component: Option<String>,
+    #[serde(default)]
+    pub property: Option<String>,
+    #[serde(default)]
+    pub asset: Option<String>,
+    #[serde(default)]
+    pub script: Option<String>,
+    #[serde(default)]
+    pub line: Option<u32>,
 }
 
 /// A flattened, serializable view of one live entity, sent to the editor's
@@ -77,6 +94,11 @@ pub struct RuntimeLogLine {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EntitySnapshot {
     pub id: usize,
+    /// Stable authored scene id carried by editor-generated 3D scene loaders.
+    /// Runtime allocation ids are deliberately separate because deletion,
+    /// inactive entities, prefabs, and scripts can change allocation order.
+    #[serde(default)]
+    pub source_id: Option<u64>,
     pub name: String,
     pub parent: Option<usize>,
     pub x: f32,
@@ -96,6 +118,12 @@ pub struct EntitySnapshot {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ComponentSnapshot {
     pub name: String,
+    /// Stable authored component slot for editor-generated 3D scenes.
+    #[serde(default)]
+    pub source_index: Option<usize>,
+    /// Exact authored component identity (`core:<name>` or `script:<path>`).
+    #[serde(default)]
+    pub source_key: Option<String>,
     pub fields: Vec<(String, String)>,
 }
 
@@ -528,6 +556,44 @@ fn web_update_trace(_index: usize) -> Option<usize> {
     None
 }
 
+fn entity_has_tag(entity: &Table, query: &str) -> mlua::Result<bool> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(false);
+    }
+    let components: Table = entity.get("components")?;
+    for component in components.sequence_values::<Table>() {
+        let component = component?;
+        if component
+            .get::<String>("__neolove_component")
+            .is_ok_and(|name| matches!(name.as_str(), "Tag" | "Tag3D"))
+            && component.get::<bool>("enabled").unwrap_or(true)
+            && component
+                .get::<String>("tag")
+                .is_ok_and(|tag| tag.trim() == query)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn entity_is_in_layer(entity: &Table, query: i64) -> mlua::Result<bool> {
+    let components: Table = entity.get("components")?;
+    for component in components.sequence_values::<Table>() {
+        let component = component?;
+        if component
+            .get::<String>("__neolove_component")
+            .is_ok_and(|name| matches!(name.as_str(), "Layer" | "Layer3D"))
+            && component.get::<bool>("enabled").unwrap_or(true)
+            && component.get::<i64>("layer").unwrap_or(0) == query
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn attach_entity_methods(lua: &Lua, entity: &Table) -> mlua::Result<()> {
     let listen = lua.create_function(
         move |lua, (entity, event_name, callback): (Table, String, Function)| {
@@ -586,6 +652,23 @@ pub(crate) fn attach_entity_methods(lua: &Lua, entity: &Table) -> mlua::Result<(
     })?;
     entity.set("findFirstChild", find_first_child.clone())?;
     entity.set("FindFirstChild", find_first_child)?;
+
+    let has_tag =
+        lua.create_function(|_lua, (entity, tag): (Table, String)| entity_has_tag(&entity, &tag))?;
+    entity.set("hasTag", has_tag.clone())?;
+    entity.set("HasTag", has_tag.clone())?;
+    // Compatibility aliases for scenes/scripts authored while these shared
+    // metadata components were briefly exposed as 3D-only.
+    entity.set("hasTag3D", has_tag.clone())?;
+    entity.set("HasTag3D", has_tag)?;
+
+    let is_in_layer = lua.create_function(|_lua, (entity, layer): (Table, i64)| {
+        entity_is_in_layer(&entity, layer)
+    })?;
+    entity.set("isInLayer", is_in_layer.clone())?;
+    entity.set("IsInLayer", is_in_layer.clone())?;
+    entity.set("isInLayer3D", is_in_layer.clone())?;
+    entity.set("IsInLayer3D", is_in_layer)?;
 
     let get_world_position = lua.create_function(move |lua, entity: Table| {
         let transform: Table = lua.globals().get("transform")?;
@@ -1125,6 +1208,69 @@ pub(crate) fn get_global_transform_3d(entity: &Table) -> mlua::Result<GlobalTran
     })
 }
 
+/// Resolve a 3D transform while sharing already-computed ancestors across a
+/// rendering pass. Entity ids are stable for the lifetime of a runtime frame.
+pub(crate) fn get_global_transform_3d_cached(
+    entity: &Table,
+    cache: &mut HashMap<usize, GlobalTransform3D>,
+) -> mlua::Result<GlobalTransform3D> {
+    use crate::render3d::{Mat4, Vec3};
+
+    let entity_id = entity.raw_get::<usize>("id").ok();
+    if let Some(transform) = entity_id.and_then(|id| cache.get(&id).copied()) {
+        return Ok(transform);
+    }
+
+    let parent_transform = match entity.get::<Option<Table>>("parent")? {
+        Some(parent) => Some(get_global_transform_3d_cached(&parent, cache)?),
+        None => None,
+    };
+    let position = Vec3::new(
+        finite_entity_number(entity, "x", 0.0),
+        finite_entity_number(entity, "y", 0.0),
+        finite_entity_number(entity, "position_z", 0.0),
+    );
+    let euler = Vec3::new(
+        finite_entity_number(entity, "rotation_x", 0.0),
+        finite_entity_number(entity, "rotation_y", 0.0),
+        finite_entity_number(entity, "rotation_z", 0.0),
+    );
+    let scale = Vec3::new(
+        finite_entity_number(entity, "scale_x", 1.0),
+        finite_entity_number(entity, "scale_y", 1.0),
+        finite_entity_number(entity, "scale_z", 1.0),
+    );
+    let local_model = Mat4::trs(position, euler, scale);
+    let (model, world_euler) = match parent_transform {
+        Some(parent) => (
+            parent.model.mul(local_model),
+            Vec3::new(
+                parent.euler.x + euler.x,
+                parent.euler.y + euler.y,
+                parent.euler.z + euler.z,
+            ),
+        ),
+        None => (local_model, euler),
+    };
+    let values = model.values;
+    let axis_length = |column: usize| {
+        (values[0][column] * values[0][column]
+            + values[1][column] * values[1][column]
+            + values[2][column] * values[2][column])
+            .sqrt()
+    };
+    let transform = GlobalTransform3D {
+        position: model.transform_point(Vec3::ZERO),
+        scale: Vec3::new(axis_length(0), axis_length(1), axis_length(2)),
+        model,
+        euler: world_euler,
+    };
+    if let Some(entity_id) = entity_id {
+        cache.insert(entity_id, transform);
+    }
+    Ok(transform)
+}
+
 pub fn get_global_transform(entity: &Table) -> mlua::Result<(f32, f32, f32)> {
     let mut chain = Vec::<Table>::new();
     let mut current_entity = entity.clone();
@@ -1219,6 +1365,303 @@ fn point_hits_entity(entity: &Table, point_x: f32, point_y: f32) -> mlua::Result
 
     let (local_x, local_y) = entity_local_point(entity, point_x, point_y)?;
     Ok(local_x >= 0.0 && local_x <= width && local_y >= 0.0 && local_y <= height)
+}
+
+/// Accumulated depth of an entity, summed up the parent chain. 2D transforms
+/// never rotate around x or y, so a plain sum matches how the renderer layers
+/// entities and keeps a flat quad in the plane its author expects.
+fn world_position_z(entity: &Table) -> f32 {
+    let mut depth = 0.0;
+    let mut current = entity.clone();
+    loop {
+        depth += finite_entity_number(&current, "position_z", 0.0);
+        match current.get::<Option<Table>>("parent") {
+            Ok(Some(parent)) => current = parent,
+            _ => break,
+        }
+    }
+    depth
+}
+
+/// A world-space oriented box, used to answer overlap queries for both
+/// dimensions with one comparison routine.
+///
+/// A 2D entity becomes a zero-depth quad sitting in its own `position_z` plane:
+/// two of them compare as rotated rectangles, and one measured against a 3D box
+/// behaves like the flat surface it actually is.
+#[derive(Clone, Copy, Debug)]
+struct OverlapBox {
+    center: crate::render3d::Vec3,
+    /// Unit axes matching `half_extents`, in local x/y/z order.
+    axes: [crate::render3d::Vec3; 3],
+    half_extents: crate::render3d::Vec3,
+    /// Set for boxes built from a 2D transform. A pair of them ignores depth
+    /// entirely, so existing 2D games keep their footprint-only answers.
+    planar: bool,
+}
+
+/// The first enabled component on `entity` whose name is in `names`.
+fn enabled_component(entity: &Table, names: &[&str]) -> Option<Table> {
+    let components: Table = entity.get("components").ok()?;
+    for component in components.sequence_values::<Table>() {
+        let Ok(component) = component else { continue };
+        let is_match = component
+            .get::<String>("__neolove_component")
+            .is_ok_and(|name| names.contains(&name.as_str()));
+        if !is_match {
+            continue;
+        }
+        // `get::<bool>` follows Lua truthiness, so a component that never set
+        // `enabled` would read as disabled; ask for the optional value instead.
+        let enabled = component
+            .get::<Option<bool>>("enabled")
+            .ok()
+            .flatten()
+            .unwrap_or(true);
+        if enabled {
+            return Some(component);
+        }
+    }
+    None
+}
+
+/// Local-space bounds of a component's resolved mesh handle. Primitives are
+/// generated into the same field, so this covers authored primitives, imported
+/// models and meshes built from script alike.
+fn mesh_handle_local_box(
+    component: &Table,
+) -> Option<(crate::render3d::Vec3, crate::render3d::Vec3)> {
+    use crate::render3d::Vec3;
+
+    let Ok(Value::UserData(userdata)) = component.get::<Value>("mesh") else {
+        return None;
+    };
+    let handle = userdata.borrow::<crate::mesh::MeshHandle>().ok()?;
+    let bounds = handle.with_read(|mesh, _| mesh.bounds).ok()?;
+    let half = Vec3::new(
+        (bounds.max[0] - bounds.min[0]) * 0.5,
+        (bounds.max[1] - bounds.min[1]) * 0.5,
+        (bounds.max[2] - bounds.min[2]) * 0.5,
+    );
+    if !half.x.is_finite() || !half.y.is_finite() || !half.z.is_finite() {
+        return None;
+    }
+    Some((
+        Vec3::new(bounds.center[0], bounds.center[1], bounds.center[2]),
+        half,
+    ))
+}
+
+/// Local box of a `Collider3D`, matching the extents the 3D physics world
+/// builds from the same fields. Spheres and capsules report their bounding box.
+fn collider_3d_local_box(
+    component: &Table,
+) -> Option<(crate::render3d::Vec3, crate::render3d::Vec3)> {
+    use crate::render3d::Vec3;
+
+    let offset = Vec3::new(
+        finite_entity_number(component, "offset_x", 0.0),
+        finite_entity_number(component, "offset_y", 0.0),
+        finite_entity_number(component, "offset_z", 0.0),
+    );
+    let shape = component
+        .get::<String>("shape")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let radius = finite_entity_number(component, "radius", 0.5).abs();
+    let half = match shape.as_str() {
+        "sphere" | "ball" => Vec3::new(radius, radius, radius),
+        "capsule" => {
+            let half_height = finite_entity_number(component, "height", 1.0).abs() * 0.5;
+            Vec3::new(radius, half_height + radius, radius)
+        }
+        "mesh" => {
+            let (center, half) = mesh_handle_local_box(component)?;
+            return Some((center.add(offset), half));
+        }
+        _ => Vec3::new(
+            finite_entity_number(component, "size_x", 1.0).abs() * 0.5,
+            finite_entity_number(component, "size_y", 1.0).abs() * 0.5,
+            finite_entity_number(component, "size_z", 1.0).abs() * 0.5,
+        ),
+    };
+    Some((offset, half))
+}
+
+/// Local box of a `MeshRenderer3D`. The generated mesh is preferred; the
+/// authored primitive fields answer for the frames before it is built.
+fn mesh_renderer_local_box(
+    component: &Table,
+) -> Option<(crate::render3d::Vec3, crate::render3d::Vec3)> {
+    use crate::render3d::Vec3;
+
+    if let Some(local) = mesh_handle_local_box(component) {
+        return Some(local);
+    }
+
+    let primitive = component
+        .get::<String>("primitive")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_', ' '], "");
+    let size = Vec3::new(
+        finite_entity_number(component, "primitive_size_x", 1.0).abs() * 0.5,
+        finite_entity_number(component, "primitive_size_y", 1.0).abs() * 0.5,
+        finite_entity_number(component, "primitive_size_z", 1.0).abs() * 0.5,
+    );
+    let radius = finite_entity_number(component, "primitive_radius", 0.5).abs();
+    let half_height = finite_entity_number(component, "primitive_height", 1.0).abs() * 0.5;
+    let half = match primitive.as_str() {
+        "cube" | "box" => size,
+        "plane" | "quad" => Vec3::new(size.x, 0.0, size.z),
+        "sphere" | "uvsphere" => Vec3::new(radius, radius, radius),
+        "cylinder" | "capsule" | "cone" => Vec3::new(radius, half_height, radius),
+        _ => return None,
+    };
+    Some((crate::render3d::Vec3::ZERO, half))
+}
+
+/// The local 3D box an entity occupies, or `None` when it carries no 3D
+/// geometry and should be measured as a 2D rectangle instead.
+fn local_box_3d(entity: &Table) -> Option<(crate::render3d::Vec3, crate::render3d::Vec3)> {
+    use crate::render3d::Vec3;
+
+    if let Some(collider) = enabled_component(entity, &["Collider3D", "Trigger3D"])
+        && let Some(local) = collider_3d_local_box(&collider)
+    {
+        return Some(local);
+    }
+    if let Some(renderer) = enabled_component(entity, &["MeshRenderer3D"])
+        && let Some(local) = mesh_renderer_local_box(&renderer)
+    {
+        return Some(local);
+    }
+
+    // An explicit `size_z` is the escape hatch for entities that describe their
+    // own volume: sizes are centred on the entity, as 3D geometry is.
+    let size_z = read_optional_f32(entity, "size_z", "sizeZ")?;
+    Some((
+        Vec3::ZERO,
+        Vec3::new(
+            finite_entity_number(entity, "size_x", 0.0).abs() * 0.5,
+            finite_entity_number(entity, "size_y", 0.0).abs() * 0.5,
+            size_z.abs() * 0.5,
+        ),
+    ))
+}
+
+/// Build the world-space box an entity occupies, honouring anchors, pivots and
+/// the full rotation of every ancestor in either dimension.
+fn entity_overlap_box(entity: &Table) -> mlua::Result<OverlapBox> {
+    use crate::render3d::Vec3;
+
+    if let Some((local_center, local_half)) = local_box_3d(entity) {
+        let transform = get_global_transform_3d(entity)?;
+        let values = transform.model.values;
+        let column = |index: usize| Vec3::new(values[0][index], values[1][index], values[2][index]);
+        // The model's columns carry rotation and scale together: normalising
+        // them leaves unit axes, and their lengths scale the local extents.
+        let scale = transform.scale;
+        return Ok(OverlapBox {
+            center: transform.model.transform_point(local_center),
+            axes: [
+                column(0).normalized(),
+                column(1).normalized(),
+                column(2).normalized(),
+            ],
+            half_extents: Vec3::new(
+                local_half.x * scale.x,
+                local_half.y * scale.y,
+                local_half.z * scale.z,
+            ),
+            planar: false,
+        });
+    }
+
+    // 2D: `get_global_transform` already resolves anchors and position/rotation
+    // pivots into the rendered top-left corner plus the accumulated rotation,
+    // exactly as the hit tests and the renderer read it.
+    let (origin_x, origin_y, rotation) = get_global_transform(entity)?;
+    let (width, height) = get_global_size(entity)?;
+    let (offset_x, offset_y) = rotate_point(width * 0.5, height * 0.5, rotation);
+    let (cos_r, sin_r) = (rotation.cos(), rotation.sin());
+    Ok(OverlapBox {
+        center: Vec3::new(
+            origin_x + offset_x,
+            origin_y + offset_y,
+            world_position_z(entity),
+        ),
+        axes: [
+            Vec3::new(cos_r, sin_r, 0.0),
+            Vec3::new(-sin_r, cos_r, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        ],
+        half_extents: Vec3::new(width.max(0.0) * 0.5, height.max(0.0) * 0.5, 0.0),
+        planar: true,
+    })
+}
+
+/// Half the box's shadow on `axis`, which must be a unit vector.
+fn projected_radius(shape: &OverlapBox, axis: crate::render3d::Vec3) -> f32 {
+    shape.half_extents.x * shape.axes[0].dot(axis).abs()
+        + shape.half_extents.y * shape.axes[1].dot(axis).abs()
+        + shape.half_extents.z * shape.axes[2].dot(axis).abs()
+}
+
+/// Separating axis test. Touching counts as separated, matching the strict
+/// comparisons the axis-aligned version used before.
+fn separated_on_axis(
+    first: &OverlapBox,
+    second: &OverlapBox,
+    between: crate::render3d::Vec3,
+    axis: crate::render3d::Vec3,
+) -> bool {
+    if axis.length_squared() <= 1e-12 {
+        return false;
+    }
+    let axis = axis.normalized();
+    between.dot(axis).abs() >= projected_radius(first, axis) + projected_radius(second, axis)
+}
+
+/// Do two world boxes intersect? Two 2D boxes are compared as rectangles so
+/// depth never separates them; any pair involving a 3D box uses the full
+/// fifteen-axis test.
+fn boxes_overlap(first: &OverlapBox, second: &OverlapBox) -> bool {
+    use crate::render3d::Vec3;
+
+    let planar_pair = first.planar && second.planar;
+    let between = if planar_pair {
+        Vec3::new(
+            second.center.x - first.center.x,
+            second.center.y - first.center.y,
+            0.0,
+        )
+    } else {
+        second.center.sub(first.center)
+    };
+
+    let face_axes = if planar_pair { 2 } else { 3 };
+    for index in 0..face_axes {
+        if separated_on_axis(first, second, between, first.axes[index])
+            || separated_on_axis(first, second, between, second.axes[index])
+        {
+            return false;
+        }
+    }
+    if planar_pair {
+        return true;
+    }
+
+    for first_axis in first.axes {
+        for second_axis in second.axes {
+            if separated_on_axis(first, second, between, first_axis.cross(second_axis)) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn compare_entity_order(a_z: f64, a_id: usize, b_z: f64, b_id: usize) -> std::cmp::Ordering {
@@ -1769,6 +2212,7 @@ impl Runtime {
             exit_reason: Rc::new(RefCell::new(None)),
             physics_world: None,
             physics_signature: 0,
+            physics_ever_registered: Rc::new(Cell::new(false)),
             platform: new_shared_platform_state(),
             render_state: new_shared_render_state(),
             root_table: None,
@@ -1801,6 +2245,7 @@ impl Runtime {
             let _ = sink.send(RuntimeLogLine {
                 level: level.to_string(),
                 message,
+                ..RuntimeLogLine::default()
             });
         }
     }
@@ -1831,6 +2276,12 @@ impl Runtime {
                         .filter_map(Result::ok)
                         .map(|component| ComponentSnapshot {
                             name: snapshot_component_name(&component),
+                            source_index: component
+                                .raw_get::<usize>("__neolove_editor_component_index")
+                                .ok(),
+                            source_key: component
+                                .raw_get::<String>("__neolove_editor_component_key")
+                                .ok(),
                             fields: snapshot_table_fields(&self.lua, &component, &["entity"]),
                         })
                         .collect()
@@ -1851,6 +2302,7 @@ impl Runtime {
             }
             out.push(EntitySnapshot {
                 id: entity.id,
+                source_id: table.raw_get::<u64>("__neolove_editor_source_id").ok(),
                 name: table.get::<String>("name").unwrap_or_default(),
                 parent,
                 x: read_f32("x"),
@@ -2568,7 +3020,13 @@ impl Runtime {
         })?;
         self.lua.globals().set("Inspector", inspector)?;
 
-        let entry_file = env_root.join("main.luau");
+        // The 3D editor stages an unsaved scene and a generated entry point in
+        // a project-local preview directory. Only an explicitly launched
+        // editor runtime receives this override; ordinary runs and packaged
+        // games continue loading the project's real `main.luau`.
+        let entry_file = std::env::var_os("NEOLOVE_EDITOR_ENTRY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| env_root.join("main.luau"));
 
         let entry_parent = entry_file
             .parent()
@@ -2677,21 +3135,17 @@ impl Runtime {
                 // Collect the Lua entity tables once before comparing them. Re-entering
                 // `pairs()` on the same table while the outer iterator is still alive has
                 // been fragile in the web runtime once gameplay starts spawning enemies.
-                let mut collected = Vec::new();
+                // Each world box is resolved once here as well, so an entity deep in a
+                // rotated hierarchy is only walked a single time.
+                let mut boxes = Vec::new();
                 for pair in entities.pairs::<Value, Table>() {
                     let (_, entity) = pair?;
-                    collected.push(entity);
+                    boxes.push(entity_overlap_box(&entity)?);
                 }
 
-                for (index, entity1) in collected.iter().enumerate() {
-                    let (x1, y1) = get_global_position(entity1)?;
-                    let (w1, h1) = get_global_size(entity1)?;
-
-                    for entity2 in collected.iter().skip(index + 1) {
-                        let (x2, y2) = get_global_position(entity2)?;
-                        let (w2, h2) = get_global_size(entity2)?;
-
-                        if x1 < x2 + w2 && x1 + w1 > x2 && y1 < y2 + h2 && y1 + h1 > y2 {
+                for (index, first) in boxes.iter().enumerate() {
+                    for second in boxes.iter().skip(index + 1) {
+                        if boxes_overlap(first, second) {
                             return Ok(true);
                         }
                     }
@@ -2885,6 +3339,8 @@ impl Runtime {
         {
             let entities = self.entities.clone();
             let entities_delete = self.entities.clone();
+            let entities_by_tag_3d = self.entities.clone();
+            let entities_by_layer_3d = self.entities.clone();
             let entity_listeners = self.entity_listeners.clone();
             let listener_cleanup_lua = self.lua.clone();
             let entity_max = Rc::new(RefCell::new(self.entity_max));
@@ -3026,6 +3482,56 @@ impl Runtime {
 
             ecs.set("findFirstChild", find_first_child)?;
 
+            let find_by_tag = self.lua.create_function(move |lua, tag: String| {
+                let output = lua.create_table()?;
+                let entities = entities_by_tag_3d.try_borrow().map_err(|_| {
+                    mlua::Error::external(
+                        "cannot query Tag while the entity registry is being changed",
+                    )
+                })?;
+                let mut ids = entities.keys().copied().collect::<Vec<_>>();
+                ids.sort_unstable();
+                for id in ids {
+                    let Some(data) = entities.get(&id) else {
+                        continue;
+                    };
+                    let entity = lua.registry_value::<Table>(&data.luau_key)?;
+                    if entity_has_tag(&entity, &tag)? {
+                        output.push(entity)?;
+                    }
+                }
+                Ok(output)
+            })?;
+            ecs.set("findByTag", find_by_tag.clone())?;
+            ecs.set("FindByTag", find_by_tag.clone())?;
+            ecs.set("findByTag3D", find_by_tag.clone())?;
+            ecs.set("FindByTag3D", find_by_tag)?;
+
+            let find_by_layer = self.lua.create_function(move |lua, layer: i64| {
+                let output = lua.create_table()?;
+                let entities = entities_by_layer_3d.try_borrow().map_err(|_| {
+                    mlua::Error::external(
+                        "cannot query Layer while the entity registry is being changed",
+                    )
+                })?;
+                let mut ids = entities.keys().copied().collect::<Vec<_>>();
+                ids.sort_unstable();
+                for id in ids {
+                    let Some(data) = entities.get(&id) else {
+                        continue;
+                    };
+                    let entity = lua.registry_value::<Table>(&data.luau_key)?;
+                    if entity_is_in_layer(&entity, layer)? {
+                        output.push(entity)?;
+                    }
+                }
+                Ok(output)
+            })?;
+            ecs.set("findByLayer", find_by_layer.clone())?;
+            ecs.set("FindByLayer", find_by_layer.clone())?;
+            ecs.set("findByLayer3D", find_by_layer.clone())?;
+            ecs.set("FindByLayer3D", find_by_layer)?;
+
             // create root entity
             let root_table = create_entity_table(&self.lua, "root", 0.0, 0.0, None)?;
             root_table.set("id", 0)?;
@@ -3058,6 +3564,7 @@ impl Runtime {
             let table_remove: Function = self.lua.globals().get::<Table>("table")?.get("remove")?;
 
             let pending_component_awakes = self.pending_component_awakes.clone();
+            let physics_ever_registered = self.physics_ever_registered.clone();
             let add_component =
                 self.lua
                     .create_function(move |lua, (entity, component): (Table, Value)| {
@@ -3093,6 +3600,7 @@ impl Runtime {
                         }
                         if let Ok(component_kind) = comp.get::<String>("__neolove_component") {
                             if is_physics_component_name(&component_kind) {
+                                physics_ever_registered.set(true);
                                 let current = entity
                                     .raw_get::<i64>("__neolove_physics_component_count")
                                     .unwrap_or(0)
@@ -3741,6 +4249,12 @@ impl Runtime {
                     "runtime.update {trace}: skipping rapier step because dt={step_dt:.6}"
                 ));
             }
+            return Ok(());
+        }
+
+        if !self.physics_ever_registered.get() {
+            self.physics_world = None;
+            self.physics_signature = 0;
             return Ok(());
         }
 
@@ -5074,12 +5588,69 @@ impl Runtime {
             .map_err(|_| "render state lock poisoned while finishing camera frame")?
             .finish_camera_frame();
 
+        #[cfg(not(neolove_2d))]
+        let fast_mesh_camera = self
+            .render_state
+            .lock()
+            .map_err(|_| "render state lock poisoned while reading 3D camera")?
+            .camera_3d();
+        #[cfg(not(neolove_2d))]
+        let fast_mesh_aspect = {
+            let window = lock_platform_state(&self.platform).window();
+            window.width.max(1.0) / window.height.max(1.0)
+        };
+        #[cfg(not(neolove_2d))]
+        let mut fast_mesh_commands = Vec::new();
+        #[cfg(not(neolove_2d))]
+        let mut fast_mesh_transform_cache = HashMap::new();
+
         panic_stage.set("rendering pass");
         if let Some(trace) = web_trace {
             web_debug_log(&format!("runtime.update {trace}: before rendering pass"));
         }
         for (entity_id, component_index, ent, component, update) in rendering_components {
             let component_name = describe_component_name(&component, Some(&ent));
+
+            #[cfg(not(neolove_2d))]
+            if component_name == "MeshRenderer3D" {
+                let transform = crate::window::get_global_transform_3d_cached(
+                    &ent,
+                    &mut fast_mesh_transform_cache,
+                )
+                .map_err(|error| {
+                    format!(
+                        "static MeshRenderer3D transform failed [entity_id={entity_id} component_index={component_index} component=MeshRenderer3D]:\n{}",
+                        describe_lua_error(&error)
+                    )
+                })?;
+                match crate::core::prepare_static_mesh_renderer_3d(
+                    &component,
+                    Some(&ent),
+                    transform.model,
+                    fast_mesh_camera,
+                    fast_mesh_aspect,
+                )
+                .map_err(|error| {
+                    format!(
+                        "static MeshRenderer3D fast path failed [entity_id={entity_id} component_index={component_index} component=MeshRenderer3D]:\n{}",
+                        describe_lua_error(&error)
+                    )
+                })? {
+                    crate::core::StaticMeshRenderer3DUpdate::Handled(command) => {
+                        fast_mesh_commands.extend(command);
+                        continue;
+                    }
+                    crate::core::StaticMeshRenderer3DUpdate::Fallback => {}
+                }
+            }
+
+            #[cfg(not(neolove_2d))]
+            if !fast_mesh_commands.is_empty() {
+                self.render_state
+                    .lock()
+                    .map_err(|_| "render state lock poisoned while queueing static 3D meshes")?
+                    .queue_all(fast_mesh_commands.drain(..));
+            }
 
             panic_stage.set("rendering component update callback");
             if let Some(trace) = web_trace {
@@ -5094,7 +5665,7 @@ impl Runtime {
             )
             .map_err(|error| {
                 format!(
-                    "rendering component update failed:\n{}",
+                    "rendering component update failed [entity_id={entity_id} component_index={component_index} {component_name}]:\n{}",
                     describe_lua_error(&error)
                 )
             })?;
@@ -5104,6 +5675,13 @@ impl Runtime {
                     entity_id, component_index
                 ));
             }
+        }
+        #[cfg(not(neolove_2d))]
+        if !fast_mesh_commands.is_empty() {
+            self.render_state
+                .lock()
+                .map_err(|_| "render state lock poisoned while queueing static 3D meshes")?
+                .queue_all(fast_mesh_commands);
         }
         if let Some(trace) = web_trace {
             web_debug_log(&format!("runtime.update {trace}: after rendering pass"));
@@ -5168,6 +5746,367 @@ mod tests {
             look_at_rotation(10.0, 20.0, 10.0, 10.0),
             -std::f32::consts::FRAC_PI_2,
         );
+    }
+
+    #[test]
+    fn runtime_3d_metadata_queries_visibility_and_camera_masks_are_live() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("metadata_visibility_layers_3d")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                local cameraEntity = ecs.newEntity("Camera", ecs.root, 0, 0)
+                cameraEntity.position_z = 5
+                testCamera3D = cameraEntity:AddComponent(core.Camera3D)
+                testCamera3D.render_mask = 2
+
+                local function mesh(name, mask, parent)
+                    local entity = ecs.newEntity(name, parent or ecs.root, 0, 0)
+                    local renderer = entity:AddComponent(core.MeshRenderer3D)
+                    renderer.primitive = "cube"
+                    local renderLayer = entity:AddComponent(core.RenderLayer3D)
+                    renderLayer.mask = mask
+                    return entity
+                end
+
+                local blocked = mesh("Blocked", 1)
+                local blockedTag = blocked:AddComponent(core.Tag)
+                blockedTag.tag = "Enemy"
+                local blockedLayer = blocked:AddComponent(core.Layer)
+                blockedLayer.layer = 7
+                blockedLayer.name = "Gameplay"
+
+                mesh("Visible", 2)
+                local hiddenParent = ecs.newEntity("Hidden Parent", ecs.root, 0, 0)
+                local parentVisibility = hiddenParent:AddComponent(core.Visibility3D)
+                parentVisibility.visible = false
+                mesh("Inherited Hidden", 2, hiddenParent)
+                local override = mesh("Visibility Boundary", 2, hiddenParent)
+                local overrideVisibility = override:AddComponent(core.Visibility3D)
+                overrideVisibility.inherit_parent = false
+
+                local disabledTagEntity = ecs.newEntity("Disabled Tag", ecs.root, 0, 0)
+                local disabledTag = disabledTagEntity:AddComponent(core.Tag)
+                disabledTag.tag = "Enemy"
+                disabledTag.enabled = false
+
+                assert(blocked:HasTag("Enemy"))
+                assert(blocked:IsInLayer(7))
+                assert(blockedTag:Matches("Enemy"))
+                assert(blockedLayer:Matches(7))
+                assert(#ecs.FindByTag("Enemy") == 1)
+                assert(ecs.FindByTag("Enemy")[1] == blocked)
+                assert(#ecs.FindByLayer(7) == 1)
+                -- The brief 3D-only API remains a source-compatible alias.
+                assert(blocked:HasTag3D("Enemy"))
+                assert(blocked:IsInLayer3D(7))
+                assert(ecs.FindByTag3D("Enemy")[1] == blocked)
+                assert(ecs.FindByLayer3D(7)[1] == blocked)
+                assert(overrideVisibility:IsVisible())
+                assert(not parentVisibility:IsVisible())
+                "#,
+            )
+            .set_name("@metadata_visibility_layers_3d/main.luau")
+            .exec()?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        let commands = crate::renderer::drain_commands(&runtime.render_state())
+            .map_err(mlua::Error::external)?;
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| { matches!(command, crate::renderer::DrawCommand::Mesh3D(_)) })
+                .count(),
+            2,
+            "mask 2 should render the visible entity and inheritance boundary only"
+        );
+
+        runtime.lua.load("testCamera3D.render_mask = 1").exec()?;
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        let commands = crate::renderer::drain_commands(&runtime.render_state())
+            .map_err(mlua::Error::external)?;
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| { matches!(command, crate::renderer::DrawCommand::Mesh3D(_)) })
+                .count(),
+            1,
+            "changing Camera3D.render_mask must affect the next real runtime frame"
+        );
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_tag_and_layer_queries_are_dimension_independent() -> mlua::Result<()> {
+        let (runtime, _root) = start_test_runtime("shared_metadata_2d")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                local actor = ecs.newEntity("2D Actor", ecs.root, 12, 34)
+                local tag = actor:AddComponent(core.Tag)
+                tag.tag = "Player"
+                local layer = actor:AddComponent(core.Layer)
+                layer.layer = 4
+                layer.name = "Gameplay"
+
+                assert(tag.__neolove_component == "Tag")
+                assert(layer.__neolove_component == "Layer")
+                assert(actor:HasTag("Player"))
+                assert(actor:IsInLayer(4))
+                assert(ecs.FindByTag("Player")[1] == actor)
+                assert(ecs.FindByLayer(4)[1] == actor)
+
+                local legacy = ecs.newEntity("Legacy metadata", ecs.root, 0, 0)
+                local legacyTag = legacy:AddComponent(core.Tag3D)
+                local legacyLayer = legacy:AddComponent(core.Layer3D)
+                legacyTag.tag = "Legacy"
+                legacyLayer.layer = 9
+                assert(legacyTag.__neolove_component == "Tag")
+                assert(legacyLayer.__neolove_component == "Layer")
+                assert(legacy:HasTag("Legacy") and legacy:IsInLayer(9))
+                "#,
+            )
+            .set_name("@shared_metadata_2d/main.luau")
+            .exec()
+    }
+
+    #[test]
+    fn character_controller_3d_lands_through_the_real_component_lifecycle() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("character_controller_3d_lifecycle")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                local ground = ecs.newEntity("Ground", ecs.root, 0, 0)
+                local groundCollider = ground:AddComponent(core.Collider3D)
+                groundCollider.size_x = 10
+                groundCollider.size_y = 1
+                groundCollider.size_z = 10
+
+                controllerActor = ecs.newEntity("Controller", ecs.root, 0, 3)
+                controller = controllerActor:AddComponent(core.CharacterController3D)
+                groundedCallbacks = 0
+                controller:setOnGrounded(function(groundHit)
+                    groundedCallbacks += 1
+                    assert(groundHit.entity_id == ground.id)
+                    assert(groundHit.normal_y > 0.99)
+                end)
+                "#,
+            )
+            .set_name("@character_controller_3d_lifecycle/main.luau")
+            .exec()?;
+
+        // Run enough real runtime frames for the controller to fall from y=3
+        // and settle with its capsule skin above the collider at y=0.
+        for _ in 0..120 {
+            runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        }
+
+        let actor: Table = runtime.lua.globals().get("controllerActor")?;
+        let controller: Table = runtime.lua.globals().get("controller")?;
+        assert!(controller.get::<bool>("grounded")?);
+        assert_close(actor.get::<f32>("y")?, 1.52);
+        assert_eq!(controller.get::<f32>("velocity_y")?, 0.0);
+        assert_eq!(runtime.lua.globals().get::<u32>("groundedCallbacks")?, 1);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rigidbody_3d_ccd_runs_through_the_real_component_lifecycle() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("rigidbody_3d_ccd_lifecycle")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                local wall = ecs.newEntity("Thin wall", ecs.root, 0, 0)
+                runtimeCcdWallId = wall.id
+                local wallCollider = wall:AddComponent(core.Collider3D)
+                wallCollider.size_x, wallCollider.size_y, wallCollider.size_z = 0.02, 4, 4
+
+                local sensor = ecs.newEntity("Swept sensor", ecs.root, -5, 0)
+                local sensorCollider = sensor:AddComponent(core.Collider3D)
+                sensorCollider.size_x, sensorCollider.size_y, sensorCollider.size_z = 0.1, 4, 4
+                sensorCollider.is_trigger = true
+
+                runtimeCcdActor = ecs.newEntity("Fast body", ecs.root, -10, 0)
+                runtimeCcdBody = runtimeCcdActor:AddComponent(core.Rigidbody3D)
+                runtimeCcdBody.gravity_scale = 0
+                runtimeCcdBody.continuous_collision = true
+                local actorCollider = runtimeCcdActor:AddComponent(core.Collider3D)
+                actorCollider.shape, actorCollider.radius = "sphere", 0.5
+                runtimeCcdTriggers, runtimeCcdContacts = 0, 0
+                runtimeCcdBody:setOnTrigger(function(hit)
+                    runtimeCcdTriggers += 1
+                    assert(hit.other_id == sensor.id and hit.continuous)
+                end)
+                runtimeCcdBody:setOnContact(function(hit)
+                    runtimeCcdContacts += 1
+                    assert(hit.other_id == wall.id and hit.continuous and hit.can_resolve)
+                end)
+                "#,
+            )
+            .set_name("@rigidbody_3d_ccd_lifecycle/main.luau")
+            .exec()?;
+
+        // Publish ordinary Collider3D snapshots through the scheduler, then
+        // cross both a trigger and a thin wall in one real runtime update.
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        let body: Table = runtime.lua.globals().get("runtimeCcdBody")?;
+        body.set("velocity_x", 1200.0)?;
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+
+        let actor: Table = runtime.lua.globals().get("runtimeCcdActor")?;
+        let x = actor.get::<f32>("x")?;
+        assert!(x > -0.52 && x < -0.50, "CCD lifecycle x={x}");
+        assert!(body.get::<bool>("ccd_hit")?);
+        assert_eq!(
+            body.get::<u64>("ccd_entity_id")?,
+            runtime.lua.globals().get::<u64>("runtimeCcdWallId")?
+        );
+        assert_close(body.get::<f32>("velocity_x")?, 0.0);
+        assert_eq!(runtime.lua.globals().get::<u32>("runtimeCcdTriggers")?, 1);
+        assert_eq!(runtime.lua.globals().get::<u32>("runtimeCcdContacts")?, 1);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn trigger_3d_events_run_through_the_real_component_lifecycle() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("trigger_3d_lifecycle")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                triggerVisitor = ecs.newEntity("Visitor", ecs.root, 0.5, 0)
+                triggerVisitorCollider = triggerVisitor:AddComponent(core.Collider3D)
+                triggerVisitorCollider.layer = 4
+                triggerVisitorCollider.mask = 2
+
+                triggerEntity = ecs.newEntity("Volume", ecs.root, 0, 0)
+                triggerVolume = triggerEntity:AddComponent(core.Trigger3D)
+                triggerVolume.layer = 2
+                triggerVolume.mask = 4
+                triggerEntered, triggerStayed, triggerExited = 0, 0, 0
+                triggerVolume:setOnEnter(function(hit)
+                    triggerEntered += 1
+                    assert(hit.entity_id == triggerVisitor.id and hit.exact)
+                end)
+                triggerVolume:setOnStay(function(hit)
+                    triggerStayed += 1
+                    assert(hit.entity_id == triggerVisitor.id)
+                end)
+                triggerVolume:setOnExit(function(hit)
+                    triggerExited += 1
+                    assert(hit.entity_id == triggerVisitor.id)
+                end)
+                "#,
+            )
+            .set_name("@trigger_3d_lifecycle/main.luau")
+            .exec()?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        assert_eq!(runtime.lua.globals().get::<u32>("triggerEntered")?, 1);
+        assert_eq!(runtime.lua.globals().get::<u32>("triggerStayed")?, 1);
+        let volume: Table = runtime.lua.globals().get("triggerVolume")?;
+        assert_eq!(volume.get::<u32>("overlap_count")?, 1);
+        assert!(volume.get::<bool>("is_trigger")?);
+        assert!(volume.get::<bool>("non_physics")?);
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        assert_eq!(runtime.lua.globals().get::<u32>("triggerEntered")?, 1);
+        assert_eq!(runtime.lua.globals().get::<u32>("triggerStayed")?, 2);
+
+        runtime.lua.load("triggerVisitor.x = 10").exec()?;
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        assert_eq!(runtime.lua.globals().get::<u32>("triggerExited")?, 1);
+        assert_eq!(volume.get::<u32>("overlap_count")?, 0);
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn physics_material_3d_file_drives_real_runtime_component_response() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("physics_material_3d_lifecycle")?;
+        let material_dir = root.join("assets/materials");
+        std::fs::create_dir_all(&material_dir).map_err(mlua::Error::external)?;
+        std::fs::write(
+            material_dir.join("bounce.neophysicsmaterial"),
+            br#"{
+                "version": 1,
+                "name": "Runtime bounce",
+                "friction": 0.0,
+                "restitution": 0.75
+            }"#,
+        )
+        .map_err(mlua::Error::external)?;
+        runtime
+            .lua
+            .load(
+                r#"
+                runtimePhysicsMaterial = assets.loadPhysicsMaterial3D(
+                    "assets/materials/bounce.neophysicsmaterial")
+                assert(runtimePhysicsMaterial:identity()
+                    == assets.loadPhysicsMaterial(
+                        "assets/materials/bounce.neophysicsmaterial"):identity())
+
+                local wall = ecs.newEntity("Wall", ecs.root, 1.5, 0)
+                runtimeWallCollider = wall:AddComponent(core.Collider3D)
+                runtimeWallCollider.shape = "sphere"
+                runtimeWallCollider.radius = 1
+                runtimeWallCollider.physics_material = runtimePhysicsMaterial
+
+                runtimeMaterialActor = ecs.newEntity("Actor", ecs.root, 0, 0)
+                runtimeMaterialBody = runtimeMaterialActor:AddComponent(core.Rigidbody3D)
+                runtimeMaterialBody.gravity_scale = 0
+                runtimeMaterialBody.auto_resolve = false
+                local actorCollider = runtimeMaterialActor:AddComponent(core.Collider3D)
+                actorCollider.shape = "sphere"
+                actorCollider.radius = 1
+                "#,
+            )
+            .set_name("@physics_material_3d_lifecycle/main.luau")
+            .exec()?;
+
+        // First frame runs the ordinary component update path and publishes
+        // both colliders with the file-backed material factors.
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        runtime
+            .lua
+            .load(
+                r#"
+                runtimeMaterialBody.velocity_x = 4
+                physics3d.resolveBody(runtimeMaterialActor, runtimeMaterialBody)
+                assert(math.abs(runtimeMaterialBody.velocity_x + 3) < 0.001)
+
+                runtimePhysicsMaterial:setRestitution(0.25)
+                runtimeMaterialActor.x = 0
+                runtimeMaterialBody.__last_world_x = 0
+                runtimeMaterialBody.velocity_x = 0
+                "#,
+            )
+            .exec()?;
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        runtime
+            .lua
+            .load(
+                r#"
+                runtimeMaterialBody.velocity_x = 4
+                physics3d.resolveBody(runtimeMaterialActor, runtimeMaterialBody)
+                assert(math.abs(runtimeMaterialBody.velocity_x + 1) < 0.001,
+                    "live file-backed material revision was not consumed")
+                "#,
+            )
+            .exec()?;
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
     }
 
     #[test]
@@ -6016,6 +6955,174 @@ mod tests {
     }
 
     #[test]
+    fn overlap_check_uses_rotated_rectangles_and_pivots() -> mlua::Result<()> {
+        let (runtime, root) = start_test_runtime("overlap_rotation_2d")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                local a = ecs.newEntity("a", ecs.root, 0, 0)
+                a.size_x, a.size_y = 100, 100
+
+                local b = ecs.newEntity("b", ecs.root, 120, 0)
+                b.size_x, b.size_y = 100, 100
+                assert(not transform.doTheyOverlap({a, b}), "squares 20px apart must not overlap")
+
+                -- Rotating b around its centre swings a corner back across the gap.
+                b.rotation_pivot = "center"
+                b.rotation = math.rad(45)
+                assert(transform.doTheyOverlap({a, b}), "rotated corner should reach a")
+
+                -- Ten pixels further out the corner falls short, which an
+                -- axis-aligned test of the rotated bounds would still call a hit.
+                b.x = 130
+                assert(not transform.doTheyOverlap({a, b}), "rotated corner should fall short")
+
+                -- Pivots move the rectangle itself, not just its rotation.
+                b.rotation = 0
+                b.position_pivot = "center"
+                b.x = 100
+                assert(transform.doTheyOverlap({a, b}), "centre pivot pulls b back over a")
+
+                -- A rotated parent carries its children's rectangles with it.
+                local parent = ecs.newEntity("parent", ecs.root, 400, 20)
+                parent.size_x, parent.size_y = 10, 10
+                local child = ecs.newEntity("child", parent, 300, 0)
+                child.size_x, child.size_y = 40, 40
+                assert(not transform.doTheyOverlap({a, child}), "child starts clear of a")
+                parent.rotation = math.rad(180)
+                assert(transform.doTheyOverlap({a, child}), "rotated parent sweeps child onto a")
+                "#,
+            )
+            .set_name("@overlap_rotation_2d/main.luau")
+            .exec()?;
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn overlap_check_compares_3d_volumes_with_rotation_and_scale() -> mlua::Result<()> {
+        let (runtime, root) = start_test_runtime("overlap_3d")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                local ground = ecs.newEntity("ground", ecs.root, 0, 0)
+                local groundCollider = ground:AddComponent(core.Collider3D)
+                groundCollider.size_x, groundCollider.size_y, groundCollider.size_z = 10, 1, 10
+
+                local crate = ecs.newEntity("crate", ecs.root, 0, 3)
+                local crateCollider = crate:AddComponent(core.Collider3D)
+                crateCollider.size_x, crateCollider.size_y, crateCollider.size_z = 1, 1, 1
+
+                local volume = ecs.newEntity("trigger volume", ecs.root, 20, 0)
+                local trigger = volume:AddComponent(core.Trigger3D)
+                trigger.size_x, trigger.size_y, trigger.size_z = 4, 4, 4
+                local probe = ecs.newEntity("trigger probe", ecs.root, 21, 0)
+                probe:AddComponent(core.Collider3D)
+                assert(transform.doTheyOverlap({volume, probe}),
+                    "dedicated trigger geometry must participate in 3D overlap checks")
+                probe.x = 24
+                assert(not transform.doTheyOverlap({volume, probe}),
+                    "separated trigger geometry must not overlap")
+
+                assert(not transform.doTheyOverlap({ground, crate}), "crate hovers above ground")
+                crate.y = 0.9
+                assert(transform.doTheyOverlap({ground, crate}), "crate rests inside ground slab")
+
+                -- Depth separates volumes, which a 2D footprint could never see.
+                crate.y = 0
+                crate.position_z = 6
+                assert(not transform.doTheyOverlap({ground, crate}), "crate sits beyond the slab")
+                crate.position_z = 4.9
+                assert(transform.doTheyOverlap({ground, crate}), "crate returns over the slab")
+
+                -- Yaw swings the slab's long axis out to meet a distant crate.
+                crate.position_z = 0
+                crate.y = 0
+                crate.x = 7
+                assert(not transform.doTheyOverlap({ground, crate}), "crate clears the slab edge")
+                ground.rotation_y = 45
+                assert(transform.doTheyOverlap({ground, crate}), "yawed corner reaches the crate")
+                ground.rotation_y = 0
+
+                -- Scale grows the volume the collider describes.
+                assert(not transform.doTheyOverlap({ground, crate}))
+                ground.scale_x = 2
+                assert(transform.doTheyOverlap({ground, crate}), "scaled slab reaches the crate")
+                ground.scale_x = 1
+
+                -- MeshRenderer3D primitives describe their own volume.
+                local left = ecs.newEntity("left", ecs.root, 0, 0)
+                local leftMesh = left:AddComponent(core.MeshRenderer3D)
+                leftMesh.primitive = "cube"
+                leftMesh.primitive_size_x = 2
+                leftMesh.primitive_size_y = 2
+                leftMesh.primitive_size_z = 2
+
+                local right = ecs.newEntity("right", ecs.root, 2.5, 0)
+                local rightMesh = right:AddComponent(core.MeshRenderer3D)
+                rightMesh.primitive = "cube"
+                rightMesh.primitive_size_x = 2
+                rightMesh.primitive_size_y = 2
+                rightMesh.primitive_size_z = 2
+                assert(not transform.doTheyOverlap({left, right}), "cubes are half a unit apart")
+                right.x = 1.5
+                assert(transform.doTheyOverlap({left, right}), "cubes share half a unit")
+                "#,
+            )
+            .set_name("@overlap_3d/main.luau")
+            .exec()?;
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn overlap_check_reads_generated_mesh_bounds_after_a_frame() -> mlua::Result<()> {
+        let (mut runtime, root) = start_test_runtime("overlap_mesh_bounds")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                left = ecs.newEntity("left", ecs.root, 0, 0)
+                local leftMesh = left:AddComponent(core.MeshRenderer3D)
+                leftMesh.primitive = "cube"
+                leftMesh.primitive_size_x = 4
+                leftMesh.primitive_size_y = 1
+                leftMesh.primitive_size_z = 1
+
+                right = ecs.newEntity("right", ecs.root, 2.6, 0)
+                local rightMesh = right:AddComponent(core.MeshRenderer3D)
+                rightMesh.primitive = "sphere"
+                rightMesh.primitive_radius = 0.75
+                "#,
+            )
+            .set_name("@overlap_mesh_bounds/main.luau")
+            .exec()?;
+
+        // One frame builds the primitive meshes, after which the overlap test
+        // measures the real generated geometry rather than the authored fields.
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+
+        runtime
+            .lua
+            .load(
+                r#"
+                assert(transform.doTheyOverlap({left, right}), "bar reaches the sphere")
+                right.x = 2.9
+                assert(not transform.doTheyOverlap({left, right}), "sphere clears the bar")
+                "#,
+            )
+            .set_name("@overlap_mesh_bounds/check.luau")
+            .exec()?;
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
     fn entity_scaler_positions_entity_by_parent_percent_and_offset() -> mlua::Result<()> {
         let (mut runtime, root) = start_test_runtime("entity_scaler")?;
 
@@ -6085,9 +7192,12 @@ mod tests {
                 r#"
                 local group = ecs.newEntity("Group", ecs.root, 4, 5)
                 local child = ecs.newEntity("Inspectable", group, 10, 20)
+                child.__neolove_editor_source_id = 81
                 child.custom = { label = "ready", count = 3 }
                 local Probe = {
                     __neolove_component = "RuntimeProbe",
+                    __neolove_editor_component_index = 2,
+                    __neolove_editor_component_key = "script:scripts/probe.luau",
                     enabled = true,
                     tint = Color4(10, 20, 30, 40),
                     settings = { speed = 12, mode = "fast" },
@@ -6107,6 +7217,7 @@ mod tests {
             .iter()
             .find(|entity| entity.name == "Inspectable")
             .expect("child snapshot");
+        assert_eq!(child.source_id, Some(81));
         assert_eq!(child.parent, Some(group.id));
         assert!(child.fields.iter().any(|(name, _)| name == "size_x"));
         assert!(child.fields.iter().any(|(name, value)| {
@@ -6118,6 +7229,11 @@ mod tests {
             .first()
             .expect("runtime component snapshot");
         assert_eq!(component.name, "RuntimeProbe");
+        assert_eq!(component.source_index, Some(2));
+        assert_eq!(
+            component.source_key.as_deref(),
+            Some("script:scripts/probe.luau")
+        );
         assert!(
             component
                 .fields
@@ -6129,6 +7245,12 @@ mod tests {
         }));
         assert!(!component.fields.iter().any(|(name, _)| name == "entity"));
         assert!(!component.fields.iter().any(|(name, _)| name == "update"));
+        assert!(
+            !child
+                .fields
+                .iter()
+                .any(|(name, _)| name.starts_with("__neolove_editor"))
+        );
 
         std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())
@@ -6325,6 +7447,97 @@ mod tests {
         assert!(component.get::<Function>("play").is_ok());
         assert!(component.get::<Function>("stop").is_ok());
         runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+
+        std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_ecs_drives_authored_3d_audio_without_touching_the_2d_voice_path() -> mlua::Result<()>
+    {
+        let (mut runtime, root) = start_test_runtime("audio_source_3d")?;
+        runtime
+            .lua
+            .load(
+                r#"
+                audio3DCalls = { plays = 0, updates = 0, listeners = 0, stops = 0 }
+                local realAudio = audio
+                audio = {
+                    -- Guard the legacy surface: this test's 3D components must
+                    -- never route through the 2D spatial functions.
+                    playSpatial = function(...) error("used 2D spatial playback") end,
+                    setPosition = function(...) error("used 2D emitter update") end,
+                    setListenerPosition = function(...) error("used 2D listener update") end,
+                    playSpatial3D = function(sound, x, y, z, options)
+                        audio3DCalls.plays += 1
+                        audio3DCalls.play = { x, y, z, options.voice_id }
+                        return options.voice_id
+                    end,
+                    updateSpatial3D = function(voiceId, x, y, z, options)
+                        audio3DCalls.updates += 1
+                        audio3DCalls.update = { voiceId, x, y, z, options.max_distance }
+                        return true
+                    end,
+                    stopSpatial3D = function(voiceId)
+                        audio3DCalls.stops += 1
+                        audio3DCalls.stopVoice = voiceId
+                    end,
+                    setListener3D = function(...)
+                        audio3DCalls.listeners += 1
+                        audio3DCalls.listener = { ... }
+                    end,
+                }
+
+                local rig = ecs.newEntity("Audio rig", ecs.root, 10, 20)
+                rig.position_z = 30
+                local listenerEntity = ecs.newEntity("Listener", rig, 1, 2)
+                listenerEntity.position_z = 3
+                testAudioListener3D = listenerEntity:AddComponent(core.AudioListener3D)
+
+                local emitter = ecs.newEntity("Emitter", rig, 4, 5)
+                emitter.position_z = 6
+                testAudioEmitterEntity = emitter
+                testAudioSource3D = emitter:AddComponent(core.AudioSource3D)
+                testAudioSource3D.sound = assets.newSound(48000, 1, 480, 0)
+                testAudioSource3D.autoplay = true
+                testAudioSource3D.looping = true
+                testAudioSource3D.max_distance = 64
+                "#,
+            )
+            .set_name("@audio_source_3d_runtime_test.luau")
+            .exec()?;
+
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        runtime
+            .lua
+            .load(
+                r#"
+                assert(audio3DCalls.plays == 1)
+                assert(audio3DCalls.updates == 1)
+                assert(audio3DCalls.listeners == 1)
+                assert(audio3DCalls.play[1] == 14 and audio3DCalls.play[2] == 25
+                    and audio3DCalls.play[3] == 36)
+                assert(audio3DCalls.listener[1] == 11 and audio3DCalls.listener[2] == 22
+                    and audio3DCalls.listener[3] == 33)
+                assert(testAudioListener3D:IsActive())
+                testAudioEmitterEntity.x = 8
+                "#,
+            )
+            .exec()?;
+        runtime.update(1.0 / 60.0).map_err(mlua::Error::external)?;
+        runtime
+            .lua
+            .load(
+                r#"
+                assert(audio3DCalls.plays == 1, "autoplay must not restart")
+                assert(audio3DCalls.updates == 2)
+                assert(audio3DCalls.update[2] == 18)
+                assert(audio3DCalls.update[5] == 64)
+                testAudioSource3D:Stop()
+                assert(audio3DCalls.stops == 1)
+                "#,
+            )
+            .exec()?;
 
         std::fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())

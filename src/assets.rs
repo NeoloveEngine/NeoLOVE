@@ -1,14 +1,16 @@
 use crate::mesh::{
-    MeshData, MeshHandle, MeshMaterial, PrimitiveOptions, Submesh, TextureBinding, Vertex,
+    MaterialHandle, MeshData, MeshHandle, MeshMaterial, PrimitiveOptions, Submesh, TextureBinding,
+    Vertex,
 };
 use crate::platform::Color;
 use crate::platform::{SharedPlatformState, lock_platform_state};
 use crate::renderer::{SharedRenderState, SoftwareRenderer, last_frame_commands};
 use base64::Engine as _;
 use image::{Rgba, RgbaImage};
-use mlua::{Lua, Table, UserData, UserDataMethods, Value, Variadic};
+use mlua::{AnyUserData, Lua, Table, UserData, UserDataMethods, Value, Variadic};
 #[cfg(not(target_os = "emscripten"))]
 use rodio::{Decoder as AudioDecoder, Source};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
@@ -30,6 +32,160 @@ struct ImageAsset {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ImageHandle(Arc<Mutex<ImageAsset>>);
+
+impl PartialEq for ImageHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ImageHandle {}
+
+/// Six square images in Vulkan/OpenGL cube-face order:
+/// +X, -X, +Y, -Y, +Z, -Z. Faces remain live `ImageHandle`s, so editing any
+/// image advances the aggregate snapshot key without replacing the cubemap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CubemapHandle {
+    faces: [ImageHandle; 6],
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CubemapSnapshot {
+    pub identities: [usize; 6],
+    pub revisions: [u64; 6],
+    pub faces: [Arc<RgbaImage>; 6],
+    pub size: u32,
+}
+
+impl CubemapHandle {
+    pub(crate) fn new(faces: [ImageHandle; 6]) -> mlua::Result<Self> {
+        let handle = Self { faces };
+        handle.snapshot()?;
+        Ok(handle)
+    }
+
+    pub(crate) fn snapshot(&self) -> mlua::Result<CubemapSnapshot> {
+        let mut identities = [0; 6];
+        let mut revisions = [0; 6];
+        let mut pixels = Vec::with_capacity(6);
+        let mut size = None;
+        for (index, face) in self.faces.iter().enumerate() {
+            let (identity, revision, image) = face.snapshot()?.into_parts();
+            let dimensions = image.dimensions();
+            if dimensions.0 == 0 || dimensions.0 != dimensions.1 {
+                return Err(mlua::Error::external(format!(
+                    "cubemap face {} must be a non-empty square image, got {}x{}",
+                    CUBEMAP_FACE_NAMES[index], dimensions.0, dimensions.1
+                )));
+            }
+            if let Some(expected) = size {
+                if dimensions.0 != expected {
+                    return Err(mlua::Error::external(format!(
+                        "cubemap faces must have one size; {} is {}x{}, expected {}x{}",
+                        CUBEMAP_FACE_NAMES[index], dimensions.0, dimensions.1, expected, expected
+                    )));
+                }
+            } else {
+                size = Some(dimensions.0);
+            }
+            identities[index] = identity;
+            revisions[index] = revision;
+            pixels.push(image);
+        }
+        let faces: [Arc<RgbaImage>; 6] =
+            pixels.try_into().expect("six cubemap faces were collected");
+        Ok(CubemapSnapshot {
+            identities,
+            revisions,
+            faces,
+            size: size.unwrap_or(0),
+        })
+    }
+}
+
+pub(crate) const CUBEMAP_FACE_NAMES: [&str; 6] = [
+    "positive_x",
+    "negative_x",
+    "positive_y",
+    "negative_y",
+    "positive_z",
+    "negative_z",
+];
+
+const CUBEMAP_FACE_ALIASES: [[&str; 3]; 6] = [
+    ["positive_x", "positiveX", "px"],
+    ["negative_x", "negativeX", "nx"],
+    ["positive_y", "positiveY", "py"],
+    ["negative_y", "negativeY", "ny"],
+    ["positive_z", "positiveZ", "pz"],
+    ["negative_z", "negativeZ", "nz"],
+];
+
+fn cubemap_face_index(name: &str) -> Option<usize> {
+    let normalized = name.trim().replace(['-', ' '], "_").to_ascii_lowercase();
+    match normalized.as_str() {
+        "positive_x" | "positivex" | "px" | "+x" | "right" => Some(0),
+        "negative_x" | "negativex" | "nx" | "-x" | "left" => Some(1),
+        "positive_y" | "positivey" | "py" | "+y" | "top" | "up" => Some(2),
+        "negative_y" | "negativey" | "ny" | "-y" | "bottom" | "down" => Some(3),
+        "positive_z" | "positivez" | "pz" | "+z" | "front" => Some(4),
+        "negative_z" | "negativez" | "nz" | "-z" | "back" => Some(5),
+        _ => None,
+    }
+}
+
+fn cubemap_handles_from_table(table: &Table) -> mlua::Result<[ImageHandle; 6]> {
+    let mut faces = Vec::with_capacity(6);
+    for (index, aliases) in CUBEMAP_FACE_ALIASES.iter().enumerate() {
+        let value = aliases
+            .iter()
+            .find_map(|name| {
+                table
+                    .get::<Value>(*name)
+                    .ok()
+                    .filter(|value| !value.is_nil())
+            })
+            .ok_or_else(|| {
+                mlua::Error::external(format!(
+                    "cubemap is missing {} (alias {})",
+                    CUBEMAP_FACE_NAMES[index], aliases[2]
+                ))
+            })?;
+        let Value::UserData(image) = value else {
+            return Err(mlua::Error::external(format!(
+                "cubemap {} must be an ImageHandle",
+                CUBEMAP_FACE_NAMES[index]
+            )));
+        };
+        faces.push(image.borrow::<ImageHandle>()?.clone());
+    }
+    Ok(faces
+        .try_into()
+        .expect("six cubemap handles were collected"))
+}
+
+fn cubemap_paths_from_table(table: &Table) -> mlua::Result<[String; 6]> {
+    let mut paths = Vec::with_capacity(6);
+    for (index, aliases) in CUBEMAP_FACE_ALIASES.iter().enumerate() {
+        let path = aliases
+            .iter()
+            .find_map(|name| {
+                table
+                    .get::<Option<String>>(*name)
+                    .ok()
+                    .flatten()
+                    .filter(|path| !path.trim().is_empty())
+            })
+            .ok_or_else(|| {
+                mlua::Error::external(format!(
+                    "cubemap is missing path {} (alias {})",
+                    CUBEMAP_FACE_NAMES[index], aliases[2]
+                ))
+            })?;
+        paths.push(path);
+    }
+    Ok(paths.try_into().expect("six cubemap paths were collected"))
+}
 
 /// Immutable pixels captured from a particular image revision.
 ///
@@ -75,6 +231,192 @@ pub(crate) struct AssetManager {
     encoded_images: HashMap<String, Weak<Mutex<ImageAsset>>>,
     sounds: HashMap<PathBuf, Weak<Mutex<SoundAsset>>>,
     meshes: HashMap<PathBuf, MeshHandle>,
+    materials: HashMap<PathBuf, MaterialHandle>,
+    physics_materials: HashMap<PathBuf, PhysicsMaterial3DHandle>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub(crate) struct PhysicsMaterial3DFile {
+    #[serde(default = "physics_material_file_version")]
+    pub version: u32,
+    #[serde(default = "physics_material_file_name")]
+    pub name: String,
+    #[serde(default = "physics_material_file_friction")]
+    pub friction: f32,
+    #[serde(default)]
+    pub restitution: f32,
+}
+
+impl Default for PhysicsMaterial3DFile {
+    fn default() -> Self {
+        Self {
+            version: physics_material_file_version(),
+            name: physics_material_file_name(),
+            friction: physics_material_file_friction(),
+            restitution: 0.0,
+        }
+    }
+}
+
+fn physics_material_file_version() -> u32 {
+    1
+}
+
+fn physics_material_file_name() -> String {
+    "PhysicsMaterial3D".to_string()
+}
+
+fn physics_material_file_friction() -> f32 {
+    0.5
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PhysicsMaterial3D {
+    pub name: String,
+    pub friction: f32,
+    pub restitution: f32,
+}
+
+#[derive(Debug)]
+struct VersionedPhysicsMaterial3D {
+    revision: u64,
+    material: PhysicsMaterial3D,
+}
+
+/// Shared live physics surface identity. Collider components retain this
+/// handle and read its current factors during their normal runtime update, so
+/// one edit is observed by every bound collider without replacing components.
+#[derive(Clone, Debug)]
+pub(crate) struct PhysicsMaterial3DHandle(Arc<Mutex<VersionedPhysicsMaterial3D>>);
+
+impl PhysicsMaterial3DHandle {
+    pub(crate) fn new(material: PhysicsMaterial3D) -> mlua::Result<Self> {
+        validate_physics_material_3d(&material)?;
+        Ok(Self(Arc::new(Mutex::new(VersionedPhysicsMaterial3D {
+            revision: 0,
+            material,
+        }))))
+    }
+
+    pub(crate) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
+    pub(crate) fn snapshot(&self) -> mlua::Result<(u64, PhysicsMaterial3D)> {
+        let asset = self
+            .0
+            .lock()
+            .map_err(|_| mlua::Error::external("physics material lock poisoned"))?;
+        Ok((asset.revision, asset.material.clone()))
+    }
+
+    fn mutate(&self, edit: impl FnOnce(&mut PhysicsMaterial3D)) -> mlua::Result<u64> {
+        let mut asset = self
+            .0
+            .lock()
+            .map_err(|_| mlua::Error::external("physics material lock poisoned"))?;
+        let mut candidate = asset.material.clone();
+        edit(&mut candidate);
+        validate_physics_material_3d(&candidate)?;
+        asset.material = candidate;
+        asset.revision = asset.revision.wrapping_add(1);
+        Ok(asset.revision)
+    }
+}
+
+fn validate_physics_material_3d(material: &PhysicsMaterial3D) -> mlua::Result<()> {
+    if material.name.trim().is_empty() {
+        return Err(mlua::Error::external(
+            "PhysicsMaterial3D name must not be empty",
+        ));
+    }
+    if !material.friction.is_finite() || !(0.0..=1.0).contains(&material.friction) {
+        return Err(mlua::Error::external(
+            "PhysicsMaterial3D friction must be finite and between 0 and 1",
+        ));
+    }
+    if !material.restitution.is_finite() || !(0.0..=1.0).contains(&material.restitution) {
+        return Err(mlua::Error::external(
+            "PhysicsMaterial3D restitution must be finite and between 0 and 1",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct MaterialTextureFile {
+    pub source: String,
+    #[serde(default)]
+    pub tex_coord: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct Material3DFile {
+    #[serde(default = "material_file_version")]
+    pub version: u32,
+    #[serde(default = "material_file_name")]
+    pub name: String,
+    #[serde(default = "material_file_white")]
+    pub base_color: [f32; 4],
+    #[serde(default)]
+    pub metallic: f32,
+    #[serde(default = "material_file_one")]
+    pub roughness: f32,
+    #[serde(default)]
+    pub emissive: [f32; 3],
+    #[serde(default = "material_file_opaque")]
+    pub alpha_mode: String,
+    #[serde(default = "material_file_half")]
+    pub alpha_cutoff: f32,
+    #[serde(default)]
+    pub double_sided: bool,
+    #[serde(default)]
+    pub base_color_texture: Option<MaterialTextureFile>,
+    #[serde(default)]
+    pub normal_texture: Option<MaterialTextureFile>,
+    #[serde(default)]
+    pub metallic_roughness_texture: Option<MaterialTextureFile>,
+    #[serde(default)]
+    pub emissive_texture: Option<MaterialTextureFile>,
+}
+
+impl Default for Material3DFile {
+    fn default() -> Self {
+        Self {
+            version: material_file_version(),
+            name: material_file_name(),
+            base_color: material_file_white(),
+            metallic: 0.0,
+            roughness: material_file_one(),
+            emissive: [0.0; 3],
+            alpha_mode: material_file_opaque(),
+            alpha_cutoff: material_file_half(),
+            double_sided: false,
+            base_color_texture: None,
+            normal_texture: None,
+            metallic_roughness_texture: None,
+            emissive_texture: None,
+        }
+    }
+}
+
+fn material_file_version() -> u32 {
+    1
+}
+fn material_file_name() -> String {
+    "Material3D".to_string()
+}
+fn material_file_white() -> [f32; 4] {
+    [1.0; 4]
+}
+fn material_file_one() -> f32 {
+    1.0
+}
+fn material_file_half() -> f32 {
+    0.5
+}
+fn material_file_opaque() -> String {
+    "opaque".to_string()
 }
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
@@ -744,6 +1086,28 @@ impl UserData for ImageHandle {
     }
 }
 
+impl UserData for CubemapHandle {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("size", |_lua, this, ()| Ok(this.snapshot()?.size));
+        methods.add_method("face", |_lua, this, name: String| {
+            let index = cubemap_face_index(&name).ok_or_else(|| {
+                mlua::Error::external(
+                    "cubemap face must be positive_x/negative_x/positive_y/negative_y/positive_z/negative_z",
+                )
+            })?;
+            Ok(this.faces[index].clone())
+        });
+        methods.add_method("getFace", |_lua, this, name: String| {
+            let index = cubemap_face_index(&name).ok_or_else(|| {
+                mlua::Error::external(
+                    "cubemap face must be positive_x/negative_x/positive_y/negative_y/positive_z/negative_z",
+                )
+            })?;
+            Ok(this.faces[index].clone())
+        });
+    }
+}
+
 impl UserData for SoundHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("sampleRate", |_lua, this, ()| this.sample_rate());
@@ -807,6 +1171,225 @@ impl UserData for SoundHandle {
                 .lock()
                 .map_err(|_| mlua::Error::external("sound lock poisoned"))?;
             Ok(sound.unloaded)
+        });
+    }
+}
+
+fn material_texture_binding(value: Value, tex_coord: u32) -> mlua::Result<Option<TextureBinding>> {
+    match value {
+        Value::Nil => Ok(None),
+        Value::String(source) => Ok(Some(TextureBinding {
+            source: source.to_string_lossy(),
+            tex_coord,
+            image: None,
+        })),
+        Value::UserData(image) => Ok(Some(TextureBinding {
+            source: "<runtime image>".to_string(),
+            tex_coord,
+            image: Some(image.borrow::<ImageHandle>()?.clone()),
+        })),
+        other => Err(mlua::Error::external(format!(
+            "material texture must be an ImageHandle, source string, or nil; got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn set_material_texture_slot(
+    material: &mut MeshMaterial,
+    slot: &str,
+    binding: Option<TextureBinding>,
+) -> crate::mesh::MeshResult<()> {
+    match slot {
+        "base" | "base_color" | "albedo" | "diffuse" => material.base_color_texture = binding,
+        "normal" | "normal_map" => material.normal_texture = binding,
+        "metallic_roughness" | "orm" => material.metallic_roughness_texture = binding,
+        "emissive" | "emission" => material.emissive_texture = binding,
+        _ => {
+            return Err(crate::mesh::MeshError::InvalidData(format!(
+                "unknown material texture slot '{slot}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_mesh_material(mesh: &mut MeshData, index: usize) -> &mut MeshMaterial {
+    while mesh.materials.len() <= index {
+        mesh.materials.push(MeshMaterial::default());
+    }
+    if index == 0 {
+        for submesh in &mut mesh.submeshes {
+            if submesh.material.is_none() {
+                submesh.material = Some(0);
+            }
+        }
+    }
+    &mut mesh.materials[index]
+}
+
+fn material_to_table(lua: &Lua, material: &MeshMaterial) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("name", material.name.clone())?;
+    table.set("metallic", material.metallic)?;
+    table.set("roughness", material.roughness)?;
+    table.set("double_sided", material.double_sided)?;
+    table.set("alpha_cutoff", material.alpha_cutoff)?;
+    table.set(
+        "alpha_mode",
+        match material.alpha_mode {
+            crate::mesh::AlphaMode::Opaque => "opaque",
+            crate::mesh::AlphaMode::Mask => "mask",
+            crate::mesh::AlphaMode::Blend => "blend",
+        },
+    )?;
+    for (name, binding) in [
+        ("base_color_texture", material.base_color_texture.as_ref()),
+        ("normal_texture", material.normal_texture.as_ref()),
+        (
+            "metallic_roughness_texture",
+            material.metallic_roughness_texture.as_ref(),
+        ),
+        ("emissive_texture", material.emissive_texture.as_ref()),
+    ] {
+        table.set(name, binding.map(|binding| binding.source.clone()))?;
+    }
+    for (name, binding) in [
+        ("base_color_image", material.base_color_texture.as_ref()),
+        ("normal_image", material.normal_texture.as_ref()),
+        (
+            "metallic_roughness_image",
+            material.metallic_roughness_texture.as_ref(),
+        ),
+        ("emissive_image", material.emissive_texture.as_ref()),
+    ] {
+        match binding.and_then(|binding| binding.image.as_ref()) {
+            Some(image) => table.set(name, lua.create_userdata(image.clone())?)?,
+            None => table.set(name, Value::Nil)?,
+        }
+    }
+    let color = lua.create_table()?;
+    color.set("r", material.base_color[0] * 255.0)?;
+    color.set("g", material.base_color[1] * 255.0)?;
+    color.set("b", material.base_color[2] * 255.0)?;
+    color.set("a", material.base_color[3] * 255.0)?;
+    table.set("base_color", color)?;
+    let emissive = lua.create_table()?;
+    emissive.set("r", material.emissive[0] * 255.0)?;
+    emissive.set("g", material.emissive[1] * 255.0)?;
+    emissive.set("b", material.emissive[2] * 255.0)?;
+    emissive.set("a", 255.0)?;
+    table.set("emissive", emissive)?;
+    Ok(table)
+}
+
+impl UserData for MaterialHandle {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("revision", |_lua, this, ()| {
+            this.revision().map_err(mlua::Error::external)
+        });
+        methods.add_method("identity", |_lua, this, ()| Ok(this.identity() as u64));
+        methods.add_method("get", |lua, this, ()| {
+            let snapshot = this.snapshot().map_err(mlua::Error::external)?;
+            material_to_table(lua, snapshot.material.as_ref())
+        });
+        methods.add_method("setColor", |_lua, this, color: Table| {
+            let color = color4_table_to_color(color)?;
+            this.mutate(move |material| {
+                material.base_color = [
+                    color.r as f32 / 255.0,
+                    color.g as f32 / 255.0,
+                    color.b as f32 / 255.0,
+                    color.a as f32 / 255.0,
+                ];
+                Ok(())
+            })
+            .map_err(mlua::Error::external)
+        });
+        methods.add_method("setPbr", |_lua, this, (metallic, roughness): (f32, f32)| {
+            this.mutate(move |material| {
+                material.metallic = metallic;
+                material.roughness = roughness;
+                Ok(())
+            })
+            .map_err(mlua::Error::external)
+        });
+        methods.add_method("setEmissive", |_lua, this, color: Table| {
+            let color = color4_table_to_color(color)?;
+            this.mutate(move |material| {
+                material.emissive = [
+                    color.r as f32 / 255.0,
+                    color.g as f32 / 255.0,
+                    color.b as f32 / 255.0,
+                ];
+                Ok(())
+            })
+            .map_err(mlua::Error::external)
+        });
+        methods.add_method(
+            "setTexture",
+            |_lua, this, (slot, source, tex_coord): (String, Value, Option<u32>)| {
+                let slot = slot.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+                let binding = material_texture_binding(source, tex_coord.unwrap_or(0))?;
+                this.mutate(move |material| set_material_texture_slot(material, &slot, binding))
+                    .map_err(mlua::Error::external)
+            },
+        );
+        methods.add_method(
+            "setAlpha",
+            |_lua, this, (mode, cutoff): (String, Option<f32>)| {
+                let mode = match mode.trim().to_ascii_lowercase().as_str() {
+                    "opaque" => crate::mesh::AlphaMode::Opaque,
+                    "mask" | "cutout" => crate::mesh::AlphaMode::Mask,
+                    "blend" | "transparent" => crate::mesh::AlphaMode::Blend,
+                    _ => {
+                        return Err(mlua::Error::external(
+                            "material alpha mode must be opaque, mask, or blend",
+                        ));
+                    }
+                };
+                let cutoff = cutoff.unwrap_or(0.5);
+                this.mutate(move |material| {
+                    material.alpha_mode = mode;
+                    material.alpha_cutoff = cutoff;
+                    Ok(())
+                })
+                .map_err(mlua::Error::external)
+            },
+        );
+        methods.add_method("setDoubleSided", |_lua, this, enabled: bool| {
+            this.mutate(move |material| {
+                material.double_sided = enabled;
+                Ok(())
+            })
+            .map_err(mlua::Error::external)
+        });
+    }
+}
+
+impl UserData for PhysicsMaterial3DHandle {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("revision", |_lua, this, ()| Ok(this.snapshot()?.0));
+        methods.add_method("identity", |_lua, this, ()| Ok(this.identity() as u64));
+        methods.add_method("get", |lua, this, ()| {
+            let (_, material) = this.snapshot()?;
+            let value = lua.create_table()?;
+            value.set("name", material.name)?;
+            value.set("friction", material.friction)?;
+            value.set("restitution", material.restitution)?;
+            Ok(value)
+        });
+        methods.add_method("setFriction", |_lua, this, friction: f32| {
+            this.mutate(move |material| material.friction = friction)
+        });
+        methods.add_method("setRestitution", |_lua, this, restitution: f32| {
+            this.mutate(move |material| material.restitution = restitution)
+        });
+        methods.add_method("set", |_lua, this, (friction, restitution): (f32, f32)| {
+            this.mutate(move |material| {
+                material.friction = friction;
+                material.restitution = restitution;
+            })
         });
     }
 }
@@ -953,67 +1536,22 @@ impl UserData for MeshHandle {
                 .with_read(|mesh, _| mesh.materials.get(index as usize - 1).cloned())
                 .map_err(mlua::Error::external)?
                 .ok_or_else(|| mlua::Error::external("mesh material index out of bounds"))?;
-            let table = lua.create_table()?;
-            table.set("name", material.name)?;
-            table.set("metallic", material.metallic)?;
-            table.set("roughness", material.roughness)?;
-            table.set("double_sided", material.double_sided)?;
-            table.set(
-                "base_color_texture",
-                material.base_color_texture.map(|binding| binding.source),
-            )?;
-            table.set(
-                "normal_texture",
-                material.normal_texture.map(|binding| binding.source),
-            )?;
-            let color = lua.create_table()?;
-            color.set("r", material.base_color[0] * 255.0)?;
-            color.set("g", material.base_color[1] * 255.0)?;
-            color.set("b", material.base_color[2] * 255.0)?;
-            color.set("a", material.base_color[3] * 255.0)?;
-            table.set("base_color", color)?;
-            Ok(table)
+            material_to_table(lua, &material)
         });
         methods.add_method(
             "setMaterialTexture",
-            |_lua,
-             this,
-             (index, slot, source, tex_coord): (i64, String, Option<String>, Option<u32>)| {
+            |_lua, this, (index, slot, source, tex_coord): (i64, String, Value, Option<u32>)| {
                 if index <= 0 {
                     return Err(mlua::Error::external(
                         "mesh materials use Lua's one-based indexing",
                     ));
                 }
                 let index = index as usize - 1;
-                let slot = slot
-                    .trim()
-                    .to_ascii_lowercase()
-                    .replace(['-', ' '], "_");
-                this.mutate(move |mesh| {
-                    while mesh.materials.len() <= index {
-                        mesh.materials.push(MeshMaterial::default());
-                    }
-                    let material = &mut mesh.materials[index];
-                    let binding = source.map(|source| TextureBinding {
-                        source,
-                        tex_coord: tex_coord.unwrap_or(0),
-                    });
-                    match slot.as_str() {
-                        "base" | "base_color" | "albedo" | "diffuse" => {
-                            material.base_color_texture = binding
-                        }
-                        "normal" | "normal_map" => material.normal_texture = binding,
-                        "metallic_roughness" | "orm" => {
-                            material.metallic_roughness_texture = binding
-                        }
-                        "emissive" | "emission" => material.emissive_texture = binding,
-                        _ => {
-                            return Err(crate::mesh::MeshError::InvalidData(format!(
-                                "unknown material texture slot '{slot}'"
-                            )));
-                        }
-                    }
-                    Ok(())
+                let slot = slot.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+                let binding = material_texture_binding(source, tex_coord.unwrap_or(0))?;
+                this.mutate_metadata(move |mesh| {
+                    let material = ensure_mesh_material(mesh, index);
+                    set_material_texture_slot(material, &slot, binding)
                 })
                 .map_err(mlua::Error::external)
             },
@@ -1028,16 +1566,111 @@ impl UserData for MeshHandle {
                 }
                 let index = index as usize - 1;
                 let color = color4_table_to_color(color)?;
-                this.mutate(move |mesh| {
-                    while mesh.materials.len() <= index {
-                        mesh.materials.push(MeshMaterial::default());
-                    }
-                    mesh.materials[index].base_color = [
+                this.mutate_metadata(move |mesh| {
+                    ensure_mesh_material(mesh, index).base_color = [
                         color.r as f32 / 255.0,
                         color.g as f32 / 255.0,
                         color.b as f32 / 255.0,
                         color.a as f32 / 255.0,
                     ];
+                    Ok(())
+                })
+                .map_err(mlua::Error::external)
+            },
+        );
+        methods.add_method(
+            "setMaterialPbr",
+            |_lua, this, (index, metallic, roughness): (i64, f32, f32)| {
+                if index <= 0 {
+                    return Err(mlua::Error::external(
+                        "mesh materials use Lua's one-based indexing",
+                    ));
+                }
+                if !metallic.is_finite()
+                    || !roughness.is_finite()
+                    || !(0.0..=1.0).contains(&metallic)
+                    || !(0.0..=1.0).contains(&roughness)
+                {
+                    return Err(mlua::Error::external(
+                        "setMaterialPbr expects metallic and roughness in 0..1",
+                    ));
+                }
+                let index = index as usize - 1;
+                this.mutate_metadata(move |mesh| {
+                    let material = ensure_mesh_material(mesh, index);
+                    material.metallic = metallic;
+                    material.roughness = roughness;
+                    Ok(())
+                })
+                .map_err(mlua::Error::external)
+            },
+        );
+        methods.add_method(
+            "setMaterialEmissive",
+            |_lua, this, (index, color): (i64, Table)| {
+                if index <= 0 {
+                    return Err(mlua::Error::external(
+                        "mesh materials use Lua's one-based indexing",
+                    ));
+                }
+                let index = index as usize - 1;
+                let color = color4_table_to_color(color)?;
+                this.mutate_metadata(move |mesh| {
+                    ensure_mesh_material(mesh, index).emissive = [
+                        color.r as f32 / 255.0,
+                        color.g as f32 / 255.0,
+                        color.b as f32 / 255.0,
+                    ];
+                    Ok(())
+                })
+                .map_err(mlua::Error::external)
+            },
+        );
+        methods.add_method(
+            "setMaterialAlpha",
+            |_lua, this, (index, mode, cutoff): (i64, String, Option<f32>)| {
+                if index <= 0 {
+                    return Err(mlua::Error::external(
+                        "mesh materials use Lua's one-based indexing",
+                    ));
+                }
+                let alpha_mode = match mode.trim().to_ascii_lowercase().as_str() {
+                    "opaque" => crate::mesh::AlphaMode::Opaque,
+                    "mask" | "cutout" => crate::mesh::AlphaMode::Mask,
+                    "blend" | "transparent" => crate::mesh::AlphaMode::Blend,
+                    _ => {
+                        return Err(mlua::Error::external(
+                            "material alpha mode must be opaque, mask, or blend",
+                        ));
+                    }
+                };
+                let cutoff = cutoff.unwrap_or(0.5);
+                if !cutoff.is_finite() || !(0.0..=1.0).contains(&cutoff) {
+                    return Err(mlua::Error::external(
+                        "material alpha cutoff must be in 0..1",
+                    ));
+                }
+                let index = index as usize - 1;
+                this.mutate_metadata(move |mesh| {
+                    let material = ensure_mesh_material(mesh, index);
+                    material.alpha_mode = alpha_mode;
+                    material.alpha_cutoff = cutoff;
+                    Ok(())
+                })
+                .map_err(mlua::Error::external)
+            },
+        );
+        methods.add_method(
+            "setMaterialDoubleSided",
+            |_lua, this, (index, enabled): (i64, bool)| {
+                if index <= 0 {
+                    return Err(mlua::Error::external(
+                        "mesh materials use Lua's one-based indexing",
+                    ));
+                }
+                let index = index as usize - 1;
+                this.mutate_metadata(move |mesh| {
+                    ensure_mesh_material(mesh, index).double_sided = enabled;
                     Ok(())
                 })
                 .map_err(mlua::Error::external)
@@ -1146,6 +1779,8 @@ impl AssetManager {
             encoded_images: HashMap::new(),
             sounds: HashMap::new(),
             meshes: HashMap::new(),
+            materials: HashMap::new(),
+            physics_materials: HashMap::new(),
         }
     }
 
@@ -1155,25 +1790,39 @@ impl AssetManager {
             return normalize_path(&path);
         }
 
+        // A bare path such as `sfx/jump.mp3` is looked up under `assets/` first,
+        // then relative to the project root itself, so assets stored outside the
+        // `assets/` directory (the editor records project-relative paths) still
+        // resolve. Paths that are already explicitly project-relative skip the
+        // `assets/` lookup.
         let project_relative = user_path.starts_with("./")
             || user_path.starts_with("../")
             || user_path.starts_with("assets/")
             || user_path.starts_with("assets\\");
-        let data_path = if project_relative {
-            self.data_root.join(&path)
-        } else {
-            self.data_root.join("assets").join(&path)
-        };
-        if data_path.exists() {
-            return normalize_path(&data_path);
+        let mut candidates: Vec<PathBuf> = Vec::with_capacity(4);
+        for root in [&self.data_root, &self.resource_root] {
+            if project_relative {
+                candidates.push(root.join(&path));
+            } else {
+                candidates.push(root.join("assets").join(&path));
+                candidates.push(root.join(&path));
+            }
         }
 
-        let resource_path = if project_relative {
-            self.resource_root.join(path)
+        for candidate in &candidates {
+            if candidate.exists() {
+                return normalize_path(candidate);
+            }
+        }
+
+        // Nothing on disk: report the canonical `assets/` location under the
+        // resource root so the error names where the asset was expected.
+        let fallback = if project_relative {
+            self.resource_root.join(&path)
         } else {
-            self.resource_root.join("assets").join(path)
+            self.resource_root.join("assets").join(&path)
         };
-        normalize_path(&resource_path)
+        normalize_path(&fallback)
     }
 
     fn canonical_for_cache(path: &Path) -> PathBuf {
@@ -1251,6 +1900,221 @@ impl AssetManager {
         })?;
         self.meshes.insert(cache_key, mesh.clone());
         Ok(mesh)
+    }
+
+    fn texture_from_material_file(
+        &mut self,
+        texture: Option<MaterialTextureFile>,
+        material_directory: &Path,
+    ) -> mlua::Result<Option<TextureBinding>> {
+        let Some(texture) = texture else {
+            return Ok(None);
+        };
+        if texture.source.trim().is_empty() {
+            return Err(mlua::Error::external(
+                "material texture source must not be empty",
+            ));
+        }
+        let load_path = if has_explicit_base64_prefix(&texture.source)
+            || Path::new(&texture.source).is_absolute()
+        {
+            texture.source.clone()
+        } else {
+            material_directory
+                .join(&texture.source)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let image = self.load_image(&load_path)?;
+        Ok(Some(TextureBinding {
+            source: texture.source,
+            tex_coord: texture.tex_coord,
+            image: Some(image),
+        }))
+    }
+
+    pub(crate) fn load_material(&mut self, user_path: &str) -> mlua::Result<MaterialHandle> {
+        let resolved = self.resolve_path(user_path);
+        let cache_key = Self::canonical_for_cache(&resolved);
+        if let Some(material) = self.materials.get(&cache_key) {
+            return Ok(material.clone());
+        }
+        let bytes = std::fs::read(&resolved)
+            .map_err(|error| asset_io_error("read material", &resolved, error))?;
+        let file: Material3DFile = serde_json::from_slice(&bytes).map_err(|error| {
+            mlua::Error::external(format!(
+                "failed to decode material '{}': {error}",
+                resolved.display()
+            ))
+        })?;
+        let handle = self.material_from_file(file, &resolved)?;
+        self.materials.insert(cache_key, handle.clone());
+        Ok(handle)
+    }
+
+    /// Build a reusable material through the exact runtime validation and
+    /// texture-resolution path without requiring the source file to be saved.
+    /// The editor material inspector uses this for an unsaved live preview.
+    pub(crate) fn material_from_file(
+        &mut self,
+        file: Material3DFile,
+        resolved_path: &Path,
+    ) -> mlua::Result<MaterialHandle> {
+        if file.version != 1 {
+            return Err(mlua::Error::external(format!(
+                "unsupported material version {}; expected 1",
+                file.version
+            )));
+        }
+        let alpha_mode = match file.alpha_mode.trim().to_ascii_lowercase().as_str() {
+            "opaque" => crate::mesh::AlphaMode::Opaque,
+            "mask" => crate::mesh::AlphaMode::Mask,
+            "blend" => crate::mesh::AlphaMode::Blend,
+            _ => {
+                return Err(mlua::Error::external(
+                    "material alpha_mode must be opaque, mask, or blend",
+                ));
+            }
+        };
+        let directory = resolved_path.parent().unwrap_or_else(|| Path::new("."));
+        let material = MeshMaterial {
+            name: file.name,
+            base_color: file.base_color,
+            metallic: file.metallic,
+            roughness: file.roughness,
+            emissive: file.emissive,
+            base_color_texture: self
+                .texture_from_material_file(file.base_color_texture, directory)?,
+            normal_texture: self.texture_from_material_file(file.normal_texture, directory)?,
+            metallic_roughness_texture: self
+                .texture_from_material_file(file.metallic_roughness_texture, directory)?,
+            emissive_texture: self.texture_from_material_file(file.emissive_texture, directory)?,
+            alpha_mode,
+            alpha_cutoff: file.alpha_cutoff,
+            double_sided: file.double_sided,
+        };
+        MaterialHandle::new(material).map_err(mlua::Error::external)
+    }
+
+    pub(crate) fn save_material(
+        &self,
+        material: &MaterialHandle,
+        user_path: &str,
+    ) -> mlua::Result<PathBuf> {
+        let snapshot = material.snapshot().map_err(mlua::Error::external)?;
+        let texture = |binding: &Option<TextureBinding>| {
+            binding.as_ref().map(|binding| MaterialTextureFile {
+                source: binding.source.clone(),
+                tex_coord: binding.tex_coord,
+            })
+        };
+        for binding in [
+            &snapshot.material.base_color_texture,
+            &snapshot.material.normal_texture,
+            &snapshot.material.metallic_roughness_texture,
+            &snapshot.material.emissive_texture,
+        ] {
+            if binding
+                .as_ref()
+                .is_some_and(|binding| binding.source == "<runtime image>")
+            {
+                return Err(mlua::Error::external(
+                    "export runtime images first, then bind their path before saving a material",
+                ));
+            }
+        }
+        let file = Material3DFile {
+            version: 1,
+            name: snapshot.material.name.clone(),
+            base_color: snapshot.material.base_color,
+            metallic: snapshot.material.metallic,
+            roughness: snapshot.material.roughness,
+            emissive: snapshot.material.emissive,
+            alpha_mode: match snapshot.material.alpha_mode {
+                crate::mesh::AlphaMode::Opaque => "opaque",
+                crate::mesh::AlphaMode::Mask => "mask",
+                crate::mesh::AlphaMode::Blend => "blend",
+            }
+            .to_string(),
+            alpha_cutoff: snapshot.material.alpha_cutoff,
+            double_sided: snapshot.material.double_sided,
+            base_color_texture: texture(&snapshot.material.base_color_texture),
+            normal_texture: texture(&snapshot.material.normal_texture),
+            metallic_roughness_texture: texture(&snapshot.material.metallic_roughness_texture),
+            emissive_texture: texture(&snapshot.material.emissive_texture),
+        };
+        let path = resolve_export_path(&self.data_root, user_path, "neomaterial")?;
+        ensure_parent_dir(&path).map_err(|error| {
+            asset_io_error("create export directory for material", &path, error)
+        })?;
+        let bytes = serde_json::to_vec_pretty(&file)
+            .map_err(|error| mlua::Error::external(format!("encode material: {error}")))?;
+        std::fs::write(&path, bytes)
+            .map_err(|error| asset_io_error("write material", &path, error))?;
+        Ok(path)
+    }
+
+    pub(crate) fn physics_material_from_file(
+        &self,
+        file: PhysicsMaterial3DFile,
+    ) -> mlua::Result<PhysicsMaterial3DHandle> {
+        if file.version != physics_material_file_version() {
+            return Err(mlua::Error::external(format!(
+                "unsupported PhysicsMaterial3D version {}; expected {}",
+                file.version,
+                physics_material_file_version()
+            )));
+        }
+        PhysicsMaterial3DHandle::new(PhysicsMaterial3D {
+            name: file.name,
+            friction: file.friction,
+            restitution: file.restitution,
+        })
+    }
+
+    pub(crate) fn load_physics_material(
+        &mut self,
+        user_path: &str,
+    ) -> mlua::Result<PhysicsMaterial3DHandle> {
+        let resolved = self.resolve_path(user_path);
+        let cache_key = Self::canonical_for_cache(&resolved);
+        if let Some(material) = self.physics_materials.get(&cache_key) {
+            return Ok(material.clone());
+        }
+        let bytes = std::fs::read(&resolved)
+            .map_err(|error| asset_io_error("read physics material", &resolved, error))?;
+        let file: PhysicsMaterial3DFile = serde_json::from_slice(&bytes).map_err(|error| {
+            mlua::Error::external(format!(
+                "failed to decode physics material '{}': {error}",
+                resolved.display()
+            ))
+        })?;
+        let handle = self.physics_material_from_file(file)?;
+        self.physics_materials.insert(cache_key, handle.clone());
+        Ok(handle)
+    }
+
+    pub(crate) fn save_physics_material(
+        &self,
+        material: &PhysicsMaterial3DHandle,
+        user_path: &str,
+    ) -> mlua::Result<PathBuf> {
+        let (_, material) = material.snapshot()?;
+        let file = PhysicsMaterial3DFile {
+            version: physics_material_file_version(),
+            name: material.name,
+            friction: material.friction,
+            restitution: material.restitution,
+        };
+        let path = resolve_export_path(&self.data_root, user_path, "neophysicsmaterial")?;
+        ensure_parent_dir(&path).map_err(|error| {
+            asset_io_error("create export directory for physics material", &path, error)
+        })?;
+        let bytes = serde_json::to_vec_pretty(&file)
+            .map_err(|error| mlua::Error::external(format!("encode physics material: {error}")))?;
+        std::fs::write(&path, bytes)
+            .map_err(|error| asset_io_error("write physics material", &path, error))?;
+        Ok(path)
     }
 
     pub(crate) fn new_mesh(
@@ -1467,6 +2331,20 @@ impl AssetManager {
         self.meshes.remove(&cache_key).is_some()
     }
 
+    pub(crate) fn unload_material_path(&mut self, user_path: &str) -> bool {
+        let resolved = self.resolve_path(user_path);
+        self.materials
+            .remove(&Self::canonical_for_cache(&resolved))
+            .is_some()
+    }
+
+    pub(crate) fn unload_physics_material_path(&mut self, user_path: &str) -> bool {
+        let resolved = self.resolve_path(user_path);
+        self.physics_materials
+            .remove(&Self::canonical_for_cache(&resolved))
+            .is_some()
+    }
+
     pub(crate) fn gc(&mut self) -> (usize, usize) {
         let before_images = self.images.len() + self.encoded_images.len();
         let before_sounds = self.sounds.len();
@@ -1494,6 +2372,152 @@ pub(crate) fn add_assets_module_with_data_root(
     )));
     let assets = lua.create_table()?;
 
+    #[cfg(not(neolove_2d))]
+    {
+        let new_material = lua.create_function(|lua, options: Option<Table>| {
+            let mut material = MeshMaterial::named("Material3D");
+            // Runtime-authored materials default to a neutral dielectric. Imported
+            // glTF materials retain the format's metallic=1 default independently.
+            material.metallic = 0.0;
+            if let Some(options) = options {
+                material.name = options
+                    .get::<Option<String>>("name")?
+                    .unwrap_or_else(|| "Material3D".to_string());
+                if let Some(color) = options.get::<Option<Table>>("color")? {
+                    let color = color4_table_to_color(color)?;
+                    material.base_color = [
+                        color.r as f32 / 255.0,
+                        color.g as f32 / 255.0,
+                        color.b as f32 / 255.0,
+                        color.a as f32 / 255.0,
+                    ];
+                }
+                if let Some(emissive) = options.get::<Option<Table>>("emissive")? {
+                    let emissive = color4_table_to_color(emissive)?;
+                    material.emissive = [
+                        emissive.r as f32 / 255.0,
+                        emissive.g as f32 / 255.0,
+                        emissive.b as f32 / 255.0,
+                    ];
+                }
+                material.metallic = options
+                    .get::<Option<f32>>("metallic")?
+                    .unwrap_or(material.metallic);
+                material.roughness = options
+                    .get::<Option<f32>>("roughness")?
+                    .unwrap_or(material.roughness);
+                material.double_sided = options
+                    .get::<Option<bool>>("double_sided")?
+                    .unwrap_or(false);
+                material.alpha_cutoff = options.get::<Option<f32>>("alpha_cutoff")?.unwrap_or(0.5);
+                material.alpha_mode = match options
+                    .get::<Option<String>>("alpha_mode")?
+                    .unwrap_or_else(|| "opaque".to_string())
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "opaque" => crate::mesh::AlphaMode::Opaque,
+                    "mask" | "cutout" => crate::mesh::AlphaMode::Mask,
+                    "blend" | "transparent" => crate::mesh::AlphaMode::Blend,
+                    _ => {
+                        return Err(mlua::Error::external(
+                            "Material3D alpha_mode must be opaque, mask, or blend",
+                        ));
+                    }
+                };
+                for (field, slot) in [
+                    ("base_color_texture", "base_color"),
+                    ("normal_texture", "normal"),
+                    ("metallic_roughness_texture", "metallic_roughness"),
+                    ("emissive_texture", "emissive"),
+                ] {
+                    let value = options.get::<Value>(field)?;
+                    if !value.is_nil() {
+                        let binding = material_texture_binding(value, 0)?;
+                        set_material_texture_slot(&mut material, slot, binding)
+                            .map_err(mlua::Error::external)?;
+                    }
+                }
+            }
+            lua.create_userdata(MaterialHandle::new(material).map_err(mlua::Error::external)?)
+        })?;
+        assets.set("newMaterial3D", new_material.clone())?;
+        assets.set("newMaterial", new_material)?;
+
+        let new_physics_material = lua.create_function(|lua, options: Option<Table>| {
+            let options = options.unwrap_or(lua.create_table()?);
+            let handle = PhysicsMaterial3DHandle::new(PhysicsMaterial3D {
+                name: options
+                    .get::<Option<String>>("name")?
+                    .unwrap_or_else(physics_material_file_name),
+                friction: options
+                    .get::<Option<f32>>("friction")?
+                    .unwrap_or_else(physics_material_file_friction),
+                restitution: options.get::<Option<f32>>("restitution")?.unwrap_or(0.0),
+            })?;
+            lua.create_userdata(handle)
+        })?;
+        assets.set("newPhysicsMaterial3D", new_physics_material.clone())?;
+        assets.set("newPhysicsMaterial", new_physics_material)?;
+
+        {
+            let manager = manager.clone();
+            let load_material = lua.create_function(move |lua, path: String| {
+                let handle = manager
+                    .lock()
+                    .map_err(|_| mlua::Error::external("asset manager lock poisoned"))?
+                    .load_material(&path)?;
+                lua.create_userdata(handle)
+            })?;
+            assets.set("loadMaterial3D", load_material.clone())?;
+            assets.set("loadMaterial", load_material)?;
+        }
+
+        {
+            let manager = manager.clone();
+            let load_physics_material = lua.create_function(move |lua, path: String| {
+                let handle = manager
+                    .lock()
+                    .map_err(|_| mlua::Error::external("asset manager lock poisoned"))?
+                    .load_physics_material(&path)?;
+                lua.create_userdata(handle)
+            })?;
+            assets.set("loadPhysicsMaterial3D", load_physics_material.clone())?;
+            assets.set("loadPhysicsMaterial", load_physics_material)?;
+        }
+
+        {
+            let manager = manager.clone();
+            let save_material =
+                lua.create_function(move |_lua, (material, path): (AnyUserData, String)| {
+                    let material = material.borrow::<MaterialHandle>()?;
+                    manager
+                        .lock()
+                        .map_err(|_| mlua::Error::external("asset manager lock poisoned"))?
+                        .save_material(&material, &path)?;
+                    Ok(())
+                })?;
+            assets.set("saveMaterial3D", save_material.clone())?;
+            assets.set("saveMaterial", save_material)?;
+        }
+
+        {
+            let manager = manager.clone();
+            let save_physics_material =
+                lua.create_function(move |_lua, (material, path): (AnyUserData, String)| {
+                    let material = material.borrow::<PhysicsMaterial3DHandle>()?;
+                    manager
+                        .lock()
+                        .map_err(|_| mlua::Error::external("asset manager lock poisoned"))?
+                        .save_physics_material(&material, &path)?;
+                    Ok(())
+                })?;
+            assets.set("savePhysicsMaterial3D", save_physics_material.clone())?;
+            assets.set("savePhysicsMaterial", save_physics_material)?;
+        }
+    }
+
     {
         let manager = manager.clone();
         assets.set(
@@ -1508,6 +2532,36 @@ pub(crate) fn add_assets_module_with_data_root(
         )?;
     }
 
+    #[cfg(not(neolove_2d))]
+    {
+        let manager = manager.clone();
+        let load_cubemap = lua.create_function(move |lua, paths: Table| {
+            let paths = cubemap_paths_from_table(&paths)?;
+            let mut manager = manager
+                .lock()
+                .map_err(|_| mlua::Error::external("asset manager lock poisoned"))?;
+            let mut faces = Vec::with_capacity(6);
+            for path in paths {
+                faces.push(manager.load_image(&path)?);
+            }
+            drop(manager);
+            let faces: [ImageHandle; 6] = faces.try_into().expect("six cubemap images were loaded");
+            lua.create_userdata(CubemapHandle::new(faces)?)
+        })?;
+        assets.set("loadCubemap", load_cubemap.clone())?;
+        assets.set("loadCubeMap", load_cubemap)?;
+    }
+
+    #[cfg(not(neolove_2d))]
+    let new_cubemap = lua.create_function(|lua, faces: Table| {
+        lua.create_userdata(CubemapHandle::new(cubemap_handles_from_table(&faces)?)?)
+    })?;
+    #[cfg(not(neolove_2d))]
+    assets.set("newCubemap", new_cubemap.clone())?;
+    #[cfg(not(neolove_2d))]
+    assets.set("newCubeMap", new_cubemap)?;
+
+    #[cfg(not(neolove_2d))]
     assets.set(
         "primitiveMesh",
         lua.create_function(move |lua, (kind, options): (String, Option<Table>)| {
@@ -1518,6 +2572,7 @@ pub(crate) fn add_assets_module_with_data_root(
         })?,
     )?;
 
+    #[cfg(not(neolove_2d))]
     {
         let manager = manager.clone();
         assets.set(
@@ -1532,6 +2587,7 @@ pub(crate) fn add_assets_module_with_data_root(
         )?;
     }
 
+    #[cfg(not(neolove_2d))]
     {
         let manager = manager.clone();
         assets.set(
@@ -1753,6 +2809,31 @@ pub(crate) fn add_assets_module_with_data_root(
     {
         let manager = manager.clone();
         assets.set(
+            "unloadMaterial3D",
+            lua.create_function(move |_lua, path: String| {
+                Ok(manager
+                    .lock()
+                    .map_err(|_| mlua::Error::external("asset manager lock poisoned"))?
+                    .unload_material_path(&path))
+            })?,
+        )?;
+    }
+
+    {
+        let manager = manager.clone();
+        let unload_physics_material = lua.create_function(move |_lua, path: String| {
+            Ok(manager
+                .lock()
+                .map_err(|_| mlua::Error::external("asset manager lock poisoned"))?
+                .unload_physics_material_path(&path))
+        })?;
+        assets.set("unloadPhysicsMaterial3D", unload_physics_material.clone())?;
+        assets.set("unloadPhysicsMaterial", unload_physics_material)?;
+    }
+
+    {
+        let manager = manager.clone();
+        assets.set(
             "gc",
             lua.create_function(move |_lua, ()| {
                 let (images, sounds) = manager
@@ -1815,6 +2896,36 @@ mod tests {
         assert!(!Arc::ptr_eq(&first_pixels, &edited_pixels));
         assert_eq!(first_pixels.get_pixel(0, 0).0, [10, 20, 30, 255]);
         assert_eq!(edited_pixels.get_pixel(0, 0).0, [200, 100, 50, 255]);
+        Ok(())
+    }
+
+    #[test]
+    fn cubemap_validates_faces_and_tracks_live_image_revisions() -> mlua::Result<()> {
+        let faces = std::array::from_fn(|index| {
+            ImageHandle::from_rgba_image(RgbaImage::from_pixel(
+                2,
+                2,
+                Rgba([index as u8 * 30, 10, 20, 255]),
+            ))
+        });
+        let edited_face = faces[4].clone();
+        let cubemap = CubemapHandle::new(faces)?;
+        let first = cubemap.snapshot()?;
+        assert_eq!(first.size, 2);
+        assert_eq!(first.faces[4].get_pixel(0, 0).0, [120, 10, 20, 255]);
+        edited_face.with_image_mut(|image| {
+            image.put_pixel(0, 0, Rgba([255, 128, 64, 255]));
+        })?;
+        let second = cubemap.snapshot()?;
+        assert_eq!(second.identities, first.identities);
+        assert_eq!(second.revisions[4], first.revisions[4].wrapping_add(1));
+        assert_eq!(second.faces[4].get_pixel(0, 0).0, [255, 128, 64, 255]);
+
+        let mismatched = std::array::from_fn(|index| {
+            ImageHandle::from_rgba_image(RgbaImage::new(if index == 5 { 4 } else { 2 }, 2))
+        });
+        let error = CubemapHandle::new(mismatched).expect_err("mismatched face must fail");
+        assert!(error.to_string().contains("negative_z"));
         Ok(())
     }
 
@@ -1889,6 +3000,238 @@ mod tests {
         assert!(result.get::<bool>("detached")?);
         assert_eq!(result.get::<u64>("sphere_triangles")?, 120);
         assert_eq!(result.get::<u64>("animations")?, 0);
+        fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mesh_material_api_accepts_live_pbr_maps_and_transactional_factors() -> mlua::Result<()> {
+        let root = temp_root("mesh_material_pbr_api");
+        fs::create_dir_all(&root).map_err(mlua::Error::external)?;
+        let lua = Lua::new();
+        add_assets_module_with_data_root(
+            &lua,
+            root.clone(),
+            root.clone(),
+            crate::platform::new_shared_platform_state(),
+            crate::renderer::new_shared_render_state(),
+        )?;
+        lua.load(
+            r#"
+                local mesh = assets.primitiveMesh("cube"):cloneDetached()
+                pbrTestMesh = mesh
+                local normal = assets.newImage(2, 2, { r = 128, g = 128, b = 255, a = 255 })
+                local orm = assets.newImage(2, 2, { r = 255, g = 90, b = 220, a = 255 })
+                local emissive = assets.newImage(2, 2, { r = 255, g = 80, b = 20, a = 255 })
+                local first_revision = mesh:revision()
+                mesh:setMaterialTexture(1, "normal", normal)
+                mesh:setMaterialTexture(1, "metallic_roughness", orm)
+                mesh:setMaterialTexture(1, "emissive", emissive)
+                mesh:setMaterialPbr(1, 0.7, 0.35)
+                mesh:setMaterialEmissive(1, { r = 20, g = 40, b = 80, a = 255 })
+                mesh:setMaterialAlpha(1, "mask", 0.42)
+                mesh:setMaterialDoubleSided(1, true)
+
+                local material = mesh:getMaterial(1)
+                assert(material.normal_image:width() == 2)
+                assert(material.metallic_roughness_image:height() == 2)
+                assert(material.emissive_image:width() == 2)
+                assert(math.abs(material.metallic - 0.7) < 0.0001)
+                assert(math.abs(material.roughness - 0.35) < 0.0001)
+                assert(material.alpha_mode == "mask")
+                assert(math.abs(material.alpha_cutoff - 0.42) < 0.0001)
+                assert(material.double_sided == true)
+                assert(material.emissive.r == 20 and material.emissive.g == 40
+                    and material.emissive.b == 80)
+                assert(mesh:revision() == first_revision + 7)
+
+                local revision = mesh:revision()
+                local ok = pcall(function() mesh:setMaterialPbr(1, 2, 0.5) end)
+                assert(not ok and mesh:revision() == revision,
+                    "invalid material edits must not commit")
+            "#,
+        )
+        .exec()?;
+        let mesh = lua.globals().get::<mlua::AnyUserData>("pbrTestMesh")?;
+        let mesh = mesh.borrow::<MeshHandle>()?;
+        assert!(
+            mesh.with_read(|mesh, _| mesh
+                .submeshes
+                .iter()
+                .all(|submesh| submesh.material == Some(0)))
+                .map_err(mlua::Error::external)?,
+            "editing the first material should attach unassigned primitive submeshes"
+        );
+        fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reusable_material_3d_lua_api_is_live_and_validated() -> mlua::Result<()> {
+        let root = temp_root("reusable_material_3d_api");
+        fs::create_dir_all(&root).map_err(mlua::Error::external)?;
+        let lua = Lua::new();
+        add_assets_module_with_data_root(
+            &lua,
+            root.clone(),
+            root.clone(),
+            crate::platform::new_shared_platform_state(),
+            crate::renderer::new_shared_render_state(),
+        )?;
+        lua.load(
+            r#"
+                local normal = assets.newImage(1, 1, { r = 128, g = 128, b = 255, a = 255 })
+                local material = assets.newMaterial3D({
+                    name = "Shared steel",
+                    color = { r = 120, g = 140, b = 170, a = 255 },
+                    metallic = 0.85,
+                    roughness = 0.3,
+                    normal_texture = normal,
+                })
+                sharedMaterialTest = material
+                local same = material
+                assert(material:identity() == same:identity())
+                assert(material:get().normal_image:width() == 1)
+                local revision = material:revision()
+                material:setPbr(0.6, 0.45)
+                material:setAlpha("mask", 0.4)
+                material:setDoubleSided(true)
+                local state = same:get()
+                assert(math.abs(state.metallic - 0.6) < 0.0001)
+                assert(math.abs(state.roughness - 0.45) < 0.0001)
+                assert(state.alpha_mode == "mask" and state.double_sided)
+                assert(material:revision() == revision + 3)
+                local before = material:revision()
+                local ok = pcall(function() material:setPbr(-1, 0.5) end)
+                assert(not ok and material:revision() == before)
+            "#,
+        )
+        .exec()?;
+        let material = lua
+            .globals()
+            .get::<mlua::AnyUserData>("sharedMaterialTest")?;
+        let material = material.borrow::<MaterialHandle>()?;
+        assert_eq!(
+            material.snapshot().map_err(mlua::Error::external)?.revision,
+            3
+        );
+        fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn physics_material_3d_assets_are_shared_live_validated_and_persistent() -> mlua::Result<()> {
+        let root = temp_root("physics_material_3d_round_trip");
+        fs::create_dir_all(root.join("assets/materials")).map_err(mlua::Error::external)?;
+        let lua = Lua::new();
+        add_assets_module_with_data_root(
+            &lua,
+            root.clone(),
+            root.clone(),
+            crate::platform::new_shared_platform_state(),
+            crate::renderer::new_shared_render_state(),
+        )?;
+        lua.load(
+            r#"
+                local authored = assets.newPhysicsMaterial3D({
+                    name = "Shared rubber",
+                    friction = 0.85,
+                    restitution = 0.2,
+                })
+                local alias = authored
+                local revision = authored:revision()
+                authored:set(0.7, 0.35)
+                assert(alias:identity() == authored:identity())
+                assert(alias:revision() == revision + 1)
+                assert(math.abs(alias:get().friction - 0.7) < 0.0001)
+                assert(math.abs(alias:get().restitution - 0.35) < 0.0001)
+
+                local before = authored:revision()
+                local ok = pcall(function() authored:setFriction(1.01) end)
+                assert(not ok and authored:revision() == before,
+                    "invalid edits must be transactional")
+
+                assets.savePhysicsMaterial3D(authored, "assets/materials/rubber")
+                local loaded = assets.loadPhysicsMaterial3D(
+                    "assets/materials/rubber.neophysicsmaterial")
+                local cached = assets.loadPhysicsMaterial(
+                    "assets/materials/rubber.neophysicsmaterial")
+                assert(loaded:identity() == cached:identity())
+                assert(loaded:get().name == "Shared rubber")
+                assert(math.abs(loaded:get().friction - 0.7) < 0.0001)
+                assert(math.abs(loaded:get().restitution - 0.35) < 0.0001)
+                assert(assets.unloadPhysicsMaterial3D(
+                    "assets/materials/rubber.neophysicsmaterial"))
+                local reloaded = assets.loadPhysicsMaterial3D(
+                    "assets/materials/rubber.neophysicsmaterial")
+                assert(reloaded:identity() ~= loaded:identity())
+            "#,
+        )
+        .exec()?;
+        let json = fs::read_to_string(root.join("assets/materials/rubber.neophysicsmaterial"))
+            .map_err(mlua::Error::external)?;
+        assert!(json.contains("\"version\": 1"));
+        assert!(json.contains("\"friction\": 0.7"));
+        assert!(json.contains("\"restitution\": 0.35"));
+        fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn material_3d_assets_round_trip_and_resolve_relative_textures() -> mlua::Result<()> {
+        let root = temp_root("material_3d_asset_round_trip");
+        let material_dir = root.join("assets/materials");
+        fs::create_dir_all(&material_dir).map_err(mlua::Error::external)?;
+        image::save_buffer_with_format(
+            material_dir.join("albedo.png"),
+            &[25, 75, 225, 255],
+            1,
+            1,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .map_err(mlua::Error::external)?;
+        let lua = Lua::new();
+        add_assets_module_with_data_root(
+            &lua,
+            root.clone(),
+            root.clone(),
+            crate::platform::new_shared_platform_state(),
+            crate::renderer::new_shared_render_state(),
+        )?;
+        lua.load(
+            r#"
+                local authored = assets.newMaterial3D({
+                    name = "Saved paint",
+                    color = { r = 90, g = 110, b = 140, a = 230 },
+                    metallic = 0.35,
+                    roughness = 0.6,
+                    alpha_mode = "mask",
+                    alpha_cutoff = 0.3,
+                    base_color_texture = "albedo.png",
+                })
+                assets.saveMaterial3D(authored, "assets/materials/paint")
+                local loaded = assets.loadMaterial3D("assets/materials/paint.neomaterial")
+                local cached = assets.loadMaterial("assets/materials/paint.neomaterial")
+                assert(loaded:identity() == cached:identity())
+                local state = loaded:get()
+                assert(state.name == "Saved paint")
+                assert(math.abs(state.metallic - 0.35) < 0.0001)
+                assert(math.abs(state.roughness - 0.6) < 0.0001)
+                assert(state.alpha_mode == "mask")
+                assert(state.base_color_texture == "albedo.png")
+                assert(state.base_color_image:width() == 1)
+                assert(state.base_color_image:height() == 1)
+                assert(assets.unloadMaterial3D("assets/materials/paint.neomaterial"))
+                local reloaded = assets.loadMaterial3D("assets/materials/paint.neomaterial")
+                assert(reloaded:identity() ~= loaded:identity())
+            "#,
+        )
+        .exec()?;
+        let json = fs::read_to_string(material_dir.join("paint.neomaterial"))
+            .map_err(mlua::Error::external)?;
+        assert!(json.contains("\"version\": 1"));
+        assert!(json.contains("\"source\": \"albedo.png\""));
         fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())
     }
@@ -1986,6 +3329,39 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .map_err(mlua::Error::external)?;
         assert_eq!(samples.len(), 4);
+
+        fs::remove_dir_all(root).map_err(mlua::Error::external)?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_path_falls_back_to_project_root_for_assets_outside_assets_dir() -> mlua::Result<()> {
+        let root = temp_root("asset_resolve_fallback");
+        fs::create_dir_all(root.join("assets/sfx")).map_err(mlua::Error::external)?;
+        fs::create_dir_all(root.join("sfx")).map_err(mlua::Error::external)?;
+        fs::write(root.join("assets/sfx/inside.wav"), b"inside").map_err(mlua::Error::external)?;
+        fs::write(root.join("sfx/outside.wav"), b"outside").map_err(mlua::Error::external)?;
+
+        let manager = AssetManager::new(root.clone());
+        assert_eq!(
+            manager.resolve_path("sfx/inside.wav"),
+            normalize_path(&root.join("assets/sfx/inside.wav")),
+            "bare paths still prefer the assets/ directory"
+        );
+        assert_eq!(
+            manager.resolve_path("sfx/outside.wav"),
+            normalize_path(&root.join("sfx/outside.wav")),
+            "assets stored outside assets/ resolve against the project root"
+        );
+        assert_eq!(
+            manager.resolve_path("assets/sfx/inside.wav"),
+            normalize_path(&root.join("assets/sfx/inside.wav"))
+        );
+        assert_eq!(
+            manager.resolve_path("sfx/missing.wav"),
+            normalize_path(&root.join("assets/sfx/missing.wav")),
+            "missing assets report the canonical assets/ location"
+        );
 
         fs::remove_dir_all(root).map_err(mlua::Error::external)?;
         Ok(())

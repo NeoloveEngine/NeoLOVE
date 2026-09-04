@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::assets::ImageHandle;
+use crate::assets::{CubemapHandle, ImageHandle, PhysicsMaterial3DHandle};
 use crate::lua_error::protect_lua_call;
 use crate::platform::{Color, InputState, SharedPlatformState, WindowState, lock_platform_state};
 use crate::renderer::{
@@ -95,6 +95,575 @@ fn shader_from_component(component: &Table) -> mlua::Result<Option<crate::shader
     };
     let shader = shader_ud.borrow::<crate::shader::ShaderHandle>()?;
     Ok(Some(shader.clone()))
+}
+
+fn materials_from_component(
+    component: &Table,
+) -> mlua::Result<Vec<Option<crate::mesh::MaterialHandle>>> {
+    let mut materials = Vec::new();
+    if let Ok(table) = component.get::<Table>("materials") {
+        let length = table.raw_len();
+        materials.reserve(length);
+        for index in 1..=length {
+            match table.raw_get::<Value>(index)? {
+                Value::Nil => materials.push(None),
+                Value::UserData(material) => materials.push(Some(
+                    material.borrow::<crate::mesh::MaterialHandle>()?.clone(),
+                )),
+                other => {
+                    return Err(mlua::Error::external(format!(
+                        "MeshRenderer3D materials[{index}] must be a Material3D handle or nil, got {}",
+                        other.type_name()
+                    )));
+                }
+            }
+        }
+    }
+    if materials.is_empty()
+        && let Value::UserData(material) = component.get::<Value>("material")?
+    {
+        materials.push(Some(
+            material.borrow::<crate::mesh::MaterialHandle>()?.clone(),
+        ));
+    }
+    Ok(materials)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EntityRenderPolicy3D {
+    pub effective_visible: bool,
+    pub entity_mask: u32,
+    pub layer_match: bool,
+}
+
+fn enabled_core_component_3d(entity: &Table, expected: &str) -> mlua::Result<Option<Table>> {
+    let Ok(components) = entity.get::<Table>("components") else {
+        return Ok(None);
+    };
+    for component in components.sequence_values::<Table>() {
+        let component = component?;
+        if component
+            .get::<String>("__neolove_component")
+            .is_ok_and(|name| name == expected)
+            && component.get::<bool>("enabled").unwrap_or(true)
+        {
+            return Ok(Some(component));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve authored 3D visibility down the entity hierarchy. A child inherits
+/// by default; an enabled Visibility3D with `inherit_parent = false` forms an
+/// explicit visibility boundary while still applying its own local value.
+pub(crate) fn effective_visibility_3d(entity: &Table) -> mlua::Result<bool> {
+    let mut current = Some(entity.clone());
+    let mut visited = std::collections::HashSet::new();
+    let mut local_visibility = None;
+    let mut effective = true;
+    while let Some(candidate) = current {
+        if !visited.insert(candidate.to_pointer() as usize) {
+            return Err(mlua::Error::external(
+                "Visibility3D cannot resolve a cyclic entity hierarchy",
+            ));
+        }
+        if let Some(component) = enabled_core_component_3d(&candidate, "Visibility3D")? {
+            if local_visibility.is_none() {
+                local_visibility = Some(component.clone());
+            }
+            effective &= component.get::<bool>("visible").unwrap_or(true);
+            if !component.get::<bool>("inherit_parent").unwrap_or(true) {
+                break;
+            }
+        }
+        current = candidate.get::<Option<Table>>("parent").unwrap_or(None);
+    }
+    if let Some(component) = local_visibility {
+        component.set("effective_visible", effective)?;
+    }
+    Ok(effective)
+}
+
+pub(crate) fn entity_render_policy_3d(
+    entity: &Table,
+    camera_mask: u32,
+) -> mlua::Result<EntityRenderPolicy3D> {
+    let effective_visible = effective_visibility_3d(entity)?;
+    let entity_mask = enabled_core_component_3d(entity, "RenderLayer3D")?
+        .and_then(|component| component.get::<i64>("mask").ok())
+        .map(crate::render3d::sanitize_render_mask_3d)
+        .unwrap_or(1);
+    Ok(EntityRenderPolicy3D {
+        effective_visible,
+        entity_mask,
+        layer_match: crate::render3d::render_layers_intersect_3d(camera_mask, entity_mask),
+    })
+}
+
+fn entity_renders_for_camera_3d(entity: &Table, camera_mask: u32) -> mlua::Result<bool> {
+    let policy = entity_render_policy_3d(entity, camera_mask)?;
+    Ok(policy.effective_visible && policy.layer_match)
+}
+
+fn translate_entity_world_3d(
+    entity: &Table,
+    world_delta: crate::render3d::Vec3,
+) -> mlua::Result<()> {
+    use crate::render3d::Vec3;
+
+    if !world_delta.x.is_finite() || !world_delta.y.is_finite() || !world_delta.z.is_finite() {
+        return Err(mlua::Error::external(
+            "3D world translation must contain finite values",
+        ));
+    }
+    let local_delta = if let Some(parent) = entity.get::<Option<Table>>("parent")? {
+        let model = crate::window::get_global_transform_3d(&parent)?
+            .model
+            .values;
+        let determinant = model[0][0] * (model[1][1] * model[2][2] - model[1][2] * model[2][1])
+            - model[0][1] * (model[1][0] * model[2][2] - model[1][2] * model[2][0])
+            + model[0][2] * (model[1][0] * model[2][1] - model[1][1] * model[2][0]);
+        if !determinant.is_finite() || determinant.abs() <= 1.0e-8 {
+            return Err(mlua::Error::external(
+                "cannot apply 3D world motion through a singular parent transform",
+            ));
+        }
+        let inverse = determinant.recip();
+        Vec3::new(
+            ((model[1][1] * model[2][2] - model[1][2] * model[2][1]) * world_delta.x
+                + (model[0][2] * model[2][1] - model[0][1] * model[2][2]) * world_delta.y
+                + (model[0][1] * model[1][2] - model[0][2] * model[1][1]) * world_delta.z)
+                * inverse,
+            ((model[1][2] * model[2][0] - model[1][0] * model[2][2]) * world_delta.x
+                + (model[0][0] * model[2][2] - model[0][2] * model[2][0]) * world_delta.y
+                + (model[0][2] * model[1][0] - model[0][0] * model[1][2]) * world_delta.z)
+                * inverse,
+            ((model[1][0] * model[2][1] - model[1][1] * model[2][0]) * world_delta.x
+                + (model[0][1] * model[2][0] - model[0][0] * model[2][1]) * world_delta.y
+                + (model[0][0] * model[1][1] - model[0][1] * model[1][0]) * world_delta.z)
+                * inverse,
+        )
+    } else {
+        world_delta
+    };
+    entity.set("x", entity.get::<f32>("x").unwrap_or(0.0) + local_delta.x)?;
+    entity.set("y", entity.get::<f32>("y").unwrap_or(0.0) + local_delta.y)?;
+    entity.set(
+        "position_z",
+        entity.get::<f32>("position_z").unwrap_or(0.0) + local_delta.z,
+    )?;
+    Ok(())
+}
+
+type ColliderRegistry3D = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<usize, crate::physics3d::Collider3D>>,
+>;
+
+fn collider_surface_material_3d(lua: &Lua, component: &Table) -> mlua::Result<(f32, f32)> {
+    let fallback = || {
+        (
+            component
+                .get::<f32>("friction")
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0),
+            component
+                .get::<f32>("restitution")
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0),
+        )
+    };
+    let value = component
+        .get::<Value>("physics_material")
+        .unwrap_or(Value::Nil);
+    let userdata = match value {
+        Value::Nil => return Ok(fallback()),
+        Value::String(path) => {
+            let path = path.to_string_lossy();
+            if path.trim().is_empty() {
+                return Ok(fallback());
+            }
+            let assets: Table = lua.globals().get("assets")?;
+            let userdata: AnyUserData = assets
+                .get::<Function>("loadPhysicsMaterial3D")?
+                .call(path)?;
+            component.set("physics_material", userdata.clone())?;
+            userdata
+        }
+        Value::UserData(userdata) => userdata,
+        other => {
+            return Err(mlua::Error::external(format!(
+                "Collider3D physics_material must be a PhysicsMaterial3D handle, path string, or nil; got {}",
+                other.type_name()
+            )));
+        }
+    };
+    let (_, material) = userdata.borrow::<PhysicsMaterial3DHandle>()?.snapshot()?;
+    Ok((material.friction, material.restitution))
+}
+
+fn character_controller_dimensions_3d(component: &Table) -> (f32, f32) {
+    let radius = component
+        .get::<f32>("radius")
+        .unwrap_or(0.5)
+        .filter_finite()
+        .clamp(0.01, 1000.0);
+    let total_height = component
+        .get::<f32>("height")
+        .unwrap_or(2.0)
+        .filter_finite()
+        .clamp(radius * 2.0, 10_000.0);
+    (radius, (total_height * 0.5 - radius).max(0.0))
+}
+
+trait FiniteFallback {
+    fn filter_finite(self) -> Self;
+}
+
+impl FiniteFallback for f32 {
+    fn filter_finite(self) -> Self {
+        if self.is_finite() { self } else { 0.0 }
+    }
+}
+
+fn character_controller_center_3d(
+    entity: &Table,
+    component: &Table,
+) -> mlua::Result<crate::render3d::Vec3> {
+    let transform = crate::window::get_global_transform_3d(entity)?;
+    let offset = crate::render3d::Vec3::new(
+        component
+            .get::<f32>("center_x")
+            .unwrap_or(0.0)
+            .filter_finite(),
+        component
+            .get::<f32>("center_y")
+            .unwrap_or(0.0)
+            .filter_finite(),
+        component
+            .get::<f32>("center_z")
+            .unwrap_or(0.0)
+            .filter_finite(),
+    );
+    let offset = transform.model.transform_direction(offset);
+    Ok(crate::render3d::Vec3::new(
+        transform.position.x + offset.x,
+        transform.position.y + offset.y,
+        transform.position.z + offset.z,
+    ))
+}
+
+fn sync_character_controller_collider_3d(
+    registry: &ColliderRegistry3D,
+    entity: &Table,
+    component: &Table,
+) -> mlua::Result<()> {
+    use crate::physics3d::{Collider3D, ColliderShape3D, CollisionFilter3D, Transform3D};
+
+    let key = component.to_pointer() as usize;
+    if !component.get::<bool>("enabled").unwrap_or(true) {
+        registry
+            .lock()
+            .map_err(|_| mlua::Error::external("3D collider registry lock poisoned"))?
+            .remove(&key);
+        return Ok(());
+    }
+    let (radius, half_height) = character_controller_dimensions_3d(component);
+    let center = character_controller_center_3d(entity, component)?;
+    let entity_id = entity.get::<u64>("id").unwrap_or(key as u64);
+    let mut collider = Collider3D::new(
+        entity_id,
+        ColliderShape3D::Capsule {
+            radius,
+            half_height,
+        },
+    );
+    collider.transform = Transform3D {
+        position: center,
+        euler: crate::render3d::Vec3::ZERO,
+        scale: crate::render3d::Vec3::new(1.0, 1.0, 1.0),
+    };
+    collider.filter = CollisionFilter3D::new(
+        component.get::<u32>("layer").unwrap_or(1),
+        component.get::<u32>("mask").unwrap_or(u32::MAX),
+    );
+    collider.response_enabled = false;
+    collider.body_is_static = false;
+    registry
+        .lock()
+        .map_err(|_| mlua::Error::external("3D collider registry lock poisoned"))?
+        .insert(key, collider);
+    Ok(())
+}
+
+fn character_controller_registry_snapshot_3d(
+    registry: &ColliderRegistry3D,
+) -> mlua::Result<Vec<crate::physics3d::Collider3D>> {
+    let mut registry = registry
+        .lock()
+        .map_err(|_| mlua::Error::external("3D collider registry lock poisoned"))?;
+    for collider in registry.values_mut() {
+        collider
+            .refresh_mesh_if_changed()
+            .map_err(mlua::Error::external)?;
+    }
+    let mut colliders = registry
+        .iter()
+        .map(|(key, collider)| (*key, collider.clone()))
+        .collect::<Vec<_>>();
+    drop(registry);
+    colliders.sort_unstable_by_key(|(key, collider)| (collider.id, *key));
+    Ok(colliders
+        .into_iter()
+        .map(|(_, collider)| collider)
+        .collect())
+}
+
+fn move_character_controller_3d(
+    lua: &Lua,
+    registry: &ColliderRegistry3D,
+    component: Table,
+    displacement: crate::render3d::Vec3,
+) -> mlua::Result<Table> {
+    use crate::physics3d::{
+        CharacterMoveSettings3D, CollisionFilter3D, QueryFilter3D, move_character_capsule,
+    };
+    let entity = component.get::<Table>("__entity").map_err(|_| {
+        mlua::Error::external("CharacterController3D must be attached before Move is called")
+    })?;
+    if !component.get::<bool>("enabled").unwrap_or(true) {
+        let result = lua.create_table()?;
+        result.set("moved_x", 0.0)?;
+        result.set("moved_y", 0.0)?;
+        result.set("moved_z", 0.0)?;
+        result.set("grounded", false)?;
+        result.set("collisions", lua.create_table()?)?;
+        return Ok(result);
+    }
+    if !displacement.x.is_finite() || !displacement.y.is_finite() || !displacement.z.is_finite() {
+        return Err(mlua::Error::external(
+            "CharacterController3D:Move displacement must be finite",
+        ));
+    }
+    let center = character_controller_center_3d(&entity, &component)?;
+    let entity_id = entity.get::<u64>("id").ok();
+    let (radius, half_height) = character_controller_dimensions_3d(&component);
+    let max_slope_degrees = component
+        .get::<f32>("max_slope_degrees")
+        .unwrap_or(50.0)
+        .filter_finite()
+        .clamp(0.0, 89.9);
+    let settings = CharacterMoveSettings3D {
+        radius,
+        half_height,
+        skin_width: component
+            .get::<f32>("skin_width")
+            .unwrap_or(0.02)
+            .filter_finite()
+            .clamp(0.0, radius * 0.5),
+        max_slope_cosine: max_slope_degrees.to_radians().cos(),
+        step_height: component
+            .get::<f32>("step_height")
+            .unwrap_or(0.3)
+            .filter_finite()
+            .clamp(0.0, 1000.0),
+        ground_snap_distance: component
+            .get::<f32>("ground_snap_distance")
+            .unwrap_or(0.2)
+            .filter_finite()
+            .clamp(0.0, 1000.0),
+        max_iterations: component
+            .get::<usize>("max_iterations")
+            .unwrap_or(6)
+            .clamp(1, 16),
+        query: QueryFilter3D {
+            collision: CollisionFilter3D::new(
+                component.get::<u32>("layer").unwrap_or(1),
+                component.get::<u32>("mask").unwrap_or(u32::MAX),
+            ),
+            include_triggers: component.get::<bool>("include_triggers").unwrap_or(false),
+        },
+        exclude_entity_id: entity_id,
+    };
+    let colliders = character_controller_registry_snapshot_3d(registry)?;
+    let movement = move_character_capsule(&colliders, center, displacement, settings)
+        .map_err(mlua::Error::external)?;
+    translate_entity_world_3d(&entity, movement.displacement)?;
+    let was_grounded = component.get::<bool>("grounded").unwrap_or(false);
+    component.set("grounded", movement.grounded)?;
+    component.set("ground_entity_id", movement.ground_entity_id)?;
+    component.set("ground_normal_x", movement.ground_normal.x)?;
+    component.set("ground_normal_y", movement.ground_normal.y)?;
+    component.set("ground_normal_z", movement.ground_normal.z)?;
+    component.set("collision_count", movement.collisions.len())?;
+
+    if movement.grounded {
+        if let Some(ground_id) = movement.ground_entity_id
+            && let Some(ground) = colliders.iter().find(|collider| collider.id == ground_id)
+        {
+            component.set("__ground_x", ground.transform.position.x)?;
+            component.set("__ground_y", ground.transform.position.y)?;
+            component.set("__ground_z", ground.transform.position.z)?;
+        }
+    } else {
+        component.set("__ground_x", Value::Nil)?;
+        component.set("__ground_y", Value::Nil)?;
+        component.set("__ground_z", Value::Nil)?;
+    }
+
+    let collision_values = lua.create_table_with_capacity(movement.collisions.len(), 0)?;
+    for (index, hit) in movement.collisions.iter().enumerate() {
+        let value = lua.create_table()?;
+        value.set("entity_id", hit.collider_id)?;
+        value.set("distance", hit.distance)?;
+        value.set("x", hit.position.x)?;
+        value.set("y", hit.position.y)?;
+        value.set("z", hit.position.z)?;
+        value.set("normal_x", hit.normal.x)?;
+        value.set("normal_y", hit.normal.y)?;
+        value.set("normal_z", hit.normal.z)?;
+        value.set("is_trigger", hit.is_trigger)?;
+        collision_values.raw_set(index + 1, value.clone())?;
+        if let Ok(Value::Function(callback)) = component.get::<Value>("onCollision") {
+            callback.call::<()>(value)?;
+        }
+    }
+    if movement.grounded
+        && !was_grounded
+        && let Ok(Value::Function(callback)) = component.get::<Value>("onGrounded")
+    {
+        let value = lua.create_table()?;
+        value.set("entity_id", movement.ground_entity_id)?;
+        value.set("normal_x", movement.ground_normal.x)?;
+        value.set("normal_y", movement.ground_normal.y)?;
+        value.set("normal_z", movement.ground_normal.z)?;
+        callback.call::<()>(value)?;
+    }
+    sync_character_controller_collider_3d(registry, &entity, &component)?;
+
+    let result = lua.create_table()?;
+    result.set("moved_x", movement.displacement.x)?;
+    result.set("moved_y", movement.displacement.y)?;
+    result.set("moved_z", movement.displacement.z)?;
+    result.set("grounded", movement.grounded)?;
+    result.set("ground_entity_id", movement.ground_entity_id)?;
+    result.set("ground_normal_x", movement.ground_normal.x)?;
+    result.set("ground_normal_y", movement.ground_normal.y)?;
+    result.set("ground_normal_z", movement.ground_normal.z)?;
+    result.set("collisions", collision_values)?;
+    Ok(result)
+}
+
+/// Fast steady-state path for manually assigned, non-animated 3D meshes.
+///
+/// The general component callback below still owns path/primitive resolution,
+/// animation state transitions, and validation. Once a component is a plain
+/// manual mesh, the runtime can queue it directly from Rust without crossing
+/// the Rust/Luau callback boundary every frame. Large automatically-instanced
+/// scenes depend on this path.
+pub(crate) enum StaticMeshRenderer3DUpdate {
+    Fallback,
+    Handled(Option<DrawCommand>),
+}
+
+pub(crate) fn prepare_static_mesh_renderer_3d(
+    component: &Table,
+    entity: Option<&Table>,
+    model: crate::render3d::Mat4,
+    camera: crate::render3d::Camera3D,
+    aspect: f32,
+) -> mlua::Result<StaticMeshRenderer3DUpdate> {
+    if !component.get::<bool>("visible").unwrap_or(true) {
+        return Ok(StaticMeshRenderer3DUpdate::Handled(None));
+    }
+    if let Some(entity) = entity
+        && !entity_renders_for_camera_3d(entity, camera.render_mask)?
+    {
+        return Ok(StaticMeshRenderer3DUpdate::Handled(None));
+    }
+    // LODGroup3D needs the entity's full component set and current camera
+    // distance, so it deliberately stays on the general runtime path.
+    let has_lod_group = entity
+        .and_then(|entity| entity.get::<Table>("components").ok())
+        .is_some_and(|components| {
+            components.sequence_values::<Table>().any(|value| {
+                value.is_ok_and(|component| {
+                    component
+                        .get::<String>("__neolove_component")
+                        .is_ok_and(|name| name == "LODGroup3D")
+                        && component.get::<bool>("enabled").unwrap_or(true)
+                })
+            })
+        });
+    if has_lod_group {
+        return Ok(StaticMeshRenderer3DUpdate::Fallback);
+    }
+    let path = component
+        .get::<Option<String>>("mesh_path")?
+        .unwrap_or_default();
+    let primitive = component
+        .get::<Option<String>>("primitive")?
+        .unwrap_or_else(|| "cube".to_string());
+    let animation = component
+        .get::<Option<String>>("animation")?
+        .unwrap_or_default();
+    let managed_source = component
+        .raw_get::<Option<String>>("__mesh_source")
+        .unwrap_or(None);
+    if !path.trim().is_empty()
+        || !matches!(
+            primitive.trim().to_ascii_lowercase().as_str(),
+            "" | "none" | "off"
+        )
+        || !animation.trim().is_empty()
+        || managed_source.is_some()
+    {
+        return Ok(StaticMeshRenderer3DUpdate::Fallback);
+    }
+
+    let mesh_userdata = match component.get::<Value>("mesh")? {
+        Value::UserData(userdata) => userdata,
+        _ => return Ok(StaticMeshRenderer3DUpdate::Handled(None)),
+    };
+    let mesh = mesh_userdata.borrow::<crate::mesh::MeshHandle>()?.clone();
+    let identity = mesh.identity() as i64;
+    if component
+        .raw_get::<Option<i64>>("__mesh_identity")
+        .unwrap_or(None)
+        != Some(identity)
+    {
+        component.raw_set("__mesh_identity", identity)?;
+        component.raw_set("__mesh_animation_detached", false)?;
+        component.raw_set("__active_mesh_animation", Value::Nil)?;
+        component.raw_set("__mesh_animation_paused", false)?;
+        component.raw_set("__mesh_animation_time", 0.0)?;
+    }
+    component.set("animation_playing", false)?;
+
+    let texture = match component.get::<Value>("texture")? {
+        Value::UserData(userdata) => Some(userdata.borrow::<ImageHandle>()?.clone()),
+        _ => None,
+    };
+    let materials = materials_from_component(component)?;
+    let color = match component.get::<Table>("color") {
+        Ok(color) => color4_to_color(color)?,
+        Err(_) => Color::WHITE,
+    };
+    let shader = shader_from_component(component)?;
+    Ok(StaticMeshRenderer3DUpdate::Handled(Some(
+        DrawCommand::Mesh3D(crate::render3d::Mesh3DCommand {
+            mesh,
+            model,
+            view_projection: camera.view_projection(aspect),
+            camera_position: camera.position,
+            tint: color,
+            texture,
+            materials,
+            shader,
+            double_sided: component.get::<bool>("double_sided").unwrap_or(false),
+            casts_shadows: component.get::<bool>("casts_shadows").unwrap_or(true),
+            receives_shadows: component.get::<bool>("receives_shadows").unwrap_or(true),
+        }),
+    )))
 }
 
 fn rotate_local(x: f32, y: f32, rotation: f32) -> (f32, f32) {
@@ -570,6 +1139,11 @@ fn camera_3d_for_entity(
             .get::<f32>("far_clip")
             .unwrap_or(1000.0)
             .max(0.0002),
+        render_mask: crate::render3d::sanitize_render_mask_3d(
+            component
+                .get::<i64>("render_mask")
+                .unwrap_or(crate::render3d::ALL_RENDER_LAYERS_3D as i64),
+        ),
     })
 }
 
@@ -578,11 +1152,45 @@ fn forward_from_euler(euler: crate::render3d::Vec3) -> crate::render3d::Vec3 {
         .transform_direction(crate::render3d::Vec3::new(0.0, 0.0, -1.0))
 }
 
+fn audio_source_3d_options(lua: &Lua, component: &Table, voice_id: i64) -> mlua::Result<Table> {
+    let options = lua.create_table()?;
+    options.set("voice_id", voice_id)?;
+    options.set("looping", component.get::<bool>("looping").unwrap_or(false))?;
+    options.set(
+        "volume",
+        component
+            .get::<f32>("volume")
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0),
+    )?;
+    let min_distance = component
+        .get::<f32>("min_distance")
+        .unwrap_or(1.0)
+        .max(0.001);
+    options.set("min_distance", min_distance)?;
+    options.set(
+        "max_distance",
+        component
+            .get::<f32>("max_distance")
+            .unwrap_or(100.0)
+            .max(min_distance),
+    )?;
+    options.set(
+        "rolloff",
+        component.get::<f32>("rolloff").unwrap_or(1.0).max(0.0),
+    )?;
+    let distance_model = component
+        .get::<String>("distance_model")
+        .unwrap_or_else(|_| "inverse".to_string());
+    options.set("distance_model", distance_model)?;
+    Ok(options)
+}
+
 fn environment_3d_from_component(
     lua: &Lua,
     component: &Table,
 ) -> mlua::Result<crate::environment3d::Environment3D> {
-    use crate::environment3d::{Environment3D, EnvironmentMode3D};
+    use crate::environment3d::{Environment3D, EnvironmentMode3D, FogMode3D};
 
     let mut environment = Environment3D::default();
     environment.enabled = component.get::<bool>("enabled").unwrap_or(true);
@@ -593,6 +1201,7 @@ fn environment_3d_from_component(
     environment.mode = match mode.as_str() {
         "solid" | "color" | "colour" => EnvironmentMode3D::Solid,
         "equirectangular" | "panorama" | "skybox" | "texture" => EnvironmentMode3D::Equirectangular,
+        "cubemap" | "cube" | "six_face" | "sixface" => EnvironmentMode3D::Cubemap,
         _ => EnvironmentMode3D::Gradient,
     };
     if let Ok(color) = component.get::<Table>("color") {
@@ -606,6 +1215,29 @@ fn environment_3d_from_component(
     }
     environment.intensity = component.get::<f32>("intensity").unwrap_or(1.0).max(0.0);
     environment.rotation_degrees = component.get::<f32>("rotation").unwrap_or(0.0);
+    environment.fog.enabled = component.get::<bool>("fog_enabled").unwrap_or(false);
+    environment.fog.mode = match component
+        .get::<String>("fog_mode")
+        .unwrap_or_else(|_| "linear".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "exponential" | "exp" => FogMode3D::Exponential,
+        "exponential_squared" | "exponential-squared" | "exp2" => FogMode3D::ExponentialSquared,
+        _ => FogMode3D::Linear,
+    };
+    if let Ok(color) = component.get::<Table>("fog_color") {
+        environment.fog.color = color4_to_color(color)?;
+    }
+    environment.fog.start_distance = component.get::<f32>("fog_start").unwrap_or(10.0);
+    environment.fog.end_distance = component.get::<f32>("fog_end").unwrap_or(100.0);
+    environment.fog.density = component.get::<f32>("fog_density").unwrap_or(0.02);
+    environment.fog = environment.fog.sanitized();
+    environment.ambient_occlusion.enabled = component.get::<bool>("ao_enabled").unwrap_or(false);
+    environment.ambient_occlusion.radius = component.get::<f32>("ao_radius").unwrap_or(2.5);
+    environment.ambient_occlusion.intensity = component.get::<f32>("ao_intensity").unwrap_or(0.65);
+    environment.ambient_occlusion.bias = component.get::<f32>("ao_bias").unwrap_or(0.025);
+    environment.ambient_occlusion = environment.ambient_occlusion.sanitized();
     environment.equirectangular = get_image_field(component, "texture")?;
     if environment.equirectangular.is_none() {
         let path = component.get::<String>("texture_path").unwrap_or_default();
@@ -616,7 +1248,105 @@ fn environment_3d_from_component(
             component.set("texture", image)?;
         }
     }
+    environment.cubemap = get_cubemap_field(component, "cubemap")?;
+    if environment.cubemap.is_none() {
+        let face_keys = [
+            "positive_x",
+            "negative_x",
+            "positive_y",
+            "negative_y",
+            "positive_z",
+            "negative_z",
+        ];
+        let faces = face_keys
+            .iter()
+            .map(|key| get_image_field(component, key))
+            .collect::<mlua::Result<Vec<_>>>()?;
+        if faces.iter().all(Option::is_some) {
+            let faces: Vec<ImageHandle> = faces.into_iter().flatten().collect();
+            environment.cubemap = Some(CubemapHandle::new(
+                faces.try_into().expect("six cubemap component faces"),
+            )?);
+        }
+    }
     Ok(environment)
+}
+
+fn reflection_probe_cubemap_from_component(
+    component: &Table,
+) -> mlua::Result<Option<CubemapHandle>> {
+    if let Some(cubemap) = get_cubemap_field(component, "cubemap")? {
+        return Ok(Some(cubemap));
+    }
+    let mut faces = Vec::with_capacity(crate::assets::CUBEMAP_FACE_NAMES.len());
+    let mut missing = Vec::new();
+    let mut authored = false;
+    for face in crate::assets::CUBEMAP_FACE_NAMES {
+        let image = get_image_field(component, face)?;
+        authored |= image.is_some();
+        if image.is_none() {
+            missing.push(face);
+        }
+        faces.push(image);
+    }
+    if !authored {
+        return Ok(None);
+    }
+    if !missing.is_empty() {
+        return Err(mlua::Error::external(format!(
+            "ReflectionProbe3D requires all six cubemap faces; missing {}",
+            missing.join(", ")
+        )));
+    }
+    let faces = faces.into_iter().flatten().collect::<Vec<_>>();
+    Ok(Some(CubemapHandle::new(
+        faces
+            .try_into()
+            .expect("six reflection-probe cubemap faces"),
+    )?))
+}
+
+fn reflection_probe_bounds_3d(
+    transform: crate::window::GlobalTransform3D,
+    component: &Table,
+) -> (crate::render3d::Vec3, crate::render3d::Vec3) {
+    use crate::render3d::Vec3;
+    let half = Vec3::new(
+        component
+            .get::<f32>("size_x")
+            .unwrap_or(10.0)
+            .abs()
+            .max(0.001)
+            * 0.5,
+        component
+            .get::<f32>("size_y")
+            .unwrap_or(10.0)
+            .abs()
+            .max(0.001)
+            * 0.5,
+        component
+            .get::<f32>("size_z")
+            .unwrap_or(10.0)
+            .abs()
+            .max(0.001)
+            * 0.5,
+    );
+    let mut minimum = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut maximum = Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for x in [-half.x, half.x] {
+        for y in [-half.y, half.y] {
+            for z in [-half.z, half.z] {
+                let point = transform.model.transform_point(Vec3::new(x, y, z));
+                minimum.x = minimum.x.min(point.x);
+                minimum.y = minimum.y.min(point.y);
+                minimum.z = minimum.z.min(point.z);
+                maximum.x = maximum.x.max(point.x);
+                maximum.y = maximum.y.max(point.y);
+                maximum.z = maximum.z.max(point.z);
+            }
+        }
+    }
+    (minimum, maximum)
 }
 
 fn particle_config_3d_from_component(
@@ -736,7 +1466,13 @@ fn post_process_number(options: &Option<Table>, name: &str, default: f32) -> f32
 fn post_process_bool(options: &Option<Table>, name: &str, default: bool) -> bool {
     options
         .as_ref()
-        .and_then(|table| table.get::<bool>(name).ok())
+        .and_then(|table| match table.get::<Value>(name).ok()? {
+            Value::Boolean(value) => Some(value),
+            // mlua's direct bool conversion treats a missing/nil field as
+            // false, which used to disable every pass that omitted `enabled`.
+            Value::Nil => None,
+            _ => None,
+        })
         .unwrap_or(default)
 }
 
@@ -1281,6 +2017,16 @@ fn get_image_field(component: &Table, key: &str) -> mlua::Result<Option<ImageHan
     let image = image.borrow::<ImageHandle>()?;
     image.ensure_uploaded()?;
     Ok(Some(image.clone()))
+}
+
+fn get_cubemap_field(component: &Table, key: &str) -> mlua::Result<Option<CubemapHandle>> {
+    let cubemap: Option<AnyUserData> = component.get(key).unwrap_or(None);
+    let Some(cubemap) = cubemap else {
+        return Ok(None);
+    };
+    let cubemap = cubemap.borrow::<CubemapHandle>()?;
+    cubemap.snapshot()?;
+    Ok(Some(cubemap.clone()))
 }
 
 fn get_image_field_any(component: &Table, keys: &[&str]) -> mlua::Result<Option<ImageHandle>> {
@@ -3138,6 +3884,7 @@ pub fn add_core_components(
     // Persistent scene environment controls. The Environment3D component below
     // writes through the same state, while scripts that do not use an ECS scene
     // can configure the sky directly through `environment3d` / `skybox`.
+    #[cfg(not(neolove_2d))]
     {
         let environment = lua.create_table()?;
         let solid_state = render_state.clone();
@@ -3197,6 +3944,29 @@ pub fn add_core_components(
                 Ok(())
             })?,
         )?;
+        let cubemap_state = render_state.clone();
+        environment.set(
+            "setCubemap",
+            lua.create_function(
+                move |_lua, (cubemap, rotation): (AnyUserData, Option<f32>)| {
+                    let cubemap = cubemap.borrow::<CubemapHandle>()?.clone();
+                    cubemap.snapshot()?;
+                    let mut value = cubemap_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                        .environment_3d();
+                    value.enabled = true;
+                    value.mode = crate::environment3d::EnvironmentMode3D::Cubemap;
+                    value.cubemap = Some(cubemap);
+                    value.rotation_degrees = rotation.unwrap_or(0.0);
+                    cubemap_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                        .set_environment_3d(None, value);
+                    Ok(())
+                },
+            )?,
+        )?;
         let enabled_state = render_state.clone();
         environment.set(
             "setEnabled",
@@ -3227,6 +3997,108 @@ pub fn add_core_components(
                     1.0
                 };
                 intensity_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .set_environment_3d(None, value);
+                Ok(())
+            })?,
+        )?;
+        let fog_state = render_state.clone();
+        environment.set(
+            "setFog",
+            lua.create_function(move |_lua, (color, options): (Table, Option<Table>)| {
+                let mut value = fog_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .environment_3d();
+                value.enabled = true;
+                value.fog.enabled = true;
+                value.fog.color = color4_to_color(color)?;
+                if let Some(options) = options {
+                    let mode = options
+                        .get::<String>("mode")
+                        .unwrap_or_else(|_| "linear".to_string())
+                        .to_ascii_lowercase();
+                    value.fog.mode = match mode.as_str() {
+                        "exponential" | "exp" => crate::environment3d::FogMode3D::Exponential,
+                        "exponential_squared" | "exponential-squared" | "exp2" => {
+                            crate::environment3d::FogMode3D::ExponentialSquared
+                        }
+                        _ => crate::environment3d::FogMode3D::Linear,
+                    };
+                    value.fog.start_distance = options
+                        .get::<f32>("start_distance")
+                        .or_else(|_| options.get::<f32>("start"))
+                        .unwrap_or(value.fog.start_distance);
+                    value.fog.end_distance = options
+                        .get::<f32>("end_distance")
+                        .or_else(|_| options.get::<f32>("end"))
+                        .unwrap_or(value.fog.end_distance);
+                    value.fog.density = options.get::<f32>("density").unwrap_or(value.fog.density);
+                }
+                value.fog = value.fog.sanitized();
+                fog_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .set_environment_3d(None, value);
+                Ok(())
+            })?,
+        )?;
+        let clear_fog_state = render_state.clone();
+        environment.set(
+            "clearFog",
+            lua.create_function(move |_lua, ()| {
+                let mut value = clear_fog_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .environment_3d();
+                value.fog.enabled = false;
+                clear_fog_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .set_environment_3d(None, value);
+                Ok(())
+            })?,
+        )?;
+        let ao_state = render_state.clone();
+        environment.set(
+            "setAmbientOcclusion",
+            lua.create_function(move |_lua, options: Option<Table>| {
+                let mut value = ao_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .environment_3d();
+                value.enabled = true;
+                value.ambient_occlusion.enabled = true;
+                if let Some(options) = options {
+                    value.ambient_occlusion.radius = options
+                        .get::<f32>("radius")
+                        .unwrap_or(value.ambient_occlusion.radius);
+                    value.ambient_occlusion.intensity = options
+                        .get::<f32>("intensity")
+                        .unwrap_or(value.ambient_occlusion.intensity);
+                    value.ambient_occlusion.bias = options
+                        .get::<f32>("bias")
+                        .unwrap_or(value.ambient_occlusion.bias);
+                }
+                value.ambient_occlusion = value.ambient_occlusion.sanitized();
+                ao_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .set_environment_3d(None, value);
+                Ok(())
+            })?,
+        )?;
+        let clear_ao_state = render_state.clone();
+        environment.set(
+            "clearAmbientOcclusion",
+            lua.create_function(move |_lua, ()| {
+                let mut value = clear_ao_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .environment_3d();
+                value.ambient_occlusion.enabled = false;
+                clear_ao_state
                     .lock()
                     .map_err(|_| mlua::Error::external("render state lock poisoned"))?
                     .set_environment_3d(None, value);
@@ -3402,6 +4274,7 @@ pub fn add_core_components(
 
     // Camera3D
     // Resolves an Euler-authored view/projection in the shared camera pre-pass.
+    #[cfg(not(neolove_2d))]
     {
         let camera = lua.create_table()?;
         camera.set("__neolove_component", "Camera3D")?;
@@ -3417,6 +4290,7 @@ pub fn add_core_components(
                 component.set("orthographic_size", 10.0)?;
                 component.set("near_clip", 0.1)?;
                 component.set("far_clip", 1000.0)?;
+                component.set("render_mask", crate::render3d::ALL_RENDER_LAYERS_3D as i64)?;
                 Ok(())
             })?,
         )?;
@@ -3480,9 +4354,10 @@ pub fn add_core_components(
     }
 
     // Environment3D / Skybox3D
-    // Fills the framebuffer before depth-tested geometry. Texture mode accepts
-    // an equirectangular ImageHandle and follows camera rotation without camera
-    // translation.
+    // Fills the framebuffer before depth-tested geometry. Texture modes accept
+    // either an equirectangular ImageHandle or six square cubemap faces and
+    // follow camera rotation without camera translation.
+    #[cfg(not(neolove_2d))]
     {
         let environment = lua.create_table()?;
         environment.set("__neolove_component", "Environment3D")?;
@@ -3498,20 +4373,50 @@ pub fn add_core_components(
                 component.set("bottom_color", color4(lua, 8, 10, 16, 255)?)?;
                 component.set("texture", Value::Nil)?;
                 component.set("texture_path", "")?;
+                component.set("cubemap", Value::Nil)?;
+                for face in crate::assets::CUBEMAP_FACE_NAMES {
+                    component.set(face, Value::Nil)?;
+                }
                 component.set("rotation", 0.0)?;
                 component.set("intensity", 1.0)?;
+                component.set("fog_enabled", false)?;
+                component.set("fog_mode", "linear")?;
+                component.set("fog_color", color4(lua, 110, 125, 145, 255)?)?;
+                component.set("fog_start", 10.0)?;
+                component.set("fog_end", 100.0)?;
+                component.set("fog_density", 0.02)?;
+                component.set("ao_enabled", false)?;
+                component.set("ao_radius", 2.5)?;
+                component.set("ao_intensity", 0.65)?;
+                component.set("ao_bias", 0.025)?;
                 Ok(())
             })?,
         )?;
         let environment_state = render_state.clone();
         environment.set(
             "update",
-            lua.create_function(move |lua, (_entity, component, _dt): (Table, Table, f32)| {
+            lua.create_function(move |lua, (entity, component, _dt): (Table, Table, f32)| {
+                let (camera_mask, source_id) = {
+                    let state = environment_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
+                    (
+                        state.camera_3d().render_mask,
+                        Some(component.to_pointer() as usize),
+                    )
+                };
+                if !entity_renders_for_camera_3d(&entity, camera_mask)? {
+                    environment_state
+                        .lock()
+                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                        .clear_environment_3d(source_id);
+                    return Ok(());
+                }
                 let value = environment_3d_from_component(lua, &component)?;
                 environment_state
                     .lock()
                     .map_err(|_| mlua::Error::external("render state lock poisoned"))?
-                    .set_environment_3d(Some(component.to_pointer() as usize), value);
+                    .set_environment_3d(source_id, value);
                 Ok(())
             })?,
         )?;
@@ -3530,9 +4435,246 @@ pub fn add_core_components(
         core_components.set("Skybox3D", environment)?;
     }
 
+    // ReflectionProbe3D
+    // Supplies local cubemap IBL inside a finite transformed influence volume.
+    // Probes are frame-queued rather than persistent so visibility, layers,
+    // scene unloads, and component removal take effect without stale state.
+    #[cfg(not(neolove_2d))]
+    {
+        let probe = lua.create_table()?;
+        probe.set("__neolove_component", "ReflectionProbe3D")?;
+        probe.set("NEOLOVE_RENDERING", true)?;
+        probe.set(
+            "awake",
+            lua.create_function(|_lua, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "ReflectionProbe3D")?;
+                component.set("enabled", true)?;
+                component.set("visible", true)?;
+                component.set("cubemap", Value::Nil)?;
+                for face in crate::assets::CUBEMAP_FACE_NAMES {
+                    component.set(face, Value::Nil)?;
+                }
+                component.set("size_x", 10.0)?;
+                component.set("size_y", 10.0)?;
+                component.set("size_z", 10.0)?;
+                component.set("blend_distance", 1.0)?;
+                component.set("intensity", 1.0)?;
+                component.set("rotation", 0.0)?;
+                component.set("priority", 0i64)?;
+                Ok(())
+            })?,
+        )?;
+        let probe_state = render_state.clone();
+        probe.set(
+            "update",
+            lua.create_function(move |_lua, (entity, component, _dt): (Table, Table, f32)| {
+                if !component.get::<bool>("enabled").unwrap_or(true)
+                    || !component.get::<bool>("visible").unwrap_or(true)
+                {
+                    return Ok(());
+                }
+                let camera_mask = probe_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .camera_3d()
+                    .render_mask;
+                if !entity_renders_for_camera_3d(&entity, camera_mask)? {
+                    return Ok(());
+                }
+                let Some(cubemap) = reflection_probe_cubemap_from_component(&component)? else {
+                    return Ok(());
+                };
+                let transform = crate::window::get_global_transform_3d(&entity)?;
+                let (bounds_min, bounds_max) = reflection_probe_bounds_3d(transform, &component);
+                probe_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .queue_reflection_probe_3d(crate::render3d::ReflectionProbe3D {
+                        source_id: component.to_pointer() as usize,
+                        cubemap,
+                        bounds_min,
+                        bounds_max,
+                        priority: component
+                            .get::<i64>("priority")
+                            .unwrap_or(0)
+                            .clamp(i32::MIN as i64, i32::MAX as i64)
+                            as i32,
+                        intensity: component.get::<f32>("intensity").unwrap_or(1.0),
+                        rotation_degrees: component.get::<f32>("rotation").unwrap_or(0.0),
+                        blend_distance: component.get::<f32>("blend_distance").unwrap_or(1.0),
+                    });
+                Ok(())
+            })?,
+        )?;
+        core_components.set("ReflectionProbe3D", probe)?;
+    }
+
+    // Visibility3D is a hierarchy-aware rendering policy shared by meshes,
+    // particles, lights, and environments. It intentionally does not disable
+    // scripts or physics; entity.enabled remains the lifecycle switch.
+    #[cfg(not(neolove_2d))]
+    {
+        let visibility = lua.create_table()?;
+        visibility.set("__neolove_component", "Visibility3D")?;
+        visibility.set(
+            "awake",
+            lua.create_function(|_lua, (entity, component): (Table, Table)| {
+                component.set("__neolove_component", "Visibility3D")?;
+                component.set("enabled", true)?;
+                component.set("visible", true)?;
+                component.set("inherit_parent", true)?;
+                component.set("effective_visible", effective_visibility_3d(&entity)?)?;
+                Ok(())
+            })?,
+        )?;
+        visibility.set(
+            "update",
+            lua.create_function(|_lua, (entity, component, _dt): (Table, Table, f32)| {
+                component.set("effective_visible", effective_visibility_3d(&entity)?)
+            })?,
+        )?;
+        let is_visible = lua.create_function(|_lua, component: Table| {
+            let Some(entity) = component.get::<Option<Table>>("entity")? else {
+                return Ok(false);
+            };
+            effective_visibility_3d(&entity)
+        })?;
+        visibility.set("isVisible", is_visible.clone())?;
+        visibility.set("IsVisible", is_visible)?;
+        core_components.set("Visibility3D", visibility)?;
+    }
+
+    // RenderLayer3D is a bit-mask membership component. Camera3D applies its
+    // render_mask before visual commands enter either backend's render queue.
+    #[cfg(not(neolove_2d))]
+    {
+        let render_layer = lua.create_table()?;
+        render_layer.set("__neolove_component", "RenderLayer3D")?;
+        render_layer.set(
+            "awake",
+            lua.create_function(|_lua, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "RenderLayer3D")?;
+                component.set("enabled", true)?;
+                component.set("mask", 1i64)?;
+                Ok(())
+            })?,
+        )?;
+        render_layer.set(
+            "update",
+            lua.create_function(|_lua, (_entity, _component, _dt): (Table, Table, f32)| Ok(()))?,
+        )?;
+        let matches_mask =
+            lua.create_function(|_lua, (component, camera_or_mask): (Table, Value)| {
+                let camera_mask = match camera_or_mask {
+                    Value::Table(camera) => camera
+                        .get::<i64>("render_mask")
+                        .unwrap_or(crate::render3d::ALL_RENDER_LAYERS_3D as i64),
+                    Value::Integer(mask) => i64::from(mask),
+                    Value::Number(mask) if mask.is_finite() => mask as i64,
+                    other => {
+                        return Err(mlua::Error::external(format!(
+                            "RenderLayer3D:MatchesMask expects a Camera3D or integer mask, got {}",
+                            other.type_name()
+                        )));
+                    }
+                };
+                let entity_mask = component.get::<i64>("mask").unwrap_or(1);
+                Ok(crate::render3d::render_layers_intersect_3d(
+                    crate::render3d::sanitize_render_mask_3d(camera_mask),
+                    crate::render3d::sanitize_render_mask_3d(entity_mask),
+                ))
+            })?;
+        render_layer.set("matchesMask", matches_mask.clone())?;
+        render_layer.set("MatchesMask", matches_mask)?;
+        core_components.set("RenderLayer3D", render_layer)?;
+    }
+
+    // Tags and logical layers are dimension-independent metadata. Scripts can
+    // organize/query both 2D and 3D entities without changing rendering.
+    {
+        let tag = lua.create_table()?;
+        tag.set("__neolove_component", "Tag")?;
+        tag.set(
+            "awake",
+            lua.create_function(|_lua, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "Tag")?;
+                component.set("enabled", true)?;
+                component.set("tag", "Untagged")?;
+                Ok(())
+            })?,
+        )?;
+        tag.set(
+            "update",
+            lua.create_function(|_lua, (_entity, _component, _dt): (Table, Table, f32)| Ok(()))?,
+        )?;
+        let matches_tag = lua.create_function(|_lua, (component, query): (Table, String)| {
+            let value = component.get::<String>("tag").unwrap_or_default();
+            Ok(!query.trim().is_empty() && value.trim() == query.trim())
+        })?;
+        tag.set("matches", matches_tag.clone())?;
+        tag.set("Matches", matches_tag)?;
+        core_components.set("Tag", tag.clone())?;
+        core_components.set("Tag3D", tag)?;
+
+        let layer = lua.create_table()?;
+        layer.set("__neolove_component", "Layer")?;
+        layer.set(
+            "awake",
+            lua.create_function(|_lua, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "Layer")?;
+                component.set("enabled", true)?;
+                component.set("layer", 0i64)?;
+                component.set("name", "Default")?;
+                Ok(())
+            })?,
+        )?;
+        layer.set(
+            "update",
+            lua.create_function(|_lua, (_entity, _component, _dt): (Table, Table, f32)| Ok(()))?,
+        )?;
+        let matches_layer = lua.create_function(|_lua, (component, query): (Table, i64)| {
+            Ok(component.get::<i64>("layer").unwrap_or(0) == query)
+        })?;
+        layer.set("matches", matches_layer.clone())?;
+        layer.set("Matches", matches_layer)?;
+        core_components.set("Layer", layer.clone())?;
+        core_components.set("Layer3D", layer)?;
+    }
+
+    // LODGroup3D is consumed directly by MeshRenderer3D before mesh resolution,
+    // so the selected level and culling decision affect the same runtime draw.
+    #[cfg(not(neolove_2d))]
+    {
+        let lod = lua.create_table()?;
+        lod.set("__neolove_component", "LODGroup3D")?;
+        lod.set(
+            "awake",
+            lua.create_function(|_lua, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "LODGroup3D")?;
+                component.set("enabled", true)?;
+                component.set("lod0_mesh", "")?;
+                component.set("lod1_mesh", "")?;
+                component.set("lod2_mesh", "")?;
+                component.set("lod1_distance", 20.0)?;
+                component.set("lod2_distance", 50.0)?;
+                component.set("cull_distance", 100.0)?;
+                component.set("force_level", "automatic")?;
+                component.set("active_level", 0)?;
+                component.set("camera_distance", 0.0)?;
+                Ok(())
+            })?,
+        )?;
+        lod.set(
+            "update",
+            lua.create_function(|_lua, (_entity, _component, _dt): (Table, Table, f32)| Ok(()))?,
+        )?;
+        core_components.set("LODGroup3D", lod)?;
+    }
+
     // MeshRenderer3D
     // Mesh handles are revisioned: scripts can edit vertices/material metadata
     // live and every backend observes the new immutable snapshot next frame.
+    #[cfg(not(neolove_2d))]
     {
         let mesh_renderer = lua.create_table()?;
         mesh_renderer.set("__neolove_component", "MeshRenderer3D")?;
@@ -3557,6 +4699,8 @@ pub fn add_core_components(
                 component.set("primitive_rings", 12)?;
                 component.set("texture", Value::Nil)?;
                 component.set("normal_texture", Value::Nil)?;
+                component.set("material", Value::Nil)?;
+                component.set("materials", lua.create_table()?)?;
                 component.set("color", color4(lua, 255, 255, 255, 255)?)?;
                 component.set("metallic", 0.0)?;
                 component.set("roughness", 1.0)?;
@@ -3646,9 +4790,62 @@ pub fn add_core_components(
                     return Ok(());
                 }
 
-                let path = component
+                let camera = mesh_render_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .camera_3d();
+                if !entity_renders_for_camera_3d(&entity, camera.render_mask)? {
+                    return Ok(());
+                }
+                let transform = crate::window::get_global_transform_3d(&entity)?;
+                let lod = entity.get::<Table>("components").ok().and_then(|components| {
+                    components.sequence_values::<Table>().find_map(|value| {
+                        let value = value.ok()?;
+                        (value
+                            .get::<String>("__neolove_component")
+                            .ok()
+                            .as_deref()
+                            == Some("LODGroup3D")
+                            && value.get::<bool>("enabled").unwrap_or(true))
+                        .then_some(value)
+                    })
+                });
+                let base_path = component
                     .get::<Option<String>>("mesh_path")?
                     .unwrap_or_default();
+                let mut path = base_path.clone();
+                if let Some(lod) = &lod {
+                    let delta_x = transform.position.x - camera.position.x;
+                    let delta_y = transform.position.y - camera.position.y;
+                    let delta_z = transform.position.z - camera.position.z;
+                    let distance =
+                        (delta_x * delta_x + delta_y * delta_y + delta_z * delta_z).sqrt();
+                    lod.set("camera_distance", distance)?;
+                    let force_value = lod
+                        .get::<String>("force_level")
+                        .unwrap_or_else(|_| "automatic".to_string());
+                    let force = crate::render3d::parse_lod_force_3d(&force_value);
+                    let Some(requested_level) = crate::render3d::select_lod_level_3d(
+                        distance,
+                        lod.get::<f32>("lod1_distance").unwrap_or(20.0),
+                        lod.get::<f32>("lod2_distance").unwrap_or(50.0),
+                        lod.get::<f32>("cull_distance").unwrap_or(100.0),
+                        force,
+                    ) else {
+                        lod.set("active_level", -1)?;
+                        return Ok(());
+                    };
+                    let lod0 = lod.get::<String>("lod0_mesh").unwrap_or_default();
+                    let lod1 = lod.get::<String>("lod1_mesh").unwrap_or_default();
+                    let lod2 = lod.get::<String>("lod2_mesh").unwrap_or_default();
+                    let selection = crate::render3d::resolve_lod_mesh_path_3d(
+                        &base_path,
+                        [&lod0, &lod1, &lod2],
+                        requested_level,
+                    );
+                    path = selection.mesh_path.to_string();
+                    lod.set("active_level", selection.active_level as i32)?;
+                }
                 let primitive = component
                     .get::<Option<String>>("primitive")?
                     .unwrap_or_else(|| "cube".to_string());
@@ -3942,21 +5139,13 @@ pub fn add_core_components(
                     Value::UserData(userdata) => Some(userdata.borrow::<ImageHandle>()?.clone()),
                     _ => None,
                 };
+                let materials = materials_from_component(&component)?;
                 let color = match component.get::<Table>("color") {
                     Ok(color) => color4_to_color(color)?,
                     Err(_) => Color::WHITE,
                 };
                 let shader = shader_from_component(&component)?;
-                let transform = crate::window::get_global_transform_3d(&entity)?;
-                let (camera, window) = {
-                    let state = mesh_render_state
-                        .lock()
-                        .map_err(|_| mlua::Error::external("render state lock poisoned"))?;
-                    (
-                        state.camera_3d(),
-                        lock_platform_state(&mesh_platform).window(),
-                    )
-                };
+                let window = lock_platform_state(&mesh_platform).window();
                 let aspect = window.width.max(1.0) / window.height.max(1.0);
                 mesh_render_state
                     .lock()
@@ -3965,10 +5154,16 @@ pub fn add_core_components(
                         mesh,
                         model: transform.model,
                         view_projection: camera.view_projection(aspect),
+                        camera_position: camera.position,
                         tint: color,
                         texture,
+                        materials,
                         shader,
                         double_sided: component.get::<bool>("double_sided").unwrap_or(false),
+                        casts_shadows: component.get::<bool>("casts_shadows").unwrap_or(true),
+                        receives_shadows: component
+                            .get::<bool>("receives_shadows")
+                            .unwrap_or(true),
                     }));
                 Ok(())
             })?,
@@ -3977,6 +5172,7 @@ pub fn add_core_components(
     }
 
     // Light3D
+    #[cfg(not(neolove_2d))]
     {
         let light = lua.create_table()?;
         light.set("__neolove_component", "Light3D")?;
@@ -4002,6 +5198,14 @@ pub fn add_core_components(
             "update",
             lua.create_function(move |_lua, (entity, component, _dt): (Table, Table, f32)| {
                 if !component.get::<bool>("visible").unwrap_or(true) {
+                    return Ok(());
+                }
+                let camera_mask = light_render_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("render state lock poisoned"))?
+                    .camera_3d()
+                    .render_mask;
+                if !entity_renders_for_camera_3d(&entity, camera_mask)? {
                     return Ok(());
                 }
                 let transform = crate::window::get_global_transform_3d(&entity)?;
@@ -4039,6 +5243,10 @@ pub fn add_core_components(
                             .unwrap_or(0.15)
                             .clamp(0.0, 1.0),
                         casts_shadows: component.get::<bool>("casts_shadows").unwrap_or(true),
+                        shadow_bias: component
+                            .get::<f32>("shadow_bias")
+                            .unwrap_or(0.005)
+                            .clamp(0.0, 0.1),
                     });
                 Ok(())
             })?,
@@ -4049,6 +5257,7 @@ pub fn add_core_components(
     // ParticleSystem3D
     // Simulation lives in a fixed-capacity native pool. Rendering expands the
     // entire emitter into a single camera-facing billboard command.
+    #[cfg(not(neolove_2d))]
     {
         let particles = lua.create_table()?;
         particles.set("__neolove_component", "ParticleSystem3D")?;
@@ -4182,6 +5391,9 @@ pub fn add_core_components(
                         lock_platform_state(&particle_platform).window(),
                     )
                 };
+                if !entity_renders_for_camera_3d(&entity, camera.render_mask)? {
+                    return Ok(());
+                }
                 let aspect = window.width.max(1.0) / window.height.max(1.0);
                 particle_render_state
                     .lock()
@@ -4190,6 +5402,7 @@ pub fn add_core_components(
                         crate::particles3d::ParticleSystem3DCommand {
                             emitter,
                             view_projection: camera.view_projection(aspect),
+                            camera_position: camera.position,
                             camera_euler: camera.euler,
                             texture,
                             filter,
@@ -4212,16 +5425,18 @@ pub fn add_core_components(
     // Physics3D collider/query registry plus lightweight rigid-body integration.
     // Triangle meshes retain their BVH across frames and refresh atomically
     // when a script edits the source MeshHandle.
+    #[cfg(not(neolove_2d))]
     {
         use crate::physics3d::{
             Collider3D as NativeCollider3D, ColliderShape3D, CollisionFilter3D, QueryFilter3D,
             Ray3D, Transform3D,
         };
 
-        let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
-            usize,
-            NativeCollider3D,
-        >::new()));
+        let registry: ColliderRegistry3D =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+                usize,
+                NativeCollider3D,
+            >::new()));
 
         let rigidbody = lua.create_table()?;
         rigidbody.set("__neolove_component", "Rigidbody3D")?;
@@ -4250,6 +5465,15 @@ pub fn add_core_components(
                 component.set("continuous_collision", false)?;
                 component.set("auto_resolve", true)?;
                 component.set("contact_slop", 0.001)?;
+                component.set("ccd_hit", false)?;
+                component.set("ccd_hit_count", 0usize)?;
+                component.set("ccd_entity_id", Value::Nil)?;
+                component.set("ccd_distance", 0.0)?;
+                component.set("ccd_time_fraction", 1.0)?;
+                component.set("ccd_normal_x", 0.0)?;
+                component.set("ccd_normal_y", 0.0)?;
+                component.set("ccd_normal_z", 0.0)?;
+                component.set("ccd_quality", Value::Nil)?;
                 component.set("onContact", Value::Nil)?;
                 component.set("onTrigger", Value::Nil)?;
                 let transform = crate::window::get_global_transform_3d(&entity)?;
@@ -4287,21 +5511,30 @@ pub fn add_core_components(
                 for axis in &mut velocity {
                     *axis *= linear_decay;
                 }
-                for (axis, field) in ["x", "y", "position_z"].into_iter().enumerate() {
+                for axis in 0..3 {
                     let frozen = component
                         .get::<bool>(["freeze_x", "freeze_y", "freeze_z"][axis])
                         .unwrap_or(false);
                     if frozen {
                         velocity[axis] = 0.0;
-                    } else {
-                        let value = entity.get::<f32>(field).unwrap_or(0.0) + velocity[axis] * dt;
-                        entity.set(field, value)?;
                     }
                     component.set(
                         ["velocity_x", "velocity_y", "velocity_z"][axis],
                         velocity[axis],
                     )?;
                 }
+                // Rigidbody velocity is world-space, matching collision
+                // normals and CharacterController3D. Convert through any
+                // authored parent exactly once rather than integrating local
+                // fields independently under rotated/non-uniform parents.
+                translate_entity_world_3d(
+                    &entity,
+                    crate::render3d::Vec3::new(
+                        velocity[0] * dt,
+                        velocity[1] * dt,
+                        velocity[2] * dt,
+                    ),
+                )?;
 
                 for axis in 0..3 {
                     let velocity_field = [
@@ -4370,6 +5603,7 @@ pub fn add_core_components(
                 component.set("offset_x", 0.0)?;
                 component.set("offset_y", 0.0)?;
                 component.set("offset_z", 0.0)?;
+                component.set("physics_material", Value::Nil)?;
                 component.set("restitution", 0.0)?;
                 component.set("friction", 0.5)?;
                 component.set("non_physics", false)?;
@@ -4390,6 +5624,7 @@ pub fn add_core_components(
                         .remove(&key);
                     return Ok(());
                 }
+                let (friction, restitution) = collider_surface_material_3d(lua, &component)?;
                 let transform = crate::window::get_global_transform_3d(&entity)?;
                 let offset = crate::render3d::Vec3::new(
                     component.get::<f32>("offset_x").unwrap_or(0.0),
@@ -4458,14 +5693,8 @@ pub fn add_core_components(
                         component.get::<u32>("layer").unwrap_or(1),
                         component.get::<u32>("mask").unwrap_or(u32::MAX),
                     );
-                    collider.restitution = component
-                        .get::<f32>("restitution")
-                        .unwrap_or(0.0)
-                        .clamp(0.0, 1.0);
-                    collider.friction = component
-                        .get::<f32>("friction")
-                        .unwrap_or(0.5)
-                        .clamp(0.0, 1.0);
+                    collider.restitution = restitution;
+                    collider.friction = friction;
                     collider.response_enabled =
                         !component.get::<bool>("non_physics").unwrap_or(false);
                     collider.body_is_static = entity
@@ -4514,14 +5743,8 @@ pub fn add_core_components(
                     component.get::<u32>("layer").unwrap_or(1),
                     component.get::<u32>("mask").unwrap_or(u32::MAX),
                 );
-                native.restitution = component
-                    .get::<f32>("restitution")
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 1.0);
-                native.friction = component
-                    .get::<f32>("friction")
-                    .unwrap_or(0.5)
-                    .clamp(0.0, 1.0);
+                native.restitution = restitution;
+                native.friction = friction;
                 native.response_enabled = !component.get::<bool>("non_physics").unwrap_or(false);
                 native.body_is_static = entity
                     .get::<Table>("components")
@@ -4551,7 +5774,304 @@ pub fn add_core_components(
                 Ok(())
             })?,
         )?;
-        core_components.set("Collider3D", collider)?;
+        core_components.set("Collider3D", collider.clone())?;
+
+        // Trigger3D deliberately reuses Collider3D's shape construction and
+        // shared native registry. Only its authored defaults and overlap-event
+        // lifecycle differ, which prevents editor/runtime geometry drift.
+        let trigger = lua.create_table()?;
+        for pair in collider.clone().pairs::<Value, Value>() {
+            let (key, value) = pair?;
+            trigger.set(key, value)?;
+        }
+        trigger.set("__neolove_component", "Trigger3D")?;
+        let collider_awake = collider.get::<Function>("awake")?;
+        trigger.set(
+            "awake",
+            lua.create_function(move |lua, (entity, component): (Table, Table)| {
+                collider_awake.call::<()>((entity, component.clone()))?;
+                component.set("__neolove_component", "Trigger3D")?;
+                component.set("is_trigger", true)?;
+                component.set("non_physics", true)?;
+                component.set("overlap_count", 0)?;
+                component.set("overlapping_entity_ids", lua.create_table()?)?;
+                component.set("__overlap_ids", lua.create_table()?)?;
+                component.set("onEnter", Value::Nil)?;
+                component.set("onStay", Value::Nil)?;
+                component.set("onExit", Value::Nil)?;
+                Ok(())
+            })?,
+        )?;
+        for (method_name, field_name) in [
+            ("setOnEnter", "onEnter"),
+            ("setOnStay", "onStay"),
+            ("setOnExit", "onExit"),
+        ] {
+            trigger.set(
+                method_name,
+                lua.create_function(move |_lua, (component, callback): (Table, Value)| {
+                    component.set(field_name, callback)?;
+                    Ok(())
+                })?,
+            )?;
+        }
+        let collider_update = collider.get::<Function>("update")?;
+        let trigger_registry = registry.clone();
+        trigger.set(
+            "update",
+            lua.create_function(move |lua, (entity, component, dt): (Table, Table, f32)| {
+                // These invariants are enforced on every update as well as
+                // awake so a script cannot accidentally turn a Trigger3D into
+                // a resolving collider by changing compatibility fields.
+                component.set("is_trigger", true)?;
+                component.set("non_physics", true)?;
+                collider_update.call::<()>((entity.clone(), component.clone(), dt))?;
+
+                let target_key = component.to_pointer() as usize;
+                let entity_id = entity.get::<u64>("id").unwrap_or(target_key as u64);
+                let mut registry = trigger_registry
+                    .lock()
+                    .map_err(|_| mlua::Error::external("3D collider registry lock poisoned"))?;
+                for collider in registry.values_mut() {
+                    collider
+                        .refresh_mesh_if_changed()
+                        .map_err(mlua::Error::external)?;
+                }
+                let mut colliders = registry
+                    .iter()
+                    .map(|(key, collider)| (*key, collider.clone()))
+                    .collect::<Vec<_>>();
+                drop(registry);
+                colliders.sort_unstable_by_key(|(key, collider)| (collider.id, *key));
+                let target_index = colliders.iter().position(|(key, _)| *key == target_key);
+                let native = colliders
+                    .iter()
+                    .map(|(_, collider)| collider.clone())
+                    .collect::<Vec<_>>();
+                let mut current = std::collections::BTreeMap::new();
+                if let Some(target_index) = target_index {
+                    for contact in
+                        crate::physics3d::contacts(&native).map_err(mlua::Error::external)?
+                    {
+                        let other_index = if contact.first_index == target_index {
+                            Some(contact.second_index)
+                        } else if contact.second_index == target_index {
+                            Some(contact.first_index)
+                        } else {
+                            None
+                        };
+                        let Some(other_index) = other_index else {
+                            continue;
+                        };
+                        let other_id = native[other_index].id;
+                        if other_id != entity_id {
+                            current.entry(other_id).or_insert(contact.quality);
+                        }
+                    }
+                }
+
+                let previous_table = component
+                    .get::<Option<Table>>("__overlap_ids")?
+                    .unwrap_or(lua.create_table()?);
+                let previous = previous_table
+                    .sequence_values::<u64>()
+                    .filter_map(Result::ok)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let event_value = |other_id: u64,
+                                   quality: Option<crate::physics3d::ContactQuality3D>|
+                 -> mlua::Result<Table> {
+                    let value = lua.create_table()?;
+                    value.set("entity_id", other_id)?;
+                    value.set("is_trigger", true)?;
+                    if let Some(quality) = quality {
+                        value.set("quality", quality.as_str())?;
+                        value.set(
+                            "exact",
+                            quality == crate::physics3d::ContactQuality3D::Exact,
+                        )?;
+                    }
+                    Ok(value)
+                };
+                for (&other_id, &quality) in &current {
+                    if !previous.contains(&other_id)
+                        && let Ok(Value::Function(callback)) = component.get::<Value>("onEnter")
+                    {
+                        callback.call::<()>(event_value(other_id, Some(quality))?)?;
+                    }
+                    if let Ok(Value::Function(callback)) = component.get::<Value>("onStay") {
+                        callback.call::<()>(event_value(other_id, Some(quality))?)?;
+                    }
+                }
+                for other_id in previous {
+                    if !current.contains_key(&other_id)
+                        && let Ok(Value::Function(callback)) = component.get::<Value>("onExit")
+                    {
+                        callback.call::<()>(event_value(other_id, None)?)?;
+                    }
+                }
+
+                let ids = lua.create_table_with_capacity(current.len(), 0)?;
+                for (index, other_id) in current.keys().copied().enumerate() {
+                    ids.raw_set(index + 1, other_id)?;
+                }
+                component.set("overlap_count", current.len())?;
+                component.set("overlapping_entity_ids", ids.clone())?;
+                component.set("__overlap_ids", ids)?;
+                Ok(())
+            })?,
+        )?;
+        core_components.set("Trigger3D", trigger)?;
+
+        let character = lua.create_table()?;
+        character.set("__neolove_component", "CharacterController3D")?;
+        character.set(
+            "awake",
+            lua.create_function(|_lua, (entity, component): (Table, Table)| {
+                component.set("__neolove_component", "CharacterController3D")?;
+                component.set("__entity", entity)?;
+                component.set("enabled", true)?;
+                component.set("radius", 0.5)?;
+                component.set("height", 2.0)?;
+                component.set("center_x", 0.0)?;
+                component.set("center_y", 0.0)?;
+                component.set("center_z", 0.0)?;
+                component.set("skin_width", 0.02)?;
+                component.set("max_slope_degrees", 50.0)?;
+                component.set("step_height", 0.3)?;
+                component.set("ground_snap_distance", 0.2)?;
+                component.set("max_iterations", 6)?;
+                component.set("layer", 1u32)?;
+                component.set("mask", u32::MAX)?;
+                component.set("include_triggers", false)?;
+                component.set("use_gravity", true)?;
+                component.set("gravity", 9.81)?;
+                component.set("velocity_x", 0.0)?;
+                component.set("velocity_y", 0.0)?;
+                component.set("velocity_z", 0.0)?;
+                component.set("grounded", false)?;
+                component.set("ground_entity_id", Value::Nil)?;
+                component.set("ground_normal_x", 0.0)?;
+                component.set("ground_normal_y", 1.0)?;
+                component.set("ground_normal_z", 0.0)?;
+                component.set("collision_count", 0)?;
+                component.set("onCollision", Value::Nil)?;
+                component.set("onGrounded", Value::Nil)?;
+                component.set("__ground_x", Value::Nil)?;
+                component.set("__ground_y", Value::Nil)?;
+                component.set("__ground_z", Value::Nil)?;
+                Ok(())
+            })?,
+        )?;
+        let move_registry = registry.clone();
+        let move_character =
+            lua.create_function(move |lua, (component, x, y, z): (Table, f32, f32, f32)| {
+                move_character_controller_3d(
+                    lua,
+                    &move_registry,
+                    component,
+                    crate::render3d::Vec3::new(x, y, z),
+                )
+            })?;
+        character.set("move", move_character.clone())?;
+        character.set("Move", move_character)?;
+        for (method_name, field_name) in [
+            ("setOnCollision", "onCollision"),
+            ("setOnGrounded", "onGrounded"),
+        ] {
+            character.set(
+                method_name,
+                lua.create_function(move |_lua, (component, callback): (Table, Value)| {
+                    component.set(field_name, callback)?;
+                    Ok(())
+                })?,
+            )?;
+        }
+        let update_character_registry = registry.clone();
+        character.set(
+            "update",
+            lua.create_function(move |_lua, (entity, component, dt): (Table, Table, f32)| {
+                if !component.get::<bool>("enabled").unwrap_or(true) {
+                    sync_character_controller_collider_3d(
+                        &update_character_registry,
+                        &entity,
+                        &component,
+                    )?;
+                    return Ok(());
+                }
+
+                let mut platform_delta = crate::render3d::Vec3::ZERO;
+                if component.get::<bool>("grounded").unwrap_or(false)
+                    && let Some(ground_id) = component
+                        .get::<Option<u64>>("ground_entity_id")
+                        .unwrap_or(None)
+                {
+                    let colliders =
+                        character_controller_registry_snapshot_3d(&update_character_registry)?;
+                    if let Some(ground) = colliders.iter().find(|collider| collider.id == ground_id)
+                        && let (Ok(last_x), Ok(last_y), Ok(last_z)) = (
+                            component.get::<f32>("__ground_x"),
+                            component.get::<f32>("__ground_y"),
+                            component.get::<f32>("__ground_z"),
+                        )
+                    {
+                        platform_delta = crate::render3d::Vec3::new(
+                            ground.transform.position.x - last_x,
+                            ground.transform.position.y - last_y,
+                            ground.transform.position.z - last_z,
+                        );
+                    }
+                }
+
+                let dt = dt.filter_finite().clamp(0.0, 0.1);
+                let mut velocity_y = component.get::<f32>("velocity_y").unwrap_or(0.0);
+                if component.get::<bool>("use_gravity").unwrap_or(true) {
+                    velocity_y -= component
+                        .get::<f32>("gravity")
+                        .unwrap_or(9.81)
+                        .filter_finite()
+                        .max(0.0)
+                        * dt;
+                }
+                let displacement = crate::render3d::Vec3::new(
+                    component
+                        .get::<f32>("velocity_x")
+                        .unwrap_or(0.0)
+                        .filter_finite()
+                        * dt
+                        + platform_delta.x,
+                    velocity_y.filter_finite() * dt + platform_delta.y,
+                    component
+                        .get::<f32>("velocity_z")
+                        .unwrap_or(0.0)
+                        .filter_finite()
+                        * dt
+                        + platform_delta.z,
+                );
+                let result = move_character_controller_3d(
+                    _lua,
+                    &update_character_registry,
+                    component.clone(),
+                    displacement,
+                )?;
+                if result.get::<bool>("grounded").unwrap_or(false) && velocity_y < 0.0 {
+                    velocity_y = 0.0;
+                }
+                component.set("velocity_y", velocity_y)?;
+                Ok(())
+            })?,
+        )?;
+        let destroy_character_registry = registry.clone();
+        character.set(
+            "destroy",
+            lua.create_function(move |_lua, (_entity, component): (Table, Table)| {
+                destroy_character_registry
+                    .lock()
+                    .map_err(|_| mlua::Error::external("3D collider registry lock poisoned"))?
+                    .remove(&(component.to_pointer() as usize));
+                Ok(())
+            })?,
+        )?;
+        core_components.set("CharacterController3D", character)?;
 
         let physics = lua.create_table()?;
         let raycast_registry = registry.clone();
@@ -4598,7 +6118,14 @@ pub fn add_core_components(
                             .refresh_mesh_if_changed()
                             .map_err(mlua::Error::external)?;
                     }
-                    let colliders = registry.values().cloned().collect::<Vec<_>>();
+                    let excluded_entity_id = options
+                        .as_ref()
+                        .and_then(|table| table.get::<u64>("exclude_entity_id").ok());
+                    let colliders = registry
+                        .values()
+                        .filter(|collider| Some(collider.id) != excluded_entity_id)
+                        .cloned()
+                        .collect::<Vec<_>>();
                     let Some(hit) = crate::physics3d::raycast_nearest(
                         &colliders,
                         ray,
@@ -4636,6 +6163,71 @@ pub fn add_core_components(
                 },
             )?,
         )?;
+
+        let sweep_registry = registry.clone();
+        let sweep_capsule = lua.create_function(
+            move |lua,
+                  (cx, cy, cz, radius, height, dx, dy, dz, options): (
+                f32,
+                f32,
+                f32,
+                f32,
+                f32,
+                f32,
+                f32,
+                f32,
+                Option<Table>,
+            )| {
+                let query = QueryFilter3D {
+                    collision: CollisionFilter3D::new(
+                        options
+                            .as_ref()
+                            .and_then(|table| table.get::<u32>("layer").ok())
+                            .unwrap_or(1),
+                        options
+                            .as_ref()
+                            .and_then(|table| table.get::<u32>("mask").ok())
+                            .unwrap_or(u32::MAX),
+                    ),
+                    include_triggers: options
+                        .as_ref()
+                        .and_then(|table| table.get::<bool>("include_triggers").ok())
+                        .unwrap_or(false),
+                };
+                let excluded = options
+                    .as_ref()
+                    .and_then(|table| table.get::<u64>("exclude_entity_id").ok());
+                let colliders = character_controller_registry_snapshot_3d(&sweep_registry)?;
+                let radius = radius.filter_finite().clamp(0.01, 1000.0);
+                let height = height.filter_finite().clamp(radius * 2.0, 10_000.0);
+                let Some(hit) = crate::physics3d::sweep_capsule_nearest(
+                    &colliders,
+                    crate::render3d::Vec3::new(cx, cy, cz),
+                    radius,
+                    (height * 0.5 - radius).max(0.0),
+                    crate::render3d::Vec3::new(dx, dy, dz),
+                    query,
+                    excluded,
+                )
+                .map_err(mlua::Error::external)?
+                else {
+                    return Ok(None::<Table>);
+                };
+                let value = lua.create_table()?;
+                value.set("entity_id", hit.collider_id)?;
+                value.set("distance", hit.distance)?;
+                value.set("x", hit.position.x)?;
+                value.set("y", hit.position.y)?;
+                value.set("z", hit.position.z)?;
+                value.set("normal_x", hit.normal.x)?;
+                value.set("normal_y", hit.normal.y)?;
+                value.set("normal_z", hit.normal.z)?;
+                value.set("is_trigger", hit.is_trigger)?;
+                Ok(Some(value))
+            },
+        )?;
+        physics.set("sweepCapsule", sweep_capsule.clone())?;
+        physics.set("sweep_capsule", sweep_capsule)?;
 
         let contacts_registry = registry.clone();
         physics.set(
@@ -4755,6 +6347,8 @@ pub fn add_core_components(
                         .unwrap_or(true)
                         && body.get::<bool>("enabled").unwrap_or(true)
                         && !body.get::<bool>("is_static").unwrap_or(false);
+                    let continuous_collision = response_enabled
+                        && body.get::<bool>("continuous_collision").unwrap_or(false);
 
                     let mut registry = resolve_registry
                         .lock()
@@ -4774,15 +6368,71 @@ pub fn add_core_components(
                         .into_iter()
                         .map(|(_, collider)| collider)
                         .collect::<Vec<_>>();
+                    let movement_length = (movement.x * movement.x
+                        + movement.y * movement.y
+                        + movement.z * movement.z)
+                        .sqrt();
+                    let mut ccd_hits = Vec::new();
+                    if continuous_collision && movement_length > 1.0e-8 {
+                        for moving in colliders.iter().filter(|collider| {
+                            collider.id == entity_id
+                                && collider.enabled
+                                && collider.response_enabled
+                        }) {
+                            ccd_hits.extend(
+                                crate::physics3d::sweep_collider_hits(
+                                    &colliders,
+                                    moving,
+                                    movement,
+                                    Some(entity_id),
+                                )
+                                .map_err(mlua::Error::external)?,
+                            );
+                        }
+                        ccd_hits.sort_unstable_by(|left, right| {
+                            left.distance
+                                .total_cmp(&right.distance)
+                                .then_with(|| left.collider_id.cmp(&right.collider_id))
+                                .then_with(|| left.is_trigger.cmp(&right.is_trigger))
+                        });
+                        let mut seen = std::collections::HashSet::new();
+                        ccd_hits.retain(|hit| seen.insert((hit.collider_id, hit.is_trigger)));
+                    }
+                    let blocking_ccd = ccd_hits
+                        .iter()
+                        .find(|hit| !hit.is_trigger && hit.response_enabled)
+                        .copied();
+                    let allowed_distance = blocking_ccd.map_or(movement_length, |hit| {
+                        (hit.distance - slop).max(0.0).min(movement_length)
+                    });
+                    let allowed_fraction = if movement_length > 1.0e-8 {
+                        (allowed_distance / movement_length).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    let allowed_movement = crate::render3d::Vec3::new(
+                        movement.x * allowed_fraction,
+                        movement.y * allowed_fraction,
+                        movement.z * allowed_fraction,
+                    );
+                    let ccd_adjustment = crate::render3d::Vec3::new(
+                        allowed_movement.x - movement.x,
+                        allowed_movement.y - movement.y,
+                        allowed_movement.z - movement.z,
+                    );
+                    if blocking_ccd.is_some() {
+                        translate_entity_world_3d(&entity, ccd_adjustment)?;
+                    }
+                    let resolved_transform = crate::window::get_global_transform_3d(&entity)?;
                     for collider in colliders
                         .iter_mut()
                         .filter(|collider| collider.id == entity_id)
                     {
-                        collider.transform.position.x += movement.x;
-                        collider.transform.position.y += movement.y;
-                        collider.transform.position.z += movement.z;
-                        collider.transform.euler = transform.euler;
-                        collider.transform.scale = transform.scale;
+                        collider.transform.position.x += allowed_movement.x;
+                        collider.transform.position.y += allowed_movement.y;
+                        collider.transform.position.z += allowed_movement.z;
+                        collider.transform.euler = resolved_transform.euler;
+                        collider.transform.scale = resolved_transform.scale;
                         collider.body_is_static = body.get::<bool>("is_static").unwrap_or(false);
                     }
 
@@ -4801,6 +6451,79 @@ pub fn add_core_components(
                         body.get::<f32>("velocity_y").unwrap_or(0.0),
                         body.get::<f32>("velocity_z").unwrap_or(0.0),
                     );
+                    let reached_ccd_distance = blocking_ccd
+                        .map(|hit| hit.distance + slop.max(1.0e-5))
+                        .unwrap_or(movement_length + 1.0e-5);
+                    let mut ccd_contact_keys = std::collections::HashSet::new();
+                    let mut ccd_hit_count = 0usize;
+                    for hit in ccd_hits
+                        .iter()
+                        .filter(|hit| hit.distance <= reached_ccd_distance)
+                    {
+                        let is_blocking_hit = blocking_ccd.is_some_and(|blocking| {
+                            !hit.is_trigger
+                                && hit.response_enabled
+                                && hit.collider_id == blocking.collider_id
+                                && (hit.distance - blocking.distance).abs() <= 1.0e-5
+                        });
+                        let exact = hit.quality == crate::physics3d::ContactQuality3D::Exact;
+                        let normal =
+                            crate::render3d::Vec3::new(-hit.normal.x, -hit.normal.y, -hit.normal.z);
+                        contact_count += 1;
+                        ccd_hit_count += 1;
+                        if hit.is_trigger {
+                            trigger_count += 1;
+                        }
+                        if exact {
+                            exact_count += 1;
+                        } else {
+                            bounds_count += 1;
+                        }
+                        if is_blocking_hit {
+                            resolved_count += 1;
+                            velocity = crate::physics3d::resolve_contact_velocity(
+                                velocity,
+                                normal,
+                                hit.restitution,
+                                hit.friction,
+                            );
+                            grounded |= hit.normal.y > 0.5;
+                        }
+                        let value = lua.create_table()?;
+                        value.set("self_id", entity_id)?;
+                        value.set("other_id", hit.collider_id)?;
+                        value.set("normal_x", normal.x)?;
+                        value.set("normal_y", normal.y)?;
+                        value.set("normal_z", normal.z)?;
+                        value.set("penetration", 0.0)?;
+                        value.set("x", hit.position.x)?;
+                        value.set("y", hit.position.y)?;
+                        value.set("z", hit.position.z)?;
+                        value.set("is_trigger", hit.is_trigger)?;
+                        value.set("quality", hit.quality.as_str())?;
+                        value.set("exact", exact)?;
+                        value.set("can_resolve", is_blocking_hit)?;
+                        value.set("continuous", true)?;
+                        value.set("distance", hit.distance)?;
+                        value.set(
+                            "time_fraction",
+                            if movement_length > 1.0e-8 {
+                                (hit.distance / movement_length).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            },
+                        )?;
+                        contact_values.raw_set(contact_count, value.clone())?;
+                        let callback_name = if hit.is_trigger {
+                            "onTrigger"
+                        } else {
+                            "onContact"
+                        };
+                        if let Ok(Value::Function(callback)) = body.get::<Value>(callback_name) {
+                            callback.call::<()>(value)?;
+                        }
+                        ccd_contact_keys.insert((hit.collider_id, hit.is_trigger));
+                    }
 
                     for contact in generated {
                         if contact.first_id == entity_id && contact.second_id == entity_id {
@@ -4823,6 +6546,9 @@ pub fn add_core_components(
                         };
                         let own = &colliders[own_index];
                         let other = &colliders[other_index];
+                        if ccd_contact_keys.contains(&(other.id, contact.has_trigger)) {
+                            continue;
+                        }
                         let exact = contact.quality == crate::physics3d::ContactQuality3D::Exact;
                         let can_resolve = response_enabled
                             && exact
@@ -4853,6 +6579,7 @@ pub fn add_core_components(
                         value.set("quality", contact.quality.as_str())?;
                         value.set("exact", exact)?;
                         value.set("can_resolve", can_resolve)?;
+                        value.set("continuous", false)?;
                         contact_values.raw_set(contact_count, value.clone())?;
 
                         let callback_name = if contact.has_trigger {
@@ -4902,18 +6629,40 @@ pub fn add_core_components(
                         resolved_count += 1;
                     }
 
-                    entity.set("x", entity.get::<f32>("x").unwrap_or(0.0) + correction.x)?;
-                    entity.set("y", entity.get::<f32>("y").unwrap_or(0.0) + correction.y)?;
-                    entity.set(
-                        "position_z",
-                        entity.get::<f32>("position_z").unwrap_or(0.0) + correction.z,
-                    )?;
+                    translate_entity_world_3d(&entity, correction)?;
                     body.set("velocity_x", velocity.x)?;
                     body.set("velocity_y", velocity.y)?;
                     body.set("velocity_z", velocity.z)?;
-                    body.set("__last_world_x", transform.position.x + correction.x)?;
-                    body.set("__last_world_y", transform.position.y + correction.y)?;
-                    body.set("__last_world_z", transform.position.z + correction.z)?;
+                    let final_transform = crate::window::get_global_transform_3d(&entity)?;
+                    body.set("__last_world_x", final_transform.position.x)?;
+                    body.set("__last_world_y", final_transform.position.y)?;
+                    body.set("__last_world_z", final_transform.position.z)?;
+                    body.set("ccd_hit", blocking_ccd.is_some())?;
+                    body.set("ccd_hit_count", ccd_hit_count)?;
+                    if let Some(hit) = blocking_ccd {
+                        body.set("ccd_entity_id", hit.collider_id)?;
+                        body.set("ccd_distance", hit.distance)?;
+                        body.set(
+                            "ccd_time_fraction",
+                            if movement_length > 1.0e-8 {
+                                (hit.distance / movement_length).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            },
+                        )?;
+                        body.set("ccd_normal_x", hit.normal.x)?;
+                        body.set("ccd_normal_y", hit.normal.y)?;
+                        body.set("ccd_normal_z", hit.normal.z)?;
+                        body.set("ccd_quality", hit.quality.as_str())?;
+                    } else {
+                        body.set("ccd_entity_id", Value::Nil)?;
+                        body.set("ccd_distance", 0.0)?;
+                        body.set("ccd_time_fraction", 1.0)?;
+                        body.set("ccd_normal_x", 0.0)?;
+                        body.set("ccd_normal_y", 0.0)?;
+                        body.set("ccd_normal_z", 0.0)?;
+                        body.set("ccd_quality", Value::Nil)?;
+                    }
 
                     // Keep the shared snapshot coherent for bodies updated
                     // later in the same frame. Collider3D.update will replace
@@ -4926,11 +6675,11 @@ pub fn add_core_components(
                         .values_mut()
                         .filter(|collider| collider.id == entity_id)
                     {
-                        collider.transform.position.x += movement.x + correction.x;
-                        collider.transform.position.y += movement.y + correction.y;
-                        collider.transform.position.z += movement.z + correction.z;
-                        collider.transform.euler = transform.euler;
-                        collider.transform.scale = transform.scale;
+                        collider.transform.position.x += allowed_movement.x + correction.x;
+                        collider.transform.position.y += allowed_movement.y + correction.y;
+                        collider.transform.position.z += allowed_movement.z + correction.z;
+                        collider.transform.euler = final_transform.euler;
+                        collider.transform.scale = final_transform.scale;
                         collider.body_is_static = body.get::<bool>("is_static").unwrap_or(false);
                     }
                     drop(registry);
@@ -4946,6 +6695,21 @@ pub fn add_core_components(
                     result.set("correction_x", correction.x)?;
                     result.set("correction_y", correction.y)?;
                     result.set("correction_z", correction.z)?;
+                    result.set("ccd_hit", blocking_ccd.is_some())?;
+                    result.set("ccd_hit_count", ccd_hit_count)?;
+                    result.set(
+                        "ccd_time_fraction",
+                        blocking_ccd.map_or(1.0, |hit| {
+                            if movement_length > 1.0e-8 {
+                                (hit.distance / movement_length).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            }
+                        }),
+                    )?;
+                    result.set("ccd_adjustment_x", ccd_adjustment.x)?;
+                    result.set("ccd_adjustment_y", ccd_adjustment.y)?;
+                    result.set("ccd_adjustment_z", ccd_adjustment.z)?;
                     Ok(result)
                 },
             )?,
@@ -4988,6 +6752,398 @@ pub fn add_core_components(
         )?;
         lua.globals().set("physics3d", physics.clone())?;
         lua.globals().set("physics3D", physics)?;
+
+        let raycast = lua.create_table()?;
+        raycast.set("__neolove_component", "Raycast3D")?;
+        raycast.set(
+            "awake",
+            lua.create_function(|_lua, (entity, component): (Table, Table)| {
+                component.set("__neolove_component", "Raycast3D")?;
+                component.set("__entity", entity)?;
+                component.set("enabled", true)?;
+                component.set("offset_x", 0.0)?;
+                component.set("offset_y", 0.0)?;
+                component.set("offset_z", 0.0)?;
+                component.set("direction_x", 0.0)?;
+                component.set("direction_y", 0.0)?;
+                component.set("direction_z", -1.0)?;
+                component.set("max_distance", 100.0)?;
+                component.set("layer", 1u32)?;
+                component.set("mask", u32::MAX)?;
+                component.set("include_triggers", true)?;
+                component.set("exclude_self", true)?;
+                component.set("hit", false)?;
+                component.set("hit_entity_id", Value::Nil)?;
+                component.set("hit_distance", 0.0)?;
+                component.set("hit_x", 0.0)?;
+                component.set("hit_y", 0.0)?;
+                component.set("hit_z", 0.0)?;
+                component.set("normal_x", 0.0)?;
+                component.set("normal_y", 0.0)?;
+                component.set("normal_z", 0.0)?;
+                component.set("onHit", Value::Nil)?;
+                Ok(())
+            })?,
+        )?;
+        let cast = lua.create_function(
+            |lua, (entity, component, _dt): (Table, Table, Option<f32>)| {
+                let clear_hit = |component: &Table| -> mlua::Result<()> {
+                    component.set("hit", false)?;
+                    component.set("hit_entity_id", Value::Nil)?;
+                    component.set("hit_distance", 0.0)?;
+                    Ok(())
+                };
+                if !component.get::<bool>("enabled").unwrap_or(true) {
+                    clear_hit(&component)?;
+                    return Ok(None::<Table>);
+                }
+                let transform = crate::window::get_global_transform_3d(&entity)?;
+                let local_offset = crate::render3d::Vec3::new(
+                    component.get::<f32>("offset_x").unwrap_or(0.0),
+                    component.get::<f32>("offset_y").unwrap_or(0.0),
+                    component.get::<f32>("offset_z").unwrap_or(0.0),
+                );
+                let offset = transform.model.transform_direction(local_offset);
+                let origin = crate::render3d::Vec3::new(
+                    transform.position.x + offset.x,
+                    transform.position.y + offset.y,
+                    transform.position.z + offset.z,
+                );
+                let local_direction = crate::render3d::Vec3::new(
+                    component.get::<f32>("direction_x").unwrap_or(0.0),
+                    component.get::<f32>("direction_y").unwrap_or(0.0),
+                    component.get::<f32>("direction_z").unwrap_or(-1.0),
+                );
+                let mut direction = transform.model.transform_direction(local_direction);
+                let direction_length = (direction.x * direction.x
+                    + direction.y * direction.y
+                    + direction.z * direction.z)
+                    .sqrt();
+                if !direction_length.is_finite() || direction_length <= 1.0e-6 {
+                    clear_hit(&component)?;
+                    return Ok(None::<Table>);
+                }
+                direction.x /= direction_length;
+                direction.y /= direction_length;
+                direction.z /= direction_length;
+
+                let options = lua.create_table()?;
+                options.set("layer", component.get::<u32>("layer").unwrap_or(1))?;
+                options.set("mask", component.get::<u32>("mask").unwrap_or(u32::MAX))?;
+                options.set(
+                    "include_triggers",
+                    component.get::<bool>("include_triggers").unwrap_or(true),
+                )?;
+                if component.get::<bool>("exclude_self").unwrap_or(true) {
+                    options.set(
+                        "exclude_entity_id",
+                        entity.get::<u64>("id").unwrap_or_default(),
+                    )?;
+                }
+                let physics = lua.globals().get::<Table>("physics3d")?;
+                let hit = physics.get::<Function>("raycast")?.call::<Option<Table>>((
+                    origin.x,
+                    origin.y,
+                    origin.z,
+                    direction.x,
+                    direction.y,
+                    direction.z,
+                    Some(
+                        component
+                            .get::<f32>("max_distance")
+                            .unwrap_or(100.0)
+                            .max(0.0),
+                    ),
+                    Some(options),
+                ))?;
+                let Some(hit) = hit else {
+                    clear_hit(&component)?;
+                    return Ok(None);
+                };
+                component.set("hit", true)?;
+                component.set("hit_entity_id", hit.get::<u64>("entity_id")?)?;
+                component.set("hit_distance", hit.get::<f32>("distance")?)?;
+                component.set("hit_x", hit.get::<f32>("x")?)?;
+                component.set("hit_y", hit.get::<f32>("y")?)?;
+                component.set("hit_z", hit.get::<f32>("z")?)?;
+                component.set("normal_x", hit.get::<f32>("normal_x")?)?;
+                component.set("normal_y", hit.get::<f32>("normal_y")?)?;
+                component.set("normal_z", hit.get::<f32>("normal_z")?)?;
+                if let Ok(Value::Function(callback)) = component.get::<Value>("onHit") {
+                    callback.call::<()>(hit.clone())?;
+                }
+                Ok(Some(hit))
+            },
+        )?;
+        raycast.set("update", cast.clone())?;
+        raycast.set(
+            "cast",
+            lua.create_function(|lua, component: Table| {
+                let entity = component.get::<Table>("__entity")?;
+                let core = lua.globals().get::<Table>("core")?;
+                core.get::<Table>("Raycast3D")?
+                    .get::<Function>("update")?
+                    .call::<Option<Table>>((entity, component, None::<f32>))
+            })?,
+        )?;
+        raycast.set(
+            "setOnHit",
+            lua.create_function(|_lua, (component, callback): (Table, Value)| {
+                component.set("onHit", callback)?;
+                Ok(())
+            })?,
+        )?;
+        core_components.set("Raycast3D", raycast)?;
+    }
+
+    // AudioListener3D
+    // Exactly one listener is active. The first enabled listener claims the
+    // role automatically; SetActive provides deterministic explicit selection.
+    #[cfg(not(neolove_2d))]
+    {
+        let listener = lua.create_table()?;
+        listener.set("__neolove_component", "AudioListener3D")?;
+        let active_listener = std::sync::Arc::new(std::sync::Mutex::new(None::<usize>));
+        listener.set(
+            "awake",
+            lua.create_function(|_lua, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "AudioListener3D")?;
+                component.set("enabled", true)?;
+                component.set("ear_distance", 0.2)?;
+                Ok(())
+            })?,
+        )?;
+
+        let set_active_state = active_listener.clone();
+        let set_active = lua.create_function(move |_lua, component: Table| {
+            if !component.get::<bool>("enabled").unwrap_or(true)
+                || component.get::<Option<Table>>("entity")?.is_none()
+            {
+                return Ok(false);
+            }
+            *set_active_state
+                .lock()
+                .map_err(|_| mlua::Error::external("3D audio listener state lock poisoned"))? =
+                Some(component.to_pointer() as usize);
+            Ok(true)
+        })?;
+        listener.set("SetActive", set_active.clone())?;
+        listener.set("setActive", set_active)?;
+
+        let is_active_state = active_listener.clone();
+        let is_active = lua.create_function(move |_lua, component: Table| {
+            Ok(*is_active_state
+                .lock()
+                .map_err(|_| mlua::Error::external("3D audio listener state lock poisoned"))?
+                == Some(component.to_pointer() as usize))
+        })?;
+        listener.set("IsActive", is_active.clone())?;
+        listener.set("isActive", is_active)?;
+
+        let update_active_state = active_listener.clone();
+        listener.set(
+            "update",
+            lua.create_function(move |lua, (entity, component, _dt): (Table, Table, f32)| {
+                let listener_id = component.to_pointer() as usize;
+                if !component.get::<bool>("enabled").unwrap_or(true) {
+                    let mut active = update_active_state.lock().map_err(|_| {
+                        mlua::Error::external("3D audio listener state lock poisoned")
+                    })?;
+                    if *active == Some(listener_id) {
+                        *active = None;
+                    }
+                    return Ok(());
+                }
+                {
+                    let mut active = update_active_state.lock().map_err(|_| {
+                        mlua::Error::external("3D audio listener state lock poisoned")
+                    })?;
+                    if active.is_none() {
+                        *active = Some(listener_id);
+                    }
+                    if *active != Some(listener_id) {
+                        return Ok(());
+                    }
+                }
+
+                let transform = crate::window::get_global_transform_3d(&entity)?;
+                let rotation = crate::render3d::Mat4::rotation_euler_degrees(transform.euler);
+                let forward =
+                    rotation.transform_direction(crate::render3d::Vec3::new(0.0, 0.0, -1.0));
+                let up = rotation.transform_direction(crate::render3d::Vec3::new(0.0, 1.0, 0.0));
+                let audio = lua.globals().get::<Table>("audio")?;
+                audio.get::<Function>("setListener3D")?.call::<()>((
+                    transform.position.x,
+                    transform.position.y,
+                    transform.position.z,
+                    forward.x,
+                    forward.y,
+                    forward.z,
+                    up.x,
+                    up.y,
+                    up.z,
+                    Some(
+                        component
+                            .get::<f32>("ear_distance")
+                            .unwrap_or(0.2)
+                            .clamp(0.001, 10.0),
+                    ),
+                ))
+            })?,
+        )?;
+
+        let destroy_active_state = active_listener.clone();
+        listener.set(
+            "destroy",
+            lua.create_function(move |_lua, (_entity, component): (Table, Table)| {
+                let listener_id = component.to_pointer() as usize;
+                let mut active = destroy_active_state
+                    .lock()
+                    .map_err(|_| mlua::Error::external("3D audio listener state lock poisoned"))?;
+                if *active == Some(listener_id) {
+                    *active = None;
+                }
+                Ok(())
+            })?,
+        )?;
+        core_components.set("AudioListener3D", listener)?;
+    }
+
+    // AudioSource3D
+    // Owns an independent playback voice so several entities can safely share
+    // one SoundHandle. Position and authored attenuation update every frame.
+    #[cfg(not(neolove_2d))]
+    {
+        let source = lua.create_table()?;
+        source.set("__neolove_component", "AudioSource3D")?;
+        source.set(
+            "awake",
+            lua.create_function(|_lua, (_entity, component): (Table, Table)| {
+                component.set("__neolove_component", "AudioSource3D")?;
+                component.set("enabled", true)?;
+                component.set("sound", Value::Nil)?;
+                component.set("volume", 1.0)?;
+                component.set("looping", false)?;
+                component.set("autoplay", false)?;
+                component.set("min_distance", 1.0)?;
+                component.set("max_distance", 100.0)?;
+                component.set("rolloff", 1.0)?;
+                component.set("distance_model", "inverse")?;
+                component.set("__autoplay_started", false)?;
+                component.set("__playing", false)?;
+                component.set("__voice_id", component.to_pointer() as usize as i64)?;
+                Ok(())
+            })?,
+        )?;
+
+        let play = lua.create_function(|lua, component: Table| {
+            if !component.get::<bool>("enabled").unwrap_or(true) {
+                return Ok(false);
+            }
+            let sound = component.get::<Value>("sound").unwrap_or(Value::Nil);
+            if !matches!(&sound, Value::UserData(_)) {
+                return Ok(false);
+            }
+            let entity = component.get::<Table>("entity")?;
+            let transform = crate::window::get_global_transform_3d(&entity)?;
+            let voice_id = component
+                .get::<i64>("__voice_id")
+                .unwrap_or(component.to_pointer() as usize as i64);
+            let options = audio_source_3d_options(lua, &component, voice_id)?;
+            let audio = lua.globals().get::<Table>("audio")?;
+            let actual_voice = audio.get::<Function>("playSpatial3D")?.call::<i64>((
+                sound,
+                transform.position.x,
+                transform.position.y,
+                transform.position.z,
+                Some(options),
+            ))?;
+            component.set("__voice_id", actual_voice)?;
+            component.set("__autoplay_started", true)?;
+            component.set("__playing", true)?;
+            Ok(true)
+        })?;
+        source.set("play", play.clone())?;
+        source.set("Play", play.clone())?;
+
+        let stop = lua.create_function(|lua, component: Table| {
+            if component.get::<bool>("__playing").unwrap_or(false) {
+                let voice_id = component
+                    .get::<i64>("__voice_id")
+                    .unwrap_or(component.to_pointer() as usize as i64);
+                let audio = lua.globals().get::<Table>("audio")?;
+                audio
+                    .get::<Function>("stopSpatial3D")?
+                    .call::<()>(voice_id)?;
+            }
+            component.set("__playing", false)
+        })?;
+        source.set("stop", stop.clone())?;
+        source.set("Stop", stop.clone())?;
+
+        let play_for_update = play.clone();
+        source.set(
+            "update",
+            lua.create_function(move |lua, (entity, component, _dt): (Table, Table, f32)| {
+                if !component.get::<bool>("enabled").unwrap_or(true) {
+                    if component.get::<bool>("__playing").unwrap_or(false) {
+                        let voice_id = component
+                            .get::<i64>("__voice_id")
+                            .unwrap_or(component.to_pointer() as usize as i64);
+                        lua.globals()
+                            .get::<Table>("audio")?
+                            .get::<Function>("stopSpatial3D")?
+                            .call::<()>(voice_id)?;
+                        component.set("__playing", false)?;
+                    }
+                    return Ok(());
+                }
+                let autoplay = component.get::<bool>("autoplay").unwrap_or(false);
+                let started = component.get::<bool>("__autoplay_started").unwrap_or(false);
+                if autoplay && !started {
+                    let _ = play_for_update.call::<bool>(component.clone())?;
+                }
+                if component.get::<bool>("__playing").unwrap_or(false) {
+                    let transform = crate::window::get_global_transform_3d(&entity)?;
+                    let voice_id = component
+                        .get::<i64>("__voice_id")
+                        .unwrap_or(component.to_pointer() as usize as i64);
+                    let options = audio_source_3d_options(lua, &component, voice_id)?;
+                    let alive = lua
+                        .globals()
+                        .get::<Table>("audio")?
+                        .get::<Function>("updateSpatial3D")?
+                        .call::<bool>((
+                            voice_id,
+                            transform.position.x,
+                            transform.position.y,
+                            transform.position.z,
+                            Some(options),
+                        ))?;
+                    if !alive {
+                        component.set("__playing", false)?;
+                    }
+                }
+                Ok(())
+            })?,
+        )?;
+
+        source.set(
+            "destroy",
+            lua.create_function(move |lua, (_entity, component): (Table, Table)| {
+                if component.get::<bool>("__playing").unwrap_or(false) {
+                    let voice_id = component
+                        .get::<i64>("__voice_id")
+                        .unwrap_or(component.to_pointer() as usize as i64);
+                    lua.globals()
+                        .get::<Table>("audio")?
+                        .get::<Function>("stopSpatial3D")?
+                        .call::<()>(voice_id)?;
+                }
+                component.set("__playing", false)
+            })?,
+        )?;
+        core_components.set("AudioSource3D", source)?;
     }
 
     // SpatialSound2D
@@ -9939,6 +12095,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn post_process_enabled_option_defaults_true_when_omitted() -> mlua::Result<()> {
+        let lua = Lua::new();
+        let options = lua.create_table()?;
+        assert!(post_process_bool(&Some(options.clone()), "enabled", true));
+        options.set("enabled", false)?;
+        assert!(!post_process_bool(&Some(options.clone()), "enabled", true));
+        options.set("enabled", true)?;
+        assert!(post_process_bool(&Some(options), "enabled", false));
+        assert!(post_process_bool(&None, "enabled", true));
+        Ok(())
+    }
+
+    #[test]
     fn tilemap_visibility_culls_large_maps_and_supports_rotation() {
         let visible = visible_tile_cells(
             -320.0,
@@ -10082,6 +12251,109 @@ mod tests {
     }
 
     #[test]
+    fn visibility_and_render_layers_share_hierarchy_policy_with_static_meshes() {
+        let (lua, _render_state) = lua_with_core_components();
+        let parent = crate::window::create_entity_table(&lua, "parent", 0.0, 0.0, None)
+            .expect("parent entity");
+        let child =
+            crate::window::create_entity_table(&lua, "child", 0.0, 0.0, Some(parent.clone()))
+                .expect("child entity");
+        let core: Table = lua.globals().get("core").expect("core components");
+
+        let attach = |name: &str, entity: &Table| {
+            let prototype: Table = core.get(name).expect("component prototype");
+            let component = lua.create_table().expect("component instance");
+            component
+                .set("entity", entity.clone())
+                .expect("entity link");
+            prototype
+                .get::<Function>("awake")
+                .and_then(|awake| awake.call::<()>((entity.clone(), component.clone())))
+                .expect("component awake");
+            entity
+                .get::<Table>("components")
+                .and_then(|components| components.push(component.clone()))
+                .expect("attach component");
+            component
+        };
+
+        let parent_visibility = attach("Visibility3D", &parent);
+        parent_visibility
+            .set("visible", false)
+            .expect("hide parent");
+        let child_visibility = attach("Visibility3D", &child);
+        assert!(!effective_visibility_3d(&child).expect("inherited visibility"));
+        assert!(
+            !child_visibility
+                .get::<bool>("effective_visible")
+                .expect("computed visibility")
+        );
+
+        child_visibility
+            .set("inherit_parent", false)
+            .expect("visibility boundary");
+        assert!(effective_visibility_3d(&child).expect("local visibility boundary"));
+
+        let render_layer = attach("RenderLayer3D", &child);
+        render_layer.set("mask", 0b0001i64).expect("entity mask");
+        let blocked = entity_render_policy_3d(&child, 0b0010).expect("blocked policy");
+        assert!(blocked.effective_visible);
+        assert!(!blocked.layer_match);
+        assert_eq!(blocked.entity_mask, 0b0001);
+
+        let mesh = crate::mesh::primitive_mesh("cube", crate::mesh::PrimitiveOptions::default())
+            .expect("mesh");
+        let renderer = mesh_renderer_test_component(&lua, &child, mesh);
+        assert!(matches!(
+            prepare_static_mesh_renderer_3d(
+                &renderer,
+                Some(&child),
+                crate::render3d::Mat4::identity(),
+                crate::render3d::Camera3D {
+                    render_mask: 0b0010,
+                    ..crate::render3d::Camera3D::default()
+                },
+                1.0,
+            )
+            .expect("blocked static mesh"),
+            StaticMeshRenderer3DUpdate::Handled(None)
+        ));
+
+        render_layer.set("mask", 0b0110i64).expect("matching mask");
+        assert!(matches!(
+            prepare_static_mesh_renderer_3d(
+                &renderer,
+                Some(&child),
+                crate::render3d::Mat4::identity(),
+                crate::render3d::Camera3D {
+                    render_mask: 0b0010,
+                    ..crate::render3d::Camera3D::default()
+                },
+                1.0,
+            )
+            .expect("visible static mesh"),
+            StaticMeshRenderer3DUpdate::Handled(Some(DrawCommand::Mesh3D(_)))
+        ));
+
+        let tag = attach("Tag", &child);
+        tag.set("tag", "Player").expect("tag value");
+        assert!(
+            core.get::<Table>("Tag")
+                .and_then(|prototype| prototype.get::<Function>("Matches"))
+                .and_then(|matches| matches.call::<bool>((tag, "Player")))
+                .expect("tag match")
+        );
+        let layer = attach("Layer", &child);
+        layer.set("layer", 7).expect("logical layer");
+        assert!(
+            core.get::<Table>("Layer")
+                .and_then(|prototype| prototype.get::<Function>("Matches"))
+                .and_then(|matches| matches.call::<bool>((layer, 7)))
+                .expect("layer match")
+        );
+    }
+
+    #[test]
     fn lighting_global_is_installed_and_updates_config() {
         let (lua, render_state) = lua_with_core_components();
         lua.load(
@@ -10125,11 +12397,28 @@ mod tests {
                 assert(environment3d == skybox)
                 environment3d.setGradient(Color4(10, 20, 30), Color4(40, 50, 60))
                 environment3d.setIntensity(1.5)
+                environment3d.setFog(Color4(91, 102, 113), {
+                    mode = "exp2",
+                    density = 0.04,
+                })
+                environment3d.setAmbientOcclusion({
+                    radius = 3.5,
+                    intensity = 0.72,
+                    bias = 0.04,
+                })
 
                 local component = {}
                 core.Environment3D.awake({}, component)
                 component.mode = "solid"
                 component.color = Color4(70, 80, 90)
+                component.fog_enabled = true
+                component.fog_mode = "exponential_squared"
+                component.fog_color = Color4(20, 30, 40)
+                component.fog_density = 0.05
+                component.ao_enabled = true
+                component.ao_radius = 4.0
+                component.ao_intensity = 0.8
+                component.ao_bias = 0.03
                 core.Environment3D.update({}, component, 0)
             "#,
         )
@@ -10143,6 +12432,144 @@ mod tests {
             crate::environment3d::EnvironmentMode3D::Solid
         );
         assert_eq!(environment.solid, Color::rgba(70, 80, 90, 255));
+        assert!(environment.fog.enabled);
+        assert_eq!(
+            environment.fog.mode,
+            crate::environment3d::FogMode3D::ExponentialSquared
+        );
+        assert_eq!(environment.fog.color, Color::rgba(20, 30, 40, 255));
+        assert!((environment.fog.density - 0.05).abs() < 0.0001);
+        assert!(environment.ambient_occlusion.enabled);
+        assert!((environment.ambient_occlusion.radius - 4.0).abs() < 0.0001);
+        assert!((environment.ambient_occlusion.intensity - 0.8).abs() < 0.0001);
+        assert!((environment.ambient_occlusion.bias - 0.03).abs() < 0.0001);
+    }
+
+    #[test]
+    fn cubemap_global_and_component_accept_handle_or_six_faces() {
+        let (lua, render_state) = lua_with_core_components();
+        let platform = crate::platform::new_shared_platform_state();
+        let root = std::env::temp_dir().join("neolove_core_cubemap_test");
+        crate::assets::add_assets_module_with_data_root(
+            &lua,
+            root.clone(),
+            root,
+            platform,
+            render_state.clone(),
+        )
+        .expect("assets module install");
+        lua.load(
+            r#"
+                local face = assets.newImage(2, 2, Color4(32, 64, 128))
+                local cube = assets.newCubemap({
+                    positive_x = face, negative_x = face,
+                    positive_y = face, negative_y = face,
+                    positive_z = face, negative_z = face,
+                })
+                assert(cube:size() == 2)
+                assert(cube:getFace("px"):width() == 2)
+                environment3d.setCubemap(cube, 45)
+
+                local component = {}
+                core.Environment3D.awake({}, component)
+                component.mode = "cubemap"
+                component.cubemap = nil
+                component.positive_x = face
+                component.negative_x = face
+                component.positive_y = face
+                component.negative_y = face
+                component.positive_z = face
+                component.negative_z = face
+                component.rotation = 90
+                component.intensity = 1.75
+                core.Environment3D.update({}, component, 0)
+            "#,
+        )
+        .exec()
+        .expect("cubemap APIs run");
+
+        let environment = render_state.lock().expect("render state").environment_3d();
+        assert_eq!(
+            environment.mode,
+            crate::environment3d::EnvironmentMode3D::Cubemap
+        );
+        assert!(environment.cubemap.is_some());
+        assert_eq!(environment.rotation_degrees, 90.0);
+        assert_eq!(environment.intensity, 1.75);
+    }
+
+    #[test]
+    fn reflection_probe_component_queues_transformed_validated_local_ibl() {
+        let (lua, render_state) = lua_with_core_components();
+        let platform = crate::platform::new_shared_platform_state();
+        let root = std::env::temp_dir().join("neolove_core_reflection_probe_test");
+        crate::assets::add_assets_module_with_data_root(
+            &lua,
+            root.clone(),
+            root,
+            platform,
+            render_state.clone(),
+        )
+        .expect("assets module install");
+        let entity = crate::window::create_entity_table(&lua, "probe", 2.0, 1.0, None)
+            .expect("probe entity");
+        entity.set("position_z", -3.0).expect("probe depth");
+        lua.globals()
+            .set("probeEntity", entity)
+            .expect("global probe");
+        lua.load(
+            r#"
+                local face = assets.newImage(2, 2, Color4(20, 80, 220))
+                local cube = assets.newCubemap({
+                    positive_x = face, negative_x = face,
+                    positive_y = face, negative_y = face,
+                    positive_z = face, negative_z = face,
+                })
+                local component = {}
+                core.ReflectionProbe3D.awake(probeEntity, component)
+                component.cubemap = cube
+                component.size_x = 4
+                component.size_y = 6
+                component.size_z = 8
+                component.blend_distance = 1.5
+                component.intensity = 2.25
+                component.rotation = 450
+                component.priority = 7
+                core.ReflectionProbe3D.update(probeEntity, component, 0)
+            "#,
+        )
+        .exec()
+        .expect("reflection probe runs");
+
+        let probes = render_state
+            .lock()
+            .expect("render state")
+            .take_reflection_probes_3d();
+        assert_eq!(probes.len(), 1);
+        let probe = &probes[0];
+        assert_eq!(probe.priority, 7);
+        assert_eq!(probe.intensity, 2.25);
+        assert_eq!(probe.rotation_degrees, 90.0);
+        assert_eq!(probe.blend_distance, 1.5);
+        assert_eq!(
+            probe.bounds_min,
+            crate::render3d::Vec3::new(0.0, -2.0, -7.0)
+        );
+        assert_eq!(probe.bounds_max, crate::render3d::Vec3::new(4.0, 4.0, 1.0));
+
+        let error = lua
+            .load(
+                r#"
+                    local face = assets.newImage(1, 1, Color4(255, 255, 255))
+                    local incomplete = {}
+                    core.ReflectionProbe3D.awake(probeEntity, incomplete)
+                    incomplete.positive_x = face
+                    core.ReflectionProbe3D.update(probeEntity, incomplete, 0)
+                "#,
+            )
+            .exec()
+            .expect_err("incomplete probe must report its missing faces");
+        assert!(error.to_string().contains("requires all six cubemap faces"));
     }
 
     #[test]
@@ -10226,6 +12653,111 @@ mod tests {
     }
 
     #[test]
+    fn lod_group_3d_selects_runtime_meshes_culls_and_disables_static_fast_path() {
+        let (lua, render_state) = lua_with_core_components();
+        let entity =
+            crate::window::create_entity_table(&lua, "lod", 30.0, 0.0, None).expect("entity");
+        lua.globals()
+            .set("lodEntity", entity.clone())
+            .expect("global");
+
+        let lod1_mesh = crate::mesh::primitive_mesh(
+            "sphere",
+            crate::mesh::PrimitiveOptions {
+                segments: 12,
+                rings: 6,
+                ..crate::mesh::PrimitiveOptions::default()
+            },
+        )
+        .expect("LOD 1 mesh");
+        let lod2_mesh = crate::mesh::primitive_mesh(
+            "cylinder",
+            crate::mesh::PrimitiveOptions {
+                segments: 8,
+                ..crate::mesh::PrimitiveOptions::default()
+            },
+        )
+        .expect("LOD 2 mesh");
+        let assets = lua.create_table().expect("assets table");
+        assets
+            .set(
+                "loadMesh",
+                lua.create_function(move |lua, path: String| {
+                    let mesh = if path == "lod1.mesh" {
+                        lod1_mesh.clone()
+                    } else if path == "lod2.mesh" {
+                        lod2_mesh.clone()
+                    } else {
+                        return Err(mlua::Error::external(format!(
+                            "unexpected LOD fixture path {path}"
+                        )));
+                    };
+                    lua.create_userdata(mesh)
+                })
+                .expect("loadMesh fixture"),
+            )
+            .expect("loadMesh export");
+        lua.globals().set("assets", assets).expect("assets global");
+
+        lua.load(
+            r#"
+                lodRenderer = {}
+                lodGroup = {}
+                core.MeshRenderer3D.awake(lodEntity, lodRenderer)
+                core.LODGroup3D.awake(lodEntity, lodGroup)
+                lodRenderer.primitive = "cube"
+                lodGroup.lod1_mesh = "lod1.mesh"
+                lodGroup.lod2_mesh = "lod2.mesh"
+                table.insert(lodEntity.components, lodRenderer)
+                table.insert(lodEntity.components, lodGroup)
+
+                core.MeshRenderer3D.update(lodEntity, lodRenderer, 0)
+                assert(lodGroup.active_level == 1, "30-unit entity should use LOD 1")
+                assert(lodGroup.camera_distance > 30 and lodGroup.camera_distance < 31)
+                local lod1Triangles = lodRenderer.mesh:triangleCount()
+
+                lodEntity.x = 60
+                core.MeshRenderer3D.update(lodEntity, lodRenderer, 0)
+                assert(lodGroup.active_level == 2, "60-unit entity should use LOD 2")
+                assert(lodRenderer.mesh:triangleCount() ~= lod1Triangles,
+                    "LOD source change must replace the managed mesh")
+
+                lodEntity.x = 120
+                core.MeshRenderer3D.update(lodEntity, lodRenderer, 0)
+                assert(lodGroup.active_level == -1, "distant entity should be culled")
+            "#,
+        )
+        .exec()
+        .expect("LOD component runtime path");
+
+        let commands = render_state.lock().expect("render state").drain();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, DrawCommand::Mesh3D(_)))
+                .count(),
+            2,
+            "the culled frame must not queue geometry"
+        );
+
+        let renderer = lua
+            .globals()
+            .get::<Table>("lodRenderer")
+            .expect("renderer global");
+        assert!(matches!(
+            prepare_static_mesh_renderer_3d(
+                &renderer,
+                Some(&entity),
+                crate::render3d::Mat4::identity(),
+                crate::render3d::Camera3D::default(),
+                1.0,
+            )
+            .expect("fast-path decision"),
+            StaticMeshRenderer3DUpdate::Fallback
+        ));
+    }
+
+    #[test]
     fn mesh_renderer_3d_manual_mode_preserves_handles_and_managed_sources_replace_them() {
         let (lua, render_state) = lua_with_core_components();
         let entity =
@@ -10299,6 +12831,75 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn static_mesh_renderer_3d_fast_path_prepares_native_command_without_queue_locks() {
+        let (lua, _render_state) = lua_with_core_components();
+        let entity =
+            crate::window::create_entity_table(&lua, "static", 3.0, -2.0, None).expect("entity");
+        let source = animated_mesh_renderer_test_handle();
+        let component = mesh_renderer_test_component(&lua, &entity, source.clone());
+        component.set("double_sided", true).expect("double sided");
+        component.set("casts_shadows", false).expect("caster flag");
+        component
+            .set("receives_shadows", false)
+            .expect("receiver flag");
+        let material = crate::mesh::MaterialHandle::new(crate::mesh::MeshMaterial::named(
+            "shared fast-path material",
+        ))
+        .expect("material");
+        component
+            .set(
+                "material",
+                lua.create_userdata(material.clone())
+                    .expect("material userdata"),
+            )
+            .expect("component material");
+
+        let update = prepare_static_mesh_renderer_3d(
+            &component,
+            Some(&entity),
+            crate::window::get_global_transform_3d(&entity)
+                .expect("global transform")
+                .model,
+            crate::render3d::Camera3D::default(),
+            16.0 / 9.0,
+        )
+        .expect("fast path");
+        let StaticMeshRenderer3DUpdate::Handled(Some(DrawCommand::Mesh3D(command))) = update else {
+            panic!("manual static mesh should produce one native-ready mesh command");
+        };
+        assert_eq!(command.mesh.identity(), source.identity());
+        assert_eq!(
+            command.materials[0]
+                .as_ref()
+                .expect("material override")
+                .identity(),
+            material.identity()
+        );
+        assert!(command.double_sided);
+        assert!(!command.casts_shadows);
+        assert!(!command.receives_shadows);
+        assert!((command.model.values[0][3] - 3.0).abs() < 0.001);
+        assert!((command.model.values[1][3] + 2.0).abs() < 0.001);
+        assert_eq!(
+            component.get::<bool>("animation_playing").expect("playing"),
+            false
+        );
+
+        component.set("primitive", "cube").expect("managed mode");
+        assert!(matches!(
+            prepare_static_mesh_renderer_3d(
+                &component,
+                None,
+                crate::render3d::Mat4::identity(),
+                crate::render3d::Camera3D::default(),
+                1.0,
+            )
+            .expect("fallback decision"),
+            StaticMeshRenderer3DUpdate::Fallback
+        ));
     }
 
     #[test]
@@ -10554,7 +13155,8 @@ mod tests {
         lua.load(
             r#"
                 for _, name in ipairs({
-                    "Camera3D", "MeshRenderer3D", "Light3D", "Rigidbody3D", "Collider3D"
+                    "Camera3D", "MeshRenderer3D", "Light3D", "ReflectionProbe3D", "Rigidbody3D", "Collider3D",
+                    "Trigger3D", "CharacterController3D", "Raycast3D", "LODGroup3D"
                 }) do
                     local component = core[name]
                     assert(type(component) == "table", name .. " missing")
@@ -10563,6 +13165,7 @@ mod tests {
                 end
                 assert(type(physics3d) == "table", "physics3d global missing")
                 assert(type(physics3d.raycast) == "function", "physics3d.raycast missing")
+                assert(type(physics3d.sweepCapsule) == "function", "physics3d sweep missing")
                 assert(type(physics3d.contacts) == "function", "physics3d contacts missing")
                 assert(type(physics3d.resolveBody) == "function", "physics3d response missing")
                 assert(type(physics3d.broadphasePairs) == "function", "physics3d broadphase missing")
@@ -10650,6 +13253,323 @@ mod tests {
     }
 
     #[test]
+    fn trigger_3d_reports_deterministic_enter_stay_exit_without_response() {
+        let (lua, _render_state) = lua_with_core_components();
+        let trigger_entity = crate::window::create_entity_table(&lua, "trigger", 0.0, 0.0, None)
+            .expect("trigger entity");
+        trigger_entity.set("id", 700u64).expect("trigger id");
+        let visitor = crate::window::create_entity_table(&lua, "visitor", 0.5, 0.0, None)
+            .expect("visitor entity");
+        visitor.set("id", 701u64).expect("visitor id");
+        lua.globals()
+            .set("trigger_entity", trigger_entity)
+            .expect("trigger global");
+        lua.globals()
+            .set("trigger_visitor", visitor)
+            .expect("visitor global");
+
+        lua.load(
+            r#"
+                local volume = {}
+                local visitorCollider = {}
+                core.Trigger3D.awake(trigger_entity, volume)
+                core.Collider3D.awake(trigger_visitor, visitorCollider)
+                volume.layer = 2
+                volume.mask = 4
+                visitorCollider.layer = 4
+                visitorCollider.mask = 2
+                local entered, stayed, exited = 0, 0, 0
+                core.Trigger3D.setOnEnter(volume, function(hit)
+                    entered += 1
+                    assert(hit.entity_id == 701 and hit.is_trigger)
+                    assert(hit.quality == "exact" and hit.exact)
+                end)
+                core.Trigger3D.setOnStay(volume, function(hit)
+                    stayed += 1
+                    assert(hit.entity_id == 701)
+                end)
+                core.Trigger3D.setOnExit(volume, function(hit)
+                    exited += 1
+                    assert(hit.entity_id == 701 and hit.quality == nil)
+                end)
+
+                core.Collider3D.update(trigger_visitor, visitorCollider, 0)
+                core.Trigger3D.update(trigger_entity, volume, 0)
+                assert(volume.is_trigger and volume.non_physics)
+                assert(volume.overlap_count == 1)
+                assert(#volume.overlapping_entity_ids == 1
+                    and volume.overlapping_entity_ids[1] == 701)
+                assert(entered == 1 and stayed == 1 and exited == 0)
+
+                core.Trigger3D.update(trigger_entity, volume, 0)
+                assert(entered == 1 and stayed == 2 and exited == 0)
+                local contacts = physics3d.contacts()
+                assert(#contacts == 1 and contacts[1].is_trigger
+                    and contacts[1].can_resolve == false,
+                    "unexpected trigger contacts: " .. tostring(#contacts)
+                        .. ", trigger=" .. tostring(contacts[1] and contacts[1].is_trigger)
+                        .. ", resolve=" .. tostring(contacts[1] and contacts[1].can_resolve))
+                assert((contacts[1].first_id == 700 and contacts[1].second_id == 701)
+                    or (contacts[1].first_id == 701 and contacts[1].second_id == 700))
+
+                trigger_visitor.x = 10
+                core.Collider3D.update(trigger_visitor, visitorCollider, 0)
+                core.Trigger3D.update(trigger_entity, volume, 0)
+                assert(volume.overlap_count == 0
+                    and #volume.overlapping_entity_ids == 0)
+                assert(entered == 1 and stayed == 2 and exited == 1)
+
+                core.Trigger3D.destroy(trigger_entity, volume)
+                core.Collider3D.destroy(trigger_visitor, visitorCollider)
+            "#,
+        )
+        .exec()
+        .expect("dedicated Trigger3D lifecycle runs");
+    }
+
+    #[test]
+    fn collider_3d_reads_live_shared_physics_material_response() {
+        let (lua, _render_state) = lua_with_core_components();
+        let dynamic = crate::window::create_entity_table(&lua, "dynamic", 0.0, 0.0, None)
+            .expect("dynamic entity");
+        dynamic.set("id", 710u64).expect("dynamic id");
+        let obstacle = crate::window::create_entity_table(&lua, "obstacle", 1.5, 0.0, None)
+            .expect("obstacle entity");
+        obstacle.set("id", 711u64).expect("obstacle id");
+        lua.globals()
+            .set("material_dynamic", dynamic)
+            .expect("dynamic global");
+        lua.globals()
+            .set("material_obstacle", obstacle)
+            .expect("obstacle global");
+        let material = PhysicsMaterial3DHandle::new(crate::assets::PhysicsMaterial3D {
+            name: "Live bounce".to_string(),
+            friction: 0.0,
+            restitution: 0.8,
+        })
+        .expect("physics material");
+        lua.globals()
+            .set(
+                "live_physics_material",
+                lua.create_userdata(material).expect("material userdata"),
+            )
+            .expect("material global");
+
+        lua.load(
+            r#"
+                local body, own, wall = {}, {}, {}
+                core.Rigidbody3D.awake(material_dynamic, body)
+                core.Collider3D.awake(material_dynamic, own)
+                core.Collider3D.awake(material_obstacle, wall)
+                own.shape, own.radius = "sphere", 1
+                wall.shape, wall.radius = "sphere", 1
+                table.insert(material_dynamic.components, body)
+                table.insert(material_dynamic.components, own)
+                table.insert(material_obstacle.components, wall)
+
+                local shared = live_physics_material
+                wall.physics_material = shared
+                wall.friction = 1
+                wall.restitution = 0
+                core.Collider3D.update(material_dynamic, own, 0)
+                core.Collider3D.update(material_obstacle, wall, 0)
+                body.gravity_scale = 0
+                body.velocity_x = 4
+                physics3d.resolveBody(material_dynamic, body)
+                assert(math.abs(body.velocity_x + 3.2) < 0.001,
+                    "bound restitution was not used")
+
+                -- The same handle is read again by the ordinary collider
+                -- update; replacing the component or rebinding is unnecessary.
+                shared:setRestitution(0.25)
+                material_dynamic.x = 0
+                body.__last_world_x = 0
+                body.velocity_x = 4
+                core.Collider3D.update(material_dynamic, own, 0)
+                core.Collider3D.update(material_obstacle, wall, 0)
+                physics3d.resolveBody(material_dynamic, body)
+                assert(math.abs(body.velocity_x + 1) < 0.001,
+                    "live physics material edit was not observed")
+
+                core.Collider3D.destroy(material_dynamic, own)
+                core.Collider3D.destroy(material_obstacle, wall)
+            "#,
+        )
+        .exec()
+        .expect("Collider3D consumes live PhysicsMaterial3D handles");
+    }
+
+    #[test]
+    fn raycast_component_uses_runtime_registry_filters_and_outputs() {
+        let (lua, _render_state) = lua_with_core_components();
+        let target = crate::window::create_entity_table(&lua, "target", 0.0, 0.0, None)
+            .expect("target entity");
+        target.set("id", 42u64).expect("target id");
+        let source = crate::window::create_entity_table(&lua, "source", 0.0, 0.0, None)
+            .expect("source entity");
+        source.set("id", 99u64).expect("source id");
+        source.set("position_z", 5.0).expect("source position");
+        lua.globals()
+            .set("ray_target", target)
+            .expect("target global");
+        lua.globals()
+            .set("ray_source", source)
+            .expect("source global");
+
+        lua.load(
+            r#"
+                local targetCollider = {}
+                core.Collider3D.awake(ray_target, targetCollider)
+                core.Collider3D.update(ray_target, targetCollider, 0)
+
+                -- A collider on the casting entity would be the nearest hit
+                -- unless Raycast3D's authored exclude_self filter reaches the
+                -- shared runtime query path.
+                local selfCollider = {}
+                core.Collider3D.awake(ray_source, selfCollider)
+                core.Collider3D.update(ray_source, selfCollider, 0)
+
+                local ray = {}
+                core.Raycast3D.awake(ray_source, ray)
+                ray.max_distance = 20
+                local callbacks = 0
+                core.Raycast3D.setOnHit(ray, function(hit)
+                    callbacks = callbacks + 1
+                    assert(hit.entity_id == 42, "callback received wrong entity")
+                end)
+                local hit = core.Raycast3D.cast(ray)
+                assert(hit ~= nil and ray.hit, "Raycast3D should report a hit")
+                assert(ray.hit_entity_id == 42, "exclude_self filter was ignored")
+                assert(ray.hit_distance > 4 and ray.hit_distance < 5,
+                    "unexpected component hit distance")
+                assert(ray.normal_z > 0.9, "component normal was not copied")
+                assert(callbacks == 1, "Raycast3D onHit should run once per cast")
+
+                ray.direction_z = 0
+                assert(core.Raycast3D.cast(ray) == nil,
+                    "zero direction must not cast")
+                assert(ray.hit == false and ray.hit_entity_id == nil,
+                    "miss state must clear stale output")
+
+                core.Collider3D.destroy(ray_target, targetCollider)
+                core.Collider3D.destroy(ray_source, selfCollider)
+            "#,
+        )
+        .exec()
+        .expect("Raycast3D component uses the runtime physics query path");
+    }
+
+    #[test]
+    fn character_controller_3d_uses_continuous_runtime_sweeps_and_grounding() {
+        let (lua, _render_state) = lua_with_core_components();
+        let ground = crate::window::create_entity_table(&lua, "ground", 0.0, 0.0, None)
+            .expect("ground entity");
+        ground.set("id", 200u64).expect("ground id");
+        let actor = crate::window::create_entity_table(&lua, "actor", 0.0, 3.0, None)
+            .expect("actor entity");
+        actor.set("id", 201u64).expect("actor id");
+        lua.globals()
+            .set("controller_ground", ground)
+            .expect("global");
+        lua.globals()
+            .set("controller_actor", actor)
+            .expect("global");
+
+        lua.load(
+            r#"
+                local groundCollider = {}
+                core.Collider3D.awake(controller_ground, groundCollider)
+                groundCollider.size_x = 10
+                groundCollider.size_y = 1
+                groundCollider.size_z = 10
+                core.Collider3D.update(controller_ground, groundCollider, 0)
+
+                local cast = physics3d.sweepCapsule(0, 3, 0, 0.5, 2, 0, -5, 0)
+                assert(cast ~= nil and cast.entity_id == 200)
+                assert(math.abs(cast.distance - 1.5) < 0.001)
+                assert(cast.normal_y > 0.99)
+
+                local controller = {}
+                core.CharacterController3D.awake(controller_actor, controller)
+                controller.use_gravity = false
+                local collisions = 0
+                core.CharacterController3D.setOnCollision(controller, function(hit)
+                    collisions += 1
+                    assert(hit.entity_id == 200 and hit.normal_y > 0.99)
+                end)
+                local result = core.CharacterController3D.Move(controller, 0, -5, 0)
+                assert(result.grounded and controller.grounded)
+                assert(result.ground_entity_id == 200)
+                assert(math.abs(result.moved_y + 1.48) < 0.002)
+                assert(math.abs(controller_actor.y - 1.52) < 0.002)
+                assert(collisions >= 1)
+
+                -- A grounded controller follows the last supporting collider's
+                -- world translation before applying its own velocity.
+                controller_ground.x = 1
+                core.Collider3D.update(controller_ground, groundCollider, 0)
+                core.CharacterController3D.update(controller_actor, controller, 0)
+                assert(math.abs(controller_actor.x - 1) < 0.002,
+                    "controller did not follow moving platform")
+
+                -- The registered controller capsule participates in the same
+                -- query registry while excluding itself from its own moves.
+                local controllerHit = physics3d.raycast(1, 4, 0, 0, -1, 0, 5, {
+                    exclude_entity_id = 200,
+                })
+                assert(controllerHit ~= nil and controllerHit.entity_id == 201)
+
+                core.CharacterController3D.destroy(controller_actor, controller)
+                core.Collider3D.destroy(controller_ground, groundCollider)
+            "#,
+        )
+        .exec()
+        .expect("CharacterController3D runtime path runs");
+    }
+
+    #[test]
+    fn character_controller_world_motion_respects_nested_negative_nonuniform_parents() {
+        let (lua, _render_state) = lua_with_core_components();
+        let parent = crate::window::create_entity_table(&lua, "parent", 4.0, -2.0, None)
+            .expect("parent entity");
+        parent.set("id", 300u64).expect("parent id");
+        parent.set("rotation_z", 90.0).expect("parent rotation");
+        parent.set("scale_x", -2.0).expect("negative scale");
+        parent.set("scale_y", 3.0).expect("nonuniform scale");
+        let child = crate::window::create_entity_table(&lua, "child", 1.0, 2.0, Some(parent))
+            .expect("child entity");
+        child.set("id", 301u64).expect("child id");
+        let component = lua.create_table().expect("component");
+        let core = lua.globals().get::<Table>("core").expect("core");
+        let prototype = core
+            .get::<Table>("CharacterController3D")
+            .expect("controller prototype");
+        prototype
+            .get::<Function>("awake")
+            .and_then(|awake| awake.call::<()>((child.clone(), component.clone())))
+            .expect("controller awake");
+        component
+            .set("use_gravity", false)
+            .expect("disable gravity");
+
+        let before = crate::window::get_global_transform_3d(&child)
+            .expect("before transform")
+            .position;
+        prototype
+            .get::<Function>("Move")
+            .and_then(|move_character| {
+                move_character.call::<Table>((component, 1.25f32, -0.75f32, 2.0f32))
+            })
+            .expect("nested controller movement");
+        let after = crate::window::get_global_transform_3d(&child)
+            .expect("after transform")
+            .position;
+        assert!((after.x - before.x - 1.25).abs() < 0.0001);
+        assert!((after.y - before.y + 0.75).abs() < 0.0001);
+        assert!((after.z - before.z - 2.0).abs() < 0.0001);
+    }
+
+    #[test]
     fn physics3d_contacts_auto_response_and_trigger_callbacks_work_through_lua() {
         let (lua, _render_state) = lua_with_core_components();
         let dynamic = crate::window::create_entity_table(&lua, "dynamic", 0.0, 0.0, None)
@@ -10724,6 +13644,206 @@ mod tests {
         )
         .exec()
         .expect("3D contact/response Lua APIs run");
+    }
+
+    #[test]
+    fn rigidbody_3d_continuous_collision_blocks_tunneling_and_reports_swept_triggers() {
+        let (lua, _render_state) = lua_with_core_components();
+        let dynamic = crate::window::create_entity_table(&lua, "ccd dynamic", -10.0, 0.0, None)
+            .expect("dynamic entity");
+        dynamic.set("id", 800u64).expect("dynamic id");
+        let trigger = crate::window::create_entity_table(&lua, "ccd trigger", -5.0, 0.0, None)
+            .expect("trigger entity");
+        trigger.set("id", 801u64).expect("trigger id");
+        let wall = crate::window::create_entity_table(&lua, "ccd wall", 0.0, 0.0, None)
+            .expect("wall entity");
+        wall.set("id", 802u64).expect("wall id");
+        lua.globals().set("ccd_dynamic", dynamic).expect("global");
+        lua.globals().set("ccd_trigger", trigger).expect("global");
+        lua.globals().set("ccd_wall", wall).expect("global");
+
+        lua.load(
+            r#"
+                local body, own, sensor, obstacle = {}, {}, {}, {}
+                core.Rigidbody3D.awake(ccd_dynamic, body)
+                core.Collider3D.awake(ccd_dynamic, own)
+                core.Collider3D.awake(ccd_trigger, sensor)
+                core.Collider3D.awake(ccd_wall, obstacle)
+                own.shape, own.radius = "sphere", 0.5
+                sensor.size_x, sensor.size_y, sensor.size_z = 0.1, 4, 4
+                sensor.is_trigger = true
+                obstacle.size_x, obstacle.size_y, obstacle.size_z = 0.02, 4, 4
+                table.insert(ccd_dynamic.components, body)
+                table.insert(ccd_dynamic.components, own)
+                table.insert(ccd_trigger.components, sensor)
+                table.insert(ccd_wall.components, obstacle)
+                core.Collider3D.update(ccd_dynamic, own, 0)
+                core.Collider3D.update(ccd_trigger, sensor, 0)
+                core.Collider3D.update(ccd_wall, obstacle, 0)
+
+                local triggerCalls, contactCalls = 0, 0
+                core.Rigidbody3D.setOnTrigger(body, function(hit)
+                    triggerCalls += 1
+                    assert(hit.other_id == 801 and hit.continuous)
+                    assert(hit.time_fraction > 0 and hit.time_fraction < 1)
+                    assert(not hit.can_resolve)
+                end)
+                core.Rigidbody3D.setOnContact(body, function(hit)
+                    contactCalls += 1
+                    assert(hit.other_id == 802 and hit.continuous)
+                    assert(hit.normal_x > 0.99 and hit.can_resolve)
+                end)
+                body.gravity_scale = 0
+                body.linear_damping = 0
+                body.continuous_collision = true
+                body.velocity_x = 200
+                core.Rigidbody3D.update(ccd_dynamic, body, 0.1)
+                assert(ccd_dynamic.x > -0.52 and ccd_dynamic.x < -0.50,
+                    "CCD did not stop at thin wall: " .. tostring(ccd_dynamic.x))
+                assert(math.abs(body.velocity_x) < 0.0001)
+                assert(body.ccd_hit and body.ccd_entity_id == 802)
+                assert(body.ccd_hit_count == 2)
+                assert(body.ccd_quality == "exact")
+                assert(body.ccd_time_fraction > 0 and body.ccd_time_fraction < 1)
+                assert(triggerCalls == 1 and contactCalls == 1)
+
+                -- The authored switch is observable: with CCD disabled the
+                -- same high-speed step has no destination overlap and tunnels.
+                ccd_dynamic.x = -10
+                body.__last_world_x = -10
+                body.velocity_x = 200
+                body.continuous_collision = false
+                core.Collider3D.update(ccd_dynamic, own, 0)
+                core.Rigidbody3D.update(ccd_dynamic, body, 0.1)
+                assert(math.abs(ccd_dynamic.x - 10) < 0.0001)
+                assert(not body.ccd_hit and body.ccd_entity_id == nil)
+
+                core.Collider3D.destroy(ccd_dynamic, own)
+                core.Collider3D.destroy(ccd_trigger, sensor)
+                core.Collider3D.destroy(ccd_wall, obstacle)
+            "#,
+        )
+        .exec()
+        .expect("Rigidbody3D CCD lifecycle runs");
+    }
+
+    #[test]
+    fn rigidbody_3d_ccd_uses_exact_runtime_mesh_triangles() {
+        let (lua, _render_state) = lua_with_core_components();
+        let dynamic = crate::window::create_entity_table(&lua, "mesh ccd dynamic", -5.0, 0.0, None)
+            .expect("dynamic entity");
+        dynamic.set("id", 810u64).expect("dynamic id");
+        let wall = crate::window::create_entity_table(&lua, "mesh ccd wall", 0.0, 0.0, None)
+            .expect("wall entity");
+        wall.set("id", 811u64).expect("wall id");
+        let vertices = [[0.0, -3.0, -3.0], [0.0, 3.0, -3.0], [0.0, 0.0, 3.0]]
+            .into_iter()
+            .map(crate::mesh::Vertex::from_position)
+            .collect();
+        let mesh = crate::mesh::MeshData::new(
+            "runtime CCD triangle",
+            vertices,
+            vec![0, 1, 2],
+            Vec::new(),
+            Vec::new(),
+            true,
+        )
+        .and_then(crate::mesh::MeshHandle::new)
+        .expect("mesh handle");
+        lua.globals()
+            .set("mesh_ccd_dynamic", dynamic)
+            .expect("global");
+        lua.globals().set("mesh_ccd_wall", wall).expect("global");
+        lua.globals()
+            .set(
+                "mesh_ccd_handle",
+                lua.create_userdata(mesh).expect("mesh userdata"),
+            )
+            .expect("mesh global");
+
+        lua.load(
+            r#"
+                local body, own, obstacle = {}, {}, {}
+                core.Rigidbody3D.awake(mesh_ccd_dynamic, body)
+                core.Collider3D.awake(mesh_ccd_dynamic, own)
+                core.Collider3D.awake(mesh_ccd_wall, obstacle)
+                own.shape, own.radius = "sphere", 0.5
+                obstacle.shape, obstacle.mesh = "mesh", mesh_ccd_handle
+                table.insert(mesh_ccd_dynamic.components, body)
+                table.insert(mesh_ccd_dynamic.components, own)
+                table.insert(mesh_ccd_wall.components, obstacle)
+                core.Collider3D.update(mesh_ccd_dynamic, own, 0)
+                core.Collider3D.update(mesh_ccd_wall, obstacle, 0)
+                body.gravity_scale = 0
+                body.continuous_collision = true
+                body.velocity_x = 100
+                core.Rigidbody3D.update(mesh_ccd_dynamic, body, 0.1)
+                assert(mesh_ccd_dynamic.x > -0.51 and mesh_ccd_dynamic.x < -0.49)
+                assert(body.ccd_hit and body.ccd_entity_id == 811)
+                assert(body.ccd_quality == "exact")
+                assert(math.abs(body.velocity_x) < 0.0001)
+                core.Collider3D.destroy(mesh_ccd_dynamic, own)
+                core.Collider3D.destroy(mesh_ccd_wall, obstacle)
+            "#,
+        )
+        .exec()
+        .expect("Rigidbody3D mesh CCD lifecycle runs");
+    }
+
+    #[test]
+    fn rigidbody_3d_world_velocity_and_ccd_respect_nested_nonuniform_parent() {
+        let (lua, _render_state) = lua_with_core_components();
+        let parent = crate::window::create_entity_table(&lua, "ccd parent", 0.0, 0.0, None)
+            .expect("parent entity");
+        parent.set("rotation_z", 90.0).expect("parent rotation");
+        parent.set("scale_x", -2.0).expect("negative scale");
+        parent.set("scale_y", 3.0).expect("non-uniform scale");
+        let dynamic =
+            crate::window::create_entity_table(&lua, "nested ccd body", 0.0, 0.0, Some(parent))
+                .expect("nested body");
+        dynamic.set("id", 820u64).expect("dynamic id");
+        let wall = crate::window::create_entity_table(&lua, "nested ccd wall", 5.0, 0.0, None)
+            .expect("wall entity");
+        wall.set("id", 821u64).expect("wall id");
+        lua.globals()
+            .set("nested_ccd_dynamic", dynamic.clone())
+            .expect("global");
+        lua.globals().set("nested_ccd_wall", wall).expect("global");
+
+        lua.load(
+            r#"
+                local body, own, obstacle = {}, {}, {}
+                core.Rigidbody3D.awake(nested_ccd_dynamic, body)
+                core.Collider3D.awake(nested_ccd_dynamic, own)
+                core.Collider3D.awake(nested_ccd_wall, obstacle)
+                own.shape, own.radius = "sphere", 0.5
+                obstacle.size_x, obstacle.size_y, obstacle.size_z = 0.02, 5, 5
+                table.insert(nested_ccd_dynamic.components, body)
+                table.insert(nested_ccd_dynamic.components, own)
+                table.insert(nested_ccd_wall.components, obstacle)
+                core.Collider3D.update(nested_ccd_dynamic, own, 0)
+                core.Collider3D.update(nested_ccd_wall, obstacle, 0)
+                body.gravity_scale = 0
+                body.continuous_collision = true
+                body.velocity_x = 100
+                core.Rigidbody3D.update(nested_ccd_dynamic, body, 0.1)
+                assert(body.ccd_hit and body.ccd_entity_id == 821)
+                -- A sphere under a non-uniform parent stays a sphere sized by
+                -- the largest scale it inherits, so the cast stays exact rather
+                -- than degrading to the collider's bounds.
+                assert(body.ccd_quality == "exact")
+                assert(math.abs(body.velocity_x) < 0.0001)
+                core.Collider3D.destroy(nested_ccd_dynamic, own)
+                core.Collider3D.destroy(nested_ccd_wall, obstacle)
+            "#,
+        )
+        .exec()
+        .expect("nested Rigidbody3D CCD lifecycle runs");
+        let world = crate::window::get_global_transform_3d(&dynamic)
+            .expect("nested body world transform")
+            .position;
+        assert!(world.x > 3.48 && world.x < 3.50, "world x={}", world.x);
+        assert!(world.y.abs() < 0.0001, "world y={}", world.y);
     }
 
     fn component_with_letter_bounds(lua: &Lua) -> mlua::Result<Table> {
@@ -11072,6 +14192,131 @@ mod tests {
         assert_eq!(list.get::<usize>("selected_index")?, 5);
         assert_eq!(list.get::<String>("selected_text")?, "five");
         assert_eq!(list.get::<usize>("scroll_index")?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn native_3d_audio_components_follow_world_transforms_and_select_one_listener()
+    -> mlua::Result<()> {
+        #[derive(Clone)]
+        struct DummySound;
+        impl mlua::UserData for DummySound {}
+
+        let (lua, _render_state) = lua_with_core_components();
+        lua.globals()
+            .set("testSound", lua.create_userdata(DummySound)?)?;
+        lua.load(
+            r#"
+            audioCalls = {
+                plays = 0,
+                updates = 0,
+                stops = 0,
+                listeners = 0,
+            }
+            audio = {}
+            function audio.playSpatial3D(sound, x, y, z, options)
+                assert(sound == testSound)
+                audioCalls.plays += 1
+                audioCalls.playX = x
+                audioCalls.playY = y
+                audioCalls.playZ = z
+                audioCalls.playOptions = options
+                return options.voice_id
+            end
+            function audio.updateSpatial3D(voiceId, x, y, z, options)
+                audioCalls.updates += 1
+                audioCalls.updateVoice = voiceId
+                audioCalls.updateX = x
+                audioCalls.updateY = y
+                audioCalls.updateZ = z
+                audioCalls.updateOptions = options
+                return true
+            end
+            function audio.stopSpatial3D(voiceId)
+                audioCalls.stops += 1
+                audioCalls.stopVoice = voiceId
+            end
+            function audio.setListener3D(x, y, z, fx, fy, fz, ux, uy, uz, earDistance)
+                audioCalls.listeners += 1
+                audioCalls.listener = {
+                    x, y, z, fx, fy, fz, ux, uy, uz, earDistance,
+                }
+            end
+
+            local parent = {
+                x = 10, y = 0, position_z = 0,
+                rotation_x = 0, rotation_y = 0, rotation_z = 0,
+                scale_x = 1, scale_y = 1, scale_z = 1,
+            }
+            sourceEntity = {
+                x = 2, y = 3, position_z = 4, parent = parent,
+                rotation_x = 0, rotation_y = 0, rotation_z = 0,
+                scale_x = 1, scale_y = 1, scale_z = 1,
+            }
+            source3D = {}
+            core.AudioSource3D.awake(sourceEntity, source3D)
+            source3D.entity = sourceEntity
+            source3D.sound = testSound
+            source3D.volume = 0.7
+            source3D.min_distance = 2
+            source3D.max_distance = 30
+            source3D.rolloff = 1.5
+            source3D.distance_model = "exponential"
+            assert(core.AudioSource3D.play(source3D))
+            assert(audioCalls.plays == 1)
+            assert(audioCalls.playX == 12 and audioCalls.playY == 3 and audioCalls.playZ == 4)
+            assert(math.abs(audioCalls.playOptions.volume - 0.7) < 0.0001)
+            assert(audioCalls.playOptions.min_distance == 2)
+            assert(audioCalls.playOptions.max_distance == 30)
+            assert(math.abs(audioCalls.playOptions.rolloff - 1.5) < 0.0001)
+            assert(audioCalls.playOptions.distance_model == "exponential")
+
+            parent.x = 20
+            core.AudioSource3D.update(sourceEntity, source3D, 1 / 60)
+            assert(audioCalls.updates == 1 and audioCalls.updateX == 22)
+            assert(audioCalls.updateVoice == source3D.__voice_id)
+
+            listenerEntityA = {
+                x = 5, y = 6, position_z = 7,
+                rotation_x = 0, rotation_y = 90, rotation_z = 0,
+                scale_x = 1, scale_y = 1, scale_z = 1,
+            }
+            listenerA = {}
+            core.AudioListener3D.awake(listenerEntityA, listenerA)
+            listenerA.entity = listenerEntityA
+            core.AudioListener3D.update(listenerEntityA, listenerA, 1 / 60)
+            assert(core.AudioListener3D.isActive(listenerA))
+            assert(audioCalls.listeners == 1)
+            assert(audioCalls.listener[1] == 5 and audioCalls.listener[2] == 6
+                and audioCalls.listener[3] == 7)
+            assert(math.abs(audioCalls.listener[4] + 1) < 0.0001)
+            assert(math.abs(audioCalls.listener[5]) < 0.0001)
+            assert(math.abs(audioCalls.listener[6]) < 0.0001)
+
+            listenerEntityB = {
+                x = -1, y = -2, position_z = -3,
+                rotation_x = 0, rotation_y = 0, rotation_z = 0,
+                scale_x = 1, scale_y = 1, scale_z = 1,
+            }
+            listenerB = {}
+            core.AudioListener3D.awake(listenerEntityB, listenerB)
+            listenerB.entity = listenerEntityB
+            core.AudioListener3D.update(listenerEntityB, listenerB, 1 / 60)
+            assert(audioCalls.listeners == 1, "a second listener must not steal active state")
+            assert(core.AudioListener3D.setActive(listenerB))
+            core.AudioListener3D.update(listenerEntityB, listenerB, 1 / 60)
+            assert(core.AudioListener3D.isActive(listenerB))
+            assert(not core.AudioListener3D.isActive(listenerA))
+            assert(audioCalls.listeners == 2 and audioCalls.listener[1] == -1)
+
+            source3D.enabled = false
+            core.AudioSource3D.update(sourceEntity, source3D, 1 / 60)
+            assert(audioCalls.stops == 1)
+            assert(not source3D.__playing)
+            "#,
+        )
+        .set_name("@audio_3d_component_test.luau")
+        .exec()?;
         Ok(())
     }
 }

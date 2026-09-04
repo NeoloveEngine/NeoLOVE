@@ -385,6 +385,7 @@ impl UserData for ParticleEmitterHandle {
 pub(crate) struct ParticleSystem3DCommand {
     pub emitter: ParticleEmitterHandle,
     pub view_projection: Mat4,
+    pub camera_position: Vec3,
     pub camera_euler: Vec3,
     pub texture: Option<ImageHandle>,
     pub filter: TextureFilter,

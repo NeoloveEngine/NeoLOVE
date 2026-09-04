@@ -13,10 +13,15 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HOME");
     println!("cargo:rerun-if-env-changed=USERPROFILE");
     println!("cargo:rerun-if-env-changed=NEOLOVE_PACKAGED_RUNTIME");
+    println!("cargo:rerun-if-env-changed=NEOLOVE_PACKAGED_PROJECT_KIND");
     println!("cargo:rustc-check-cfg=cfg(neolove_packaged)");
+    println!("cargo:rustc-check-cfg=cfg(neolove_2d)");
 
     if std::env::var_os("NEOLOVE_PACKAGED_RUNTIME").is_some_and(|value| !value.is_empty()) {
         println!("cargo:rustc-cfg=neolove_packaged");
+        if std::env::var("NEOLOVE_PACKAGED_PROJECT_KIND").as_deref() == Ok("2d") {
+            println!("cargo:rustc-cfg=neolove_2d");
+        }
     }
 
     emit_git_revision();

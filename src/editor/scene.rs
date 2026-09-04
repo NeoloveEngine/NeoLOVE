@@ -131,6 +131,12 @@ pub enum PropValue {
     /// discriminants remain stable. MeshRenderer3D and Collider3D consume the
     /// path and load/cache their live MeshHandle at runtime.
     Mesh(String),
+    /// A reusable `.neomaterial` asset path. Appended to preserve existing
+    /// serialized enum discriminants.
+    Material(String),
+    /// A reusable `.neophysicsmaterial` asset path. Appended to preserve every
+    /// pre-existing serialized enum discriminant.
+    PhysicsMaterial(String),
 }
 
 impl PropValue {
@@ -161,6 +167,12 @@ impl PropValue {
             PropValue::Font(s) => format!("\"{}\"", escape_luau(s)),
             PropValue::Sound(s) => format!("assets.loadSound(\"{}\")", escape_luau(s)),
             PropValue::Mesh(s) => format!("\"{}\"", escape_luau(s)),
+            PropValue::Material(s) => {
+                format!("assets.loadMaterial3D(\"{}\")", escape_luau(s))
+            }
+            PropValue::PhysicsMaterial(s) => {
+                format!("assets.loadPhysicsMaterial3D(\"{}\")", escape_luau(s))
+            }
             PropValue::Shader(s) => format!("shaders.loadFragment(\"{}\")", escape_luau(s)),
             PropValue::Animation(s) => format!("animation.load(\"{}\")", escape_luau(s)),
             PropValue::ColorSequence(keypoints) => format!(
@@ -275,6 +287,25 @@ impl Prop {
             name: name.to_string(),
             label: label.to_string(),
             value: PropValue::Mesh(v.to_string()),
+            advanced: false,
+            optional: true,
+        }
+    }
+    fn material(name: &str, label: &str, v: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            label: label.to_string(),
+            value: PropValue::Material(v.to_string()),
+            advanced: false,
+            optional: true,
+        }
+    }
+
+    fn physics_material(name: &str, label: &str, v: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            label: label.to_string(),
+            value: PropValue::PhysicsMaterial(v.to_string()),
             advanced: false,
             optional: true,
         }
@@ -624,6 +655,13 @@ fn normalize_core_component(component: &mut Component) {
     let Component::Core { name, props } = component else {
         return;
     };
+    if name == "Light3D" {
+        for prop in props.iter_mut().filter(|prop| prop.name == "visible") {
+            // This field controls whether the light participates in rendering;
+            // "Enabled" is clearer than the old drawable-oriented label.
+            prop.label = "Enabled".to_string();
+        }
+    }
     // Scenes saved before asset pickers had fonts represented as generic text.
     // Upgrade them in place so existing projects get the picker too.
     if matches!(
@@ -642,7 +680,7 @@ fn normalize_core_component(component: &mut Component) {
     // Early 3D scene builds stored mesh paths as generic text. Upgrade them
     // in-memory so the asset picker and drag/drop work without breaking the
     // serialized path or the runtime's string-based mesh_path contract.
-    if matches!(name.as_str(), "MeshRenderer3D" | "Collider3D") {
+    if matches!(name.as_str(), "MeshRenderer3D" | "Collider3D" | "Trigger3D") {
         for prop in props.iter_mut() {
             if prop.name == "mesh_path"
                 && let PropValue::Text(path) = &prop.value
@@ -652,10 +690,22 @@ fn normalize_core_component(component: &mut Component) {
         }
     }
 
-    if matches!(name.as_str(), "Environment3D" | "Skybox3D") {
+    if matches!(
+        name.as_str(),
+        "Environment3D" | "Skybox3D" | "ReflectionProbe3D"
+    ) {
         for prop in props.iter_mut() {
-            if matches!(prop.name.as_str(), "texture" | "texture_path")
-                && let PropValue::Text(path) = &prop.value
+            if matches!(
+                prop.name.as_str(),
+                "texture"
+                    | "texture_path"
+                    | "positive_x"
+                    | "negative_x"
+                    | "positive_y"
+                    | "negative_y"
+                    | "positive_z"
+                    | "negative_z"
+            ) && let PropValue::Text(path) = &prop.value
             {
                 prop.value = PropValue::Image(path.clone());
             }
@@ -748,9 +798,22 @@ fn normalize_core_component(component: &mut Component) {
             | "Light3D"
             | "Environment3D"
             | "Skybox3D"
+            | "ReflectionProbe3D"
             | "ParticleSystem3D"
             | "Rigidbody3D"
             | "Collider3D"
+            | "Trigger3D"
+            | "CharacterController3D"
+            | "Raycast3D"
+            | "LODGroup3D"
+            | "Visibility3D"
+            | "RenderLayer3D"
+            | "AudioSource3D"
+            | "AudioListener3D"
+            | "Tag"
+            | "Layer"
+            | "Tag3D"
+            | "Layer3D"
             | "Panel"
             | "Frame"
             | "Button"
@@ -806,9 +869,20 @@ pub const CORE_COMPONENTS: &[&str] = &[
     "Camera3D",
     "Light3D",
     "Environment3D",
+    "ReflectionProbe3D",
     "ParticleSystem3D",
+    "AudioSource3D",
+    "AudioListener3D",
     "Rigidbody3D",
     "Collider3D",
+    "Trigger3D",
+    "CharacterController3D",
+    "Raycast3D",
+    "LODGroup3D",
+    "Visibility3D",
+    "RenderLayer3D",
+    "Tag",
+    "Layer",
 ];
 
 /// Advanced / legacy core components, shown under an "Advanced" submenu.
@@ -846,6 +920,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
                 false,
             ),
             Prop::mesh("mesh_path", "Mesh", ""),
+            Prop::material("material", "Material", ""),
             Prop::image("texture", "Texture", ""),
             Prop::image("normal_texture", "Normal Map", ""),
             Prop::color("color", "Tint", [255, 255, 255, 255]),
@@ -882,6 +957,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::num("orthographic_size", "Ortho Size", 10.0),
             Prop::num_adv("near_clip", "Near Clip", 0.1),
             Prop::num_adv("far_clip", "Far Clip", 1000.0),
+            Prop::int("render_mask", "Render Mask", i32::MAX),
         ],
         "Light3D" => vec![
             Prop::enumv(
@@ -898,7 +974,7 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::num_adv("spot_softness", "Spot Softness", 0.15),
             Prop::boolean("casts_shadows", "Casts Shadows", true),
             Prop::num_adv("shadow_bias", "Shadow Bias", 0.005),
-            Prop::boolean("visible", "Visible", true),
+            Prop::boolean("visible", "Enabled", true),
         ],
         "Environment3D" | "Skybox3D" => vec![
             Prop::boolean("enabled", "Enabled", true),
@@ -906,15 +982,54 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
                 "mode",
                 "Mode",
                 "gradient",
-                &["solid", "gradient", "equirectangular"],
+                &["solid", "gradient", "equirectangular", "cubemap"],
                 false,
             ),
             Prop::color("color", "Solid Color", [20, 24, 32, 255]),
             Prop::color("top_color", "Top Color", [30, 47, 78, 255]),
             Prop::color("bottom_color", "Bottom Color", [8, 10, 16, 255]),
             Prop::image("texture", "Panorama", ""),
+            Prop::image("positive_x", "Cubemap +X", ""),
+            Prop::image("negative_x", "Cubemap -X", ""),
+            Prop::image("positive_y", "Cubemap +Y", ""),
+            Prop::image("negative_y", "Cubemap -Y", ""),
+            Prop::image("positive_z", "Cubemap +Z", ""),
+            Prop::image("negative_z", "Cubemap -Z", ""),
             Prop::num("rotation", "Rotation °", 0.0),
             Prop::num("intensity", "Intensity", 1.0),
+            Prop::boolean("fog_enabled", "Fog", false),
+            Prop::enumv(
+                "fog_mode",
+                "Fog Mode",
+                "linear",
+                &["linear", "exponential", "exponential_squared"],
+                false,
+            ),
+            Prop::color("fog_color", "Fog Color", [110, 125, 145, 255]),
+            Prop::num_adv("fog_start", "Fog Start", 10.0),
+            Prop::num_adv("fog_end", "Fog End", 100.0),
+            Prop::num_adv("fog_density", "Fog Density", 0.02),
+            Prop::boolean("ao_enabled", "Ambient Occlusion", false),
+            Prop::num("ao_radius", "AO Radius", 2.5),
+            Prop::num("ao_intensity", "AO Intensity", 0.65),
+            Prop::num_adv("ao_bias", "AO Bias", 0.025),
+        ],
+        "ReflectionProbe3D" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::boolean("visible", "Visible", true),
+            Prop::image("positive_x", "Cubemap +X", ""),
+            Prop::image("negative_x", "Cubemap -X", ""),
+            Prop::image("positive_y", "Cubemap +Y", ""),
+            Prop::image("negative_y", "Cubemap -Y", ""),
+            Prop::image("positive_z", "Cubemap +Z", ""),
+            Prop::image("negative_z", "Cubemap -Z", ""),
+            Prop::num("size_x", "Influence Size X", 10.0),
+            Prop::num("size_y", "Influence Size Y", 10.0),
+            Prop::num("size_z", "Influence Size Z", 10.0),
+            Prop::num("blend_distance", "Edge Blend", 1.0),
+            Prop::num("intensity", "Intensity", 1.0),
+            Prop::num("rotation", "Rotation °", 0.0),
+            Prop::int("priority", "Priority", 0),
         ],
         "ParticleSystem3D" => vec![
             Prop::boolean("enabled", "Enabled", true),
@@ -997,9 +1112,103 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::num_adv("offset_x", "Offset X", 0.0),
             Prop::num_adv("offset_y", "Offset Y", 0.0),
             Prop::num_adv("offset_z", "Offset Z", 0.0),
-            Prop::num_adv("restitution", "Restitution", 0.0),
-            Prop::num_adv("friction", "Friction", 0.5),
+            Prop::physics_material("physics_material", "Physics Material", ""),
+            Prop::num_adv("restitution", "Restitution Fallback", 0.0),
+            Prop::num_adv("friction", "Friction Fallback", 0.5),
             Prop::boolean_adv("non_physics", "Non Physics", false),
+            Prop::int("layer", "Collision Layer", 1),
+            Prop::int("mask", "Collision Mask", i32::MAX),
+        ],
+        "Trigger3D" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::enumv(
+                "shape",
+                "Shape",
+                "box",
+                &["box", "sphere", "capsule", "mesh"],
+                false,
+            ),
+            Prop::mesh("mesh_path", "Mesh", ""),
+            Prop::boolean_adv("convex", "Convex Mesh", false),
+            Prop::num("size_x", "Size X", 1.0),
+            Prop::num("size_y", "Size Y", 1.0),
+            Prop::num("size_z", "Size Z", 1.0),
+            Prop::num("radius", "Radius", 0.5),
+            Prop::num("height", "Height", 1.0),
+            Prop::num_adv("offset_x", "Offset X", 0.0),
+            Prop::num_adv("offset_y", "Offset Y", 0.0),
+            Prop::num_adv("offset_z", "Offset Z", 0.0),
+            Prop::int("layer", "Collision Layer", 1),
+            Prop::int("mask", "Collision Mask", i32::MAX),
+        ],
+        "CharacterController3D" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::num("radius", "Radius", 0.5),
+            Prop::num("height", "Total Height", 2.0),
+            Prop::num("center_x", "Center X", 0.0),
+            Prop::num("center_y", "Center Y", 0.0),
+            Prop::num("center_z", "Center Z", 0.0),
+            Prop::num("skin_width", "Skin Width", 0.02),
+            Prop::num("max_slope_degrees", "Max Slope °", 50.0),
+            Prop::num("step_height", "Step Height", 0.3),
+            Prop::num("ground_snap_distance", "Ground Snap", 0.2),
+            Prop::int("max_iterations", "Max Iterations", 6),
+            Prop::int("layer", "Collision Layer", 1),
+            Prop::int("mask", "Collision Mask", i32::MAX),
+            Prop::boolean("include_triggers", "Include Triggers", false),
+            Prop::boolean("use_gravity", "Use Gravity", true),
+            Prop::num("gravity", "Gravity", 9.81),
+            Prop::num("velocity_x", "Velocity X", 0.0),
+            Prop::num("velocity_y", "Velocity Y", 0.0),
+            Prop::num("velocity_z", "Velocity Z", 0.0),
+        ],
+        "Raycast3D" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::num_adv("offset_x", "Offset X", 0.0),
+            Prop::num_adv("offset_y", "Offset Y", 0.0),
+            Prop::num_adv("offset_z", "Offset Z", 0.0),
+            Prop::num("direction_x", "Direction X", 0.0),
+            Prop::num("direction_y", "Direction Y", 0.0),
+            Prop::num("direction_z", "Direction Z", -1.0),
+            Prop::num("max_distance", "Max Distance", 100.0),
+            Prop::int("layer", "Query Layer", 1),
+            Prop::int("mask", "Query Mask", i32::MAX),
+            Prop::boolean("include_triggers", "Include Triggers", true),
+            Prop::boolean_adv("exclude_self", "Exclude Self", true),
+        ],
+        "LODGroup3D" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::mesh("lod0_mesh", "LOD 0 Mesh", ""),
+            Prop::mesh("lod1_mesh", "LOD 1 Mesh", ""),
+            Prop::mesh("lod2_mesh", "LOD 2 Mesh", ""),
+            Prop::num("lod1_distance", "LOD 1 Distance", 20.0),
+            Prop::num("lod2_distance", "LOD 2 Distance", 50.0),
+            Prop::num("cull_distance", "Cull Distance", 100.0),
+            Prop::enumv(
+                "force_level",
+                "Force Level",
+                "automatic",
+                &["automatic", "lod0", "lod1", "lod2", "culled"],
+                false,
+            ),
+        ],
+        "Visibility3D" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::boolean("visible", "Visible", true),
+            Prop::boolean("inherit_parent", "Inherit Parent", true),
+        ],
+        "RenderLayer3D" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::int("mask", "Render Mask", 1),
+        ],
+        "Tag" | "Tag3D" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::text("tag", "Tag", "Untagged"),
+        ],
+        "Layer" | "Layer3D" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::int("layer", "Layer", 0),
+            Prop::text("name", "Name", "Default"),
         ],
         "Light2D" => vec![
             Prop::enumv(
@@ -1214,6 +1423,27 @@ pub fn core_component_props(name: &str) -> Vec<Prop> {
             Prop::num("tile_height", "Tile H", 32.0),
             Prop::num_adv("offset_x", "Offset X", 0.0),
             Prop::num_adv("offset_y", "Offset Y", 0.0),
+        ],
+        "AudioSource3D" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::sound("sound", "Sound", ""),
+            Prop::num("volume", "Volume", 1.0),
+            Prop::boolean("looping", "Looping", false),
+            Prop::boolean("autoplay", "Autoplay", false),
+            Prop::enumv(
+                "distance_model",
+                "Distance Model",
+                "inverse",
+                &["inverse", "linear", "exponential"],
+                false,
+            ),
+            Prop::num("min_distance", "Minimum Distance", 1.0),
+            Prop::num("max_distance", "Maximum Distance", 100.0),
+            Prop::num_adv("rolloff", "Rolloff", 1.0),
+        ],
+        "AudioListener3D" => vec![
+            Prop::boolean("enabled", "Enabled", true),
+            Prop::num_adv("ear_distance", "Ear Distance", 0.2),
         ],
         "Tilemap2D" => vec![
             Prop::image("image", "Tileset", "assets/tiles.png"),
@@ -2168,10 +2398,15 @@ impl Scene {
         self.to_luau_with_image_mode(ImageEmitMode::Inline)
     }
 
-    /// Emit `lighting.*` configuration when the scene enables lighting. Nothing
-    /// is written for the default disabled state, keeping generated `main.luau`
-    /// clean for scenes that do not use lighting.
+    /// Emit the legacy 2D `lighting.*` configuration when a 2D scene enables
+    /// it. 3D scenes use `Light3D` and `Environment3D`; explicitly resetting
+    /// the 2D compositor prevents a previously-loaded 2D scene (or stale
+    /// authored settings) from multiplying the completed PBR frame.
     fn emit_lighting(&self, out: &mut String) {
+        if self.kind == SceneKind::ThreeD {
+            out.push_str("lighting.reset() -- 3D lighting comes from Light3D / Environment3D\n\n");
+            return;
+        }
         let l = &self.lighting;
         if !l.enabled {
             return;
@@ -2376,6 +2611,15 @@ impl Scene {
                 fmt_num(entity.x),
                 fmt_num(entity.y),
             ));
+            // The real runtime owns allocation ids. Carry the authored id
+            // separately for 3D Game View diagnostics/parity links without
+            // changing legacy 2D entity tables.
+            if self.kind == SceneKind::ThreeD {
+                out.push_str(&format!(
+                    "{var}.__neolove_editor_source_id = {}\n",
+                    entity.id
+                ));
+            }
             out.push_str(&format!("{var}.size_x = {}\n", fmt_num(entity.size_x)));
             out.push_str(&format!("{var}.size_y = {}\n", fmt_num(entity.size_y)));
             if entity.z != 0.0 {
@@ -2478,6 +2722,12 @@ impl Scene {
                 match component {
                     Component::Core { name, props } => {
                         out.push_str(&format!("local {cvar} = {var}:AddComponent(core.{name})\n"));
+                        if self.kind == SceneKind::ThreeD {
+                            out.push_str(&format!(
+                                "{cvar}.__neolove_editor_component_index = {ci}\n{cvar}.__neolove_editor_component_key = \"core:{}\"\n",
+                                escape_luau(name)
+                            ));
+                        }
                         for prop in props {
                             // Skip optional asset/text props left empty, and
                             // empty handle paths, so the runtime keeps defaults.
@@ -2489,6 +2739,8 @@ impl Scene {
                                         | PropValue::Image(path)
                                         | PropValue::Sound(path)
                                         | PropValue::Mesh(path)
+                                        | PropValue::Material(path)
+                                        | PropValue::PhysicsMaterial(path)
                                         | PropValue::Shader(path)
                                         | PropValue::Animation(path)
                                         if path.is_empty()
@@ -2530,6 +2782,12 @@ impl Scene {
                                 .unwrap_or_else(|| "nil -- missing script module".to_string())
                         };
                         out.push_str(&format!("local {cvar} = {var}:AddComponent({module})\n"));
+                        if self.kind == SceneKind::ThreeD {
+                            out.push_str(&format!(
+                                "{cvar}.__neolove_editor_component_index = {ci}\n{cvar}.__neolove_editor_component_key = \"script:{}\"\n",
+                                escape_luau(path)
+                            ));
+                        }
                         for variable in variables {
                             if variable.name.is_empty() {
                                 continue;
@@ -2975,15 +3233,126 @@ mod tests {
     }
 
     #[test]
-    fn three_d_core_component_schemas_include_mesh_colliders() {
+    fn shared_tag_and_layer_round_trip_and_export_in_2d_scenes() {
+        let mut scene = Scene::new_for_kind(SceneKind::TwoD);
+        let entity = scene.entities.first_mut().expect("default entity");
+        let mut tag = Component::core("Tag");
+        set_core_prop(&mut tag, "tag", PropValue::Text("Player".into()));
+        let mut layer = Component::core("Layer");
+        set_core_prop(&mut layer, "layer", PropValue::Int(4));
+        set_core_prop(&mut layer, "name", PropValue::Text("Gameplay".into()));
+        entity.components = vec![tag, layer];
+
+        let json = scene.to_json().expect("serialize json");
+        let binary = scene.to_bytes().expect("serialize binary");
+        for restored in [
+            Scene::from_json(&json).expect("restore json"),
+            Scene::from_bytes(&binary).expect("restore binary"),
+        ] {
+            assert_eq!(restored.kind, SceneKind::TwoD);
+            assert_eq!(
+                restored.entities[0].components,
+                scene.entities[0].components
+            );
+        }
+
+        let luau = scene.to_luau_runtime();
+        assert!(luau.contains("ent_0:AddComponent(core.Tag)"));
+        assert!(luau.contains("ent_0_c0.tag = \"Player\""));
+        assert!(luau.contains("ent_0:AddComponent(core.Layer)"));
+        assert!(luau.contains("ent_0_c1.layer = 4"));
+        assert!(luau.contains("ent_0_c1.name = \"Gameplay\""));
+    }
+
+    #[test]
+    fn authored_3d_physics_components_round_trip_typed_settings() {
+        let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
+        let entity_id = scene.add_entity("Player", 1.0, 3.0).id;
+        let mut controller = Component::core("CharacterController3D");
+        set_core_prop(&mut controller, "radius", PropValue::Number(0.42));
+        set_core_prop(&mut controller, "height", PropValue::Number(1.85));
+        set_core_prop(
+            &mut controller,
+            "max_slope_degrees",
+            PropValue::Number(47.0),
+        );
+        set_core_prop(&mut controller, "step_height", PropValue::Number(0.28));
+        set_core_prop(&mut controller, "layer", PropValue::Int(4));
+        set_core_prop(&mut controller, "mask", PropValue::Int(11));
+        scene
+            .entity_mut(entity_id)
+            .expect("player entity")
+            .components
+            .push(controller);
+        let mut collider = Component::core("Collider3D");
+        set_core_prop(
+            &mut collider,
+            "physics_material",
+            PropValue::PhysicsMaterial("assets/materials/ice.neophysicsmaterial".into()),
+        );
+        let mut trigger = Component::core("Trigger3D");
+        set_core_prop(
+            &mut trigger,
+            "shape",
+            PropValue::Enum {
+                value: "sphere".into(),
+                options: vec!["box", "sphere", "capsule", "mesh"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            },
+        );
+        set_core_prop(&mut trigger, "radius", PropValue::Number(2.5));
+        let mut rigidbody = Component::core("Rigidbody3D");
+        set_core_prop(
+            &mut rigidbody,
+            "continuous_collision",
+            PropValue::Bool(true),
+        );
+        set_core_prop(&mut rigidbody, "contact_slop", PropValue::Number(0.002));
+        scene
+            .entity_mut(entity_id)
+            .expect("player entity")
+            .components
+            .extend([collider, trigger, rigidbody]);
+
+        let json = scene.to_json().expect("serialize 3D physics JSON");
+        let binary = scene.to_bytes().expect("serialize 3D physics binary");
+        for restored in [
+            Scene::from_json(&json).expect("restore 3D physics JSON"),
+            Scene::from_bytes(&binary).expect("restore 3D physics binary"),
+        ] {
+            assert_eq!(
+                restored
+                    .entity(entity_id)
+                    .expect("restored player")
+                    .components,
+                scene.entity(entity_id).expect("authored player").components
+            );
+        }
+    }
+
+    #[test]
+    fn core_component_schemas_include_shared_metadata_and_3d_authoring() {
         for name in [
             "MeshRenderer3D",
             "Camera3D",
             "Light3D",
             "Environment3D",
+            "ReflectionProbe3D",
             "ParticleSystem3D",
+            "AudioSource3D",
+            "AudioListener3D",
             "Rigidbody3D",
             "Collider3D",
+            "Trigger3D",
+            "CharacterController3D",
+            "Raycast3D",
+            "LODGroup3D",
+            "Visibility3D",
+            "RenderLayer3D",
+            "Tag",
+            "Layer",
         ] {
             assert!(
                 CORE_COMPONENTS.contains(&name),
@@ -2992,6 +3361,47 @@ mod tests {
             assert!(
                 !core_component_props(name).is_empty(),
                 "{name} has no editable schema"
+            );
+        }
+
+        let environment = core_component_props("Environment3D");
+        for name in [
+            "fog_enabled",
+            "fog_mode",
+            "fog_color",
+            "fog_start",
+            "fog_end",
+            "fog_density",
+            "ao_enabled",
+            "ao_radius",
+            "ao_intensity",
+            "ao_bias",
+        ] {
+            assert!(
+                environment.iter().any(|prop| prop.name == name),
+                "Environment3D is missing {name}"
+            );
+        }
+
+        let probe = core_component_props("ReflectionProbe3D");
+        for name in [
+            "positive_x",
+            "negative_x",
+            "positive_y",
+            "negative_y",
+            "positive_z",
+            "negative_z",
+            "size_x",
+            "size_y",
+            "size_z",
+            "blend_distance",
+            "intensity",
+            "rotation",
+            "priority",
+        ] {
+            assert!(
+                probe.iter().any(|prop| prop.name == name),
+                "ReflectionProbe3D is missing {name}"
             );
         }
 
@@ -3012,6 +3422,127 @@ mod tests {
             .expect("mesh path");
         assert!(mesh.optional);
         assert_eq!(mesh.value, PropValue::Mesh(String::new()));
+        for name in ["layer", "mask"] {
+            assert!(
+                collider.iter().any(|prop| prop.name == name),
+                "Collider3D is missing editable {name} filtering"
+            );
+        }
+        let physics_material = collider
+            .iter()
+            .find(|prop| prop.name == "physics_material")
+            .expect("physics material");
+        assert!(physics_material.optional);
+        assert_eq!(
+            physics_material.value,
+            PropValue::PhysicsMaterial(String::new())
+        );
+        let trigger = core_component_props("Trigger3D");
+        for name in [
+            "shape",
+            "mesh_path",
+            "size_x",
+            "size_y",
+            "size_z",
+            "radius",
+            "height",
+            "layer",
+            "mask",
+        ] {
+            assert!(
+                trigger.iter().any(|prop| prop.name == name),
+                "Trigger3D is missing {name}"
+            );
+        }
+        assert!(trigger.iter().all(|prop| prop.name != "is_trigger"));
+        assert!(trigger.iter().all(|prop| prop.name != "non_physics"));
+        let controller = core_component_props("CharacterController3D");
+        for name in [
+            "radius",
+            "height",
+            "skin_width",
+            "max_slope_degrees",
+            "step_height",
+            "ground_snap_distance",
+            "max_iterations",
+            "layer",
+            "mask",
+            "use_gravity",
+            "velocity_y",
+        ] {
+            assert!(
+                controller.iter().any(|prop| prop.name == name),
+                "CharacterController3D is missing {name}"
+            );
+        }
+        let raycast = core_component_props("Raycast3D");
+        for name in [
+            "direction_x",
+            "direction_y",
+            "direction_z",
+            "max_distance",
+            "layer",
+            "mask",
+            "include_triggers",
+            "exclude_self",
+        ] {
+            assert!(
+                raycast.iter().any(|prop| prop.name == name),
+                "Raycast3D is missing {name}"
+            );
+        }
+        let lod = core_component_props("LODGroup3D");
+        for name in [
+            "lod0_mesh",
+            "lod1_mesh",
+            "lod2_mesh",
+            "lod1_distance",
+            "lod2_distance",
+            "cull_distance",
+            "force_level",
+        ] {
+            assert!(
+                lod.iter().any(|prop| prop.name == name),
+                "LODGroup3D is missing {name}"
+            );
+        }
+        let renderer = core_component_props("MeshRenderer3D");
+        let material = renderer
+            .iter()
+            .find(|prop| prop.name == "material")
+            .expect("material asset");
+        assert!(material.optional);
+        assert_eq!(material.value, PropValue::Material(String::new()));
+
+        let light = core_component_props("Light3D");
+        assert_eq!(
+            light
+                .iter()
+                .find(|prop| prop.name == "visible")
+                .expect("Light3D enabled field")
+                .label,
+            "Enabled"
+        );
+        let mut legacy_light = Component::core("Light3D");
+        if let Component::Core { props, .. } = &mut legacy_light {
+            props
+                .iter_mut()
+                .find(|prop| prop.name == "visible")
+                .expect("legacy Light3D visible field")
+                .label = "Visible".to_string();
+        }
+        normalize_core_component(&mut legacy_light);
+        let Component::Core { props, .. } = legacy_light else {
+            unreachable!()
+        };
+        assert_eq!(
+            props
+                .iter()
+                .find(|prop| prop.name == "visible")
+                .expect("normalized Light3D enabled field")
+                .label,
+            "Enabled"
+        );
     }
 
     #[test]
@@ -3041,12 +3572,22 @@ mod tests {
             "texture",
             PropValue::Image("assets/crate.png".into()),
         );
+        set_core_prop(
+            &mut mesh,
+            "material",
+            PropValue::Material("assets/materials/crate.neomaterial".into()),
+        );
         let mut camera = Component::core("Camera3D");
         set_core_prop(&mut camera, "fov", PropValue::Number(75.0));
         let mut light = Component::core("Light3D");
         set_core_prop(&mut light, "intensity", PropValue::Number(3.0));
         let mut rigidbody = Component::core("Rigidbody3D");
         set_core_prop(&mut rigidbody, "mass", PropValue::Number(10.0));
+        set_core_prop(
+            &mut rigidbody,
+            "continuous_collision",
+            PropValue::Bool(true),
+        );
         let mut collider = Component::core("Collider3D");
         set_core_prop(
             &mut collider,
@@ -3066,9 +3607,27 @@ mod tests {
             "mesh_path",
             PropValue::Mesh("assets/crate.gltf".into()),
         );
-        entity.components = vec![mesh, camera, light, rigidbody, collider];
+        set_core_prop(
+            &mut collider,
+            "physics_material",
+            PropValue::PhysicsMaterial("assets/materials/rubber.neophysicsmaterial".into()),
+        );
+        let mut trigger = Component::core("Trigger3D");
+        set_core_prop(&mut trigger, "radius", PropValue::Number(0.75));
+        let mut controller = Component::core("CharacterController3D");
+        set_core_prop(
+            &mut controller,
+            "max_slope_degrees",
+            PropValue::Number(42.0),
+        );
+        entity.components = vec![
+            mesh, camera, light, rigidbody, collider, trigger, controller,
+        ];
 
         let luau = scene.to_luau_runtime();
+        assert!(luau.contains("ent_0.__neolove_editor_source_id = 1"));
+        assert!(luau.contains("ent_0_c0.__neolove_editor_component_index = 0"));
+        assert!(luau.contains("ent_0_c0.__neolove_editor_component_key = \"core:MeshRenderer3D\""));
         for assignment in [
             "ent_0.z = 7",
             "ent_0.position_z = 8",
@@ -3082,11 +3641,16 @@ mod tests {
             "ent_0.scale_z = 4",
             "ent_0_c0.mesh_path = \"assets/crate.gltf\"",
             "ent_0_c0.texture = Images[\"assets/crate.png\"]",
+            "ent_0_c0.material = assets.loadMaterial3D(\"assets/materials/crate.neomaterial\")",
             "ent_0_c1.fov = 75",
             "ent_0_c2.intensity = 3",
             "ent_0_c3.mass = 10",
+            "ent_0_c3.continuous_collision = true",
             "ent_0_c4.shape = \"mesh\"",
             "ent_0_c4.mesh_path = \"assets/crate.gltf\"",
+            "ent_0_c4.physics_material = assets.loadPhysicsMaterial3D(\"assets/materials/rubber.neophysicsmaterial\")",
+            "ent_0_c5.radius = 0.75",
+            "ent_0_c6.max_slope_degrees = 42",
         ] {
             assert!(
                 luau.contains(assignment),
@@ -3099,6 +3663,8 @@ mod tests {
             "Light3D",
             "Rigidbody3D",
             "Collider3D",
+            "Trigger3D",
+            "CharacterController3D",
         ] {
             assert!(
                 luau.contains(&format!("AddComponent(core.{component})")),
@@ -3107,6 +3673,8 @@ mod tests {
         }
 
         let defaults = Scene::default().to_luau_runtime();
+        assert!(!defaults.contains("__neolove_editor_source_id"));
+        assert!(!defaults.contains("__neolove_editor_component_index"));
         for field in [
             ".position_z =",
             ".rotation_x =",
@@ -3201,6 +3769,20 @@ mod tests {
         let mut off = Scene::default();
         off.lighting.enabled = false;
         assert!(!off.to_luau_runtime().contains("lighting."));
+
+        // 3D lighting is component-driven. Even stale serialized 2D settings
+        // must not darken the PBR frame, and loading a 3D scene after a lit 2D
+        // scene must clear the persistent compositor configuration.
+        let mut three_d = Scene::new_for_kind(SceneKind::ThreeD);
+        three_d.lighting.enabled = true;
+        three_d.lighting.ambient = [0, 0, 0, 255];
+        let luau = three_d.to_luau_runtime();
+        assert!(
+            luau.contains("lighting.reset()"),
+            "missing 3D reset: {luau}"
+        );
+        assert!(!luau.contains("lighting.setEnabled(true)"));
+        assert!(!luau.contains("lighting.setAmbient("));
     }
 
     #[test]
@@ -3476,6 +4058,77 @@ mod tests {
         assert!(luau.contains("AddComponent(core.SpatialSound2D)"));
         assert!(luau.contains(".sound = assets.loadSound(\"assets/ambience.ogg\")"));
         assert!(luau.contains(".volume = 1"));
+    }
+
+    #[test]
+    fn native_3d_audio_authoring_round_trips_and_exports_runtime_components() {
+        let mut scene = Scene::new_for_kind(SceneKind::ThreeD);
+        let emitter_id = scene.add_entity("Emitter", 2.0, 3.0).id;
+        let mut source = Component::core("AudioSource3D");
+        set_core_prop(
+            &mut source,
+            "sound",
+            PropValue::Sound("assets/machine.ogg".into()),
+        );
+        set_core_prop(&mut source, "autoplay", PropValue::Bool(true));
+        set_core_prop(&mut source, "min_distance", PropValue::Number(2.5));
+        set_core_prop(&mut source, "max_distance", PropValue::Number(45.0));
+        set_core_prop(&mut source, "rolloff", PropValue::Number(1.25));
+        set_core_prop(
+            &mut source,
+            "distance_model",
+            PropValue::Enum {
+                value: "exponential".into(),
+                options: vec!["inverse".into(), "linear".into(), "exponential".into()],
+            },
+        );
+        scene
+            .entity_mut(emitter_id)
+            .expect("emitter")
+            .components
+            .push(source);
+        let listener_id = scene.add_entity("Listener", 0.0, 1.0).id;
+        scene
+            .entity_mut(listener_id)
+            .expect("listener")
+            .components
+            .push(Component::core("AudioListener3D"));
+
+        let json = scene.to_json().expect("3D audio JSON");
+        let binary = scene.to_bytes().expect("3D audio binary");
+        for restored in [
+            Scene::from_json(&json).expect("restore 3D audio JSON"),
+            Scene::from_bytes(&binary).expect("restore 3D audio binary"),
+        ] {
+            assert_eq!(
+                restored
+                    .entity(emitter_id)
+                    .expect("restored emitter")
+                    .components,
+                scene
+                    .entity(emitter_id)
+                    .expect("authored emitter")
+                    .components
+            );
+            assert_eq!(
+                restored
+                    .entity(listener_id)
+                    .expect("restored listener")
+                    .components,
+                scene
+                    .entity(listener_id)
+                    .expect("authored listener")
+                    .components
+            );
+        }
+
+        let luau = scene.to_luau();
+        assert!(luau.contains("AddComponent(core.AudioSource3D)"));
+        assert!(luau.contains(".sound = assets.loadSound(\"assets/machine.ogg\")"));
+        assert!(luau.contains(".min_distance = 2.5"));
+        assert!(luau.contains(".max_distance = 45"));
+        assert!(luau.contains(".distance_model = \"exponential\""));
+        assert!(luau.contains("AddComponent(core.AudioListener3D)"));
     }
 
     #[test]
